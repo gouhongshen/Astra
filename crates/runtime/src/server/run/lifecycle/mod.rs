@@ -5161,13 +5161,18 @@ impl AgenticRunLifecycleService {
             session_id,
             astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
         );
-        let head = coordinator.load_head(&key).await.map_err(|error| {
-            error_response_coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("failed to load canonical session head: {error}"),
-                "session_head_unavailable",
-            )
-        })?;
+        let admission_snapshot =
+            coordinator
+                .load_admission_snapshot(&key)
+                .await
+                .map_err(|error| {
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("failed to load canonical session head: {error}"),
+                        "session_head_unavailable",
+                    )
+                })?;
+        let head = admission_snapshot.head;
         let prior_canonical_bytes = head.as_ref().map_or(0, |head| head.total_canonical_bytes);
         let current_bytes = fresh_request_admission_bytes(request).map_err(|error| {
             error_response_coded(
@@ -5244,16 +5249,8 @@ impl AgenticRunLifecycleService {
         };
         let (lease, release_writer_on_finish) =
             if let Some(authority) = request.conversation_authority.as_ref() {
-                let active = coordinator
-                    .load_active_writer(&key)
-                    .await
-                    .map_err(|error| {
-                        error_response_coded(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("failed to load canonical writer: {error}"),
-                            "session_writer_unavailable",
-                        )
-                    })?
+                let active = admission_snapshot
+                    .active_writer
                     .filter(|lease| {
                         lease.key == key
                             && lease.lease_id == authority.execution_grant.claims.lease_id
@@ -5272,17 +5269,7 @@ impl AgenticRunLifecycleService {
                     })?;
                 (active, false)
             } else {
-                let authority_epochs = coordinator
-                    .load_authority_epochs(&key)
-                    .await
-                    .map_err(|error| {
-                        error_response_coded(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("failed to load canonical authority epochs: {error}"),
-                            "session_authority_unavailable",
-                        )
-                    })?
-                    .unwrap_or_default();
+                let authority_epochs = admission_snapshot.authority_epochs;
                 let actor = astra_turn_types::ActorContextV1::owner_user(
                     user_id,
                     format!("server-run:{run_id}"),

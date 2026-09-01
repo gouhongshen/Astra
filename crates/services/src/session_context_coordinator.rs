@@ -142,12 +142,33 @@ pub struct MaterializedConversationV1 {
     pub canonical_segment_bytes: u64,
 }
 
+/// Read-only facts used to prepare a canonical turn. Mutating admission still
+/// revalidates the writer, cursor, epochs, and reservation while holding the
+/// database row lock; this snapshot only removes duplicate preflight reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAdmissionSnapshotV1 {
+    pub head: Option<SessionContextHeadV1>,
+    pub active_writer: Option<ConversationWriterLeaseV1>,
+    pub authority_epochs: AuthorityEpochsV1,
+}
+
 #[async_trait]
 pub trait SessionContextCoordinator: Send + Sync {
     async fn load_head(
         &self,
         key: &SessionKeyV1,
     ) -> Result<Option<SessionContextHeadV1>, SessionContextCoordinatorError>;
+
+    async fn load_admission_snapshot(
+        &self,
+        key: &SessionKeyV1,
+    ) -> Result<SessionAdmissionSnapshotV1, SessionContextCoordinatorError> {
+        Ok(SessionAdmissionSnapshotV1 {
+            head: self.load_head(key).await?,
+            active_writer: self.load_active_writer(key).await?,
+            authority_epochs: self.load_authority_epochs(key).await?.unwrap_or_default(),
+        })
+    }
 
     async fn materialize(
         &self,
@@ -417,6 +438,77 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             }
         }
         Ok(head)
+    }
+
+    async fn load_admission_snapshot(
+        &self,
+        key: &SessionKeyV1,
+    ) -> Result<SessionAdmissionSnapshotV1, SessionContextCoordinatorError> {
+        key.validate()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        let row = sqlx::query(
+            "SELECT head_json, active_writer_json, authorization_epoch,
+                    device_trust_epoch, permission_epoch,
+                    CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) AS database_now_unix_ms
+             FROM session_context_heads
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| database_error("load_admission_snapshot", source))?;
+        let Some(row) = row else {
+            return Ok(SessionAdmissionSnapshotV1 {
+                head: None,
+                active_writer: None,
+                authority_epochs: AuthorityEpochsV1::default(),
+            });
+        };
+        let head = row
+            .try_get::<Option<String>, _>("head_json")
+            .map_err(|source| database_error("decode_admission_head", source))?
+            .as_deref()
+            .map(|json| database_json("head", json))
+            .transpose()?;
+        if let Some(head) = &head {
+            validate_head(head)?;
+            if head.key != *key {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "database admission head key mismatch".into(),
+                ));
+            }
+        }
+        let now = row
+            .try_get::<i64, _>("database_now_unix_ms")
+            .map_err(|source| database_error("decode_admission_database_time", source))?;
+        let active_writer = row
+            .try_get::<Option<String>, _>("active_writer_json")
+            .map_err(|source| database_error("decode_admission_writer", source))?
+            .as_deref()
+            .map(|json| database_json::<ConversationWriterLeaseV1>("active_writer", json))
+            .transpose()?
+            .filter(|lease| lease.expires_at_unix_ms > now);
+        if active_writer
+            .as_ref()
+            .is_some_and(|lease| lease.key != *key)
+        {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "admission writer owner-scoped key mismatch".into(),
+            ));
+        }
+        Ok(SessionAdmissionSnapshotV1 {
+            head,
+            active_writer,
+            authority_epochs: AuthorityEpochsV1 {
+                authorization_epoch: database_u64(&row, "authorization_epoch")?,
+                device_trust_epoch: database_u64(&row, "device_trust_epoch")?,
+                permission_epoch: database_u64(&row, "permission_epoch")?,
+            },
+        })
     }
 
     async fn materialize(
@@ -999,10 +1091,9 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_acquire_writer", source))?;
-        let now = database_now_ms(&mut tx).await?;
-        let expires_at = checked_expiry(now, ttl)?;
         ensure_database_state(&mut tx, key, actor.authority_epochs).await?;
-        let mut state = lock_database_state(&mut tx, key).await?;
+        let (mut state, now) = lock_database_state_at_now(&mut tx, key).await?;
+        let expires_at = checked_expiry(now, ttl)?;
         let request_hash = lease_request_hash(key, expected_cursor, actor);
         if let Some(receipt) = load_database_receipt::<LeaseReceiptV1>(
             &mut tx,
@@ -1178,8 +1269,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_renew_writer", source))?;
-        let now = database_now_ms(&mut tx).await?;
-        let mut state = lock_database_state(&mut tx, &lease.key).await?;
+        let (mut state, now) = lock_database_state_at_now(&mut tx, &lease.key).await?;
         if let Err(error) = validate_active_lease(&state, lease, now) {
             record_database_authority_event(
                 &mut tx,
@@ -1597,8 +1687,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_reserve_turn", source))?;
-        let now = database_now_ms(&mut tx).await?;
-        let mut state = lock_database_state(&mut tx, &lease.key).await?;
+        let (mut state, now) = lock_database_state_at_now(&mut tx, &lease.key).await?;
         let request_hash = reservation_request_hash(lease, expected_cursor);
         if let Some(receipt) = load_database_receipt::<ReservationReceiptV1>(
             &mut tx,
@@ -1878,8 +1967,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_commit_turn", source))?;
-        let now = database_now_ms(&mut tx).await?;
-        let mut state = lock_database_state(&mut tx, &reservation.key).await?;
+        let (mut state, now) = lock_database_state_at_now(&mut tx, &reservation.key).await?;
         if let Some(last) = state.last_commit.clone()
             && last.idempotency_key == idempotency_key
         {
@@ -2098,8 +2186,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .begin()
             .await
             .map_err(|source| database_error("begin_renew_turn_reservation", source))?;
-        let now = database_now_ms(&mut tx).await?;
-        let mut state = lock_database_state(&mut tx, &reservation.key).await?;
+        let (mut state, now) = lock_database_state_at_now(&mut tx, &reservation.key).await?;
         if let Err(error) = validate_active_reservation(&state, reservation, now) {
             record_database_authority_event(
                 &mut tx,
@@ -2865,10 +2952,20 @@ async fn lock_database_state(
     tx: &mut Transaction<'_, MySql>,
     key: &SessionKeyV1,
 ) -> Result<CoordinatorStateV1, SessionContextCoordinatorError> {
+    lock_database_state_at_now(tx, key)
+        .await
+        .map(|(state, _)| state)
+}
+
+async fn lock_database_state_at_now(
+    tx: &mut Transaction<'_, MySql>,
+    key: &SessionKeyV1,
+) -> Result<(CoordinatorStateV1, i64), SessionContextCoordinatorError> {
     let row = sqlx::query(
         "SELECT head_json, writer_epoch, authorization_epoch, device_trust_epoch,
                 permission_epoch, active_writer_json, active_reservation_json,
-                last_commit_json, fork_base_json
+                last_commit_json, fork_base_json,
+                CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) AS database_now_unix_ms
          FROM session_context_heads
          WHERE isolation_domain = ? AND owner_user_id = ?
            AND session_id = ? AND branch_id = ?
@@ -2922,7 +3019,10 @@ async fn lock_database_state(
         .map(|json| database_json("fork_base", json))
         .transpose()?;
     state.validate_for(key)?;
-    Ok(state)
+    let now = row
+        .try_get::<i64, _>("database_now_unix_ms")
+        .map_err(|source| database_error("decode_locked_database_time", source))?;
+    Ok((state, now))
 }
 
 async fn update_database_state(

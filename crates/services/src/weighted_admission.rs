@@ -22,7 +22,7 @@ use thiserror::Error;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-const DISTRIBUTED_ADMISSION_SCOPE: &str = "canonical_turn_v1";
+pub(crate) const DISTRIBUTED_ADMISSION_SCOPE: &str = "canonical_turn_v1";
 const DISTRIBUTED_ADMISSION_MAX_TTL: Duration = Duration::from_secs(15 * 60);
 const DISTRIBUTED_ADMISSION_IDEMPOTENCY_DOMAIN: &[u8] =
     b"astra.distributed-weighted-admission-idempotency.v1\0";
@@ -153,8 +153,7 @@ impl DatabaseWeightedAdmissionController {
             .begin()
             .await
             .map_err(|source| distributed_database_error("begin_reservation", source))?;
-        lock_distributed_admission_gate(&mut tx).await?;
-        let now = distributed_database_now(&mut tx).await?;
+        let now = lock_distributed_admission_gate(&mut tx).await?;
         sqlx::query(
             "DELETE FROM session_weighted_admission_reservations
              WHERE scope_name = ? AND expires_at <= ?",
@@ -218,8 +217,7 @@ impl DatabaseWeightedAdmissionController {
             .begin()
             .await
             .map_err(|source| distributed_database_error("begin_renewal", source))?;
-        lock_distributed_admission_gate(&mut tx).await?;
-        let now = distributed_database_now(&mut tx).await?;
+        let now = lock_distributed_admission_gate(&mut tx).await?;
         let expires_at = now
             .checked_add_signed(chrono::Duration::from_std(ttl).map_err(|_| {
                 DistributedAdmissionError::Invalid("admission TTL is outside clock range".into())
@@ -407,29 +405,20 @@ fn validate_available_work(
 
 async fn lock_distributed_admission_gate(
     tx: &mut Transaction<'_, MySql>,
-) -> Result<(), DistributedAdmissionError> {
-    sqlx::query("INSERT IGNORE INTO session_weighted_admission_gates (scope_name) VALUES (?)")
-        .bind(DISTRIBUTED_ADMISSION_SCOPE)
-        .execute(&mut **tx)
-        .await
-        .map_err(|source| distributed_database_error("ensure_gate", source))?;
-    sqlx::query(
-        "SELECT scope_name FROM session_weighted_admission_gates
+) -> Result<chrono::NaiveDateTime, DistributedAdmissionError> {
+    let row = sqlx::query(
+        "SELECT scope_name,
+                CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) AS database_now_unix_ms
+         FROM session_weighted_admission_gates
          WHERE scope_name = ? FOR UPDATE",
     )
     .bind(DISTRIBUTED_ADMISSION_SCOPE)
     .fetch_one(&mut **tx)
     .await
     .map_err(|source| distributed_database_error("lock_gate", source))?;
-    Ok(())
-}
-
-async fn distributed_database_now(
-    tx: &mut Transaction<'_, MySql>,
-) -> Result<chrono::NaiveDateTime, DistributedAdmissionError> {
-    let unix_ms = crate::db_row::database_now_unix_ms(tx)
-        .await
-        .map_err(|source| distributed_database_error("load_database_time", source))?;
+    let unix_ms = row
+        .try_get::<i64, _>("database_now_unix_ms")
+        .map_err(|source| distributed_database_error("decode_gate_database_time", source))?;
     chrono::DateTime::from_timestamp_millis(unix_ms)
         .map(|timestamp| timestamp.naive_utc())
         .ok_or_else(|| {

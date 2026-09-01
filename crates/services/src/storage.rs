@@ -4456,6 +4456,10 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+    sqlx::query("INSERT IGNORE INTO session_weighted_admission_gates (scope_name) VALUES (?)")
+        .bind(crate::weighted_admission::DISTRIBUTED_ADMISSION_SCOPE)
+        .execute(&pool)
+        .await?;
 
     core_schema_create!(
         pool,
