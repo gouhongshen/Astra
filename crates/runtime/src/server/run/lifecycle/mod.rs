@@ -16554,13 +16554,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     run.settlement_in_progress = false;
                 }
 
-                // The terminal status and its durable evidence form one
-                // externally observable completion boundary. Finish every
-                // mandatory write before publishing terminal SSE so a client
-                // cannot observe success while usage, transcript evidence, or
-                // projections are still vulnerable to process termination.
-                // These stores are independent after the terminal CAS, so keep
-                // their latency overlapped.
+                // Restore the existing pre-publication ordering for derived
+                // usage, transcript, and observability projections. Canonical
+                // journal/context, provider settlement, and the terminal CAS
+                // above remain the success gates; these projections retain
+                // their established best-effort error semantics. Their stores
+                // are independent after the terminal CAS, so keep the latency
+                // overlapped before publishing terminal SSE.
                 let persist_usage = async {
                     astra_core::log_persist!(
                         run_engine
