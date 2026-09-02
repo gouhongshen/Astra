@@ -58,8 +58,13 @@ pub(super) async fn validate_conversation_authority(
             "execution_grant_verifier_unavailable",
         )
     })?;
-    let active_lease = coordinator
-        .load_active_writer(&authority.key)
+    // The authority lease and canonical head must come from one database
+    // snapshot. Besides avoiding two serialized round trips, this prevents
+    // validating the grant against a lease and cursor observed at different
+    // instants. The run lifecycle still revalidates and reserves the turn
+    // immediately before execution.
+    let admission_snapshot = coordinator
+        .load_admission_snapshot(&authority.key)
         .await
         .map_err(|error| {
             error_response_coded(
@@ -67,14 +72,14 @@ pub(super) async fn validate_conversation_authority(
                 format!("failed to load current session authority: {error}"),
                 "session_authority_unavailable",
             )
-        })?
-        .ok_or_else(|| {
-            error_response_coded(
-                StatusCode::CONFLICT,
-                "conversation authority no longer owns the active writer lease",
-                "conversation_authority_fenced",
-            )
         })?;
+    let active_lease = admission_snapshot.active_writer.ok_or_else(|| {
+        error_response_coded(
+            StatusCode::CONFLICT,
+            "conversation authority no longer owns the active writer lease",
+            "conversation_authority_fenced",
+        )
+    })?;
     let now_unix_ms = chrono::Utc::now().timestamp_millis();
     let claims = signer
         .verify(
@@ -103,16 +108,7 @@ pub(super) async fn validate_conversation_authority(
             "conversation_authority_fenced",
         ));
     }
-    let head = coordinator
-        .load_head(&authority.key)
-        .await
-        .map_err(|error| {
-            error_response_coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("failed to load canonical conversation head: {error}"),
-                "session_head_unavailable",
-            )
-        })?;
+    let head = admission_snapshot.head;
     if head.as_ref().map(|head| &head.cursor) != authority.expected_cursor.as_ref()
         || authority.prompt_manifest_root.as_deref()
             != head.as_ref().map(|head| head.latest_manifest_root.as_str())

@@ -1507,6 +1507,59 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
             "agent_binding_discovery_failed",
         )
     })?;
+    build_agent_binding_mcp_bundle(
+        server_id,
+        endpoint_url,
+        authorization,
+        semantic_read_capability,
+        tools,
+    )
+}
+
+pub(crate) fn prepare_agent_binding_mcp_bundle_from_snapshot(
+    server_id: &str,
+    endpoint_url: &str,
+    authorization: &str,
+    semantic_read_capability: Option<&astra_services::runs::RuntimeSemanticReadCapabilityRequest>,
+    raw_tools: &[Value],
+) -> Result<RuntimeMcpBundle, (StatusCode, Json<ErrorResponse>)> {
+    let tool_namespace = sanitize_tool_name(server_id);
+    if tool_namespace.is_empty() {
+        return Err(mcp_error(
+            StatusCode::BAD_REQUEST,
+            "agent binding MCP server id must not be empty after sanitization",
+            "agent_binding_capability_ref_invalid",
+        ));
+    }
+    astra_services::validate_registered_endpoint_url(
+        "agent_binding.capability_server.endpoint_url",
+        endpoint_url,
+        "agent_binding_capability_ref_invalid",
+    )?;
+    let tools = parse_agent_binding_mcp_tools(json!({ "tools": raw_tools })).map_err(|error| {
+        agent_binding_mcp_error_response(
+            StatusCode::BAD_REQUEST,
+            error,
+            "agent_binding_discovery_snapshot_invalid",
+        )
+    })?;
+    build_agent_binding_mcp_bundle(
+        server_id,
+        endpoint_url,
+        authorization,
+        semantic_read_capability,
+        tools,
+    )
+}
+
+fn build_agent_binding_mcp_bundle(
+    server_id: &str,
+    endpoint_url: &str,
+    authorization: &str,
+    semantic_read_capability: Option<&astra_services::runs::RuntimeSemanticReadCapabilityRequest>,
+    tools: Vec<AgentBindingMcpTool>,
+) -> Result<RuntimeMcpBundle, (StatusCode, Json<ErrorResponse>)> {
+    let tool_namespace = sanitize_tool_name(server_id);
     let (_adapter_schemas, control_tools, stop_after_success_tools) =
         agent_binding_tools_to_schemas_checked(&tool_namespace, &tools)
             .map_err(|(error, code)| mcp_error(StatusCode::BAD_GATEWAY, error, code))?;
@@ -1642,6 +1695,26 @@ pub(crate) async fn prepare_agent_binding_mcp_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepares_agent_binding_mcp_bundle_from_frozen_snapshot() {
+        let bundle = prepare_agent_binding_mcp_bundle_from_snapshot(
+            "tools",
+            "https://catalog.example.test/api/v1/mcp/http",
+            "Bearer runtime-grant",
+            None,
+            &[json!({
+                "name": "file_list",
+                "description": "List files",
+                "inputSchema": {"type": "object", "properties": {}},
+                "side_effect_class": "read"
+            })],
+        )
+        .expect("frozen MCP discovery snapshot should prepare");
+
+        assert_eq!(bundle.schemas.len(), 1);
+        assert!(bundle.agent_binding_mcp.is_some());
+    }
 
     #[test]
     fn agent_binding_timeout_preserves_unknown_outcome_evidence() {

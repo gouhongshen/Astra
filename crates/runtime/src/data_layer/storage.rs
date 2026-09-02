@@ -3,12 +3,12 @@ pub use astra_services::storage::*;
 use std::time::Duration;
 
 use serde_json::Value;
-use sqlx::{MySql, query};
+use sqlx::{MySql, QueryBuilder, Row, query};
 
 use astra_core::canonical_names::{
     metadata_duration_ms, metadata_tool_call_id, metadata_tool_name,
 };
-use astra_core::matrixone_statement_with_null_shape;
+use astra_core::{matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnDecisionAuditRecord, TurnSkillSelectionRecord, TurnToolEventRecord,
 };
@@ -211,68 +211,98 @@ fn trace_event_insert_values(event: &TraceEvent) -> Result<TraceEventInsertValue
     })
 }
 
-pub(crate) async fn insert_trace_event(
+pub(crate) async fn insert_trace_events(
     tx: &mut sqlx::Transaction<'_, MySql>,
-    event: &TraceEvent,
-) -> Result<bool, sqlx::Error> {
-    let values = trace_event_insert_values(event)?;
-    let insert_sql = matrixone_statement_with_null_shape(
+    events: &[TraceEvent],
+) -> Result<(u64, Option<String>), sqlx::Error> {
+    let Some(first) = events.first() else {
+        return Ok((0, None));
+    };
+    if events
+        .iter()
+        .any(|event| event.user_id != first.user_id || event.session_id != first.session_id)
+    {
+        return Err(sqlx::Error::Protocol(
+            "trace event batch must belong to one user session".to_string(),
+        ));
+    }
+
+    let prepared = events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| trace_event_insert_values(event).map(|values| (index, values)))
+        .collect::<Result<Vec<_>, _>>()?;
+    if prepared.is_empty() {
+        return Ok((0, None));
+    }
+
+    let mut insert = QueryBuilder::<MySql>::new(
         "INSERT IGNORE INTO agent_events \
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
           parent_event_id, causal_chain_id, run_id, parent_run_id, turn_id, turn_seq, \
           round_index, tool_call_id, parent_agent_id, trace_kind, token_usage, \
           llm_model_used, reasoning_content, token_input, token_output, token_total, \
-          meta_tool_name, meta_duration_ms, metadata, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        values.nullable_shape(event),
+          meta_tool_name, meta_duration_ms, metadata, created_at) ",
     );
-    let result = query(&insert_sql)
-        .bind(&event.event_id)
-        .bind(&event.session_id)
-        .bind(&event.user_id)
-        .bind(event.agent_id.as_deref().unwrap_or("astra-server"))
-        .bind(env!("CARGO_PKG_VERSION"))
-        .bind(&event.event_type)
-        .bind(&event.content)
-        .bind(&event.parent_event_id)
-        .bind(&event.causal_chain_id)
-        .bind(&event.run_id)
-        .bind(&event.parent_run_id)
-        .bind(&event.turn_id)
-        .bind(event.turn_seq)
-        .bind(event.round_index)
-        .bind(&event.tool_call_id)
-        .bind(&event.parent_agent_id)
-        .bind(&event.trace_kind)
-        .bind(values.token_usage_json)
-        .bind(&event.llm_model_used)
-        .bind(&event.reasoning_content)
-        .bind(values.token_input)
-        .bind(values.token_output)
-        .bind(values.token_total)
-        .bind(&event.meta_tool_name)
-        .bind(event.meta_duration_ms)
-        .bind(values.metadata_json)
-        .bind(values.created_at)
-        .execute(&mut **tx)
-        .await?;
-    let inserted = result.rows_affected() > 0;
-    if inserted {
-        insert_agent_event_edges(
-            &mut **tx,
-            &event.user_id,
-            &event.session_id,
-            &event.event_id,
-            event.parent_event_id.as_deref(),
-            event
+    insert.push_values(prepared.iter(), |mut row, (index, values)| {
+        let event = &events[*index];
+        row.push_bind(&event.event_id)
+            .push_bind(&event.session_id)
+            .push_bind(&event.user_id)
+            .push_bind(event.agent_id.as_deref().unwrap_or("astra-server"))
+            .push_bind(env!("CARGO_PKG_VERSION"))
+            .push_bind(&event.event_type)
+            .push_bind(&event.content)
+            .push_bind(&event.parent_event_id)
+            .push_bind(&event.causal_chain_id)
+            .push_bind(&event.run_id)
+            .push_bind(&event.parent_run_id)
+            .push_bind(&event.turn_id)
+            .push_bind(event.turn_seq)
+            .push_bind(event.round_index)
+            .push_bind(&event.tool_call_id)
+            .push_bind(&event.parent_agent_id)
+            .push_bind(&event.trace_kind)
+            .push_bind(&values.token_usage_json)
+            .push_bind(&event.llm_model_used)
+            .push_bind(&event.reasoning_content)
+            .push_bind(values.token_input)
+            .push_bind(values.token_output)
+            .push_bind(values.token_total)
+            .push_bind(&event.meta_tool_name)
+            .push_bind(event.meta_duration_ms)
+            .push_bind(&values.metadata_json)
+            .push_bind(&values.created_at);
+    });
+    insert.push(matrixone_null_shape_comment(
+        prepared
+            .iter()
+            .flat_map(|(index, values)| values.nullable_shape(&events[*index])),
+    ));
+    let inserted = insert.build().execute(&mut **tx).await?.rows_affected();
+
+    // Both immutable event rows and their edge projection are idempotent
+    // inserts. Sending the complete deterministic batch lets MatrixOne report
+    // the number of newly inserted events and removes the preceding existence
+    // read. Replayed edges are ignored by their unique key, while a partial
+    // replay still repairs any missing edge rows.
+    let edge_inputs = events
+        .iter()
+        .map(|event| astra_services::storage::AgentEventEdgeInsert {
+            user_id: &event.user_id,
+            session_id: &event.session_id,
+            child_event_id: &event.event_id,
+            primary_parent_event_id: event.parent_event_id.as_deref(),
+            parent_event_ids: event
                 .parent_event_id
                 .as_ref()
-                .map(|id| std::slice::from_ref(id))
+                .map(std::slice::from_ref)
                 .unwrap_or(&[]),
-        )
-        .await?;
-    }
-    Ok(inserted)
+        })
+        .collect::<Vec<_>>();
+    astra_services::storage::insert_agent_event_edges_batch(&mut **tx, &edge_inputs).await?;
+
+    Ok((inserted, events.last().map(|event| event.event_id.clone())))
 }
 
 pub(crate) async fn insert_core_turn_event(
