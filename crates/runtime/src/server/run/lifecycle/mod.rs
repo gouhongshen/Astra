@@ -5452,7 +5452,7 @@ impl AgenticRunLifecycleService {
                     let cursor = base.ok_or_else(|| {
                         "canonical replacement is missing its admitted base cursor".to_string()
                     })?;
-                    if proof.base_root() != cursor.canonical_root_hash {
+                    if proof.base_manifest_root() != cursor.canonical_root_hash {
                         return Err(
                             "canonical rewrite proof does not match the admitted base root".into(),
                         );
