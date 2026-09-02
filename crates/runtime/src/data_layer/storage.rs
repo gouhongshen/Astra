@@ -293,11 +293,7 @@ pub(crate) async fn insert_trace_events(
             session_id: &event.session_id,
             child_event_id: &event.event_id,
             primary_parent_event_id: event.parent_event_id.as_deref(),
-            parent_event_ids: event
-                .parent_event_id
-                .as_ref()
-                .map(std::slice::from_ref)
-                .unwrap_or(&[]),
+            parent_event_ids: event.parent_event_id.as_slice(),
         })
         .collect::<Vec<_>>();
     astra_services::storage::insert_agent_event_edges_batch(&mut **tx, &edge_inputs).await?;

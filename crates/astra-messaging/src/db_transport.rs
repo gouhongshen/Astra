@@ -656,10 +656,10 @@ impl DatabaseTransport {
             .read()
             .await
             .iter()
-            .filter_map(|(address, registered_delegation_id)| {
-                (registered_delegation_id.as_deref() == Some(delegation_id))
-                    .then(|| format!("{}@{}", address.agent_id, address.run_id))
+            .filter(|(_, registered_delegation_id)| {
+                registered_delegation_id.as_deref() == Some(delegation_id)
             })
+            .map(|(address, _)| format!("{}@{}", address.agent_id, address.run_id))
             .collect::<Vec<_>>();
         let controls = self
             .poll_abort_handles
