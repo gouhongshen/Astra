@@ -367,11 +367,12 @@ impl ResourceGovernor for DatabaseResourceGovernor {
         // Run admission needs three authoritative facts, but not the rest of
         // ResourceUsage. Fetch them in one statement so a remote database does
         // not turn an observational quota check into three network round trips.
+        let today = Self::today();
         let row: Result<(i32, i64, i64, i64), sqlx::Error> = sqlx::query_as(
             "SELECT \
                 CAST(COALESCE((SELECT max_concurrent_sessions FROM resource_limits WHERE user_id = ?), ?) AS SIGNED), \
                 CAST(COALESCE((SELECT max_tokens_per_day FROM resource_limits WHERE user_id = ?), ?) AS SIGNED), \
-                CAST(COALESCE((SELECT tokens_consumed FROM resource_usage WHERE user_id = ? AND usage_date = CURRENT_DATE), 0) AS SIGNED), \
+                CAST(COALESCE((SELECT tokens_consumed FROM resource_usage WHERE user_id = ? AND usage_date = ?), 0) AS SIGNED), \
                 CAST((SELECT COUNT(DISTINCT session_id) FROM agent_runs WHERE user_id = ? AND status IN ('running', 'paused', 'waiting')) AS SIGNED)",
         )
         .bind(user_id)
@@ -379,6 +380,7 @@ impl ResourceGovernor for DatabaseResourceGovernor {
         .bind(user_id)
         .bind(ResourceLimits::DEFAULT_MAX_TOKENS_PER_DAY as i64)
         .bind(user_id)
+        .bind(&today)
         .bind(user_id)
         .fetch_one(self.pool.get())
         .await;
@@ -418,14 +420,16 @@ impl ResourceGovernor for DatabaseResourceGovernor {
     async fn check_token_budget(&self, user_id: &str) -> LimitCheck {
         // Mid-turn enforcement only depends on the token limit and today's
         // token counter. In particular it must not count active sessions.
+        let today = Self::today();
         let row: Result<(i64, i64), sqlx::Error> = sqlx::query_as(
             "SELECT \
                 CAST(COALESCE((SELECT max_tokens_per_day FROM resource_limits WHERE user_id = ?), ?) AS SIGNED), \
-                CAST(COALESCE((SELECT tokens_consumed FROM resource_usage WHERE user_id = ? AND usage_date = CURRENT_DATE), 0) AS SIGNED)",
+                CAST(COALESCE((SELECT tokens_consumed FROM resource_usage WHERE user_id = ? AND usage_date = ?), 0) AS SIGNED)",
         )
         .bind(user_id)
         .bind(ResourceLimits::DEFAULT_MAX_TOKENS_PER_DAY as i64)
         .bind(user_id)
+        .bind(&today)
         .fetch_one(self.pool.get())
         .await;
         let (max_tokens_per_day, tokens_consumed) = match row {
