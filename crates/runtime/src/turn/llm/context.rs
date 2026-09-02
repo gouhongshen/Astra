@@ -7,7 +7,6 @@
 //! volatile preambles, provider cache placement, or tier-pruned tool schemas.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::OnceLock;
 
 use astra_services::SessionArtifactStore;
 use serde_json::{Map, Value, json};
@@ -1284,20 +1283,21 @@ pub(crate) fn assemble_context_pipeline(
     if !input.tool_surface.deferred_tools_block.is_empty() {
         session_ctx.deferred_tools_block = input.tool_surface.deferred_tools_block.to_string();
     }
-    // Prompt overrides are process configuration and static sections are
-    // immutable by contract. Building and tokenizing the same large strings
-    // on every model round adds CPU latency without changing the prompt.
-    static PIPELINE_STATIC_SECTIONS: OnceLock<astra_turn_core::context_sources::StaticSections> =
-        OnceLock::new();
-    let statics =
-        PIPELINE_STATIC_SECTIONS.get_or_init(crate::prompts::build_pipeline_static_sections);
+    // Prompt overrides are stable within one pipeline session, but a newly
+    // created/restored session must observe the current override files. Cache
+    // the compiled sections on PipelineSession rather than for the process.
+    let statics = state
+        .pipeline_session
+        .as_mut()
+        .expect("pipeline_session checked before context assembly")
+        .static_sections_or_init(crate::prompts::build_pipeline_static_sections);
     let agent = AgentContext {
         tool_schemas: effective_tools,
         ..Default::default()
     };
 
     let adaptive = AdaptiveTurnInput {
-        statics,
+        statics: &statics,
         agent: &agent,
         session: &session_ctx,
         turn: &turn_state,
