@@ -888,7 +888,15 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // whether the same evidence is also rendered as user-facing status text.
     // Auto permission is not a request to disable the feedback loop.
     let show_policy_feedback_status = host.turn_interaction_mode().shows_policy_feedback_status();
-    state.refresh_task_board_snapshot().await;
+    if state.hooks.task_board_snapshot_fresh_for_turn {
+        // The advisory phase and the pre-LLM phase are in the same turn with
+        // no task-board mutation boundary between them. Consume the successful
+        // snapshot once here; finalization still refreshes after model/tool
+        // execution before making any completion decision.
+        state.hooks.task_board_snapshot_fresh_for_turn = false;
+    } else {
+        state.refresh_task_board_snapshot().await;
+    }
 
     // Inject round budget guidance so the model knows to batch or synthesize.
     // Use llm_rounds_completed (actual LLM call count) not turn_index (step

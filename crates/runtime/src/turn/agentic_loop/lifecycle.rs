@@ -892,7 +892,9 @@ async fn queue_task_board_advisory<H: AgenticLoopHost>(host: &H, state: &mut Age
         return;
     }
 
-    state.refresh_task_board_snapshot().await;
+    if !state.hooks.task_board_snapshot_fresh_for_turn {
+        state.hooks.task_board_snapshot_fresh_for_turn = state.refresh_task_board_snapshot().await;
+    }
     if state.hooks.task_board_snapshot.has_unfinished_tasks() {
         state.push_volatile_payload(
             super::host::VolatileKind::TaskBoardAdvisory,
@@ -1616,6 +1618,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         };
         crate::observability::on_turn_start(hub, session_id, &user_id, &state.message);
     }
+    let intent_started = Instant::now();
     match host.judge_turn_intent(state).await {
         TurnIntentJudgeOutcome::Intent(intent) => {
             let record_feedback = record_current_user_turn_semantics(state, &intent);
@@ -1638,7 +1641,20 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             tracing::debug!("turn intent judge unavailable; preserving current runtime profile");
         }
     }
+    tracing::info!(
+        target: "astra_runtime::timing",
+        run_id = state.current_run_id.as_deref().unwrap_or(""),
+        elapsed_ms = intent_started.elapsed().as_millis(),
+        "turn intent preparation completed"
+    );
+    let task_board_started = Instant::now();
     queue_task_board_advisory(host, state).await;
+    tracing::info!(
+        target: "astra_runtime::timing",
+        run_id = state.current_run_id.as_deref().unwrap_or(""),
+        elapsed_ms = task_board_started.elapsed().as_millis(),
+        "turn task board preparation completed"
+    );
     if let Some(prompt) =
         astra_turn_core::stop_hooks::build_stop_hook_prompt(&state.hooks.stop_hooks)
         && let Some(content) = prompt.get("content").and_then(Value::as_str)
@@ -1889,7 +1905,14 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             };
         }
     }
+    let skill_route_started = Instant::now();
     maybe_pre_route_skill(host, state).await;
+    tracing::info!(
+        target: "astra_runtime::timing",
+        run_id = state.current_run_id.as_deref().unwrap_or(""),
+        elapsed_ms = skill_route_started.elapsed().as_millis(),
+        "turn skill route preparation completed"
+    );
 
     if turn_index > 0 {
         // ── Stall correction: inject a nudge if stall was detected ────

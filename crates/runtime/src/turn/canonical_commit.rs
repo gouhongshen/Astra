@@ -2,7 +2,9 @@ use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CanonicalRewriteProof {
-    base_root: String,
+    // This is the manifest-chain root used to fence the eventual commit. It is
+    // intentionally a different hash domain from `authorized_prefix_root`.
+    base_manifest_root: String,
     base_compaction_generation: u64,
     authorized_prefix_len: usize,
     authorized_prefix_root: String,
@@ -16,19 +18,24 @@ pub(crate) struct CanonicalRewritePermit {
 }
 
 impl CanonicalRewriteProof {
-    pub(crate) fn new(
+    /// Binds a rewrite proof to history materialized from the admitted manifest.
+    ///
+    /// The caller must pass the messages returned by coordinator materialization
+    /// for `base_manifest_root`. `begin` proves that compaction starts from those
+    /// messages, while commit separately fences the manifest root.
+    pub(crate) fn from_materialized_admission(
         admitted_prefix: &[Value],
-        base_root: &str,
+        base_manifest_root: &str,
         base_compaction_generation: u64,
     ) -> Self {
         let admitted_root = astra_turn_types::canonical_conversation_root(admitted_prefix);
         Self {
-            base_root: base_root.to_string(),
+            base_manifest_root: base_manifest_root.to_string(),
             base_compaction_generation,
             authorized_prefix_len: admitted_prefix.len(),
-            authorized_prefix_root: admitted_root.clone(),
+            authorized_prefix_root: admitted_root,
             rewritten: false,
-            valid: admitted_root == base_root,
+            valid: true,
         }
     }
 
@@ -66,8 +73,8 @@ impl CanonicalRewriteProof {
             .then(|| self.base_compaction_generation.saturating_add(1))
     }
 
-    pub(crate) fn base_root(&self) -> &str {
-        &self.base_root
+    pub(crate) fn base_manifest_root(&self) -> &str {
+        &self.base_manifest_root
     }
 }
 

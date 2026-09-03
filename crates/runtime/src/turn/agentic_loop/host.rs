@@ -1097,6 +1097,10 @@ pub struct TelemetryState {
     /// the journal event is only emitted when the turn actually commits (not on
     /// aborts/retries), preventing ghost `context_assembly_recorded` events.
     pub pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
+    /// Latest context-trace signal awaiting best-effort persistence after the
+    /// durable terminal boundary. Context trace is observability data, not an
+    /// input to turn outcome selection, so it must not extend the live turn.
+    pub pending_context_trace_signal: Option<astra_services::session_workspace::ContextTraceSignal>,
 }
 
 #[derive(Clone, Debug)]
@@ -1646,6 +1650,10 @@ pub struct StopHookState {
     pub task_board_monitor: Option<Arc<TaskManager>>,
     /// Cached view of unfinished task-board work for completion gating.
     pub task_board_snapshot: TaskBoardSnapshot,
+    /// The cached task-board view was loaded during this turn's resume
+    /// hydration and has not yet been consumed by the pre-turn advisory.
+    /// Finalization always refreshes again after tool execution.
+    pub task_board_snapshot_fresh_for_turn: bool,
     /// Bounded settlement state for evidence discovered after a candidate
     /// answer has already been produced.
     pub completion_settlement: CompletionSettlementState,
@@ -2424,15 +2432,16 @@ impl AgenticLoopState {
     pub(crate) fn initialize_canonical_rewrite_proof(
         &mut self,
         admitted_prefix: &[Value],
-        base_root: &str,
+        base_manifest_root: &str,
         base_compaction_generation: u64,
     ) {
-        self.canonical_rewrite_state.proof =
-            Some(crate::turn::canonical_commit::CanonicalRewriteProof::new(
+        self.canonical_rewrite_state.proof = Some(
+            crate::turn::canonical_commit::CanonicalRewriteProof::from_materialized_admission(
                 admitted_prefix,
-                base_root,
+                base_manifest_root,
                 base_compaction_generation,
-            ));
+            ),
+        );
     }
 
     pub(crate) fn canonical_rewrite_proof(
@@ -2598,9 +2607,9 @@ impl AgenticLoopState {
     ///
     /// The DB call is guarded by a 5-second timeout to prevent a stalled
     /// store from holding up loop finalisation indefinitely.
-    pub async fn refresh_task_board_snapshot(&mut self) {
+    pub async fn refresh_task_board_snapshot(&mut self) -> bool {
         let Some(task_manager) = self.hooks.task_board_monitor.clone() else {
-            return;
+            return false;
         };
         let load = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -2610,6 +2619,7 @@ impl AgenticLoopState {
             Ok(Ok(snapshot)) => {
                 self.hooks.task_board_snapshot =
                     TaskBoardSnapshot::from_active_tasks(&snapshot.tasks);
+                true
             }
             Ok(Err(error)) => {
                 tracing::warn!(
@@ -2618,6 +2628,7 @@ impl AgenticLoopState {
                     error = %error,
                     "failed to refresh active task-board snapshot; preserving previous snapshot"
                 );
+                false
             }
             Err(_elapsed) => {
                 tracing::warn!(
@@ -2625,6 +2636,7 @@ impl AgenticLoopState {
                     session_id = self.current_session_id.as_deref().unwrap_or_default(),
                     "timed out refreshing active task-board snapshot; preserving previous snapshot"
                 );
+                false
             }
         }
     }

@@ -265,6 +265,7 @@ pub(crate) fn run_start_context_from_request(
         runtime_profile: effective_runtime_profile(request),
         provider_request_fingerprint: None,
         provider_run_owner: request.provider_run_owner.clone(),
+        initial_events: Vec::new(),
     }
 }
 

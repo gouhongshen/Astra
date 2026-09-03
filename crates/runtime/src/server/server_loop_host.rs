@@ -3298,11 +3298,13 @@ impl ServerAgenticLoopHost {
             context_window: None,
             max_completion_tokens: None,
         };
+        let mock_thinking = state.thinking.clone();
         let wire_messages = self.assemble_llm_messages(
             system_msgs.clone(),
             volatile_preamble.clone(),
             pipeline_messages,
             state,
+            &mock_thinking,
             &mock_llm_cfg,
             &cache_cfg,
         );
@@ -5084,6 +5086,7 @@ impl ServerAgenticLoopHost {
         volatile_preamble: Vec<Value>,
         compacted_messages: Vec<Value>,
         state: &mut AgenticLoopState,
+        thinking: &ThinkingConfig,
         llm_cfg: &ResolvedTurnLlmConfig,
         cache_cfg: &PromptCacheConfig,
     ) -> Vec<Value> {
@@ -5091,14 +5094,13 @@ impl ServerAgenticLoopHost {
         // pipeline as an `extra_dynamic_sections` entry (RuntimeVolatile,
         // None scope). See `context_pipeline_adapter` — post-hoc injection
         // here would double up the content on the wire.
-        let thinking = state.thinking.clone();
         crate::turn::llm::context::assemble_wire_messages(
             crate::turn::llm::context::LlmWireAssemblyInput {
                 system_messages,
                 volatile_preamble,
                 compacted_messages,
                 state,
-                thinking: &thinking,
+                thinking,
                 edge_profile: &self.edge_profile,
                 session_id: &self.session_id,
                 provider: &llm_cfg.provider,
@@ -5413,6 +5415,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
         let turn_started = Instant::now();
+        let timing_run_id = state.current_run_id.clone().unwrap_or_default();
 
         // ── Test hook: mock LLM rounds ──────────────────────────────────
         #[cfg(feature = "bridge-e2e-hooks")]
@@ -5457,6 +5460,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .and_then(|m| m.get("content").and_then(Value::as_str))
             .unwrap_or("")
             .to_string();
+
+        let turn_thinking = state.thinking.clone();
 
         // Model revalidation, query-relevant recall, and the current-session
         // snapshot are independent remote reads. Start them together so a
@@ -5504,6 +5509,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 session_memoria_client,
                 session_memory_session_id,
             ),
+        );
+        tracing::info!(
+            target: "astra_runtime::timing",
+            run_id = timing_run_id,
+            elapsed_ms = turn_started.elapsed().as_millis(),
+            "turn prefetch completed"
         );
         if fetched_prompt_memory {
             self.prompt_memory_recall_cache = Some(PromptMemoryRecallCache {
@@ -5629,6 +5640,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &memoria_prefetch_entries,
             &user_content,
         )?;
+        tracing::info!(
+            target: "astra_runtime::timing",
+            run_id = timing_run_id,
+            elapsed_ms = turn_started.elapsed().as_millis(),
+            "turn context pipeline completed"
+        );
         let PipelineTurnOutcome {
             system_messages,
             volatile_preamble,
@@ -5675,6 +5692,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg,
             )
             .await;
+        tracing::info!(
+            target: "astra_runtime::timing",
+            run_id = timing_run_id,
+            elapsed_ms = turn_started.elapsed().as_millis(),
+            "turn compaction phase completed"
+        );
         // One Server HTTP turn may execute multiple LLM rounds. Keep repeated
         // snapshots stable within a round without conflating later compactions.
         let context_compactions = crate::turn::wire_assembly::observe_context_compaction(
@@ -5747,6 +5770,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             final_volatile_preamble,
             compacted_messages,
             state,
+            &turn_thinking,
             &llm_cfg,
             &cache_cfg,
         );
@@ -5924,23 +5948,32 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &final_tools,
                 Some(effective_max_output),
             );
-            crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
-                "server_loop_host",
-                self.shared_pool.clone(),
-                astra_services::PromptRequestPersistInput {
-                    session_id: self.session_id.clone(),
-                    user_id: self.user_id.clone(),
-                    run_id: state.current_run_id.clone(),
-                    turn: state.session_turn,
-                    round: prompt_round,
-                    attempt: attempt_in_round,
-                    source: "server_loop_host".to_string(),
-                    model: llm_cfg.model_name.clone(),
-                    provider: llm_cfg.provider.clone(),
-                },
-                prompt_request_plan,
-            )
-            .await;
+            let prompt_request_persistence = async {
+                let started = Instant::now();
+                crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
+                    "server_loop_host",
+                    self.shared_pool.clone(),
+                    astra_services::PromptRequestPersistInput {
+                        session_id: self.session_id.clone(),
+                        user_id: self.user_id.clone(),
+                        run_id: state.current_run_id.clone(),
+                        turn: state.session_turn,
+                        round: prompt_round,
+                        attempt: attempt_in_round,
+                        source: "server_loop_host".to_string(),
+                        model: llm_cfg.model_name.clone(),
+                        provider: llm_cfg.provider.clone(),
+                    },
+                    prompt_request_plan,
+                )
+                .await;
+                tracing::info!(
+                    target: "astra_runtime::timing",
+                    run_id = timing_run_id,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "prompt request persistence completed"
+                );
+            };
             let durable_ledger = self.required_inference_ledger()?;
             let run_id = state.current_run_id.clone().ok_or_else(|| {
                 astra_core::ClassifiedError::new(
@@ -5953,26 +5986,49 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     astra_services::ModelRequestTopology::ServerOnly,
                     state.last_llm_context_manifest_trace.as_ref(),
                 );
-            let durable_invocation = durable_ledger
-                .admit_with_request_context(
-                    astra_turn_types::InferenceInvocationScope::Run {
-                        session_id: self.session_id.clone(),
-                        run_id,
-                        turn: state.session_turn,
-                        round: prompt_round,
-                        operation_id: "agent_turn".to_string(),
-                        logical_attempt: attempt_in_round,
-                    },
-                    state.inference_purpose,
-                    &llm_cfg.model_name,
-                    llm_cfg
-                        .wire_model_name
-                        .as_deref()
-                        .unwrap_or(&llm_cfg.model_name),
-                    &llm_cfg.provider,
-                    request_context,
-                )
-                .await?;
+            let durable_admission = async {
+                let started = Instant::now();
+                let result = durable_ledger
+                    .admit_with_request_context(
+                        astra_turn_types::InferenceInvocationScope::Run {
+                            session_id: self.session_id.clone(),
+                            run_id,
+                            turn: state.session_turn,
+                            round: prompt_round,
+                            operation_id: "agent_turn".to_string(),
+                            logical_attempt: attempt_in_round,
+                        },
+                        state.inference_purpose,
+                        &llm_cfg.model_name,
+                        llm_cfg
+                            .wire_model_name
+                            .as_deref()
+                            .unwrap_or(&llm_cfg.model_name),
+                        &llm_cfg.provider,
+                        request_context,
+                    )
+                    .await;
+                tracing::info!(
+                    target: "astra_runtime::timing",
+                    run_id = timing_run_id,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "inference ledger admission completed"
+                );
+                result
+            };
+            // Prompt capture and the fenced inference ledger are independent
+            // durable records. Both must finish before the provider call, but
+            // serializing their transactions only adds database latency.
+            let ((), durable_invocation) =
+                tokio::join!(prompt_request_persistence, durable_admission);
+            let durable_invocation = durable_invocation?;
+            tracing::info!(
+                target: "astra_runtime::timing",
+                run_id = timing_run_id,
+                elapsed_ms = turn_started.elapsed().as_millis(),
+                attempt = attempt_in_round,
+                "durable inference admission completed"
+            );
             state
                 .step_recorder
                 .begin_llm_round(&llm_cfg.model_name, state.inference_purpose);
@@ -6115,7 +6171,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         max_output_tokens: Some(effective_max_output),
                         temperature: None,
                         has_fallback,
-                        thinking: &state.thinking,
+                        thinking: &turn_thinking,
                     },
                     llm_cancel,
                     Some(&mut on_stream_update),
@@ -9967,6 +10023,7 @@ mod tests {
             Vec::new(),
             state.messages.clone(),
             &mut state,
+            &ThinkingConfig::Off,
             &llm_cfg,
             &PromptCacheConfig::latch("openai", "gpt-4"),
         );

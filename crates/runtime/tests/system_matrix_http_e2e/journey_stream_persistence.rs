@@ -25,7 +25,7 @@ use tower::util::ServiceExt;
 
 use super::harness::{
     bootstrap, cleanup_session_data, get_json, post_json, seeded_model_selection,
-    sse_first_data_json_with_type,
+    sse_first_data_json_with_type, wait_for_agent_event_type_counts,
 };
 
 /// Collect the FULL SSE stream body (up to deadline), not just until session_info.
@@ -77,36 +77,6 @@ fn parse_sse_events(raw: &str) -> Vec<Value> {
         .filter_map(|line| line.strip_prefix("data: "))
         .filter_map(|data| serde_json::from_str(data).ok())
         .collect()
-}
-
-/// Poll until `agent_events` has at least `min_count` rows for the session.
-async fn wait_for_agent_events_count(
-    pool: &sqlx::MySqlPool,
-    user_id: &str,
-    session_id: &str,
-    min_count: i64,
-    timeout: std::time::Duration,
-) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-        if n >= min_count {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timeout ({timeout:?}) waiting for >= {min_count} agent_events for user_id={user_id} session_id={session_id} (got {n})"
-            );
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
 }
 
 /// B1: Session row persists, chat/stream completes, run status is queryable.
@@ -713,12 +683,18 @@ pub async fn run_stream_context_trace_persistence() {
         &body[..body.len().min(300)]
     );
 
-    // Wait for events to be persisted (user_query + llm_response + context_trace_signal = 3).
-    wait_for_agent_events_count(
+    // The terminal SSE boundary intentionally precedes non-critical context-trace
+    // projection. Wait for the required event types, rather than an aggregate
+    // row count that can be satisfied first by llm_round_completed.
+    wait_for_agent_event_type_counts(
         pool,
         user_id,
         &session_id,
-        3,
+        &[
+            ("user_query", 1),
+            ("llm_response", 1),
+            ("context_trace_signal", 1),
+        ],
         std::time::Duration::from_secs(15),
     )
     .await;
@@ -872,12 +848,17 @@ pub async fn run_stream_multi_turn_persistence() {
         &body1[..body1.len().min(200)]
     );
 
-    // Wait for Turn 1 events (user_query + llm_response + context_trace_signal = 3).
-    wait_for_agent_events_count(
+    // Wait for each turn-owned event type instead of an ambiguous total row
+    // count that can be satisfied by unrelated trace-detail rows.
+    wait_for_agent_event_type_counts(
         pool,
         user_id,
         &session_id,
-        3,
+        &[
+            ("user_query", 1),
+            ("llm_response", 1),
+            ("context_trace_signal", 1),
+        ],
         std::time::Duration::from_secs(15),
     )
     .await;
@@ -923,12 +904,17 @@ pub async fn run_stream_multi_turn_persistence() {
         &body2[..body2.len().min(200)]
     );
 
-    // Wait for Turn 2 events (3 more events).
-    wait_for_agent_events_count(
+    // Wait for both turns' durable projections. Aggregate counts are not a
+    // sufficient fence because trace-detail rows are committed earlier.
+    wait_for_agent_event_type_counts(
         pool,
         user_id,
         &session_id,
-        count_after_turn1 + 3,
+        &[
+            ("user_query", 2),
+            ("llm_response", 2),
+            ("context_trace_signal", 2),
+        ],
         std::time::Duration::from_secs(15),
     )
     .await;

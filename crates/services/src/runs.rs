@@ -487,6 +487,28 @@ pub struct RuntimeCapabilityDescriptorsRequest {
     // the edge agent identified by id via the existing edge WebSocket registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_agent: Option<RuntimeCapabilityDescriptorRequest>,
+    /// Immutable discovery view frozen by the provider for this turn. Endpoint
+    /// descriptors remain authoritative for actual calls and lazy Skill reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_snapshot: Option<RuntimeCapabilityDiscoverySnapshotRequest>,
+}
+
+pub const RUNTIME_CAPABILITY_DISCOVERY_SNAPSHOT_VERSION: &str =
+    "moi-runtime-capability-discovery-v1";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCapabilityDiscoverySnapshotRequest {
+    pub version: String,
+    pub tools: Vec<serde_json::Value>,
+    pub skill_catalogs: Vec<RuntimeCapabilitySkillCatalogSnapshotRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCapabilitySkillCatalogSnapshotRequest {
+    pub agent_binding_id: String,
+    pub skills: Vec<serde_json::Value>,
 }
 
 /// Request-scoped provider authorization exposed to each bash subprocess on
@@ -3796,6 +3818,26 @@ impl DatabaseRunStateStore {
         Ok(())
     }
 
+    async fn insert_run_projection_if_absent_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        projection: &DurableRunDisplayProjectionRecord,
+    ) -> DbStoreResult<()> {
+        let sql =
+            Self::run_projection_write_sql(projection, RunProjectionWriteMode::InsertIfAbsent);
+        Self::bind_run_projection_query(&sql, projection)
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| {
+                db_error(
+                    "insert_run_projection_if_absent_tx",
+                    &projection.run_id,
+                    source,
+                )
+            })?;
+        Ok(())
+    }
+
     async fn load_latest_checkpoint_for_user_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
@@ -4598,6 +4640,27 @@ impl DatabaseRunStateStore {
                 })?;
                 return Err(source.to_string());
             }
+            let projection = build_run_display_projection(
+                &record,
+                atomic_initial_events
+                    .then(|| events.last().map(extract_event_type))
+                    .flatten(),
+                None,
+            );
+            if let Err(source) = self
+                .insert_run_projection_if_absent_tx(&mut tx, &projection)
+                .await
+            {
+                tx.rollback().await.map_err(|rollback_error| {
+                    db_error(
+                        "insert_run_rollback_projection",
+                        &record.run_id,
+                        rollback_error,
+                    )
+                    .to_string()
+                })?;
+                return Err(source.to_string());
+            }
             tx.commit().await.map_err(|source| {
                 db_error("insert_run_commit", &record.run_id, source).to_string()
             })?;
@@ -4685,16 +4748,13 @@ impl DatabaseRunStateStore {
         }
 
         if initial_events_committed {
-            let projection =
-                build_run_display_projection(&record, events.last().map(extract_event_type), None);
-            self.insert_run_projection_if_absent(&projection)
-                .await
-                .map_err(|error| error.to_string())?;
+            // Blocking runs persist their initial events and display projection
+            // in the same transaction as the run claim above.
         } else if !events.is_empty() {
             self.append_events_batch_for_user(&record.user_id, &record.run_id, &events)
                 .await
                 .map_err(|e| e.to_string())?;
-        } else {
+        } else if !holds_session_slot {
             let projection = build_run_display_projection(&record, None, None);
             self.insert_run_projection_if_absent(&projection)
                 .await
@@ -4726,26 +4786,41 @@ impl RunStateStore for DatabaseRunStateStore {
         user_id: &str,
         run_id: &str,
     ) -> Result<Option<DurableRunRecord>, String> {
-        let Some(mut run) = self
-            .load_run_metadata_for_user(user_id, run_id)
+        let qualified_run_columns = AGENT_RUN_COLUMNS
+            .split(',')
+            .map(|column| format!("r.{}", column.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {qualified_run_columns}, e.payload_json, e.event_idx
+             FROM agent_runs r
+             LEFT JOIN agent_run_events e
+               ON e.user_id = r.user_id AND e.run_id = r.run_id
+             WHERE r.user_id = ? AND r.run_id = ?
+             ORDER BY e.event_idx ASC"
+        );
+        let rows = sqlx::query(&sql)
+            .bind(user_id)
+            .bind(run_id)
+            .fetch_all(self.pool.get())
             .await
-            .map_err(|e| e.to_string())?
-        else {
+            .map_err(|source| db_error("load_run_with_events", run_id, source).to_string())?;
+        let Some(first_row) = rows.first() else {
             return Ok(None);
         };
 
-        let rows = sqlx::query(
-            "SELECT payload_json, event_idx FROM agent_run_events
-             WHERE user_id = ? AND run_id = ?
-             ORDER BY event_idx ASC",
-        )
-        .bind(&run.user_id)
-        .bind(run_id)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| db_error("load_run_events", run_id, source).to_string())?;
-
+        let mut run = decode_run_record_from_row(first_row).map_err(|error| error.to_string())?;
         run.events = rows
+            .into_iter()
+            .filter_map(
+                |row| match row.try_get::<Option<String>, _>("payload_json") {
+                    Ok(Some(_)) => Some(Ok(row)),
+                    Ok(None) => None,
+                    Err(source) => Some(Err(source)),
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| db_error("load_run_event_presence", run_id, source).to_string())?
             .into_iter()
             .map(|row| decode_run_event_payload(&row, run_id))
             .collect::<DbStoreResult<Vec<_>>>()
@@ -7444,6 +7519,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "reasoning_delta",
     "reasoning_done",
     "reasoning_message_content",
+    "assistant_output_settled",
     // Tool-call lifecycle.
     "tool_call",
     "tool_call_start",
@@ -7674,7 +7750,9 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             "type": "thinking_delta",
             "content": data.get("chunk").cloned().unwrap_or(serde_json::Value::String(String::new())),
         }),
-        "thinking_done" | "reasoning_done" => serde_json::json!({ "type": event_type }),
+        "thinking_done" | "reasoning_done" | "assistant_output_settled" => {
+            serde_json::json!({ "type": event_type })
+        }
         "tool_call_start" => {
             let mut out = serde_json::Map::from_iter([(
                 "type".to_string(),
@@ -10926,6 +11004,20 @@ mod tests {
         assert_eq!(projected["tokens_before"], 16_000);
         assert_eq!(projected["tokens_after"], 6_000);
         assert_eq!(projected["tokens_freed"], 10_000);
+    }
+
+    #[test]
+    fn assistant_output_settled_is_exposed_in_both_event_shapes() {
+        let client_ready = json!({"type": "assistant_output_settled"});
+        assert_eq!(
+            transform_run_event_for_client(client_ready.clone()),
+            client_ready
+        );
+
+        assert_eq!(
+            transform_run_event_for_client(make_event("assistant_output_settled", json!({}),)),
+            json!({"type": "assistant_output_settled"})
+        );
     }
 
     #[test]

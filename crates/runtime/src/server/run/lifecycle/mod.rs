@@ -110,7 +110,7 @@ use crate::server::session_turn::infer_session_turn;
 use crate::turn::agentic_loop::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CancellationState,
     ContextTracePersistenceContext, EvaluationPersistenceContext, MessagingState,
-    RequestConstraints, SkillState, StopHookState, run_agentic_loop_with_host,
+    RequestConstraints, SkillState, StopHookState, TaskBoardSnapshot, run_agentic_loop_with_host,
 };
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
@@ -180,6 +180,9 @@ const DURABLE_EVENT_COMMITTED_FIELD: &str = "_astra_durable_event_committed";
 
 enum DurableLiveFanoutControl {
     Flush {
+        ack: oneshot::Sender<Result<(), String>>,
+    },
+    FlushAndDetachClient {
         ack: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -803,6 +806,12 @@ const ACTIVE_RUN_DURABLE_CONTROL_WATCH_INTERVAL: Duration = Duration::from_secs(
 const ACTIVE_RUN_DURABLE_CONTROL_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
 const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
+
+#[derive(Default)]
+struct TaskBoardResumeState {
+    hint: Option<String>,
+    snapshot: Option<TaskBoardSnapshot>,
+}
 fn should_restore_prior_prompt_history(
     request_targets_existing_session: bool,
     session_has_prior_prompt_history: bool,
@@ -1954,9 +1963,9 @@ async fn install_server_root_mailbox(
 /// after the final model boundary. Those messages are acknowledged on the old
 /// stream and re-sent through Parent routing, which parks them under the same
 /// stable session mailbox for the next turn.
-async fn park_server_root_mailbox(state: &mut AgenticLoopState) {
+async fn park_server_root_mailbox(mailbox: Option<astra_messaging::router::AgentMailbox>) {
     const MAX_LATE_ROOT_MESSAGES: usize = 256;
-    let Some(mut mailbox) = state.messaging.mailbox.take() else {
+    let Some(mut mailbox) = mailbox else {
         return;
     };
     let address = mailbox.address.clone();
@@ -3126,13 +3135,18 @@ impl AgenticRunLifecycleService {
             session_id,
             astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
         );
-        let head = coordinator.load_head(&key).await.map_err(|error| {
-            error_response_coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("failed to load canonical session head: {error}"),
-                "session_head_unavailable",
-            )
-        })?;
+        let admission_snapshot =
+            coordinator
+                .load_admission_snapshot(&key)
+                .await
+                .map_err(|error| {
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("failed to load canonical session head: {error}"),
+                        "session_head_unavailable",
+                    )
+                })?;
+        let head = admission_snapshot.head;
         let prior_canonical_bytes = head.as_ref().map_or(0, |head| head.total_canonical_bytes);
         let current_bytes = fresh_request_admission_bytes(request).map_err(|error| {
             error_response_coded(
@@ -3161,64 +3175,75 @@ impl AgenticRunLifecycleService {
                     "weighted_session_admission_rejected",
                 )
             })?;
-        let distributed_permit = self
-            .distributed_weighted_admission
-            .as_ref()
-            .ok_or_else(|| {
-                error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "cross-pod weighted session admission is unavailable",
-                    "distributed_session_admission_unavailable",
-                )
-            })?
-            .try_reserve(
-                &key,
-                weighted_work,
-                Duration::from_secs(15 * 60),
-                &format!("server-run:{run_id}:weighted-admission"),
-            )
-            .await
-            .map_err(|error| {
-                let status = if matches!(
-                    &error,
-                    astra_services::DistributedAdmissionError::Capacity(_)
-                ) {
-                    StatusCode::TOO_MANY_REQUESTS
-                } else {
-                    StatusCode::SERVICE_UNAVAILABLE
-                };
-                error_response_coded(
-                    status,
-                    format!("distributed weighted session admission rejected this turn: {error}"),
-                    "distributed_session_admission_rejected",
-                )
-            })?;
-        let prior_messages = match &head {
-            Some(head) => coordinator
-                .materialize(head)
-                .await
-                .map(|materialized| materialized.messages)
-                .map_err(|error| {
+        let distributed_admission =
+            self.distributed_weighted_admission
+                .as_ref()
+                .ok_or_else(|| {
                     error_response_coded(
-                        StatusCode::CONFLICT,
-                        format!("canonical session materialization requires repair: {error}"),
-                        "session_context_needs_repair",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "cross-pod weighted session admission is unavailable",
+                        "distributed_session_admission_unavailable",
                     )
-                })?,
-            None => Vec::new(),
-        };
-        let (lease, release_writer_on_finish) =
-            if let Some(authority) = request.conversation_authority.as_ref() {
-                let active = coordinator
-                    .load_active_writer(&key)
+                })?;
+        let admission_ttl = Duration::from_secs(15 * 60);
+        let distributed_reservation_id = format!("server-run:{run_id}:weighted-admission");
+        let materialize_prior_messages = async {
+            match &head {
+                Some(head) => coordinator
+                    .materialize(head)
                     .await
+                    .map(|materialized| materialized.messages)
                     .map_err(|error| {
                         error_response_coded(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("failed to load canonical writer: {error}"),
-                            "session_writer_unavailable",
+                            StatusCode::CONFLICT,
+                            format!("canonical session materialization requires repair: {error}"),
+                            "session_context_needs_repair",
                         )
-                    })?
+                    }),
+                None => Ok(Vec::new()),
+            }
+        };
+        let map_distributed_error = |error: astra_services::DistributedAdmissionError| {
+            let status = if matches!(
+                &error,
+                astra_services::DistributedAdmissionError::Capacity(_)
+            ) {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            error_response_coded(
+                status,
+                format!("distributed weighted session admission rejected this turn: {error}"),
+                "distributed_session_admission_rejected",
+            )
+        };
+
+        let (distributed_permit, prior_messages, lease, reservation, release_writer_on_finish) =
+            if let Some(authority) = request.conversation_authority.as_ref() {
+                // Request-supplied authority already owns a writer. Avoid
+                // speculatively installing its turn reservation until the
+                // independent distributed admission and history reads have
+                // both succeeded, because this caller must not release that
+                // externally owned writer on a sibling failure.
+                let distributed_reservation = distributed_admission.try_reserve(
+                    &key,
+                    weighted_work,
+                    admission_ttl,
+                    &distributed_reservation_id,
+                );
+                let (distributed_permit, prior_messages) =
+                    tokio::join!(distributed_reservation, materialize_prior_messages);
+                let distributed_permit = distributed_permit.map_err(map_distributed_error)?;
+                let prior_messages = match prior_messages {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        let _ = distributed_permit.release().await;
+                        return Err(error);
+                    }
+                };
+                let active = admission_snapshot
+                    .active_writer
                     .filter(|lease| {
                         lease.key == key
                             && lease.lease_id == authority.execution_grant.claims.lease_id
@@ -3235,19 +3260,45 @@ impl AgenticRunLifecycleService {
                             "conversation_authority_fenced",
                         )
                     })?;
-                (active, false)
-            } else {
-                let authority_epochs = coordinator
-                    .load_authority_epochs(&key)
+                let reservation = match coordinator
+                    .reserve_turn(
+                        &active,
+                        head.as_ref().map(|head| &head.cursor),
+                        admission_ttl,
+                        &format!("server-run:{run_id}:turn"),
+                    )
                     .await
-                    .map_err(|error| {
-                        error_response_coded(
+                {
+                    Ok(astra_services::ReserveTurnOutcome::Reserved(reservation))
+                    | Ok(astra_services::ReserveTurnOutcome::AlreadyReserved(reservation)) => {
+                        reservation
+                    }
+                    Ok(astra_services::ReserveTurnOutcome::Conflict { .. }) => {
+                        let _ = distributed_permit.release().await;
+                        return Err(error_response_coded(
+                            StatusCode::CONFLICT,
+                            "canonical session cursor changed before turn reservation",
+                            "conversation_cursor_conflict",
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = distributed_permit.release().await;
+                        return Err(error_response_coded(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            format!("failed to load canonical authority epochs: {error}"),
-                            "session_authority_unavailable",
-                        )
-                    })?
-                    .unwrap_or_default();
+                            format!("failed to reserve canonical turn: {error}"),
+                            "session_turn_reservation_unavailable",
+                        ));
+                    }
+                };
+                (
+                    distributed_permit,
+                    prior_messages,
+                    active,
+                    reservation,
+                    false,
+                )
+            } else {
+                let authority_epochs = admission_snapshot.authority_epochs;
                 let actor = astra_turn_types::ActorContextV1::owner_user(
                     user_id,
                     format!("server-run:{run_id}"),
@@ -3256,69 +3307,95 @@ impl AgenticRunLifecycleService {
                     None,
                     authority_epochs,
                 );
-                let acquired = coordinator
-                    .acquire_writer(
-                        &key,
-                        head.as_ref().map(|head| &head.cursor),
-                        &actor,
-                        Duration::from_secs(15 * 60),
-                        &format!("server-run:{run_id}:writer"),
-                    )
-                    .await
-                    .map_err(|error| {
-                        error_response_coded(
+                // These three stores are independent at admission time. The
+                // database coordinator installs writer+turn facts atomically,
+                // while distributed capacity and immutable history are read in
+                // parallel. Any sibling failure releases facts acquired here.
+                let distributed_reservation = distributed_admission.try_reserve(
+                    &key,
+                    weighted_work,
+                    admission_ttl,
+                    &distributed_reservation_id,
+                );
+                let writer_idempotency_key = format!("server-run:{run_id}:writer");
+                let reservation_idempotency_key = format!("server-run:{run_id}:turn");
+                let acquire_and_reserve = coordinator.acquire_writer_and_reserve_turn(
+                    &key,
+                    head.as_ref().map(|head| &head.cursor),
+                    &actor,
+                    admission_ttl,
+                    &writer_idempotency_key,
+                    &reservation_idempotency_key,
+                );
+                let (distributed_result, prior_messages_result, canonical_result) = tokio::join!(
+                    distributed_reservation,
+                    materialize_prior_messages,
+                    acquire_and_reserve,
+                );
+                let canonical_outcome = match canonical_result {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        if let Ok(distributed_permit) = distributed_result {
+                            let _ = distributed_permit.release().await;
+                        }
+                        return Err(error_response_coded(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            format!("failed to acquire canonical writer: {error}"),
-                            "session_writer_unavailable",
-                        )
-                    })?;
-                let lease = match acquired {
-                    astra_services::AcquireWriterOutcome::Acquired(lease)
-                    | astra_services::AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
-                    astra_services::AcquireWriterOutcome::Conflict { .. } => {
+                            format!("failed to acquire canonical turn authority: {error}"),
+                            "session_turn_reservation_unavailable",
+                        ));
+                    }
+                };
+                let (lease, reservation) = match canonical_outcome {
+                    astra_services::AcquireWriterAndReserveTurnOutcome::Ready {
+                        lease,
+                        reservation,
+                    } => (lease, reservation),
+                    astra_services::AcquireWriterAndReserveTurnOutcome::WriterConflict {
+                        ..
+                    } => {
+                        if let Ok(distributed_permit) = distributed_result {
+                            let _ = distributed_permit.release().await;
+                        }
                         return Err(error_response_coded(
                             StatusCode::CONFLICT,
                             "another controller owns this canonical session branch",
                             "session_writer_conflict",
                         ));
                     }
+                    astra_services::AcquireWriterAndReserveTurnOutcome::ReservationConflict {
+                        lease,
+                        ..
+                    } => {
+                        let _ = coordinator.release_writer(&lease).await;
+                        if let Ok(distributed_permit) = distributed_result {
+                            let _ = distributed_permit.release().await;
+                        }
+                        return Err(error_response_coded(
+                            StatusCode::CONFLICT,
+                            "canonical session cursor changed before turn reservation",
+                            "conversation_cursor_conflict",
+                        ));
+                    }
                 };
-                (lease, true)
+                let distributed_permit = match distributed_result {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        let _ = coordinator.release_writer(&lease).await;
+                        return Err(map_distributed_error(error));
+                    }
+                };
+                let prior_messages = match prior_messages_result {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        let (_, _) = tokio::join!(
+                            coordinator.release_writer(&lease),
+                            distributed_permit.release(),
+                        );
+                        return Err(error);
+                    }
+                };
+                (distributed_permit, prior_messages, lease, reservation, true)
             };
-        let reservation_outcome = coordinator
-            .reserve_turn(
-                &lease,
-                head.as_ref().map(|head| &head.cursor),
-                Duration::from_secs(15 * 60),
-                &format!("server-run:{run_id}:turn"),
-            )
-            .await;
-        let reservation = match reservation_outcome {
-            Err(error) => {
-                if release_writer_on_finish {
-                    let _ = coordinator.release_writer(&lease).await;
-                }
-                let _ = distributed_permit.release().await;
-                return Err(error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("failed to reserve canonical turn: {error}"),
-                    "session_turn_reservation_unavailable",
-                ));
-            }
-            Ok(astra_services::ReserveTurnOutcome::Reserved(reservation))
-            | Ok(astra_services::ReserveTurnOutcome::AlreadyReserved(reservation)) => reservation,
-            Ok(astra_services::ReserveTurnOutcome::Conflict { .. }) => {
-                if release_writer_on_finish {
-                    let _ = coordinator.release_writer(&lease).await;
-                }
-                let _ = distributed_permit.release().await;
-                return Err(error_response_coded(
-                    StatusCode::CONFLICT,
-                    "canonical session cursor changed before turn reservation",
-                    "conversation_cursor_conflict",
-                ));
-            }
-        };
         let renewal_cancel = CancellationToken::new();
         let heartbeat_cancel = renewal_cancel.clone();
         let heartbeat_run_cancel = authority_loss_cancel;
@@ -3438,7 +3515,7 @@ impl AgenticRunLifecycleService {
                     let cursor = base.ok_or_else(|| {
                         "canonical replacement is missing its admitted base cursor".to_string()
                     })?;
-                    if proof.base_root() != cursor.canonical_root_hash {
+                    if proof.base_manifest_root() != cursor.canonical_root_hash {
                         return Err(
                             "canonical rewrite proof does not match the admitted base root".into(),
                         );
@@ -3472,17 +3549,31 @@ impl AgenticRunLifecycleService {
             }
         }
         .await;
-        if admission.release_writer_on_finish {
-            let _ = admission.coordinator.release_writer(&admission.lease).await;
-        }
-        let _ = admission.distributed_permit.release().await;
-        admission.release_started.store(true, Ordering::Release);
         result.map_err(|message| {
             astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Unknown,
                 format!("canonical turn commit failed: {message}"),
             )
         })
+    }
+
+    async fn release_canonical_turn(admission: Option<&CanonicalTurnAdmission>) {
+        let Some(admission) = admission else {
+            return;
+        };
+        admission.renewal_cancel.cancel();
+        // The writer lease and distributed admission reservation belong to
+        // independent authorities. Release them together, and let callers
+        // overlap this cleanup with terminal persistence when both results are
+        // required only at the terminal publication boundary.
+        let release_writer = async {
+            if admission.release_writer_on_finish {
+                let _ = admission.coordinator.release_writer(&admission.lease).await;
+            }
+        };
+        let release_distributed = admission.distributed_permit.release();
+        let (_, _) = tokio::join!(release_writer, release_distributed);
+        admission.release_started.store(true, Ordering::Release);
     }
 
     pub fn with_memory_extraction_service(
@@ -4826,6 +4917,14 @@ impl AgenticRunLifecycleService {
             execution_bindings,
             agent_binding_context.map(|context| context.bindings.as_slice()),
         );
+        if let Some(snapshot) = execution_bindings {
+            context.initial_events.extend(binding_snapshot_events(
+                run_id,
+                session_id,
+                &snapshot.workspace,
+                &snapshot.executor,
+            ));
+        }
         context.provider_request_fingerprint =
             provider_request_fingerprint.map(ToString::to_string);
         let result = match mode {
@@ -6117,25 +6216,53 @@ impl AgenticRunLifecycleService {
             .iter()
             .map(|binding| binding.binding.id.clone())
             .collect::<Vec<_>>();
-        // Tool and skill discovery are independent reads from the same
-        // provider runtime. Keep binding validation ahead of both calls, then
-        // overlap their network latency before constructing the shared prompt.
-        let (bundle, prepared_skills) = tokio::join!(
-            runtime_mcp::prepare_agent_binding_mcp_bundle(
-                &mcp_descriptor.id,
-                &mcp_endpoint_url,
-                &runtime_auth.authorization,
-                mcp_descriptor.semantic_read.as_ref(),
-            ),
-            agent_binding_skill_runtime::prepare_agent_binding_skill_resolver(
-                &skill_descriptor.id,
-                &skill_endpoint_url,
-                &runtime_auth.authorization,
-                &binding_ids,
-            ),
-        );
-        let bundle = bundle?;
-        let prepared_skills = prepared_skills?;
+        let (bundle, prepared_skills) =
+            if let Some(snapshot) = descriptors.discovery_snapshot.as_ref() {
+                if snapshot.version
+                    != astra_services::runs::RUNTIME_CAPABILITY_DISCOVERY_SNAPSHOT_VERSION
+                {
+                    return Err(error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        "unsupported runtime capability discovery snapshot version",
+                        "agent_binding_discovery_snapshot_invalid",
+                    ));
+                }
+                (
+                    runtime_mcp::prepare_agent_binding_mcp_bundle_from_snapshot(
+                        &mcp_descriptor.id,
+                        &mcp_endpoint_url,
+                        &runtime_auth.authorization,
+                        mcp_descriptor.semantic_read.as_ref(),
+                        &snapshot.tools,
+                    )?,
+                    agent_binding_skill_runtime::prepare_agent_binding_skill_resolver_from_snapshot(
+                        &skill_descriptor.id,
+                        &skill_endpoint_url,
+                        &runtime_auth.authorization,
+                        &binding_ids,
+                        &snapshot.skill_catalogs,
+                    )?,
+                )
+            } else {
+                // Providers that have not adopted the frozen discovery
+                // contract still use endpoint discovery. The two independent
+                // reads remain overlapped.
+                let (bundle, prepared_skills) = tokio::join!(
+                    runtime_mcp::prepare_agent_binding_mcp_bundle(
+                        &mcp_descriptor.id,
+                        &mcp_endpoint_url,
+                        &runtime_auth.authorization,
+                        mcp_descriptor.semantic_read.as_ref(),
+                    ),
+                    agent_binding_skill_runtime::prepare_agent_binding_skill_resolver(
+                        &skill_descriptor.id,
+                        &skill_endpoint_url,
+                        &runtime_auth.authorization,
+                        &binding_ids,
+                    ),
+                );
+                (bundle?, prepared_skills?)
+            };
         let skill_resolver =
             apply_normalized_skill_allowlist(prepared_skills.resolver, request_constraints)
                 .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
@@ -7262,9 +7389,9 @@ impl AgenticRunLifecycleService {
         &self,
         user_id: &str,
         session_id: &str,
-    ) -> Option<String> {
+    ) -> TaskBoardResumeState {
         let Some(shared) = &self.shared_pool else {
-            return None;
+            return TaskBoardResumeState::default();
         };
         let store: Arc<dyn TaskStore> =
             match MatrixOneTaskStore::from_shared_for_user(shared, user_id) {
@@ -7276,12 +7403,15 @@ impl AgenticRunLifecycleService {
                         error = %error,
                         "failed to construct user-scoped task store for resume hint"
                     );
-                    return None;
+                    return TaskBoardResumeState::default();
                 }
             };
         let manager = TaskManager::new(session_id.to_string(), store);
         match manager.load_tasks().await {
-            Ok(tasks) => format_task_board_resume_hint(&tasks),
+            Ok(tasks) => TaskBoardResumeState {
+                hint: format_task_board_resume_hint(&tasks),
+                snapshot: Some(TaskBoardSnapshot::from_active_tasks(&tasks)),
+            },
             Err(error) => {
                 tracing::warn!(
                     session_id = %session_id,
@@ -7289,10 +7419,13 @@ impl AgenticRunLifecycleService {
                     error = %error,
                     "failed to load task board resume hint for Cloud turn"
                 );
-                Some(format!(
-                    "Task board state could not be loaded for this turn: {error}. \
-                     Do not assume the task board is empty; avoid creating duplicate tasks and surface the load failure to the user."
-                ))
+                TaskBoardResumeState {
+                    hint: Some(format!(
+                        "Task board state could not be loaded for this turn: {error}. \
+                         Do not assume the task board is empty; avoid creating duplicate tasks and surface the load failure to the user."
+                    )),
+                    snapshot: None,
+                }
             }
         }
     }
@@ -8971,7 +9104,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let plan_snapshot_resume_hint = plan_resume_snapshot.prompt_hint;
         let plan_resume_hint = plan_snapshot_resume_hint.clone();
         let plan_authoring_active = plan_resume_snapshot.authoring_active;
-        let task_board_resume_hint = self
+        let TaskBoardResumeState {
+            hint: task_board_resume_hint,
+            snapshot: task_board_resume_snapshot,
+        } = self
             .task_board_resume_hint_for_session(&user_id, &session_id)
             .await;
         let mut host = self.build_host(
@@ -9079,6 +9215,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             runtime_capabilities.request_scoped_skill_resolver.clone(),
             runtime_capabilities.agent_binding.as_ref(),
         );
+        if let Some(snapshot) = task_board_resume_snapshot {
+            loop_state.hooks.task_board_snapshot = snapshot;
+            loop_state.hooks.task_board_snapshot_fresh_for_turn = true;
+        }
         loop_state.context_manifest_user_id = Some(user_id.clone());
         loop_state.runtime_manifest = Self::build_runtime_manifest(
             &request,
@@ -9592,10 +9732,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
                 let outcome =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut loop_state).await;
-                park_server_root_mailbox(&mut loop_state).await;
+                let root_mailbox = loop_state.messaging.mailbox.take();
+                park_server_root_mailbox(root_mailbox).await;
                 let (mut outcome, events) = host.settle_loop_turn(outcome);
                 let core_trace_result = persist_ctx
-                    .persist_core_and_trace_in_transaction(&loop_state)
+                    .persist_core_and_trace_in_transaction(&loop_state, false)
                     .await;
                 let mut canonical_context_persisted = false;
                 if let Err(error) = &core_trace_result {
@@ -9620,6 +9761,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         Err(commit_error) => outcome = Err(commit_error),
                     }
                 }
+                Self::release_canonical_turn(canonical_turn.as_ref()).await;
                 let loop_success = outcome.is_ok();
                 let (events, final_status, error_msg) =
                     Self::finalize_run_events(outcome, events, &loop_state);
@@ -9954,6 +10096,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+        let stream_prepare_started = Instant::now();
         let provider_identity = self.provider_idempotency_identity(&user_id, &request)?;
         let request = if let Some(identity) = provider_identity.as_ref() {
             // Provider retries must be replayable even when they omit trusted
@@ -9983,20 +10126,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             self.prepare_chat_request(request).await?
         };
+        tracing::info!(
+            target: "astra_runtime::timing",
+            elapsed_ms = stream_prepare_started.elapsed().as_millis(),
+            "stream request preparation completed"
+        );
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;
         let mut request = request;
         Self::install_agent_binding_runtime_forward_headers(&mut request)?;
-
-        // ── Resource governance check ────────────────────────────────
-        if let Some(ref gov) = self.resource_governor {
-            if let astra_services::resource_governor::LimitCheck::Denied { limit, reason } =
-                gov.check_run_start(&user_id).await
-            {
-                return Err(per_user_run_quota_response(limit, reason));
-            }
-        }
 
         let provider_idempotent_start = provider_identity.is_some();
         let authority_run_id = request
@@ -10034,9 +10173,31 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 agent_binding_mode,
                 edge_context.has_tools(),
             );
-        let runtime_capabilities = self
-            .prepare_runtime_capabilities(&request, &request_constraints)
-            .await?;
+        // Runtime capability resolution and the per-user run quota are
+        // independent read-only admissions over the same immutable request.
+        // Preserve both fail-closed results while avoiding one serialized
+        // database/network round trip on every turn.
+        let run_start_admission = async {
+            if let Some(ref gov) = self.resource_governor
+                && let astra_services::resource_governor::LimitCheck::Denied { limit, reason } =
+                    gov.check_run_start(&user_id).await
+            {
+                return Err(per_user_run_quota_response(limit, reason));
+            }
+            Ok(())
+        };
+        let (run_start_admission, runtime_capabilities) = tokio::join!(
+            run_start_admission,
+            self.prepare_runtime_capabilities(&request, &request_constraints),
+        );
+        run_start_admission?;
+        let runtime_capabilities = runtime_capabilities?;
+        tracing::info!(
+            target: "astra_runtime::timing",
+            run_id = %run_id,
+            elapsed_ms = stream_prepare_started.elapsed().as_millis(),
+            "stream runtime capability admission completed"
+        );
         let requires_runtime_mcp_executor = runtime_capabilities.mcp_bundle.is_some();
         let mut edge_profile = edge_context.edge_profile.to_map();
         Self::apply_agent_binding_prompt_context(
@@ -10046,6 +10207,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             request.runtime_system_prompt.as_deref(),
             request.context.as_ref(),
         )?;
+
+        // A non-provisioned binding is a pure projection of the immutable
+        // admitted request and edge profile. Commit it with the provider run
+        // claim instead of opening a second event-append transaction. Cloud
+        // and server workspaces stay on the post-provision path because their
+        // exact binding is not known yet.
+        let claimed_execution_bindings = if request_uses_server_workspace(&request)
+            || matches!(
+                request
+                    .workspace_binding
+                    .as_ref()
+                    .map(|binding| binding.kind),
+                Some(astra_services::runs::WorkspaceBindingRequestKind::CloudWorkspace)
+            ) {
+            None
+        } else {
+            resolve_request_execution_bindings_without_server_workspace(&request, &edge_profile)
+                .map(|(workspace, executor)| {
+                    ExecutionBindingSnapshot::inferred(workspace, executor)
+                })
+        };
 
         // A provider task_ref is the durable run identity. Claim it before
         // provisioning a workspace or starting any execution-side task so a
@@ -10057,7 +10239,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     &user_id,
                     &session_id,
                     &request,
-                    None,
+                    claimed_execution_bindings.as_ref(),
                     runtime_capabilities.agent_binding.as_ref(),
                     provider_identity
                         .as_ref()
@@ -10091,6 +10273,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             false
         };
+        tracing::info!(
+            target: "astra_runtime::timing",
+            run_id = %run_id,
+            elapsed_ms = stream_prepare_started.elapsed().as_millis(),
+            "stream provider run claim completed"
+        );
 
         // Provision explicit workspace bindings early so build_initial_state
         // and durable run_started metadata use the same execution boundary.
@@ -10178,22 +10366,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
             return Err(error);
         }
-        if provider_run_claimed && let Some(snapshot) = execution_bindings.as_ref() {
-            let binding_events = binding_snapshot_events(
-                &run_id,
-                &session_id,
-                &snapshot.workspace,
-                &snapshot.executor,
-            );
-            if let Err(error) = self
-                .run_engine
-                .append_events_batch(&user_id, &run_id, &binding_events)
-                .await
+        if provider_run_claimed {
+            if let Some(claimed) = claimed_execution_bindings.as_ref()
+                && execution_bindings.as_ref() != Some(claimed)
             {
                 self.fail_started_run_before_spawn(
                     &user_id,
                     &run_id,
-                    "execution binding persistence failed after provider run claim",
+                    "execution binding changed after provider run claim",
                     PreSpawnFailureCode::PreSpawnFailure,
                 )
                 .await;
@@ -10203,14 +10383,51 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &session_id,
                         &run_id,
                         record,
-                        "execution binding persistence failed before stream start".to_string(),
+                        "execution binding changed after provider run claim".to_string(),
                     )
                     .await;
                 }
                 return Err(error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("Failed to persist provider run execution binding: {error}"),
+                    StatusCode::CONFLICT,
+                    "Execution binding changed after provider run claim".to_string(),
                 ));
+            }
+            if claimed_execution_bindings.is_none()
+                && let Some(snapshot) = execution_bindings.as_ref()
+            {
+                let binding_events = binding_snapshot_events(
+                    &run_id,
+                    &session_id,
+                    &snapshot.workspace,
+                    &snapshot.executor,
+                );
+                if let Err(error) = self
+                    .run_engine
+                    .append_events_batch(&user_id, &run_id, &binding_events)
+                    .await
+                {
+                    self.fail_started_run_before_spawn(
+                        &user_id,
+                        &run_id,
+                        "execution binding persistence failed after provider run claim",
+                        PreSpawnFailureCode::PreSpawnFailure,
+                    )
+                    .await;
+                    if let Some(record) = cloud_workspace_record.as_ref() {
+                        self.cleanup_cloud_workspace_after_failed_start(
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            record,
+                            "execution binding persistence failed before stream start".to_string(),
+                        )
+                        .await;
+                    }
+                    return Err(error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Failed to persist provider run execution binding: {error}"),
+                    ));
+                }
             }
         }
         let tool_runtime_workspace = cloud_workspace.clone().or_else(|| server_workspace.clone());
@@ -10248,6 +10465,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let stream_agent_spawner_entry = self
             .server_agent_spawner_for_session(&user_id, &session_id)
             .await;
+        tracing::info!(
+            target: "astra_runtime::timing",
+            run_id = %run_id,
+            elapsed_ms = stream_prepare_started.elapsed().as_millis(),
+            "stream workspace and spawner preparation completed"
+        );
         let stream_agent_spawner = Arc::clone(&stream_agent_spawner_entry.spawner);
 
         // Network observer delivery is bounded. Internal producers are
@@ -10334,9 +10557,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             }
                         }
                         control = fanout_control_rx.recv(), if control_open => {
-                            let Some(DurableLiveFanoutControl::Flush { ack }) = control else {
+                            let Some(control) = control else {
                                 control_open = false;
                                 continue;
+                            };
+                            let (ack, detach_client) = match control {
+                                DurableLiveFanoutControl::Flush { ack } => (ack, false),
+                                DurableLiveFanoutControl::FlushAndDetachClient { ack } => {
+                                    (ack, true)
+                                }
                             };
                             let mut result = Ok(());
                             while let Ok(event) = fanout_rx.try_recv() {
@@ -10388,6 +10617,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 }
                             }
                             let failed = result.is_err();
+                            if !failed && detach_client {
+                                client_event_tx_for_fanout = None;
+                            }
                             let _ = ack.send(result);
                             if failed {
                                 break;
@@ -10523,6 +10755,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 return Err(error);
             }
         };
+        tracing::info!(
+            target: "astra_runtime::timing",
+            run_id = %run_id,
+            elapsed_ms = stream_prepare_started.elapsed().as_millis(),
+            "stream canonical admission and agent restore completed"
+        );
         let mut state = self.build_initial_state_inner(
             &user_id,
             &request,
@@ -10588,6 +10826,26 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Legacy CSL resume cursors derive their completed turn from this
         // field, so establish it before history restoration.
         state.session_turn = session_turn;
+        let transcript_trace =
+            server_trace_context(&user_id, &session_id, &run_id, state.session_turn);
+        let user_transcript = TranscriptPersistItem {
+            run_id: Some(run_id.clone()),
+            role: "user",
+            content: request.message.clone(),
+            payload: None,
+            source_event_id: transcript_trace.root_event_id,
+        };
+        // The user transcript is independent of prompt construction. Keep its
+        // inputs ready, but start the write only after admission and history
+        // hydration finish so it cannot contend with the database reads that
+        // gate the provider call. It still runs concurrently with inference
+        // and remains mandatory before canonical state persistence below.
+        let user_transcript_persistence_input = (
+            self.shared_pool.clone(),
+            user_id.clone(),
+            session_id.clone(),
+            user_transcript,
+        );
         let history_restore = async {
             // ── Runtime warm-start from step checkpoint ────────────────
             let restore_prior_prompt_history = should_restore_prior_prompt_history(
@@ -10645,16 +10903,30 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 astra_plan::PlanResumeSnapshot::default()
             }
         };
-        let ((csl_manager, session_resume_hint), plan_resume_snapshot, task_board_resume_hint) = tokio::join!(
+        let ((csl_manager, session_resume_hint), plan_resume_snapshot, task_board_resume_state) = tokio::join!(
             history_restore,
             plan_resume,
             self.task_board_resume_hint_for_session(&user_id, &session_id),
+        );
+        tracing::info!(
+            target: "astra_runtime::timing",
+            run_id = %run_id,
+            elapsed_ms = stream_prepare_started.elapsed().as_millis(),
+            "stream resume hydration completed"
         );
         let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(
             session_resume_hint,
             plan_resume_snapshot.prompt_hint,
         );
         let plan_authoring_active = plan_resume_snapshot.authoring_active;
+        let TaskBoardResumeState {
+            hint: task_board_resume_hint,
+            snapshot: task_board_resume_snapshot,
+        } = task_board_resume_state;
+        if let Some(snapshot) = task_board_resume_snapshot {
+            state.hooks.task_board_snapshot = snapshot;
+            state.hooks.task_board_snapshot_fresh_for_turn = true;
+        }
         let mut host = self.build_host(
             &user_id,
             &session_id,
@@ -10832,7 +11104,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &snapshot.workspace,
                 &snapshot.executor,
             ) {
-                if provider_run_claimed && let Some(object) = event.as_object_mut() {
+                if let Some(object) = event.as_object_mut() {
                     object.insert(DURABLE_EVENT_COMMITTED_FIELD.to_string(), Value::Bool(true));
                 }
                 if event_tx.send(event).await.is_err() {
@@ -10867,38 +11139,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &pause_flag,
             (*llm_cancel_token).clone(),
         );
-        let transcript_turn = state.session_turn;
-        let persist_user_transcript = async {
-            let Some(pool) = &self.shared_pool else {
-                return;
-            };
-            let trace = server_trace_context(&user_id, &session_id, &run_id, transcript_turn);
-            let user_transcript = TranscriptPersistItem {
-                run_id: Some(run_id.clone()),
-                role: "user",
-                content: request.message.clone(),
-                payload: None,
-                source_event_id: trace.root_event_id,
-            };
-            if let Err(error) =
-                persist_session_transcript_items(pool, &user_id, &session_id, &[user_transcript])
-                    .await
-            {
-                tracing::warn!(
-                    %session_id,
-                    %error,
-                    "user intent transcript item was not committed"
-                );
-            }
-        };
-        let configure_controllers = configure_runtime_controllers(
+        configure_runtime_controllers(
             &self.matrixone,
             self.shared_pool.as_ref(),
             &mut state,
             &user_id,
             &session_id,
+        )
+        .await;
+        tracing::info!(
+            target: "astra_runtime::timing",
+            run_id = %run_id,
+            elapsed_ms = stream_prepare_started.elapsed().as_millis(),
+            "stream runtime controller preparation completed"
         );
-        tokio::join!(persist_user_transcript, configure_controllers);
 
         // Wire the server-side runtime tool owner whenever the host exposes the
         // server tool catalog. For edge-bound runs this uses an internal
@@ -11142,6 +11396,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
             wire_executor_into_state(executor, &mut state);
         }
+        tracing::info!(
+            target: "astra_runtime::timing",
+            run_id = %run_id,
+            elapsed_ms = stream_prepare_started.elapsed().as_millis(),
+            "stream executor preparation completed"
+        );
 
         // Clone handles for the background task.
         let runs = self.runs_handle();
@@ -11224,62 +11484,98 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let _guard = TaskCountGuard(bg_task_count_2);
                 let _owner_lease_heartbeat =
                     run_engine.start_owner_lease_heartbeat(bg_user_id.clone(), bg_run_id.clone());
-                if let Some(ref gov) = bg_resource_governor {
-                    use astra_services::resource_governor::LimitCheck;
-                    if let LimitCheck::Denied { limit, reason } =
-                        gov.check_token_budget(&bg_user_id).await
-                    {
-                        tracing::warn!(
-                            target: "astra_runtime::run_lifecycle",
-                            user_id = %bg_user_id,
+                // Quota admission and mailbox registration read/write
+                // independent durable state. Run them together, while still
+                // tearing down the mailbox before returning on quota denial.
+                let turn_admission_started = Instant::now();
+                let token_budget_check = async {
+                    let started = Instant::now();
+                    if let Some(gov) = bg_resource_governor.as_ref() {
+                        let result = Some(gov.check_token_budget(&bg_user_id).await);
+                        tracing::info!(
+                            target: "astra_runtime::timing",
                             run_id = %bg_run_id,
-                            limit = %limit.as_str(),
-                            reason = %reason,
-                            "streaming run rejected: daily token budget exhausted"
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "turn token budget admission completed"
                         );
-                        let terminal_events = Self::persist_started_run_quota_rejection(
-                            &run_engine,
-                            &runs,
-                            &bg_user_id,
+                        result
+                    } else {
+                        None
+                    }
+                };
+                let install_root_mailbox = async {
+                    let started = Instant::now();
+                    install_server_root_mailbox(
+                        &mut state,
+                        &bg_root_mailbox_router,
+                        &bg_session_id,
+                        &bg_run_id,
+                        &bg_root_mailbox_agent_id,
+                    )
+                    .await;
+                    tracing::info!(
+                        target: "astra_runtime::timing",
+                        run_id = %bg_run_id,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "turn root mailbox admission completed"
+                    );
+                };
+                let (token_budget_check, ()) =
+                    tokio::join!(token_budget_check, install_root_mailbox,);
+                tracing::info!(
+                    target: "astra_runtime::timing",
+                    run_id = %bg_run_id,
+                    elapsed_ms = turn_admission_started.elapsed().as_millis(),
+                    "turn background admission completed"
+                );
+                if let Some(astra_services::resource_governor::LimitCheck::Denied {
+                    limit,
+                    reason,
+                }) = token_budget_check
+                {
+                    tracing::warn!(
+                        target: "astra_runtime::run_lifecycle",
+                        user_id = %bg_user_id,
+                        run_id = %bg_run_id,
+                        limit = %limit.as_str(),
+                        reason = %reason,
+                        "streaming run rejected: daily token budget exhausted"
+                    );
+                    let terminal_events = Self::persist_started_run_quota_rejection(
+                        &run_engine,
+                        &runs,
+                        &bg_user_id,
+                        &bg_run_id,
+                        limit,
+                        &reason,
+                    )
+                    .await;
+                    if let Some(terminal_events) = terminal_events {
+                        for event in run_handlers::transform_stream_run_events_for_client(
                             &bg_run_id,
-                            limit,
-                            &reason,
-                        )
-                        .await;
-                        if let Some(terminal_events) = terminal_events {
-                            for event in run_handlers::transform_stream_run_events_for_client(
-                                &bg_run_id,
-                                terminal_events,
-                            ) {
-                                if event_tx.send(event).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Self::schedule_run_eviction(&runs, bg_run_id.clone());
-                            if let Some(record) = bg_cloud_workspace_record.as_ref() {
-                                Self::cleanup_cloud_workspace_after_terminal_run(
-                                    bg_workspace_record_store.clone(),
-                                    &bg_user_id,
-                                    &bg_session_id,
-                                    &bg_run_id,
-                                    record,
-                                    &RunStatus::Failed,
-                                )
-                                .await;
+                            terminal_events,
+                        ) {
+                            if event_tx.send(event).await.is_err() {
+                                break;
                             }
                         }
-                        drop(event_tx);
-                        return;
+                        Self::schedule_run_eviction(&runs, bg_run_id.clone());
+                        if let Some(record) = bg_cloud_workspace_record.as_ref() {
+                            Self::cleanup_cloud_workspace_after_terminal_run(
+                                bg_workspace_record_store.clone(),
+                                &bg_user_id,
+                                &bg_session_id,
+                                &bg_run_id,
+                                record,
+                                &RunStatus::Failed,
+                            )
+                            .await;
+                        }
                     }
+                    park_server_root_mailbox(state.messaging.mailbox.take()).await;
+                    drop(event_tx);
+                    return;
                 }
-                install_server_root_mailbox(
-                    &mut state,
-                    &bg_root_mailbox_router,
-                    &bg_session_id,
-                    &bg_run_id,
-                    &bg_root_mailbox_agent_id,
-                )
-                .await;
                 let _control_watcher = start_active_run_control_watcher(
                     state.run_control.clone(),
                     bg_user_id.clone(),
@@ -11288,8 +11584,39 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     bg_pause_flag.clone(),
                     bg_llm_cancel_token.clone(),
                 );
+                let (transcript_pool, transcript_user_id, transcript_session_id, user_transcript) =
+                    user_transcript_persistence_input;
+                let user_transcript_persistence = tokio::spawn(async move {
+                    let Some(pool) = transcript_pool.as_ref() else {
+                        return true;
+                    };
+                    match persist_session_transcript_items(
+                        pool,
+                        &transcript_user_id,
+                        &transcript_session_id,
+                        &[user_transcript],
+                    )
+                    .await
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            tracing::warn!(
+                                session_id = %transcript_session_id,
+                                %error,
+                                "user intent transcript item was not committed"
+                            );
+                            false
+                        }
+                    }
+                });
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
+                let settlement_started = Instant::now();
+                tracing::info!(
+                    target: "astra_runtime::timing",
+                    run_id = %bg_run_id,
+                    "agentic loop completed"
+                );
                 host.detach_event_tx();
                 match tokio::time::timeout(Duration::from_secs(2), &mut host_event_bridge).await {
                     Ok(Ok(())) => {}
@@ -11309,54 +11636,78 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         );
                     }
                 }
-                park_server_root_mailbox(&mut state).await;
                 let (mut loop_result, emitted_events) = host.settle_loop_turn(loop_result);
-                let core_trace_result = persist_ctx
-                    .persist_core_and_trace_in_transaction(&state)
-                    .await;
-                let mut canonical_context_persisted = false;
-                if let Err(error) = &core_trace_result {
-                    loop_result = Err(astra_core::ClassifiedError::new(
-                        astra_core::ErrorKind::Unknown,
-                        format!(
-                            "canonical journal transaction failed before context commit: {error}"
-                        ),
-                    ));
-                } else {
-                    match Self::commit_canonical_turn(
-                        canonical_turn.as_ref(),
-                        &state.messages,
-                        state.canonical_rewrite_proof(),
-                        bg_cancel_flag.load(Ordering::Acquire)
-                            || bg_llm_cancel_token.is_cancelled(),
-                        &bg_run_id,
-                    )
-                    .await
-                    {
-                        Ok(persisted) => canonical_context_persisted = persisted,
-                        Err(commit_error) => loop_result = Err(commit_error),
+                tracing::info!(
+                    target: "astra_runtime::timing",
+                    run_id = %bg_run_id,
+                    elapsed_ms = settlement_started.elapsed().as_millis(),
+                    "host event bridge settled"
+                );
+                let root_mailbox = state.messaging.mailbox.take();
+                let user_transcript_persisted = match user_transcript_persistence.await {
+                    Ok(persisted) => persisted,
+                    Err(error) => {
+                        tracing::warn!(
+                            session_id = %bg_session_id,
+                            error = %error,
+                            "user intent transcript persistence task stopped before completion"
+                        );
+                        false
                     }
-                }
-                let loop_success = loop_result.is_ok();
-
-                // Best-effort post-loop persistence (core events, tool events,
-                // hook DB, observer, session-end hooks, promotion events).
-                if let Err(e) = persist_ctx
-                    .run_after_core(
-                        &state,
-                        loop_success,
-                        core_trace_result,
-                        canonical_context_persisted,
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        session_id = %bg_session_id,
+                };
+                let persist_canonical_state = async {
+                    let canonical_persist_started = Instant::now();
+                    let core_trace_result = persist_ctx
+                        .persist_core_and_trace_in_transaction(&state, user_transcript_persisted)
+                        .await;
+                    tracing::info!(
+                        target: "astra_runtime::timing",
                         run_id = %bg_run_id,
-                        error = %e,
-                        "post-loop persistence failed"
+                        elapsed_ms = canonical_persist_started.elapsed().as_millis(),
+                        "core and trace persistence completed"
                     );
-                }
+                    let mut canonical_context_persisted = false;
+                    if let Err(error) = &core_trace_result {
+                        loop_result = Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::Unknown,
+                            format!(
+                                "canonical journal transaction failed before context commit: {error}"
+                            ),
+                        ));
+                    } else {
+                        match Self::commit_canonical_turn(
+                            canonical_turn.as_ref(),
+                            &state.messages,
+                            state.canonical_rewrite_proof(),
+                            bg_cancel_flag.load(Ordering::Acquire)
+                                || bg_llm_cancel_token.is_cancelled(),
+                            &bg_run_id,
+                        )
+                        .await
+                        {
+                            Ok(persisted) => canonical_context_persisted = persisted,
+                            Err(commit_error) => loop_result = Err(commit_error),
+                        }
+                    }
+                    tracing::info!(
+                        target: "astra_runtime::timing",
+                        run_id = %bg_run_id,
+                        elapsed_ms = canonical_persist_started.elapsed().as_millis(),
+                        "canonical context commit completed"
+                    );
+                    (loop_result, canonical_context_persisted, core_trace_result)
+                };
+                let ((loop_result, canonical_context_persisted, core_trace_result), ()) = tokio::join!(
+                    persist_canonical_state,
+                    park_server_root_mailbox(root_mailbox),
+                );
+                tracing::info!(
+                    target: "astra_runtime::timing",
+                    run_id = %bg_run_id,
+                    elapsed_ms = settlement_started.elapsed().as_millis(),
+                    "canonical state persisted"
+                );
+                let loop_success = loop_result.is_ok();
 
                 let (final_events, final_status, error_msg) =
                     Self::finalize_run_events(loop_result, emitted_events, &state);
@@ -11430,6 +11781,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         "ordered live-event writer did not acknowledge its terminal watermark"
                     );
                 }
+                tracing::info!(
+                    target: "astra_runtime::timing",
+                    run_id = %bg_run_id,
+                    elapsed_ms = settlement_started.elapsed().as_millis(),
+                    "live event watermark flushed"
+                );
                 // In streaming mode, host-emitted `type` events have already gone
                 // through event_tx and the fanout persistence path. Replay only the
                 // synthesized terminal events appended by finalize_run_events.
@@ -11507,46 +11864,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
 
-                if persist_status_update
-                    && should_preserve_manual_pause_from_durable(
-                        &run_engine,
-                        &bg_user_id,
-                        &bg_run_id,
-                        &final_status,
-                    )
-                    .await
-                {
-                    persist_status_update = false;
-                    persisted_status = RunStatus::Paused;
-                    if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                        if run.status == RunStatus::Paused
-                            || run.status.try_transition(&RunStatus::Paused).is_ok()
-                        {
-                            run.status = RunStatus::Paused;
-                            run.pause_flag.store(true, Ordering::SeqCst);
-                            run.waiting_for
-                                .get_or_insert_with(|| "user_resume".to_string());
-                            run.live_tx = None;
-                        } else {
-                            tracing::warn!(
-                                target: "astra_runtime::run_lifecycle",
-                                run_id = %bg_run_id,
-                                current_status = %run.status.as_str(),
-                                "durable pause projection arrived after an incompatible local terminal state"
-                            );
-                        }
-                    }
-                }
-
-                // Record tokens consumed regardless of cancel — cancelled runs still
-                // consumed tokens and must count toward the daily budget.
-                if let Some(ref gov) = bg_resource_governor {
-                    let total = state.provider_total_tokens();
-                    if total > 0 {
-                        gov.record_tokens(&bg_user_id, total).await;
-                    }
-                }
-
                 let mut durable_status_committed = !persist_status_update && live_events_flushed;
                 let mut streaming_events_committed = false;
                 if !persist_streaming_events {
@@ -11557,24 +11874,79 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &streaming_events_for_durable,
                     );
                 }
-                if persist_status_update {
+                // Quota accounting and the fenced terminal transition are owned
+                // by independent durable stores. Both remain mandatory before
+                // publishing terminal events, but neither needs the other's
+                // result, so do not serialize their database round trips.
+                let record_consumed_tokens = async {
+                    let started = Instant::now();
+                    if let Some(ref gov) = bg_resource_governor {
+                        let total = state.provider_total_tokens();
+                        if total > 0 {
+                            gov.record_tokens(&bg_user_id, total).await;
+                        }
+                    }
+                    tracing::info!(
+                        target: "astra_runtime::timing",
+                        run_id = %bg_run_id,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "terminal token accounting completed"
+                    );
+                };
+                let commit_terminal_transition = async {
+                    let started = Instant::now();
+                    if !persist_status_update {
+                        return None;
+                    }
                     let events_for_transition: &[Value] = if persist_streaming_events {
                         streaming_events_for_durable.as_slice()
                     } else {
                         &[]
                     };
-                    match run_engine
-                        .commit_terminal_status_with_events_if_current(
-                            &bg_user_id,
-                            &bg_run_id,
-                            &[STATUS_RUNNING, STATUS_WAITING],
-                            persisted_status.as_str(),
-                            None,
-                            error_msg.as_deref(),
-                            events_for_transition,
-                        )
-                        .await
-                    {
+                    let result = Some(
+                        run_engine
+                            .commit_root_terminal_status_with_events_if_current(
+                                &bg_user_id,
+                                &bg_run_id,
+                                &[STATUS_RUNNING, STATUS_WAITING],
+                                persisted_status.as_str(),
+                                None,
+                                error_msg.as_deref(),
+                                events_for_transition,
+                            )
+                            .await,
+                    );
+                    tracing::info!(
+                        target: "astra_runtime::timing",
+                        run_id = %bg_run_id,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "terminal durable transition completed"
+                    );
+                    result
+                };
+                let release_canonical_turn = async {
+                    let started = Instant::now();
+                    Self::release_canonical_turn(canonical_turn.as_ref()).await;
+                    tracing::info!(
+                        target: "astra_runtime::timing",
+                        run_id = %bg_run_id,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "terminal canonical authority release completed"
+                    );
+                };
+                let (_, terminal_transition, ()) = tokio::join!(
+                    record_consumed_tokens,
+                    commit_terminal_transition,
+                    release_canonical_turn,
+                );
+                tracing::info!(
+                    target: "astra_runtime::timing",
+                    run_id = %bg_run_id,
+                    elapsed_ms = settlement_started.elapsed().as_millis(),
+                    "terminal transition dependencies completed"
+                );
+                if let Some(terminal_transition) = terminal_transition {
+                    match terminal_transition {
                         Ok(TerminalTransitionOutcome::Committed) => {
                             durable_status_committed = true;
                             streaming_events_committed = persist_streaming_events
@@ -11642,23 +12014,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     Self::schedule_run_eviction(&runs, bg_run_id.clone());
                 }
 
-                // Persist usage unconditionally — cancelled runs still consumed tokens
-                // and must have accurate usage in durable store for billing/audit.
-                astra_core::log_persist!(
-                    run_engine
-                        .persist_usage(
-                            &bg_user_id,
-                            &bg_run_id,
-                            state.provider_input_tokens(),
-                            state.total_completion,
-                            state.total_tool_calls,
-                        )
-                        .await,
-                    "run_lifecycle",
-                    &bg_run_id,
-                    "usage"
-                );
-
                 // Persist terminal events to durable store in a single batch.
                 if durable_status_committed
                     && persist_streaming_events
@@ -11694,21 +12049,63 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
 
-                if let Err(e) = persist_ctx
-                    .materialize_run_transcript_evidence(&state)
-                    .await
-                {
-                    tracing::warn!(
+                // Restore the existing pre-publication ordering for derived
+                // usage, transcript, and observability projections. Canonical
+                // journal/context, provider settlement, and the terminal CAS
+                // above remain the success gates; these projections retain
+                // their established best-effort error semantics. Their stores
+                // are independent after the terminal CAS, so keep the latency
+                // overlapped before publishing terminal SSE.
+                let persist_usage = async {
+                    astra_core::log_persist!(
+                        run_engine
+                            .persist_usage(
+                                &bg_user_id,
+                                &bg_run_id,
+                                state.provider_input_tokens(),
+                                state.total_completion,
+                                state.total_tool_calls,
+                            )
+                            .await,
+                        "run_lifecycle",
+                        &bg_run_id,
+                        "usage"
+                    );
+                };
+                let materialize_transcript = async {
+                    if let Err(e) = persist_ctx
+                        .materialize_run_transcript_evidence(&state)
+                        .await
+                    {
+                        tracing::warn!(
+                            session_id = %bg_session_id,
+                            run_id = %bg_run_id,
+                            error = %e,
+                            "durable transcript evidence materialization failed"
+                        );
+                    }
+                };
+                let post_loop_persistence = persist_ctx.run_after_core(
+                    &state,
+                    loop_success,
+                    core_trace_result,
+                    canonical_context_persisted,
+                );
+                let (_, _, post_loop_result) =
+                    tokio::join!(persist_usage, materialize_transcript, post_loop_persistence,);
+                if let Err(e) = post_loop_result {
+                    tracing::error!(
                         session_id = %bg_session_id,
                         run_id = %bg_run_id,
                         error = %e,
-                        "durable transcript evidence materialization failed"
+                        "post-loop persistence failed"
                     );
                 }
 
                 // Keep the owner lease through terminal CAS/event repair, then
-                // release it before client fanout and post-loop cleanup. These
-                // side effects must not advertise a live resume/input consumer.
+                // release it before client fanout and non-durable cleanup.
+                // Cleanup side effects must not advertise a live resume/input
+                // consumer.
                 drop(_owner_lease_heartbeat);
 
                 if publish_stream_terminal {
@@ -11738,7 +12135,31 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         .await;
                 }
 
-                // Drop event_tx — signals end-of-stream to the HTTP handler.
+                // Flush every queued terminal marker and explicitly detach the
+                // HTTP observer. Several runtime components retain event_tx
+                // clones until post-loop cleanup; relying on sender drop would
+                // otherwise keep an already-complete SSE response open.
+                let (detach_ack_tx, detach_ack_rx) = oneshot::channel();
+                let client_detached = fanout_control_tx
+                    .send(DurableLiveFanoutControl::FlushAndDetachClient { ack: detach_ack_tx })
+                    .await
+                    .is_ok()
+                    && matches!(detach_ack_rx.await, Ok(Ok(())));
+                if !client_detached {
+                    tracing::error!(
+                        target: "astra_runtime::run_lifecycle",
+                        user_id = %bg_user_id,
+                        run_id = %bg_run_id,
+                        "ordered live-event writer did not detach the terminal client stream"
+                    );
+                }
+                tracing::info!(
+                    target: "astra_runtime::timing",
+                    run_id = %bg_run_id,
+                    elapsed_ms = settlement_started.elapsed().as_millis(),
+                    "terminal client detached"
+                );
+
                 drop(event_tx);
 
                 // Post-loop memory cleanup — identical to `create_run`. Runs
@@ -11766,6 +12187,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             },
             "agentic_loop_stream_chat",
+        );
+
+        tracing::info!(
+            target: "astra_runtime::timing",
+            run_id = %run_id,
+            elapsed_ms = stream_prepare_started.elapsed().as_millis(),
+            "stream response ready"
         );
 
         Ok(ChatStreamRecord {

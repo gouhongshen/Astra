@@ -160,6 +160,11 @@ pub struct RunStartContext {
     pub runtime_profile: Option<RuntimeProfileRequest>,
     pub provider_request_fingerprint: Option<String>,
     pub provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
+    /// Lifecycle facts that are already final when the run identity is
+    /// claimed. They commit in the same transaction as `run_started` and the
+    /// session execution slot, avoiding a second append transaction without
+    /// weakening replay or recovery guarantees.
+    pub initial_events: Vec<serde_json::Value>,
 }
 
 fn durable_model_identity(
@@ -726,10 +731,9 @@ impl RunEngine {
             .store
             .claim_run_start(record, requested_session_id)
             .await?;
-        if claim == DurableRunStartClaim::Started {
-            self.project_delegation_run_if_needed(user_id, run_id, None)
-                .await?;
-        }
+        // This entry point always creates a root provider run: build_run_start_record
+        // receives no parent/delegation identity above. Avoid reloading the run and
+        // its event journal merely to rediscover that no delegation projection exists.
         Ok(claim)
     }
 
@@ -766,6 +770,11 @@ impl RunEngine {
             .map(runtime_profile_label)
             .map(str::to_string);
         let run_started_data = run_started_event_data(&context);
+        let mut events = vec![serde_json::json!({
+            "event_type": "run_started",
+            "data": run_started_data
+        })];
+        events.append(&mut context.initial_events);
         let record = DurableRunRecord {
             run_id: run_id.to_string(),
             user_id: user_id.to_string(),
@@ -799,10 +808,7 @@ impl RunEngine {
             resolved_model_name,
             runtime_profile,
             provider_request_fingerprint: context.provider_request_fingerprint,
-            events: vec![serde_json::json!({
-                "event_type": "run_started",
-                "data": run_started_data
-            })],
+            events,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -1100,6 +1106,31 @@ impl RunEngine {
         error_message: Option<&str>,
         events: &[serde_json::Value],
     ) -> Result<bool, String> {
+        self.transition_status_with_events_if_current_inner(
+            user_id,
+            run_id,
+            expected_statuses,
+            status,
+            waiting_for,
+            error_message,
+            events,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn transition_status_with_events_if_current_inner(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+        project_delegation: bool,
+    ) -> Result<bool, String> {
         let updated = self
             .store
             .update_run_status_with_events_if_current(
@@ -1112,7 +1143,7 @@ impl RunEngine {
                 events,
             )
             .await?;
-        if updated {
+        if updated && project_delegation {
             let summary = error_message.or(waiting_for);
             if let Err(error) = self
                 .project_delegation_run_if_needed(user_id, run_id, summary)
@@ -1148,12 +1179,13 @@ impl RunEngine {
         waiting_for: Option<&str>,
         error_message: Option<&str>,
         events: &[serde_json::Value],
+        project_delegation: bool,
     ) -> Result<bool, String> {
         let mut saw_store_error = false;
         let mut last_error: Option<String> = None;
         for attempt in 1..=TERMINAL_TRANSITION_MAX_ATTEMPTS {
             match self
-                .transition_status_with_events_if_current(
+                .transition_status_with_events_if_current_inner(
                     user_id,
                     run_id,
                     expected_statuses,
@@ -1161,6 +1193,7 @@ impl RunEngine {
                     waiting_for,
                     error_message,
                     events,
+                    project_delegation,
                 )
                 .await
             {
@@ -1175,6 +1208,7 @@ impl RunEngine {
                             error_message,
                             events,
                             last_error.as_deref(),
+                            project_delegation,
                         )
                         .await;
                 }
@@ -1214,6 +1248,58 @@ impl RunEngine {
         error_message: Option<&str>,
         events: &[serde_json::Value],
     ) -> Result<TerminalTransitionOutcome, String> {
+        self.commit_terminal_status_with_events_if_current_inner(
+            user_id,
+            run_id,
+            expected_statuses,
+            status,
+            waiting_for,
+            error_message,
+            events,
+            true,
+        )
+        .await
+    }
+
+    /// Root provider runs cannot own delegation projections. Keeping that
+    /// known identity avoids reloading the complete run and event journal
+    /// after the terminal CAS merely to prove both delegation keys are empty.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_root_terminal_status_with_events_if_current(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+    ) -> Result<TerminalTransitionOutcome, String> {
+        self.commit_terminal_status_with_events_if_current_inner(
+            user_id,
+            run_id,
+            expected_statuses,
+            status,
+            waiting_for,
+            error_message,
+            events,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_terminal_status_with_events_if_current_inner(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected_statuses: &[&str],
+        status: &str,
+        waiting_for: Option<&str>,
+        error_message: Option<&str>,
+        events: &[serde_json::Value],
+        project_delegation: bool,
+    ) -> Result<TerminalTransitionOutcome, String> {
         if self
             .try_transition_terminal_status_with_events_if_current(
                 user_id,
@@ -1223,6 +1309,7 @@ impl RunEngine {
                 waiting_for,
                 error_message,
                 events,
+                project_delegation,
             )
             .await?
         {
@@ -1245,6 +1332,7 @@ impl RunEngine {
         error_message: Option<&str>,
         events: &[serde_json::Value],
         last_error: Option<&str>,
+        project_delegation: bool,
     ) -> Result<bool, String> {
         let Some(run) = self
             .store
@@ -1289,9 +1377,10 @@ impl RunEngine {
             );
         }
         let summary = error_message.or(waiting_for);
-        if let Err(error) = self
-            .project_delegation_run_if_needed(user_id, run_id, summary)
-            .await
+        if project_delegation
+            && let Err(error) = self
+                .project_delegation_run_if_needed(user_id, run_id, summary)
+                .await
         {
             tracing::warn!(
                 user_id,
@@ -3196,6 +3285,36 @@ mod tests {
         assert_eq!(run.events[0]["data"]["interactive_client"], true);
         assert_eq!(run.events[0]["data"]["turn_intent_policy"], "fixed_default");
         assert_eq!(run.events[0]["data"]["skill_auto_route_policy"], "disabled");
+    }
+
+    #[tokio::test]
+    async fn start_run_with_context_commits_final_initial_events_in_order() {
+        let engine = test_engine();
+        engine
+            .start_run_with_context(
+                "run-initial-events",
+                "user-1",
+                "sess-1",
+                RunStartContext {
+                    initial_events: vec![
+                        serde_json::json!({"type": "workspace_bound", "workspace": {"kind": "edge_workspace"}}),
+                        serde_json::json!({"type": "executor_bound", "executor": {"kind": "edge_agent"}}),
+                    ],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let run = engine
+            .load_run("user-1", "run-initial-events")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.events.len(), 3);
+        assert_eq!(run.events[0]["event_type"], "run_started");
+        assert_eq!(run.events[1]["type"], "workspace_bound");
+        assert_eq!(run.events[2]["type"], "executor_bound");
     }
 
     #[test]

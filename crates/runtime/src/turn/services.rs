@@ -1,5 +1,5 @@
 use crate::data_layer::storage::{
-    bump_agent_session_event_count, insert_trace_event, touch_agent_session_activity,
+    bump_agent_session_event_count, insert_trace_events, touch_agent_session_activity,
 };
 use crate::server::run::lifecycle::{
     TranscriptPersistItem, TranscriptPersistPayload, persist_session_transcript_items_inner_in_tx,
@@ -436,26 +436,25 @@ impl DatabaseTraceEventWriter {
         if events.is_empty() {
             return Ok(());
         }
-        let mut touched_sessions =
-            std::collections::BTreeMap::<(String, String), (i64, Option<String>)>::new();
-        for event in &events {
-            if insert_trace_event(tx, event)
-                .await
-                .map_err(|error| TraceWriteError::Persist(error.to_string()))?
-            {
-                let entry = touched_sessions
-                    .entry((event.user_id.clone(), event.session_id.clone()))
-                    .or_default();
-                entry.0 += 1;
-                entry.1 = Some(event.event_id.clone());
-            }
+        let mut by_session = std::collections::BTreeMap::<(String, String), Vec<TraceEvent>>::new();
+        for event in events {
+            by_session
+                .entry((event.user_id.clone(), event.session_id.clone()))
+                .or_default()
+                .push(event);
         }
-        for ((user_id, session_id), (delta, last_event_id)) in touched_sessions {
+        for ((user_id, session_id), events) in by_session {
+            let (inserted, last_event_id) = insert_trace_events(tx, &events)
+                .await
+                .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
+            if inserted == 0 {
+                continue;
+            }
             bump_agent_session_event_count(
                 &mut **tx,
                 &session_id,
                 &user_id,
-                delta,
+                i64::try_from(inserted).unwrap_or(i64::MAX),
                 last_event_id.as_deref(),
             )
             .await

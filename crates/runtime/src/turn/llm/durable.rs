@@ -61,6 +61,13 @@ pub(crate) trait InferenceLedgerPersistence: Send + Sync {
         attempt: &astra_services::InferenceProviderAttemptPlan,
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> astra_services::ServiceResult<()>;
+
+    async fn finish_successful_provider_attempt_and_invocation(
+        &self,
+        plan: &astra_services::InferenceInvocationPlan,
+        attempt: &astra_services::InferenceProviderAttemptPlan,
+        terminal: &astra_services::InferenceInvocationTerminal,
+    ) -> astra_services::ServiceResult<()>;
 }
 
 struct DatabaseInferenceLedgerPersistence {
@@ -119,6 +126,21 @@ impl InferenceLedgerPersistence for DatabaseInferenceLedgerPersistence {
     ) -> astra_services::ServiceResult<()> {
         astra_services::finish_inference_provider_attempt(&self.shared_pool, attempt, terminal)
             .await
+    }
+
+    async fn finish_successful_provider_attempt_and_invocation(
+        &self,
+        plan: &astra_services::InferenceInvocationPlan,
+        attempt: &astra_services::InferenceProviderAttemptPlan,
+        terminal: &astra_services::InferenceInvocationTerminal,
+    ) -> astra_services::ServiceResult<()> {
+        astra_services::finish_successful_inference_provider_attempt_and_invocation(
+            &self.shared_pool,
+            plan,
+            attempt,
+            terminal,
+        )
+        .await
     }
 }
 
@@ -371,6 +393,75 @@ impl InferenceLedgerPersistence for TestInferenceLedgerPersistence {
             None => attempt_state.terminal = Some(terminal.clone()),
         }
         Ok(())
+    }
+
+    async fn finish_successful_provider_attempt_and_invocation(
+        &self,
+        plan: &astra_services::InferenceInvocationPlan,
+        attempt: &astra_services::InferenceProviderAttemptPlan,
+        terminal: &astra_services::InferenceInvocationTerminal,
+    ) -> astra_services::ServiceResult<()> {
+        if terminal.status != astra_services::InferenceTerminalStatus::Succeeded {
+            return Err(astra_services::ServiceError::invalid(
+                "combined test inference settlement requires a successful terminal",
+            ));
+        }
+        let mut state = self.lock();
+        let provider_attempt = state
+            .attempts
+            .get_mut(attempt.attempt_id())
+            .ok_or_else(|| {
+                astra_services::ServiceError::conflict(format!(
+                    "test provider attempt {} was not admitted",
+                    attempt.attempt_id()
+                ))
+            })?;
+        if provider_attempt.invocation_id != plan.invocation_id() {
+            return Err(astra_services::ServiceError::conflict(format!(
+                "test provider attempt {} belongs to a different invocation",
+                attempt.attempt_id()
+            )));
+        }
+        match provider_attempt.terminal.as_ref() {
+            Some(existing) if existing != terminal => {
+                return Err(astra_services::ServiceError::conflict(format!(
+                    "test provider attempt {} has a conflicting terminal",
+                    attempt.attempt_id()
+                )));
+            }
+            Some(_) => {}
+            None => provider_attempt.terminal = Some(terminal.clone()),
+        }
+        if state.attempts.values().any(|candidate| {
+            candidate.invocation_id == plan.invocation_id() && candidate.terminal.is_none()
+        }) {
+            return Err(astra_services::ServiceError::conflict(format!(
+                "test inference invocation {} still has an open provider attempt",
+                plan.invocation_id()
+            )));
+        }
+        let invocation = state
+            .invocations
+            .get_mut(plan.invocation_id())
+            .ok_or_else(|| {
+                astra_services::ServiceError::conflict(format!(
+                    "test inference invocation {} was not admitted",
+                    plan.invocation_id()
+                ))
+            })?;
+        match invocation.terminal.as_ref() {
+            Some(existing) if existing != terminal => {
+                Err(astra_services::ServiceError::conflict(format!(
+                    "test inference invocation {} has a conflicting terminal",
+                    plan.invocation_id()
+                )))
+            }
+            Some(_) => Ok(()),
+            None => {
+                invocation.terminal = Some(terminal.clone());
+                Ok(())
+            }
+        }
     }
 }
 
@@ -823,6 +914,16 @@ impl DurableInferenceInvocation {
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> Result<(), astra_core::ClassifiedError> {
         self.observer.ensure_invocation_admitted().await?;
+        if let Some(committed) = self.observer.committed_logical_terminal().await {
+            return if committed == *terminal {
+                Ok(())
+            } else {
+                Err(contract_error(
+                    "terminal commit",
+                    "logical terminal conflicts with the successful provider settlement",
+                ))
+            };
+        }
         self.persistence
             .finish_invocation(&self.plan, terminal)
             .await
@@ -863,6 +964,7 @@ struct ProviderAttemptState {
     open_attempts: BTreeMap<u32, astra_services::InferenceProviderAttemptPlan>,
     requests: BTreeMap<u32, DurableProviderRequestIdentity>,
     terminals: BTreeMap<u32, astra_services::InferenceInvocationTerminal>,
+    logical_terminal: Option<astra_services::InferenceInvocationTerminal>,
 }
 
 impl ProviderAttemptState {
@@ -1019,6 +1121,12 @@ impl DurableProviderAttemptObserver {
             .map_err(|error| service_error("admission", error))?;
         state.invocation_admitted = true;
         Ok(())
+    }
+
+    async fn committed_logical_terminal(
+        &self,
+    ) -> Option<astra_services::InferenceInvocationTerminal> {
+        self.state.lock().await.logical_terminal.clone()
     }
 
     async fn finish_open_attempts(
@@ -1180,6 +1288,7 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
         // durable commit and the matching state transition.
         let permit = self.operations.register("provider attempt terminal")?;
         let persistence = self.persistence.clone();
+        let invocation = self.invocation.clone();
         let state = self.state.clone();
         let terminal = terminal.clone();
         tokio::spawn(async move {
@@ -1195,10 +1304,24 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
                         format!("attempt {attempt_index} is not open"),
                     )
                 })?;
-            persistence
-                .finish_provider_attempt(&attempt, &terminal)
-                .await
-                .map_err(|error| service_error("provider attempt terminal commit", error))?;
+            if terminal.status == astra_services::InferenceTerminalStatus::Succeeded {
+                persistence
+                    .finish_successful_provider_attempt_and_invocation(
+                        &invocation,
+                        &attempt,
+                        &terminal,
+                    )
+                    .await
+                    .map_err(|error| {
+                        service_error("combined provider and invocation terminal commit", error)
+                    })?;
+                state.logical_terminal = Some(terminal.clone());
+            } else {
+                persistence
+                    .finish_provider_attempt(&attempt, &terminal)
+                    .await
+                    .map_err(|error| service_error("provider attempt terminal commit", error))?;
+            }
             state.open_attempts.remove(&attempt_index);
             state.terminals.insert(attempt_index, terminal);
             Ok(())

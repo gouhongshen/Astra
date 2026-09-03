@@ -3256,7 +3256,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
     // All providers stream — including Bedrock (via converse-stream +
     // AWS vnd.amazon.eventstream). The body builder and URL builder flip
     // to the streaming variant for every supported provider.
-    let body = build_provider_request_body_with_overrides(
+    let mut body = build_provider_request_body_with_overrides(
         &messages,
         tools,
         upstream_name,
@@ -3267,6 +3267,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
         thinking,
         request_body_overrides,
     );
+    thinking.apply_openai_suppression(&mut body, provider, base_url);
     let prepared_request =
         PreparedProviderRequest::from_json(&body, llm_provider_protocol(provider))?;
 
@@ -4610,7 +4611,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     let messages =
         consolidate_system_messages_for_provider(messages, provider, model_name, cache_capability);
 
-    let body = build_provider_request_body_with_overrides(
+    let mut body = build_provider_request_body_with_overrides(
         &messages,
         tools,
         upstream_name,
@@ -4621,6 +4622,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         thinking,
         request_body_overrides,
     );
+    thinking.apply_openai_suppression(&mut body, provider, base_url);
     let prepared_request =
         PreparedProviderRequest::from_json(&body, llm_provider_protocol(provider))?;
 

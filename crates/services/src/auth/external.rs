@@ -424,6 +424,7 @@ impl ExternalRuntimeCapabilityDescriptors {
                 .edge_agent
                 .as_ref()
                 .map(ExternalRuntimeCapabilityDescriptor::to_request_descriptor),
+            discovery_snapshot: None,
         }
     }
 }

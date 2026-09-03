@@ -898,6 +898,7 @@ pub(crate) async fn stream_chat_sse(
             context_trace_persistence: None,
             promotion_events: Vec::new(),
             pending_context_assembly_trace: None,
+            pending_context_trace_signal: None,
             completed_turns_for_tuning: 0,
             initial_skill_selector_shortlist: None,
         },
@@ -925,6 +926,7 @@ pub(crate) async fn stream_chat_sse(
             admitted_model_execution: None,
             task_board_monitor: p.task_manager.clone(),
             task_board_snapshot: Default::default(),
+            task_board_snapshot_fresh_for_turn: false,
             completion_settlement: Default::default(),
         },
         messaging: MessagingState {

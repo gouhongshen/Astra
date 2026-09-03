@@ -690,6 +690,66 @@ pub(crate) async fn prepare_agent_binding_skill_resolver(
     build_resolver_from_catalogs(server_id, endpoint_url, authorization, catalogs)
 }
 
+pub(crate) fn prepare_agent_binding_skill_resolver_from_snapshot(
+    server_id: &str,
+    endpoint_url: &str,
+    authorization: &str,
+    agent_binding_ids: &[String],
+    snapshot_catalogs: &[astra_services::runs::RuntimeCapabilitySkillCatalogSnapshotRequest],
+) -> Result<PreparedAgentBindingSkills, (StatusCode, Json<ErrorResponse>)> {
+    validate_skill_endpoint(endpoint_url)?;
+    let mut catalogs_by_binding = HashMap::with_capacity(snapshot_catalogs.len());
+    for catalog in snapshot_catalogs {
+        if catalog.agent_binding_id.trim().is_empty()
+            || catalog.agent_binding_id != catalog.agent_binding_id.trim()
+            || catalogs_by_binding
+                .insert(catalog.agent_binding_id.clone(), &catalog.skills)
+                .is_some()
+        {
+            return Err(skill_error(
+                StatusCode::BAD_REQUEST,
+                "runtime capability discovery snapshot has an invalid or duplicate agent_binding_id",
+                "agent_binding_discovery_snapshot_invalid",
+            ));
+        }
+    }
+    if catalogs_by_binding.len() != agent_binding_ids.len()
+        || catalogs_by_binding
+            .keys()
+            .any(|id| !agent_binding_ids.contains(id))
+    {
+        return Err(skill_error(
+            StatusCode::BAD_REQUEST,
+            "runtime capability discovery snapshot does not match the Agent Binding Set",
+            "agent_binding_discovery_snapshot_invalid",
+        ));
+    }
+    let mut catalogs = Vec::with_capacity(agent_binding_ids.len());
+    for agent_binding_id in agent_binding_ids {
+        let Some(raw_skills) = catalogs_by_binding.get(agent_binding_id) else {
+            return Err(skill_error(
+                StatusCode::BAD_REQUEST,
+                "runtime capability discovery snapshot is missing an Agent Binding skill catalog",
+                "agent_binding_discovery_snapshot_invalid",
+            ));
+        };
+        let mut skills = Vec::with_capacity(raw_skills.len());
+        for raw_skill in *raw_skills {
+            let skill =
+                serde_json::from_value::<DiscoveredSkill>(raw_skill.clone()).map_err(|error| {
+                    skill_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("runtime capability discovery Skill is invalid: {error}"),
+                        "agent_binding_discovery_snapshot_invalid",
+                    )
+                })?;
+            skills.push(skill);
+        }
+        catalogs.push((Some(agent_binding_id.clone()), skills));
+    }
+    build_resolver_from_catalogs(server_id, endpoint_url, authorization, catalogs)
+}
+
 pub(crate) async fn prepare_runtime_skill_resolver(
     server_id: &str,
     endpoint_url: &str,
@@ -718,6 +778,31 @@ mod tests {
             input_schema: None,
             output_schema: None,
         }
+    }
+
+    #[test]
+    fn prepares_agent_binding_skills_from_frozen_snapshot() {
+        let prepared = prepare_agent_binding_skill_resolver_from_snapshot(
+            "skills",
+            "https://catalog.example.test/api/v1/skills/http",
+            "Bearer runtime-grant",
+            &["binding_1".to_string()],
+            &[
+                astra_services::runs::RuntimeCapabilitySkillCatalogSnapshotRequest {
+                    agent_binding_id: "binding_1".to_string(),
+                    skills: vec![json!({
+                        "name": "pdf",
+                        "description": "Read PDF files",
+                        "allowed_tools": ["file_download"]
+                    })],
+                },
+            ],
+        )
+        .expect("frozen Skill discovery snapshot should prepare");
+
+        assert_eq!(prepared.catalogs.len(), 1);
+        assert_eq!(prepared.catalogs[0].agent_binding_id, "binding_1");
+        assert!(prepared.resolver.is_some());
     }
 
     #[test]

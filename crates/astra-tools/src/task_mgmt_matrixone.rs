@@ -22,8 +22,8 @@ use std::sync::Arc;
 
 use crate::task_mgmt::{
     InMemoryTaskStore, SESSION_TASK_STATUS_IN_PROGRESS, SESSION_TASK_STATUS_PAUSED,
-    SESSION_TASK_STATUS_PENDING, SessionSubtask, SessionTask, SessionTaskStatusKind, TaskMutation,
-    TaskMutationOutcome, TaskStore,
+    SESSION_TASK_STATUS_PENDING, SessionSubtask, SessionTask, SessionTaskStatusKind,
+    TaskManagerSnapshot, TaskMutation, TaskMutationOutcome, TaskStore,
 };
 
 const INSERT_BATCH_ROWS: usize = 100;
@@ -496,6 +496,73 @@ impl TaskStore for MatrixOneTaskStore {
             tasks.push(row_to_task(&row).map_err(|e| e.to_string())?);
         }
         Ok(tasks)
+    }
+
+    async fn load_snapshot_state(&self, session_id: &str) -> Result<TaskManagerSnapshot, String> {
+        // MatrixOne gives one statement a consistent snapshot. Read the board,
+        // allocator, and mutation version together instead of using the
+        // generic four-round-trip optimistic protocol. The aggregate anchor
+        // always yields one row, including for a board with no tasks/counter.
+        let rows = sqlx::query(
+            "SELECT todo.todo_id, todo.title, todo.description, todo.active_form,
+                    todo.status, todo.owner, todo.metadata, todo.blocks, todo.blocked_by,
+                    todo.subtasks, CAST(todo.archived_at AS CHAR) AS archived_at,
+                    CAST(todo.created_at AS CHAR) AS created_at,
+                    CAST(todo.updated_at AS CHAR) AS updated_at,
+                    snapshot.next_id AS snapshot_next_id,
+                    snapshot.version AS snapshot_version
+             FROM (
+                 SELECT COALESCE(MAX(next_id), 1) AS next_id,
+                        COALESCE(MAX(version), 0) AS version
+                 FROM session_todo_counters
+                 WHERE session_id = ? AND user_id = ?
+             ) AS snapshot
+             LEFT JOIN session_todos AS todo
+               ON todo.session_id = ? AND todo.user_id = ?
+             ORDER BY todo.ordinal ASC",
+        )
+        .bind(session_id)
+        .bind(&self.user_id)
+        .bind(session_id)
+        .bind(&self.user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| format!("load atomic task-board snapshot failed: {error}"))?;
+
+        let first = rows.first().ok_or_else(|| {
+            "atomic task-board snapshot query returned no aggregate anchor".to_string()
+        })?;
+        let raw_next = first
+            .try_get::<i64, _>("snapshot_next_id")
+            .map_err(|error| format!("decode task-board snapshot next_id failed: {error}"))?;
+        let raw_version = first
+            .try_get::<i64, _>("snapshot_version")
+            .map_err(|error| format!("decode task-board snapshot version failed: {error}"))?;
+        if raw_version < 0 {
+            return Err(format!(
+                "session_todo_counters.version out of range for {session_id}: {raw_version}"
+            ));
+        }
+        let next_task_id = peek_task_id_from_counter(Some(raw_next), session_id)
+            .map_err(|error| format!("peek_next_task_id failed: {error}"))?;
+        let version = u64::try_from(raw_version)
+            .map_err(|_| format!("session_todo_counters.version overflow for {session_id}"))?;
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row
+                .try_get::<Option<String>, _>("todo_id")
+                .map_err(|error| format!("decode task-board snapshot todo_id failed: {error}"))?
+                .is_some()
+            {
+                tasks.push(row_to_task(&row).map_err(|error| error.to_string())?);
+            }
+        }
+        Ok(TaskManagerSnapshot {
+            tasks,
+            next_task_id,
+            version,
+            restore_version: None,
+        })
     }
 
     async fn save(&self, session_id: &str, tasks: Vec<SessionTask>) -> Result<(), String> {
