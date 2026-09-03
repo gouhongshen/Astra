@@ -283,6 +283,13 @@ pub(crate) trait InferenceLedgerPersistence: Send + Sync {
         attempt: &astra_services::InferenceProviderAttemptPlan,
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> astra_services::ServiceResult<()>;
+
+    async fn finish_successful_provider_attempt_and_invocation(
+        &self,
+        plan: &astra_services::InferenceInvocationPlan,
+        attempt: &astra_services::InferenceProviderAttemptPlan,
+        terminal: &astra_services::InferenceInvocationTerminal,
+    ) -> astra_services::ServiceResult<()>;
 }
 
 struct DatabaseInferenceLedgerPersistence {
@@ -376,6 +383,21 @@ impl InferenceLedgerPersistence for DatabaseInferenceLedgerPersistence {
     ) -> astra_services::ServiceResult<()> {
         astra_services::finish_inference_provider_attempt(&self.shared_pool, attempt, terminal)
             .await
+    }
+
+    async fn finish_successful_provider_attempt_and_invocation(
+        &self,
+        plan: &astra_services::InferenceInvocationPlan,
+        attempt: &astra_services::InferenceProviderAttemptPlan,
+        terminal: &astra_services::InferenceInvocationTerminal,
+    ) -> astra_services::ServiceResult<()> {
+        astra_services::finish_successful_inference_provider_attempt_and_invocation(
+            &self.shared_pool,
+            plan,
+            attempt,
+            terminal,
+        )
+        .await
     }
 }
 
@@ -2469,6 +2491,75 @@ impl InferenceLedgerPersistence for TestInferenceLedgerPersistence {
         }
         Ok(())
     }
+
+    async fn finish_successful_provider_attempt_and_invocation(
+        &self,
+        plan: &astra_services::InferenceInvocationPlan,
+        attempt: &astra_services::InferenceProviderAttemptPlan,
+        terminal: &astra_services::InferenceInvocationTerminal,
+    ) -> astra_services::ServiceResult<()> {
+        if terminal.status != astra_services::InferenceTerminalStatus::Succeeded {
+            return Err(astra_services::ServiceError::invalid(
+                "combined test inference settlement requires a successful terminal",
+            ));
+        }
+        let mut state = self.lock();
+        let provider_attempt = state
+            .attempts
+            .get_mut(attempt.attempt_id())
+            .ok_or_else(|| {
+                astra_services::ServiceError::conflict(format!(
+                    "test provider attempt {} was not admitted",
+                    attempt.attempt_id()
+                ))
+            })?;
+        if provider_attempt.invocation_id != plan.invocation_id() {
+            return Err(astra_services::ServiceError::conflict(format!(
+                "test provider attempt {} belongs to a different invocation",
+                attempt.attempt_id()
+            )));
+        }
+        match provider_attempt.terminal.as_ref() {
+            Some(existing) if existing != terminal => {
+                return Err(astra_services::ServiceError::conflict(format!(
+                    "test provider attempt {} has a conflicting terminal",
+                    attempt.attempt_id()
+                )));
+            }
+            Some(_) => {}
+            None => provider_attempt.terminal = Some(terminal.clone()),
+        }
+        if state.attempts.values().any(|candidate| {
+            candidate.invocation_id == plan.invocation_id() && candidate.terminal.is_none()
+        }) {
+            return Err(astra_services::ServiceError::conflict(format!(
+                "test inference invocation {} still has an open provider attempt",
+                plan.invocation_id()
+            )));
+        }
+        let invocation = state
+            .invocations
+            .get_mut(plan.invocation_id())
+            .ok_or_else(|| {
+                astra_services::ServiceError::conflict(format!(
+                    "test inference invocation {} was not admitted",
+                    plan.invocation_id()
+                ))
+            })?;
+        match invocation.terminal.as_ref() {
+            Some(existing) if existing != terminal => {
+                Err(astra_services::ServiceError::conflict(format!(
+                    "test inference invocation {} has a conflicting terminal",
+                    plan.invocation_id()
+                )))
+            }
+            Some(_) => Ok(()),
+            None => {
+                invocation.terminal = Some(terminal.clone());
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -3678,6 +3769,20 @@ impl DurableInferenceInvocation {
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> Result<(), astra_core::ClassifiedError> {
         self.owner_lease.ensure_live("logical terminal")?;
+        if let Some(committed) = self.observer.committed_logical_terminal().await {
+            if committed != *terminal {
+                return Err(contract_error(
+                    "terminal commit",
+                    "logical terminal conflicts with the successful provider settlement",
+                ));
+            }
+            drop(
+                self.take_settlement_reservation("combined logical terminal")
+                    .await?,
+            );
+            self.owner_lease.stop();
+            return Ok(());
+        }
         // Successful provider terminalization atomically creates the matching
         // debt in the services layer. Other terminal kinds are retryable at
         // the physical layer, so only the logical owner may declare them final.
@@ -3779,6 +3884,7 @@ struct ProviderAttemptState {
     settlement_handed_off: BTreeSet<u32>,
     pending_terminals: BTreeMap<u32, astra_services::InferenceInvocationTerminal>,
     terminals: BTreeMap<u32, astra_services::InferenceInvocationTerminal>,
+    logical_terminal: Option<astra_services::InferenceInvocationTerminal>,
 }
 
 impl ProviderAttemptState {
@@ -3964,6 +4070,12 @@ impl DurableProviderAttemptObserver {
             operations: ProviderOperationGate::default(),
             owner_lease,
         }
+    }
+
+    async fn committed_logical_terminal(
+        &self,
+    ) -> Option<astra_services::InferenceInvocationTerminal> {
+        self.state.lock().await.logical_terminal.clone()
     }
 
     async fn finish_open_attempts(
@@ -4246,15 +4358,31 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
                 .insert(attempt_index, terminal.clone());
             attempt
         };
-        self.persistence
-            .finish_provider_attempt(&attempt, terminal)
-            .await
-            .map_err(|error| service_error("provider attempt terminal commit", error))?;
+        if terminal.status == astra_services::InferenceTerminalStatus::Succeeded {
+            self.persistence
+                .finish_successful_provider_attempt_and_invocation(
+                    &self.invocation,
+                    &attempt,
+                    terminal,
+                )
+                .await
+                .map_err(|error| {
+                    service_error("combined provider and invocation terminal commit", error)
+                })?;
+        } else {
+            self.persistence
+                .finish_provider_attempt(&attempt, terminal)
+                .await
+                .map_err(|error| service_error("provider attempt terminal commit", error))?;
+        }
         let mut state = self.state.lock().await;
         state.open_attempts.remove(&attempt_index);
         state.delivery_authorized.remove(&attempt_index);
         state.pending_terminals.remove(&attempt_index);
         state.terminals.insert(attempt_index, terminal.clone());
+        if terminal.status == astra_services::InferenceTerminalStatus::Succeeded {
+            state.logical_terminal = Some(terminal.clone());
+        }
         Ok(())
     }
 
@@ -4915,6 +5043,15 @@ mod tests {
         ) -> astra_services::ServiceResult<()> {
             Ok(())
         }
+
+        async fn finish_successful_provider_attempt_and_invocation(
+            &self,
+            _plan: &astra_services::InferenceInvocationPlan,
+            _attempt: &astra_services::InferenceProviderAttemptPlan,
+            _terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> astra_services::ServiceResult<()> {
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -4997,6 +5134,17 @@ mod tests {
         ) -> astra_services::ServiceResult<()> {
             self.inner.finish_provider_attempt(attempt, terminal).await
         }
+
+        async fn finish_successful_provider_attempt_and_invocation(
+            &self,
+            plan: &astra_services::InferenceInvocationPlan,
+            attempt: &astra_services::InferenceProviderAttemptPlan,
+            terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> astra_services::ServiceResult<()> {
+            self.inner
+                .finish_successful_provider_attempt_and_invocation(plan, attempt, terminal)
+                .await
+        }
     }
 
     #[async_trait]
@@ -5066,6 +5214,17 @@ mod tests {
         ) -> astra_services::ServiceResult<()> {
             self.inner.finish_provider_attempt(attempt, terminal).await
         }
+
+        async fn finish_successful_provider_attempt_and_invocation(
+            &self,
+            plan: &astra_services::InferenceInvocationPlan,
+            attempt: &astra_services::InferenceProviderAttemptPlan,
+            terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> astra_services::ServiceResult<()> {
+            self.inner
+                .finish_successful_provider_attempt_and_invocation(plan, attempt, terminal)
+                .await
+        }
     }
 
     #[async_trait]
@@ -5123,6 +5282,18 @@ mod tests {
 
         async fn finish_provider_attempt(
             &self,
+            _attempt: &astra_services::InferenceProviderAttemptPlan,
+            _terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> astra_services::ServiceResult<()> {
+            self.finish_entered.fetch_add(1, Ordering::SeqCst);
+            self.active_finish_workers.fetch_add(1, Ordering::SeqCst);
+            let _active = ActiveWorkerGuard(&self.active_finish_workers);
+            std::future::pending().await
+        }
+
+        async fn finish_successful_provider_attempt_and_invocation(
+            &self,
+            _plan: &astra_services::InferenceInvocationPlan,
             _attempt: &astra_services::InferenceProviderAttemptPlan,
             _terminal: &astra_services::InferenceInvocationTerminal,
         ) -> astra_services::ServiceResult<()> {
@@ -5207,6 +5378,17 @@ mod tests {
         ) -> astra_services::ServiceResult<()> {
             self.inner.finish_provider_attempt(attempt, terminal).await
         }
+
+        async fn finish_successful_provider_attempt_and_invocation(
+            &self,
+            plan: &astra_services::InferenceInvocationPlan,
+            attempt: &astra_services::InferenceProviderAttemptPlan,
+            terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> astra_services::ServiceResult<()> {
+            self.inner
+                .finish_successful_provider_attempt_and_invocation(plan, attempt, terminal)
+                .await
+        }
     }
 
     #[async_trait]
@@ -5280,6 +5462,19 @@ mod tests {
             self.release_finish.notified().await;
             self.inner.finish_provider_attempt(attempt, terminal).await
         }
+
+        async fn finish_successful_provider_attempt_and_invocation(
+            &self,
+            plan: &astra_services::InferenceInvocationPlan,
+            attempt: &astra_services::InferenceProviderAttemptPlan,
+            terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> astra_services::ServiceResult<()> {
+            self.finish_entered.fetch_add(1, Ordering::SeqCst);
+            self.release_finish.notified().await;
+            self.inner
+                .finish_successful_provider_attempt_and_invocation(plan, attempt, terminal)
+                .await
+        }
     }
 
     #[async_trait]
@@ -5337,6 +5532,16 @@ mod tests {
 
         async fn finish_provider_attempt(
             &self,
+            _attempt: &astra_services::InferenceProviderAttemptPlan,
+            _terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> astra_services::ServiceResult<()> {
+            self.finished.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn finish_successful_provider_attempt_and_invocation(
+            &self,
+            _plan: &astra_services::InferenceInvocationPlan,
             _attempt: &astra_services::InferenceProviderAttemptPlan,
             _terminal: &astra_services::InferenceInvocationTerminal,
         ) -> astra_services::ServiceResult<()> {
@@ -5418,6 +5623,17 @@ mod tests {
         ) -> astra_services::ServiceResult<()> {
             self.inner.finish_provider_attempt(attempt, terminal).await
         }
+
+        async fn finish_successful_provider_attempt_and_invocation(
+            &self,
+            plan: &astra_services::InferenceInvocationPlan,
+            attempt: &astra_services::InferenceProviderAttemptPlan,
+            terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> astra_services::ServiceResult<()> {
+            self.inner
+                .finish_successful_provider_attempt_and_invocation(plan, attempt, terminal)
+                .await
+        }
     }
 
     #[async_trait]
@@ -5495,6 +5711,15 @@ mod tests {
 
         async fn finish_provider_attempt(
             &self,
+            _attempt: &astra_services::InferenceProviderAttemptPlan,
+            _terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> astra_services::ServiceResult<()> {
+            Ok(())
+        }
+
+        async fn finish_successful_provider_attempt_and_invocation(
+            &self,
+            _plan: &astra_services::InferenceInvocationPlan,
             _attempt: &astra_services::InferenceProviderAttemptPlan,
             _terminal: &astra_services::InferenceInvocationTerminal,
         ) -> astra_services::ServiceResult<()> {

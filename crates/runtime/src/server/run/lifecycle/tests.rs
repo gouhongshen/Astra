@@ -601,8 +601,8 @@ fn admitted_proof_allows_successful_turn_to_normalize_prior_execution_scratch() 
         json!({"role": "user", "content": "new request"}),
         json!({"role": "assistant", "content": "new result"}),
     ]);
-    let base_root = astra_turn_types::canonical_conversation_root(&prior);
-    let proof = CanonicalRewriteProof::new(&prior, &base_root, 0);
+    let base_manifest_root = "a".repeat(64);
+    let proof = CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
 
     let (mode, packs) = canonical_commit_delta(&prior, true, &messages, Some(&proof), false)
         .unwrap()
@@ -12794,6 +12794,7 @@ fn authorized_edge_dispatch_request() -> astra_services::runs::ChatRequestData {
             mcp: None,
             skills: None,
             edge_agent: Some(descriptor),
+            discovery_snapshot: None,
         });
     request
 }
@@ -13000,6 +13001,7 @@ async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_
             mcp: None,
             skills: None,
             edge_agent: None,
+            discovery_snapshot: None,
         });
 
     let prepared = service
@@ -13043,6 +13045,7 @@ async fn validate_request_constraints_rejects_descriptor_without_provider_author
             mcp: None,
             skills: None,
             edge_agent: None,
+            discovery_snapshot: None,
         });
 
     let err = service

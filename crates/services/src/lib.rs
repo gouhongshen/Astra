@@ -210,7 +210,9 @@ pub use inference_execution::{
     plan_inference_invocation, plan_inference_provider_attempt,
     plan_inference_provider_attempt_with_context, reconcile_inference_settlement,
     reconcile_inference_settlements, renew_inference_invocation_owner,
-    retire_inference_canonical_transitions_through_turn, settle_uncertain_inference_admission,
+    retire_inference_canonical_transitions_through_turn,
+    finish_successful_inference_provider_attempt_and_invocation,
+    settle_uncertain_inference_admission,
 };
 pub use interaction_contract::{
     InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,
@@ -324,11 +326,11 @@ pub use session_artifact_store::{
     local_owner_scope, local_owner_user_id, local_session_artifact_store,
 };
 pub use session_context_coordinator::{
-    AcquireWriterOutcome, CoordinatorClock, DatabaseSessionContextCoordinator,
-    FileSessionContextCoordinator, MaterializedConversationV1, RenewedTurnAuthority,
-    ReserveTurnOutcome, SessionAdmissionSnapshotV1, SessionAuthorityEventV1,
-    SessionContextCoordinator, SessionContextCoordinatorError, SystemCoordinatorClock,
-    TransferWriterOutcome, WriterTransferConflictV1, WriterTransferRequestV1,
+    AcquireWriterAndReserveTurnOutcome, AcquireWriterOutcome, DatabaseSessionContextCoordinator,
+    MaterializedConversationV1, RenewedTurnAuthority, ReserveTurnOutcome,
+    SessionAdmissionSnapshotV1, SessionAuthorityEventV1, SessionContextCoordinator,
+    SessionContextCoordinatorError, TransferWriterOutcome, WriterTransferConflictV1,
+    WriterTransferRequestV1,
 };
 pub use session_fork_coordinator::{
     DatabaseSessionForkCoordinator, PrepareSessionForkV1, SessionForkCoordinatorError,

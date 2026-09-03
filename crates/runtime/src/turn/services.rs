@@ -1,4 +1,4 @@
-use crate::data_layer::storage::{insert_trace_event, touch_agent_session_activity};
+use crate::data_layer::storage::{insert_trace_events, touch_agent_session_activity};
 use crate::server::run::lifecycle::{
     TranscriptPersistItem, TranscriptPersistPayload, persist_session_transcript_items_inner_in_tx,
 };
@@ -502,17 +502,23 @@ impl DatabaseTraceEventWriter {
         )
         .await
         .map_err(TraceWriteError::Persist)?;
+        let mut by_session = std::collections::BTreeMap::<(String, String), Vec<TraceEvent>>::new();
+        for event in events {
+            by_session
+                .entry((event.user_id.clone(), event.session_id.clone()))
+                .or_default()
+                .push(event);
+        }
         let mut deltas = SessionEventDeltas::new();
-        for event in &events {
-            if insert_trace_event(tx, event)
+        for ((user_id, session_id), events) in by_session {
+            let (inserted, last_event_id) = insert_trace_events(tx, &events)
                 .await
-                .map_err(|error| TraceWriteError::Persist(error.to_string()))?
-            {
-                let entry = deltas
-                    .entry((event.user_id.clone(), event.session_id.clone()))
-                    .or_default();
-                entry.0 += 1;
-                entry.1 = Some(event.event_id.clone());
+                .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
+            if inserted > 0 {
+                deltas.insert(
+                    (user_id, session_id),
+                    (i64::try_from(inserted).unwrap_or(i64::MAX), last_event_id),
+                );
             }
         }
         // Session summary updates are deliberately deferred until the owning
