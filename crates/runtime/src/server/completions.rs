@@ -910,33 +910,83 @@ mod tests {
                 .is_cancelled()
         );
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let mut poll = tokio::time::interval(std::time::Duration::from_millis(20));
-            loop {
-                poll.tick().await;
-                let row = sqlx::query(
-                    "SELECT i.status AS invocation_status, a.status AS attempt_status
+        let cancellation_converged =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut poll = tokio::time::interval(std::time::Duration::from_millis(20));
+                loop {
+                    poll.tick().await;
+                    let row = sqlx::query(
+                        "SELECT i.status AS invocation_status, a.status AS attempt_status
                      FROM inference_invocations i
                      JOIN inference_provider_attempts a
                        ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id
                      WHERE i.user_id = 'test-user' AND i.session_id = ?
                        AND i.operation_id = 'completion_proxy:memory_extraction'
                        AND i.logical_attempt = 3",
-                )
-                .bind(&session_id)
-                .fetch_optional(pool)
-                .await
-                .expect("poll cancelled durable inference");
-                if row.as_ref().is_some_and(|row| {
-                    row.get::<String, _>("invocation_status") == "delivery_unknown"
-                        && row.get::<String, _>("attempt_status") == "delivery_unknown"
-                }) {
-                    break;
+                    )
+                    .bind(&session_id)
+                    .fetch_optional(pool)
+                    .await
+                    .expect("poll cancelled durable inference");
+                    if row.as_ref().is_some_and(|row| {
+                        row.get::<String, _>("invocation_status") == "delivery_unknown"
+                            && row.get::<String, _>("attempt_status") == "delivery_unknown"
+                    }) {
+                        break;
+                    }
                 }
-            }
-        })
-        .await
-        .expect("detached settlement must converge after caller cancellation");
+            })
+            .await;
+        if let Err(error) = cancellation_converged {
+            let invocation_status = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM inference_invocations
+                 WHERE user_id = 'test-user' AND session_id = ?
+                   AND operation_id = 'completion_proxy:memory_extraction'
+                   AND logical_attempt = 3",
+            )
+            .bind(&session_id)
+            .fetch_optional(pool)
+            .await
+            .expect("load cancelled invocation diagnostic");
+            let attempt_status = sqlx::query_scalar::<_, String>(
+                "SELECT a.status FROM inference_provider_attempts a
+                 JOIN inference_invocations i
+                   ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id
+                 WHERE i.user_id = 'test-user' AND i.session_id = ?
+                   AND i.operation_id = 'completion_proxy:memory_extraction'
+                   AND i.logical_attempt = 3",
+            )
+            .bind(&session_id)
+            .fetch_optional(pool)
+            .await
+            .expect("load cancelled attempt diagnostic");
+            let debt = sqlx::query(
+                "SELECT debt.terminal_status, debt.provider_delivery_state,
+                        debt.reconciliation_status
+                 FROM inference_invocation_settlement_debts debt
+                 JOIN inference_invocations i
+                   ON debt.user_id = i.user_id AND debt.invocation_id = i.invocation_id
+                 WHERE i.user_id = 'test-user' AND i.session_id = ?
+                   AND i.operation_id = 'completion_proxy:memory_extraction'
+                   AND i.logical_attempt = 3",
+            )
+            .bind(&session_id)
+            .fetch_optional(pool)
+            .await
+            .expect("load cancelled settlement debt diagnostic")
+            .map(|row| {
+                (
+                    row.get::<String, _>("terminal_status"),
+                    row.get::<String, _>("provider_delivery_state"),
+                    row.get::<String, _>("reconciliation_status"),
+                )
+            });
+            panic!(
+                "detached settlement must converge after caller cancellation: {error}; \
+                 invocation_status={invocation_status:?}, attempt_status={attempt_status:?}, \
+                 debt={debt:?}"
+            );
+        }
 
         for statement in [
             "DELETE FROM inference_invocation_settlement_debts WHERE user_id = 'test-user' AND session_id = ?",
