@@ -223,6 +223,18 @@ fn durable_settlement_fence_closed(
     control_terminal_settlement_committed == Some(true) || settlement_finished_committed
 }
 
+async fn run_owner_fenced_terminal_projections<F, Fut>(
+    owner_terminal_committed: bool,
+    projections: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if owner_terminal_committed {
+        projections().await;
+    }
+}
+
 /// A normal loop completion is not a durable completion until every provider
 /// tool attempt has one canonical terminal class. Apply this before terminal
 /// events/status are derived so storage, stream clients, and receipts share a
@@ -16664,67 +16676,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     run.settlement_in_progress = false;
                 }
 
-                // Restore the existing pre-publication ordering for derived
-                // usage, transcript, and observability projections. Canonical
-                // journal/context, provider settlement, and the terminal CAS
-                // above remain the success gates; these projections retain
-                // their established best-effort error semantics. Their stores
-                // are independent after the terminal CAS, so keep the latency
-                // overlapped before publishing terminal SSE.
-                let persist_usage = async {
-                    astra_core::log_persist!(
-                        run_engine
-                            .persist_usage(
-                                &bg_user_id,
-                                &bg_session_id,
-                                &bg_run_id,
-                                state.provider_input_tokens(),
-                                state.total_completion,
-                                state.total_tool_calls,
-                            )
-                            .await,
-                        "run_lifecycle",
-                        &bg_run_id,
-                        "usage"
-                    );
-                };
-                let materialize_transcript = async {
-                    if let Err(e) = persist_ctx
-                        .materialize_run_transcript_evidence(
-                            &state,
-                            canonical_context_cursor.as_ref(),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            session_id = %bg_session_id,
-                            run_id = %bg_run_id,
-                            error = %e,
-                            "durable transcript evidence materialization failed"
-                        );
-                    }
-                };
-                let post_loop_persistence = persist_ctx.run_after_core(
-                    &state,
-                    loop_success,
-                    core_trace_result,
-                    canonical_context_cursor.is_some(),
-                );
-                let (_, _, post_loop_result) =
-                    tokio::join!(persist_usage, materialize_transcript, post_loop_persistence,);
-                if let Err(e) = post_loop_result {
-                    tracing::error!(
-                        session_id = %bg_session_id,
-                        run_id = %bg_run_id,
-                        error = %e,
-                        "post-loop persistence failed"
-                    );
-                }
-
                 // Keep the owner lease through terminal CAS/event repair, then
-                // release it before client fanout and non-durable cleanup.
-                // Cleanup side effects must not advertise a live resume/input
-                // consumer.
+                // release it before client fanout and post-loop cleanup. These
+                // side effects must not advertise a live resume/input consumer.
                 drop(_owner_lease_heartbeat);
 
                 if publish_stream_terminal {
@@ -16793,7 +16747,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 // Drop event_tx — signals end-of-stream to the HTTP handler.
                 drop(event_tx);
 
-                if owner_terminal_committed {
+                run_owner_fenced_terminal_projections(owner_terminal_committed, || async {
                     persist_turn_evaluation_journal(
                         &bg_user_id,
                         &bg_session_id,
@@ -16816,6 +16770,41 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             run_id = %bg_run_id,
                             error = %error,
                             "Work subject remains unavailable after execution"
+                        );
+                    }
+
+                    // Only the generation that committed the durable terminal
+                    // may publish derived session state. These operations run
+                    // after the SSE terminal boundary so slow hooks never hold
+                    // the user's stream open.
+                    if let Err(e) = persist_ctx
+                        .run_after_core(
+                            &state,
+                            loop_success,
+                            core_trace_result,
+                            canonical_context_cursor.is_some(),
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            session_id = %bg_session_id,
+                            run_id = %bg_run_id,
+                            error = %e,
+                            "post-loop persistence failed"
+                        );
+                    }
+                    if let Err(e) = persist_ctx
+                        .materialize_run_transcript_evidence(
+                            &state,
+                            canonical_context_cursor.as_ref(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            session_id = %bg_session_id,
+                            run_id = %bg_run_id,
+                            error = %e,
+                            "durable transcript evidence materialization failed"
                         );
                     }
 
@@ -16845,7 +16834,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         )
                         .await;
                     }
-                }
+                })
+                .await;
                 if let Some(guard) = bg_root_runtime_context_guard.as_mut() {
                     guard.settle().await;
                 }

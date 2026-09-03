@@ -15140,12 +15140,38 @@ fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
     ];
 
     let persisted = terminal_events_for_persistence(&events);
-    assert_eq!(persisted.len(), 5);
-    assert_eq!(persisted[0]["type"], "runtime.control.handoff.requested");
-    assert_eq!(persisted[1]["type"], "runtime.control.handoff.rejected");
-    assert_eq!(persisted[2]["event_type"], "text_done");
-    assert_eq!(persisted[3]["event_type"], "run_error");
-    assert_eq!(persisted[4]["event_type"], "run_finished");
+    assert_eq!(persisted.len(), 7);
+    assert_eq!(persisted[0]["type"], "reasoning_done");
+    assert_eq!(persisted[1]["type"], "thinking_done");
+    assert_eq!(persisted[2]["type"], "runtime.control.handoff.requested");
+    assert_eq!(persisted[3]["type"], "runtime.control.handoff.rejected");
+    assert_eq!(persisted[4]["event_type"], "text_done");
+    assert_eq!(persisted[5]["event_type"], "run_error");
+    assert_eq!(persisted[6]["event_type"], "run_finished");
+}
+
+#[tokio::test]
+async fn superseded_terminal_skips_all_owner_derived_projections() {
+    let journal_calls = Arc::new(AtomicUsize::new(0));
+    let transcript_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let observed = (
+        Arc::clone(&journal_calls),
+        Arc::clone(&transcript_calls),
+        Arc::clone(&hook_calls),
+    );
+
+    // A Superseded terminal transition leaves owner_terminal_committed false.
+    run_owner_fenced_terminal_projections(false, move || async move {
+        observed.0.fetch_add(1, Ordering::SeqCst);
+        observed.1.fetch_add(1, Ordering::SeqCst);
+        observed.2.fetch_add(1, Ordering::SeqCst);
+    })
+    .await;
+
+    assert_eq!(journal_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transcript_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]

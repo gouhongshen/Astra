@@ -414,6 +414,10 @@ pub fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
                         | "run_interrupted"
                         | "run_waiting"
                         | "run_finished"
+                        // Keep reasoning/thinking completion markers, not raw
+                        // chain-of-thought content or incremental deltas.
+                        | "reasoning_done"
+                        | "thinking_done"
                 )
             )
         })
@@ -506,6 +510,10 @@ pub(super) fn durable_replay_boundary_event(event: &Value) -> bool {
                 | "agent_waiting"
                 | "agent_cancelled"
                 | "agent_interrupted"
+                // Keep completion markers as replay boundaries. Raw
+                // reasoning_message_content remains live-only.
+                | "reasoning_done"
+                | "thinking_done"
         )
     )
 }
@@ -672,10 +680,11 @@ pub fn live_delta_event_for_persistence(event: &Value) -> bool {
     }
     matches!(
         event_type,
-        // Reasoning/thinking content and completion markers are live
-        // transport only. A completion marker without persisted reasoning
-        // text carries no replayable transcript state.
-        "runtime.control.handoff.requested"
+        // Reasoning/thinking deltas and raw reasoning_message_content are
+        // live transport only; durable replay keeps completion markers.
+        "reasoning_done"
+            | "thinking_done"
+            | "runtime.control.handoff.requested"
             | "runtime.control.handoff.rejected"
             | "workspace_bound"
             | "executor_bound"
