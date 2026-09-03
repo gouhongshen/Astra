@@ -114,6 +114,89 @@ fn compaction_commits_the_complete_replacement_projection() {
 }
 
 #[test]
+fn single_user_tool_turn_remains_committable_after_real_tiered_compaction() {
+    let mut messages = vec![json!({"role": "user", "content": "translate the document"})];
+    for index in 0..6 {
+        messages.push(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": format!("call-{index}"),
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": format!(r#"{{"chunk":{index}}}"#),
+                },
+            }],
+        }));
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": format!("call-{index}"),
+            "content": format!("translated chunk {index}"),
+        }));
+    }
+    messages.push(json!({"role": "assistant", "content": "translation complete"}));
+
+    let mut engine = crate::turn::CompactionEngine::new();
+    engine.add_layer(Box::new(crate::turn::cloud::TieredCompaction::new(2, 0.0)));
+    let outcome = engine.compress_if_needed(
+        &mut messages,
+        &crate::turn::TokenBudget {
+            max_prompt_tokens: 64_000,
+            last_measured_tokens: 100_000,
+            current_round_index: None,
+            now_secs: 10_000_000,
+        },
+    );
+
+    assert!(
+        outcome.total_tokens_freed > 0,
+        "the real pipeline must compact"
+    );
+    let boundary_index = messages
+        .iter()
+        .position(|message| message["_compact_boundary"].as_bool() == Some(true))
+        .expect("tiered compaction must leave its canonical boundary marker");
+    assert_eq!(
+        boundary_index, 1,
+        "the protected first user precedes the boundary"
+    );
+    assert!(
+        messages[boundary_index + 1..]
+            .iter()
+            .all(|message| message["role"] != "user"),
+        "one agentic turn has no second user anchor after compaction"
+    );
+
+    let (mode, packs) = canonical_commit_delta(&[], false, &messages, None, false)
+        .expect("a compacted single-user turn must remain committable")
+        .expect("a completed turn must produce a canonical delta");
+    let committed = packs.concat();
+
+    assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+    assert_eq!(
+        committed.first(),
+        Some(&json!({
+            "role": "user",
+            "content": "translate the document",
+        }))
+    );
+    assert_eq!(
+        committed.last(),
+        Some(&json!({
+            "role": "assistant",
+            "content": "translation complete",
+        }))
+    );
+    assert!(
+        committed
+            .iter()
+            .all(|message| message.get("_compact_boundary").is_none()),
+        "the marker is runtime state, not canonical conversation content"
+    );
+}
+
+#[test]
 fn unexplained_canonical_prefix_shrink_remains_rejected() {
     let prior = vec![json!({"role": "user", "content": "committed"})];
     let shortened = vec![json!({"role": "user", "content": "unexpected tail"})];
