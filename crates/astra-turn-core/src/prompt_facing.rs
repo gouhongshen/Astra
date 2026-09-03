@@ -168,10 +168,12 @@ pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
         }
     }
 
-    let start = latest_compaction_boundary_start(&messages).unwrap_or(0);
+    // Compaction has already removed the compacted middle from this vector.
+    // The boundary marker separates that removed region from the retained
+    // tail; messages before it (notably the protected first user) are still
+    // canonical conversation content.
     let messages = messages
         .into_iter()
-        .skip(start)
         .filter_map(|mut message| {
             let keep = message.get("_compact_boundary").and_then(Value::as_bool) != Some(true)
                 && !is_runtime_owned_message(&message);
@@ -239,10 +241,9 @@ pub fn sanitize_completed_canonical_turn_messages_with_turn_semantics(
         }
     }
 
-    let start = latest_compaction_boundary_start(&messages).unwrap_or(0);
     let mut out = Vec::new();
     let mut has_user_context = false;
-    for message in messages.into_iter().skip(start) {
+    for message in messages {
         if message.get("_compact_boundary").and_then(Value::as_bool) == Some(true)
             || is_runtime_owned_message(&message)
         {
@@ -826,9 +827,9 @@ mod tests {
     }
 
     #[test]
-    fn recovery_drops_only_corrupt_semantics_then_runs_the_full_sanitizer() {
+    fn recovery_drops_corrupt_semantics_without_discarding_the_compacted_head() {
         let messages = vec![
-            json!({"role": "user", "content": "stale objective"}),
+            json!({"role": "user", "content": "protected objective"}),
             json!({"role": "system", "content": "boundary", "_compact_boundary": true}),
             runtime_owned_message(
                 "system",
@@ -854,6 +855,7 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                json!({"role": "user", "content": "protected objective"}),
                 json!({"role": "user", "content": "current objective"}),
                 json!({"role": "assistant", "content": "current answer"}),
             ]
