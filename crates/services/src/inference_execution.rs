@@ -4713,7 +4713,7 @@ async fn write_inference_settlement_debt(
     let fingerprint = terminal.terminal_fingerprint.as_deref().ok_or_else(|| {
         ServiceError::invalid("inference settlement debt requires a terminal fingerprint")
     })?;
-    let inserted = sqlx::query(
+    sqlx::query(
         "INSERT IGNORE INTO inference_invocation_settlement_debts
          (user_id, invocation_id, session_id, harness_run_id,
           terminal_status, terminal_fingerprint, usage_status,
@@ -4749,12 +4749,6 @@ async fn write_inference_settlement_debt(
             error,
         )
     })?;
-
-    // A newly inserted row is necessarily the exact terminal above. Only an
-    // idempotent/conflicting insert needs an authoritative re-read.
-    if inserted.rows_affected() == 1 {
-        return Ok(());
-    }
 
     let existing = sqlx::query(
         "SELECT terminal_status, terminal_fingerprint, provider_attempt_id,
