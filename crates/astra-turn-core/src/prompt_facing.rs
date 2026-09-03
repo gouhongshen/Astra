@@ -159,6 +159,26 @@ pub fn sanitize_prompt_facing_messages_with_state(
 pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
     messages: Vec<Value>,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
+    sanitize_canonical_continuation_messages_impl(messages, false)
+}
+
+/// Project an already-compacted current-turn delta for resumable canonical
+/// commit.
+///
+/// Tiered compaction has already removed the compacted middle from this
+/// vector. The boundary marker separates that removed region from the retained
+/// tail, while messages before it (notably the protected first user) remain
+/// canonical conversation content.
+pub fn sanitize_compacted_canonical_continuation_messages_with_turn_semantics(
+    messages: Vec<Value>,
+) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
+    sanitize_canonical_continuation_messages_impl(messages, true)
+}
+
+fn sanitize_canonical_continuation_messages_impl(
+    messages: Vec<Value>,
+    preserve_compacted_head: bool,
+) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
     for message in &messages {
         if message
             .get(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
@@ -168,12 +188,14 @@ pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
         }
     }
 
-    // Compaction has already removed the compacted middle from this vector.
-    // The boundary marker separates that removed region from the retained
-    // tail; messages before it (notably the protected first user) are still
-    // canonical conversation content.
+    let start = if preserve_compacted_head {
+        0
+    } else {
+        latest_compaction_boundary_start(&messages).unwrap_or(0)
+    };
     let messages = messages
         .into_iter()
+        .skip(start)
         .filter_map(|mut message| {
             let keep = message.get("_compact_boundary").and_then(Value::as_bool) != Some(true)
                 && !is_runtime_owned_message(&message);
@@ -827,9 +849,9 @@ mod tests {
     }
 
     #[test]
-    fn recovery_drops_corrupt_semantics_without_discarding_the_compacted_head() {
+    fn recovery_drops_corrupt_semantics_and_pre_boundary_history() {
         let messages = vec![
-            json!({"role": "user", "content": "protected objective"}),
+            json!({"role": "user", "content": "stale objective"}),
             json!({"role": "system", "content": "boundary", "_compact_boundary": true}),
             runtime_owned_message(
                 "system",
@@ -855,7 +877,6 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                json!({"role": "user", "content": "protected objective"}),
                 json!({"role": "user", "content": "current objective"}),
                 json!({"role": "assistant", "content": "current answer"}),
             ]

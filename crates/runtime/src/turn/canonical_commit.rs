@@ -114,7 +114,7 @@ pub(crate) fn canonical_commit_delta(
     let canonical_changed = if preserve_execution_scratch {
         // An interrupted turn may resume from its tool boundary, so retain
         // complete call/result groups until recovery has settled it.
-        astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+        astra_turn_core::prompt_facing::sanitize_compacted_canonical_continuation_messages_with_turn_semantics(
             changed_messages.to_vec(),
         )
     } else {
