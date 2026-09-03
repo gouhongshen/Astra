@@ -166,9 +166,9 @@ pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
 /// commit.
 ///
 /// Tiered compaction has already removed the compacted middle from this
-/// vector. The boundary marker separates that removed region from the retained
-/// tail, while messages before it (notably the protected first user) remain
-/// canonical conversation content.
+/// vector. When the retained tail has no newer user, the protected first user
+/// before the boundary remains the turn anchor. A newer tail user supersedes
+/// that head and becomes the anchor instead.
 pub fn sanitize_compacted_canonical_continuation_messages_with_turn_semantics(
     messages: Vec<Value>,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
@@ -189,7 +189,7 @@ fn sanitize_canonical_continuation_messages_impl(
     }
 
     let start = if preserve_compacted_head {
-        0
+        compacted_canonical_turn_start(&messages)
     } else {
         latest_compaction_boundary_start(&messages).unwrap_or(0)
     };
@@ -249,8 +249,8 @@ fn sanitize_canonical_continuation_messages_impl(
 /// Completed tool call/result frames are execution evidence owned by the run
 /// transcript and recovery checkpoint, not by every future model request. This
 /// projection intentionally has no generic recent-message cap: the caller
-/// passes one canonical turn delta, and dropping its opening user message would
-/// make the resulting suffix structurally invalid.
+/// passes one canonical turn delta. Its opening user is retained when no newer
+/// user exists after compaction; otherwise the newer tail user supersedes it.
 pub fn sanitize_completed_canonical_turn_messages_with_turn_semantics(
     messages: Vec<Value>,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
@@ -263,9 +263,10 @@ pub fn sanitize_completed_canonical_turn_messages_with_turn_semantics(
         }
     }
 
+    let start = compacted_canonical_turn_start(&messages);
     let mut out = Vec::new();
     let mut has_user_context = false;
-    for message in messages {
+    for message in messages.into_iter().skip(start) {
         if message.get("_compact_boundary").and_then(Value::as_bool) == Some(true)
             || is_runtime_owned_message(&message)
         {
@@ -565,6 +566,18 @@ fn latest_compaction_boundary_start(messages: &[Value]) -> Option<usize> {
     })
 }
 
+fn compacted_canonical_turn_start(messages: &[Value]) -> usize {
+    let Some(boundary_index) = latest_compaction_boundary_start(messages) else {
+        return 0;
+    };
+    let tail_has_user = messages[boundary_index + 1..].iter().any(|message| {
+        !is_runtime_owned_message(message)
+            && message.get("role").and_then(Value::as_str) == Some("user")
+            && canonical_text_message(message, "user", false).is_some()
+    });
+    if tail_has_user { boundary_index } else { 0 }
+}
+
 fn prompt_facing_content_for_role(role: &str, content: &str) -> Option<String> {
     let _ = role;
     let content = content.trim().to_string();
@@ -646,8 +659,11 @@ fn trim_to_recent_messages(mut messages: Vec<Value>) -> Vec<Value> {
 mod tests {
     use super::{
         recover_canonical_continuation_messages_with_turn_semantics, runtime_recap_message,
-        sanitize_canonical_continuation_messages_with_state, sanitize_prompt_facing_messages,
-        sanitize_prompt_facing_messages_with_state, sanitize_user_visible_messages,
+        sanitize_canonical_continuation_messages_with_state,
+        sanitize_compacted_canonical_continuation_messages_with_turn_semantics,
+        sanitize_completed_canonical_turn_messages_with_turn_semantics,
+        sanitize_prompt_facing_messages, sanitize_prompt_facing_messages_with_state,
+        sanitize_user_visible_messages,
     };
     use crate::conversation_log::{DelegationCompact, SessionStateCompact};
     use astra_turn_types::{RuntimeMessageDelivery, runtime_owned_message};
@@ -724,6 +740,30 @@ mod tests {
                 .all(|message| message["content"] != "retry this tool round"),
             "runtime-owned control messages must not cross a continuation boundary"
         );
+    }
+
+    #[test]
+    fn compacted_current_turn_drops_superseded_head_when_tail_has_new_user() {
+        let messages = vec![
+            json!({"role": "user", "content": "review everything"}),
+            json!({"role": "system", "content": "boundary", "_compact_boundary": true}),
+            json!({"role": "user", "content": "do not review; translate instead"}),
+            json!({"role": "assistant", "content": "translated"}),
+        ];
+        let expected = vec![
+            json!({"role": "user", "content": "do not review; translate instead"}),
+            json!({"role": "assistant", "content": "translated"}),
+        ];
+
+        let resumable = sanitize_compacted_canonical_continuation_messages_with_turn_semantics(
+            messages.clone(),
+        )
+        .expect("valid resumable projection");
+        let completed = sanitize_completed_canonical_turn_messages_with_turn_semantics(messages)
+            .expect("valid completed projection");
+
+        assert_eq!(resumable, expected);
+        assert_eq!(completed, expected);
     }
 
     #[test]
