@@ -168,12 +168,14 @@ pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
         }
     }
 
-    // Compaction has already removed the compacted middle from this vector.
-    // The boundary marker separates that removed region from the retained
-    // tail; messages before it (notably the protected first user) are still
-    // canonical conversation content.
+    // A compaction boundary supersedes the earlier conversation only when its
+    // retained tail owns a newer user turn. Tiered compaction can otherwise
+    // place the marker after the protected first user while retaining only an
+    // assistant/tool tail; cutting there would orphan the entire turn.
+    let start = canonical_continuation_start(&messages);
     let messages = messages
         .into_iter()
+        .skip(start)
         .filter_map(|mut message| {
             let keep = message.get("_compact_boundary").and_then(Value::as_bool) != Some(true)
                 && !is_runtime_owned_message(&message);
@@ -498,6 +500,18 @@ fn latest_compaction_boundary_start(messages: &[Value]) -> Option<usize> {
     })
 }
 
+fn canonical_continuation_start(messages: &[Value]) -> usize {
+    let Some(boundary_index) = latest_compaction_boundary_start(messages) else {
+        return 0;
+    };
+    let tail_has_user = messages[boundary_index + 1..].iter().any(|message| {
+        !is_runtime_owned_message(message)
+            && message.get("role").and_then(Value::as_str) == Some("user")
+            && canonical_text_message(message, "user", false).is_some()
+    });
+    if tail_has_user { boundary_index } else { 0 }
+}
+
 fn prompt_facing_content_for_role(role: &str, content: &str) -> Option<String> {
     let _ = role;
     let content = content.trim().to_string();
@@ -782,9 +796,9 @@ mod tests {
     }
 
     #[test]
-    fn recovery_drops_corrupt_semantics_without_discarding_the_compacted_head() {
+    fn recovery_drops_only_corrupt_semantics_then_runs_the_full_sanitizer() {
         let messages = vec![
-            json!({"role": "user", "content": "protected objective"}),
+            json!({"role": "user", "content": "stale objective"}),
             json!({"role": "system", "content": "boundary", "_compact_boundary": true}),
             runtime_owned_message(
                 "system",
@@ -810,7 +824,6 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                json!({"role": "user", "content": "protected objective"}),
                 json!({"role": "user", "content": "current objective"}),
                 json!({"role": "assistant", "content": "current answer"}),
             ]
