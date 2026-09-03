@@ -61,7 +61,10 @@ def main() -> None:
 
     contract_scripts = [
         Path("scripts/dev/test_setup_contract.sh"),
+        Path("scripts/dev/test_edge_process_contract.sh"),
         Path("scripts/ops/test_production_env_contract.sh"),
+        Path("scripts/ci/test_release_contract.sh"),
+        Path("scripts/ci/test_sccache_fallback.sh"),
     ]
     for contract_script in contract_scripts:
         result = subprocess.run(
@@ -136,6 +139,92 @@ def main() -> None:
             errors.append(
                 ".github/workflows/release-docker.yml: rolling promotion must depend on and match the verified manifest"
             )
+
+    binary_release_workflow = Path(".github/workflows/release-binaries.yml").read_text(
+        encoding="utf-8"
+    )
+    for forbidden in (
+        "ASTRA_SUITE_PAT",
+        "RELEASE_MIRROR_REPOSITORY",
+        "repository: ${{",
+        "\n  mirror:",
+    ):
+        if forbidden in binary_release_workflow:
+            errors.append(
+                ".github/workflows/release-binaries.yml: releases must remain owned by the current repository "
+                f"(found {forbidden.strip()})"
+            )
+    for required in (
+        "permissions:\n      contents: write",
+        "fetch-depth: 0",
+        "git merge-base --is-ancestor",
+        "EVENT_SOURCE_SHA",
+        "source_sha",
+        "astra-edge",
+        "scripts/verify-release-artifacts.sh",
+        "fail_on_unmatched_files: true",
+    ):
+        if required not in binary_release_workflow:
+            errors.append(
+                ".github/workflows/release-binaries.yml: missing current-repository release guard "
+                f"({required})"
+            )
+
+    for required in (
+        "fetch-depth: 0",
+        "EVENT_SOURCE_SHA",
+        "source_sha",
+        "EXPECTED_TAG_OBJECT",
+    ):
+        if required not in release_workflow:
+            errors.append(
+                ".github/workflows/release-docker.yml: missing immutable release source guard "
+                f"({required})"
+            )
+
+    installer = Path("scripts/install-astra.sh").read_text(encoding="utf-8")
+    if 'REPOSITORY="matrixorigin/Astra"' not in installer:
+        errors.append("scripts/install-astra.sh: installer must download from matrixorigin/Astra")
+    if (
+        "failed to download the required checksum" not in installer
+        or "checksum mismatch" not in installer
+    ):
+        errors.append(
+            "scripts/install-astra.sh: release checksum verification must be mandatory"
+        )
+
+    release_version_validator = Path("scripts/validate-release-version.sh").read_text(
+        encoding="utf-8"
+    )
+    for version_source in (
+        "packages/sdk/package.json",
+        "web/package.json",
+        "CITATION.cff",
+        "deployment/kubernetes/chart/Chart.yaml",
+    ):
+        if version_source not in release_version_validator:
+            errors.append(
+                f"scripts/validate-release-version.sh: missing release version source {version_source}"
+            )
+
+    makefile = Path("Makefile").read_text(encoding="utf-8")
+    for required in (
+        "stack-start: stack-env",
+        "$(MAKE) stack-up",
+        "$(MAKE) stack-verify",
+        "dev-start: dev-start-server-only",
+    ):
+        if required not in makefile:
+            errors.append(f"Makefile: missing reproducible local journey contract ({required})")
+
+    edge_lifecycle = "\n".join(
+        Path(path).read_text(encoding="utf-8")
+        for path in ("scripts/dev/start-edge.sh", "scripts/dev/stop-edge.sh")
+    )
+    if "pgrep" in edge_lifecycle or "edge_process_is_owned" not in edge_lifecycle:
+        errors.append(
+            "scripts/dev: edge lifecycle must manage only the PID owned by this checkout"
+        )
 
     design_index = Path("docs/design/README.md").read_text(encoding="utf-8")
     for design in Path("docs/design").glob("*.md"):
