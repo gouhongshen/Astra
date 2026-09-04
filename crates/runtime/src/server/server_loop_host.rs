@@ -6029,6 +6029,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 attempt = attempt_in_round,
                 "durable inference admission completed"
             );
+            if state.messaging.progress_emitter.is_none() {
+                self.emit_progress_event(json!({
+                    "type": "agent_progress",
+                    "status": "llm_call_started",
+                    "turn": state.llm_rounds_completed,
+                }));
+            }
             state
                 .step_recorder
                 .begin_llm_round(&llm_cfg.model_name, state.inference_purpose);
@@ -6179,6 +6186,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 )
                 .await
             };
+
+            if state.messaging.progress_emitter.is_none() {
+                self.emit_progress_event(json!({
+                    "type": "agent_progress",
+                    "status": "llm_call_completed",
+                    "turn": state.llm_rounds_completed,
+                    "ttft_ms": attempt_first_stream_update_ms,
+                    "duration_ms": llm_round_start.elapsed().as_millis() as u64,
+                }));
+            }
 
             let provider_attempts = durable_invocation.provider_attempt_facts().await;
             if !provider_attempts.is_empty() {
@@ -11322,6 +11339,37 @@ mod tests {
         state
     }
 
+    fn assert_root_llm_progress_pairs(events: &[Value], expected_pairs: usize) {
+        let lifecycle: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str) == Some("agent_progress")
+                    && matches!(
+                        event.get("status").and_then(Value::as_str),
+                        Some("llm_call_started" | "llm_call_completed")
+                    )
+            })
+            .collect();
+        assert_eq!(
+            lifecycle.len(),
+            expected_pairs * 2,
+            "each provider attempt must emit one exact LLM lifecycle pair: {lifecycle:?}"
+        );
+        for pair in lifecycle.chunks_exact(2) {
+            assert_eq!(
+                pair[0].get("status").and_then(Value::as_str),
+                Some("llm_call_started")
+            );
+            assert_eq!(
+                pair[1].get("status").and_then(Value::as_str),
+                Some("llm_call_completed")
+            );
+            assert_eq!(pair[0].get("turn"), pair[1].get("turn"));
+            assert!(pair[1].get("ttft_ms").is_some());
+            assert!(pair[1].get("duration_ms").and_then(Value::as_u64).is_some());
+        }
+    }
+
     #[derive(Clone)]
     struct GatewayState {
         requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
@@ -13183,6 +13231,7 @@ mod tests {
 
         let observe_first_text = async {
             let mut visible_order = Vec::new();
+            let mut saw_llm_call_started = false;
             loop {
                 let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
                     .await
@@ -13192,11 +13241,24 @@ mod tests {
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if event_type == "agent_progress"
+                    && event.get("status").and_then(Value::as_str) == Some("llm_call_started")
+                {
+                    assert!(
+                        !provider_completed.load(Ordering::SeqCst),
+                        "LLM start waited for provider response completion"
+                    );
+                    saw_llm_call_started = true;
+                }
                 if matches!(event_type, "reasoning_delta" | "text_delta") {
                     visible_order.push(event_type.to_string());
                 }
                 if event_type == "text_delta" {
                     assert_eq!(event["content"].as_str(), Some("visible first"));
+                    assert!(
+                        saw_llm_call_started,
+                        "visible provider output arrived before the LLM start lifecycle event"
+                    );
                     assert!(
                         !provider_completed.load(Ordering::SeqCst),
                         "text-first control window waited for the full provider response"
@@ -13216,6 +13278,7 @@ mod tests {
             host.take_terminal_control_outcome(),
             None | Some(crate::turn::terminal_control::TerminalControlOutcome::Passthrough)
         ));
+        assert_root_llm_progress_pairs(&host.take_emitted_events(), 1);
         inference_ledger.assert_quiescent();
         server.abort();
     }
@@ -13621,7 +13684,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000127";
-        let (gateway_url, _requests, server) = spawn_gateway(
+        let (gateway_url, requests, server) = spawn_gateway(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             json!({"error": {"message": "upstream exploded"}}),
         )
@@ -13654,6 +13717,8 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind, astra_core::ErrorKind::ServerError);
+        let emitted_events = host.take_emitted_events();
+        assert_root_llm_progress_pairs(&emitted_events, 1);
 
         state
             .turn_event_buffer
@@ -13701,6 +13766,10 @@ mod tests {
         assert_eq!(
             llm_events[1]["metadata"]["trace"]["session_turn_source"].as_str(),
             Some("state")
+        );
+        assert!(
+            requests.lock().await.len() > 1,
+            "transport retries must stay inside one LLM lifecycle pair"
         );
 
         inference_ledger.assert_quiescent();
