@@ -101,7 +101,7 @@ pub(crate) fn canonical_commit_delta(
         &messages[prior_messages.len()..]
     };
     let canonical_changed =
-        astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+        astra_turn_core::prompt_facing::sanitize_compacted_canonical_continuation_messages_with_turn_semantics(
             changed_messages.to_vec(),
         )
         .map_err(|error| {
