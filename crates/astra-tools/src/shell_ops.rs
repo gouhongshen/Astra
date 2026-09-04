@@ -560,8 +560,8 @@ struct SearchIgnoreRule {
 /// boundary because command parsing cannot enumerate arbitrary writers.
 ///
 /// Layering:
-/// 1. Local substring/heuristic rules (destructive `rm`, pipe-to-shell, netcat, etc.).
-/// 2. [`analyze_command_risks`] (tree-sitter + legacy): any reported risk **blocks** except
+/// 1. Local rules for shell syntax with no ordinary executable (`rm -rf`, fork bombs, etc.).
+/// 2. [`analyze_command_risks`] (tree-sitter command analysis): any reported risk **blocks** except
 ///    [`CommandRisk::PathTraversal`] and [`CommandRisk::NetworkAccess`], which are allowed here
 ///    so normal `cd ../..` and `curl`/`wget` workflows remain usable (network still subject to
 ///    sandbox/permissions elsewhere). All other sandbox risks (e.g. [`CommandRisk::Eval`],
@@ -734,25 +734,10 @@ pub fn validate_execute_bash_command_in_workspace(
     }
     validate_bash_background_task_contract(cmd)?;
     let lower = cmd.to_ascii_lowercase();
-    let blocked_substrings = [
-        "mkfs",
-        "mkswap",
-        " wipefs",
-        " dd if=",
-        " dd of=",
-        "shutdown",
-        "reboot",
-        "poweroff",
-        "halt",
-        "telinit",
-        "kill -9",
-        "pkill",
-        "killall",
-        " :(){",
-        ":(){ :",
-        "fork bomb",
-    ];
-    for pat in blocked_substrings {
+    // Fork bombs are shell syntax rather than an executable invocation, so
+    // they remain an explicit syntax check. Executable risks are owned by the
+    // AST analyzer below and must not scan heredoc/interpreter source text.
+    for pat in [" :(){", ":(){ :"] {
         if lower.contains(pat) {
             return Err(format!(
                 "Error: bash command matches a blocked destructive pattern ({pat:?})"
@@ -6162,6 +6147,15 @@ printf 'probe.txt:1:needle\n'
                 "{command} should be blocked"
             );
         }
+    }
+
+    #[test]
+    fn validate_execute_bash_allows_destructive_words_inside_heredoc_data() {
+        let command = "python3 <<'PY'\ndd = {'chart': 'bar'}\nprint(dd)\nPY";
+        assert!(
+            validate_execute_bash_command(command).is_ok(),
+            "Python identifiers in heredoc data must not be treated as shell commands"
+        );
     }
 
     #[test]
