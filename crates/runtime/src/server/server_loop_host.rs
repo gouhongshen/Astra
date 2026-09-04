@@ -21613,11 +21613,14 @@ mod tests {
         })];
         let durable_base =
             astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
-        let mut proof = crate::turn::canonical_commit::CanonicalRewriteProof::new(
-            &durable,
-            &durable_base.canonical.root_hash,
-            3,
-        );
+        let base_manifest_root = "a".repeat(64);
+        assert_ne!(base_manifest_root, durable_base.canonical.root_hash);
+        let mut proof =
+            crate::turn::canonical_commit::CanonicalRewriteProof::from_materialized_admission(
+                &durable,
+                &base_manifest_root,
+                3,
+            );
         let permit = proof.begin(&durable);
         let mut rewritten = durable.clone();
         rewritten.push(json!({
