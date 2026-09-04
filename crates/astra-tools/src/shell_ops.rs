@@ -5118,6 +5118,12 @@ printf 'probe.txt:1:needle\n'
             "bash --norc -c 'dd if=/dev/zero of=/dev/sda'",
             "env MODE=secure bash --rcfile /tmp/bashrc -c 'wipefs -a /dev/sdb'",
             "busybox dd if=/dev/zero of=/dev/sda",
+            "timeout 5 dd if=/dev/zero of=/dev/sda",
+            "sudo timeout -s KILL 5 dd if=/dev/zero of=/dev/sda",
+            "nice -n 5 wipefs -a /dev/sdb",
+            "ionice -c 2 dd if=/dev/zero of=/dev/sda",
+            "setsid wipefs -a /dev/sdb",
+            "setsid env MODE=secure timeout 5 sudo dd if=/dev/zero of=/dev/sda",
             "printf data | xargs dd if=/dev/zero of=/dev/sda",
             "find . -exec wipefs -a /dev/sdb {} \\;",
             "tool=dd; \"$tool\" if=/dev/zero of=/dev/sda",
@@ -5146,6 +5152,25 @@ printf 'probe.txt:1:needle\n'
     fn validate_execute_bash_allows_typical_build_commands() {
         assert!(validate_execute_bash_command("cargo test -p foo --quiet").is_ok());
         assert!(validate_execute_bash_command("echo hello && ls").is_ok());
+        assert!(validate_execute_bash_command("timeout 5 printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("nice -n 5 printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("ionice -c 2 printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("setsid printf '%s\\n' dd").is_ok());
+    }
+
+    #[test]
+    fn validate_execute_bash_rejects_ambiguous_dispatcher_options() {
+        for command in [
+            "timeout --future-option 5 dd if=/dev/zero of=/dev/sda",
+            "nice --future-option dd if=/dev/zero of=/dev/sda",
+            "ionice --future-option dd if=/dev/zero of=/dev/sda",
+            "setsid --future-option dd if=/dev/zero of=/dev/sda",
+        ] {
+            assert!(
+                validate_execute_bash_command(command).is_err(),
+                "unknown dispatcher option arity must fail closed: {command}"
+            );
+        }
     }
 
     #[test]

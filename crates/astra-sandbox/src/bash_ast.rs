@@ -528,6 +528,84 @@ fn resolve_transparent_launcher(
                 };
                 index = next;
             }
+            "timeout" | "gtimeout" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "fpv",
+                        "ks",
+                        &[
+                            "--foreground",
+                            "--preserve-status",
+                            "--verbose",
+                            "--help",
+                            "--version",
+                        ],
+                        &["--kill-after", "--signal"],
+                        &[],
+                    ),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(next) = skip_launcher_operands(words, next, 1)? else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "nice" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "",
+                        "n",
+                        &["--help", "--version"],
+                        &["--adjustment"],
+                        &[],
+                    )
+                    .with_legacy_numeric_short_option(),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "ionice" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "thV",
+                        "cnpPu",
+                        &["--ignore", "--help", "--version"],
+                        &["--class", "--classdata", "--pid", "--pgid", "--uid"],
+                        &[],
+                    ),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "setsid" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "cfwhV",
+                        "",
+                        &["--ctty", "--fork", "--wait", "--help", "--version"],
+                        &[],
+                        &[],
+                    ),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
             _ => return Ok(Some(index - 1)),
         }
     }
@@ -540,6 +618,7 @@ struct LauncherOptionGrammar {
     long_flags: &'static [&'static str],
     long_options_with_value: &'static [&'static str],
     long_options_with_optional_value: &'static [&'static str],
+    legacy_numeric_short_option: bool,
 }
 
 impl LauncherOptionGrammar {
@@ -556,7 +635,13 @@ impl LauncherOptionGrammar {
             long_flags,
             long_options_with_value,
             long_options_with_optional_value,
+            legacy_numeric_short_option: false,
         }
+    }
+
+    const fn with_legacy_numeric_short_option(mut self) -> Self {
+        self.legacy_numeric_short_option = true;
+        self
     }
 }
 
@@ -597,6 +682,15 @@ fn skip_launcher_options(
             continue;
         }
 
+        if grammar.legacy_numeric_short_option
+            && argument.strip_prefix('-').is_some_and(|value| {
+                !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
+            })
+        {
+            index += 1;
+            continue;
+        }
+
         let mut flags = argument[1..].chars().peekable();
         if flags.peek().is_none() {
             return Ok(Some(index));
@@ -619,6 +713,18 @@ fn skip_launcher_options(
         index += 1;
     }
     Ok(None)
+}
+
+fn skip_launcher_operands(
+    words: &[CommandWord],
+    index: usize,
+    count: usize,
+) -> Result<Option<usize>, ()> {
+    let command_index = index.checked_add(count).ok_or(())?;
+    if command_index > words.len() {
+        return Ok(None);
+    }
+    Ok((command_index < words.len()).then_some(command_index))
 }
 
 fn resolve_multicall_applet(
@@ -1123,6 +1229,13 @@ mod tests {
             "busybox dd if=/dev/zero of=/dev/sda",
             "toybox wipefs -a /dev/sdb",
             "sudo busybox dd if=/dev/zero of=/dev/sda",
+            "timeout 5 dd if=/dev/zero of=/dev/sda",
+            "sudo timeout -s KILL 5 dd if=/dev/zero of=/dev/sda",
+            "nice -n 5 wipefs -a /dev/sdb",
+            "nice -5 dd if=/dev/zero of=/dev/sda",
+            "ionice -c 2 dd if=/dev/zero of=/dev/sda",
+            "setsid wipefs -a /dev/sdb",
+            "setsid env MODE=secure timeout 5 sudo dd if=/dev/zero of=/dev/sda",
             "printf '%s\\n' data | xargs -n 1 dd if=/dev/zero of=/dev/sda",
             "find . -exec dd if=/dev/zero of=/dev/sda {} \\;",
             "find . -execdir sh -c 'wipefs -a /dev/sdb' {} \\;",
@@ -1150,6 +1263,10 @@ mod tests {
             "exec -a alias printf '%s\\n' dd",
             "env -u HOME printf '%s\\n' dd",
             "sudo -u root printf '%s\\n' dd",
+            "timeout 5 printf '%s\\n' dd",
+            "nice -n 5 printf '%s\\n' dd",
+            "ionice -c 2 printf '%s\\n' dd",
+            "setsid printf '%s\\n' dd",
             "busybox echo dd",
             "printf '%s\\n' dd | xargs printf '%s\\n'",
             "printf '%s\\n' dd | xargs",
@@ -1199,6 +1316,10 @@ mod tests {
             "exec --future-option dd if=/dev/zero of=/dev/sda",
             "sudo --future-option dd if=/dev/zero of=/dev/sda",
             "env -S 'dd if=/dev/zero of=/dev/sda'",
+            "timeout --future-option 5 dd if=/dev/zero of=/dev/sda",
+            "nice --future-option dd if=/dev/zero of=/dev/sda",
+            "ionice --future-option dd if=/dev/zero of=/dev/sda",
+            "setsid --future-option dd if=/dev/zero of=/dev/sda",
         ] {
             assert!(
                 analyze_bash_risks_ast(command).contains(&CommandRisk::RemoteCodeExecution),
