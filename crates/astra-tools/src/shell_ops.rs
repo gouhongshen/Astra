@@ -6137,6 +6137,8 @@ printf 'probe.txt:1:needle\n'
     fn validate_execute_bash_blocks_top5_security_risks() {
         for command in [
             "dd if=/dev/zero of=/dev/sda",
+            "bash --norc -c 'dd if=/dev/zero of=/dev/sda'",
+            "env MODE=secure bash --rcfile /tmp/bashrc -c 'wipefs -a /dev/sdb'",
             "cat ~/.ssh/id_rsa",
             "echo data > ../outside.txt",
             "eval \"echo hi\"",
