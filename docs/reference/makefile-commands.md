@@ -59,6 +59,18 @@
 | `make stack-down` | Stop the stack while preserving its data |
 | `make stack-clean` | Immediately delete the stack and its persisted data (destructive; no confirmation prompt) |
 
+## Release maintenance
+
+| Command | Description |
+| --- | --- |
+| `make release-prepare VERSION=X.Y.Z` | Safely synchronize release versions without committing, tagging, building, or publishing |
+| `make release-check VERSION=X.Y.Z` | Read-only preflight for synchronized versions, installer/archive unhappy paths, repository workflow contracts, and documentation links |
+
+Publication itself is owned by the protected **Release Astra** GitHub workflow;
+neither Make target creates a tag or publishes an artifact. `release-prepare`
+refuses to overwrite existing version-file edits and leaves MatrixOne/Memoria
+digest changes for deliberate maintainer review.
+
 ## Memoria
 
 | Command | Description |
@@ -71,6 +83,17 @@
 Memoria persists through the shared MatrixOne dependency. Use
 `make dev-deps-clean` when you intentionally need to remove all local
 dependency data; that command prompts before deletion.
+
+## All-in-One first run
+
+| Command | Description |
+| --- | --- |
+| `make stack-setup` | State-aware wizard for embedding preflight, data-preserving stack reconciliation, runtime verification, admin, and model probe |
+| `make stack-start` | Non-interactively initialize configuration, start the stack, and verify health plus a memory round trip |
+| `make stack-env` | Create local `.env` and generate secrets without prompting |
+| `make stack-up` | Start the configured Compose stack |
+| `make stack-up STACK_RECREATE=1` | Recreate containers and network attachments while preserving volumes |
+| `make stack-verify` | Verify health and a memory round trip |
 
 ## Useful Direct Cargo Commands
 

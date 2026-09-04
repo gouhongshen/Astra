@@ -2,48 +2,55 @@
 
 Run Astra with the all-in-one Docker Compose stack.
 
+The guided setup requires Docker Compose v2, OpenSSL, and Python 3.9 or newer.
+
 ## Quick Start
 
 ```bash
 # 1. Install the checksum-verified CLI and Edge/User Runner
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh -s -- --dir "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
 
-# 2. Clone the deployment files
-git clone https://github.com/matrixorigin/Astra.git
-cd Astra
+# 2. Clone the deployment files from the exact installed release
+ASTRA_VERSION="$(astra --version | awk '{print $2}')"
+git clone --branch "v${ASTRA_VERSION}" --depth 1 https://github.com/matrixorigin/Astra.git "Astra-${ASTRA_VERSION}"
+cd "Astra-${ASTRA_VERSION}"
 
-# 3. Generate local secrets, start Compose, and verify the runtime
-MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
+# 3. Start the stack and follow the guided prompts
+make stack-setup
 
-# 4. Bootstrap the admin account and register a model
-astra admin register --username admin --password '<password>'
-astra admin model add MODEL_NAME openai --api-key "$LLM_API_KEY" --base-url https://your-endpoint/v1
-astra admin model check MODEL_NAME
-
-# 5. Complete a real agent turn
+# 4. First agent response
 astra chat -m "Explain what you can and cannot do in this deployment"
 ```
 
-`stack-start` creates `deployment/all-in-one/.env`, generates local secrets,
-waits for all services, and proves API, database, Memoria, and memory
-write/retrieval behavior. The explicit mock mode is for local evaluation, not
-production retrieval. For semantic memory, replace it with:
+`make stack-setup` validates a mock or real embedding configuration before
+starting services, detects and safely reconciles an existing stack, verifies a
+real memory round trip, then runs `astra admin setup`. It never deletes volumes;
+on failure it lets you retry, stop containers while preserving data, or leave
+the state for inspection. The CLI defaults to `http://127.0.0.1:17001`; set
+`ASTRA_API_URL` if you remapped `ASTRA_API_PORT`. For CI or scripts, use explicit
+`make stack-env`, `make stack-up`, and `make stack-verify` targets instead.
+
+For a non-interactive local evaluation, use deterministic mock embeddings:
 
 ```bash
-MEMORIA_EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1 \
-MEMORIA_EMBEDDING_API_KEY="$EMBEDDING_API_KEY" \
-make stack-start
+MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 ```
 
-The API key is optional for unauthenticated local endpoints. The CLI defaults
-to `http://127.0.0.1:17001`; set `ASTRA_API_URL` or pass `--api-url` if you
-remapped `ASTRA_API_PORT`. `model check` reports `is_active` and `connectivity`,
-and a model becomes active only when the probe succeeds. Process-level
-embedding settings are not written to `.env`; export them again for later
-starts, or persist them there deliberately.
+For semantic memory, set `MEMORIA_EMBEDDING_BASE_URL` and, when the endpoint
+requires it, `MEMORIA_EMBEDDING_API_KEY`, then run `make stack-start`.
+`stack-start` initializes configuration, starts Compose, waits for health, and
+verifies an exact memory round trip.
+The released clients and full guided path support Linux, macOS, and Windows
+through WSL. Native Windows and Git Bash are not release targets yet.
+Loopback embedding endpoints are tested directly; other endpoints honor the
+host proxy settings and report when `NO_PROXY` may be needed for a private URL.
+The release checkout pins Astra, MatrixOne, and Memoria to the compatibility
+set verified by the release workflow; do not replace those pins with `latest`
+when diagnosing a reproducibility or upgrade problem.
 
-The installer also provides `astra-edge`. To give Web sessions access to a
-specific local workspace without building from source, run:
+The installer also provides `astra-edge`. To give Web sessions access to one
+explicit local workspace, run:
 
 ```bash
 astra-edge --workspace-dir /path/to/workspace

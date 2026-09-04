@@ -87,6 +87,20 @@ Required check names remain present when their heavy work is skipped, so this
 routing is compatible with branch protection and the merge queue. The routing
 contract and its tests live in [`scripts/ci/`](scripts/ci/).
 
+For fork pull requests, an update may require maintainer approval before the
+replacement test run can enter the normal concurrency group. A separate
+trusted-workflow-revision controller cancels active runs for earlier heads
+without waiting for replacement-run approval. The controller never checks out
+or executes pull request code; the
+test workflows remain low-privilege `pull_request` workflows. Normal concurrency
+groups use the pull request number, so identically named branches in different
+forks remain isolated. Each synchronize event cancels only its exact `before`
+head and is intentionally not coalesced, so rapid pushes cannot make an older
+controller cancel a newer generation or skip an intermediate cleanup. Jobs that
+must run after scope-classification failure use `!cancelled()` rather than
+`always()`, preserving fail-safe coverage without making superseded work resist
+cancellation.
+
 ## Open a pull request
 
 1. Rebase the feature branch on the current `main` branch.

@@ -10,7 +10,7 @@ on:
     branches: [main, develop]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -63,7 +63,7 @@ jobs:
   shard-a:
     name: "Test: astra-cli (${{ matrix.segment }})"
     needs: scope
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -121,12 +121,12 @@ jobs:
           -E 'test(/local_cli_catalog_exposes_the_root_work_lifecycle/)'
       - name: Dump processes on failure
         if: failure() && env.RUN_TESTS == 'true'
-        run: ps -ef | grep -E 'cargo|nextest|astra|bash|sleep' || true
+        run: pgrep -af 'cargo|nextest|astra|bash|sleep' || true
 
   shard-b:
     name: "Test: astra-runtime"
     needs: scope
-    if: ${{ always() && (needs.scope.result != 'success' || needs.scope.outputs.test_runtime == 'true') }}
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_runtime == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -157,7 +157,7 @@ jobs:
   shard-c:
     name: "Test: turn-core + services + plan"
     needs: scope
-    if: ${{ always() && (needs.scope.result != 'success' || needs.scope.outputs.test_services == 'true') }}
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_services == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -177,7 +177,7 @@ jobs:
   shard-d:
     name: "Test: core crates + bridge hooks"
     needs: scope
-    if: ${{ always() && (needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true') }}
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -209,7 +209,7 @@ jobs:
   test-online:
     name: "Test: online (${{ matrix.lane }})"
     needs: scope
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:

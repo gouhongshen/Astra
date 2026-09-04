@@ -2,6 +2,8 @@
 
 This compose stack starts MatrixOne, Memoria, and `astra-server`.
 
+The guided setup requires Docker Compose v2, OpenSSL, and Python 3.9 or newer.
+
 The development flow is separate and still uses `docker-compose.deps.yml` through the repo-root `make dev-deps-*` targets, followed by `make dev-api-start` for a locally built API server.
 
 ## Start With Make
@@ -9,19 +11,56 @@ The development flow is separate and still uses `docker-compose.deps.yml` throug
 Install the released client binaries if they are not already available:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh -s -- --dir "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-From the repository root, the shortest local evaluation path is one command:
+Use this directory from the matching `vX.Y.Z` source checkout. The installer
+prints the exact clone command after resolving the latest stable release. The
+checked-in `.env.example` pins Astra, MatrixOne, and Memoria to the release's
+tested compatibility set; advancing only one image makes the deployment an
+intentional compatibility test rather than the supported default.
+The canonical Compose file requires those image variables and fails before a
+pull if `.env` is missing, rather than silently substituting mutable images.
+
+From the repository root, the recommended first-run path is guided:
+
+```bash
+make stack-setup
+```
+
+The guided path tests the embedding endpoint, credentials, model, and dimension
+before starting Compose. It inventories an existing stack, reuses healthy
+services, repairs disconnected containers without deleting volumes, verifies a
+memory round trip, and then launches `astra admin setup`. Startup failures offer
+repair/retry, stop-and-preserve, and leave-for-inspection choices. API keys are
+hidden and the local `.env` is owner-only. The released clients and full
+guided path support Linux, macOS, and Windows through WSL. Native Windows and
+Git Bash are not release targets yet.
+Loopback embedding probes bypass HTTP proxies; other endpoints honor the host
+proxy configuration and suggest `NO_PROXY` when a private URL is intercepted.
+
+For a non-interactive local evaluation, use deterministic mock embeddings:
 
 ```bash
 MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 ```
 
+When configuring the file by hand, set `MEMORIA_EMBEDDING_BASE_URL` and, when
+required, `MEMORIA_EMBEDDING_API_KEY`. For no-credential evaluation, set
+`MEMORIA_EMBEDDING_PROVIDER=mock` and leave both blank.
+
 `stack-start` creates `deployment/all-in-one/.env`, generates local secrets,
 validates Compose, starts every service, waits for readiness, and verifies an
-exact memory write/retrieval round trip. Mock embeddings are deterministic and
-suitable for evaluation or tests, not production retrieval.
+exact memory write/retrieval round trip. For lower-level automation, run
+`make stack-env`, `make stack-up`, and `make stack-verify` explicitly.
+
+`make stack-up` fails before starting containers if a required secret is empty,
+or if a non-mock embedding provider is missing its base URL. An API key is
+optional for unauthenticated local endpoints. If a service does not become
+healthy, the command prints container status and recent logs while leaving the
+partial stack available for inspection. Fix the first reported error and rerun
+the command, or use `make stack-down` to stop it.
 
 For semantic memory, supply a real OpenAI-compatible embedding endpoint; its
 API key is optional when the endpoint is unauthenticated:
@@ -91,9 +130,10 @@ make test-runtime-profiles
 
 ## Admin Accounts
 
-Use `astra admin register` to create an administrator account. On a fresh MatrixOne
-data volume this performs the initial admin bootstrap. After an admin exists,
-`astra admin register` must be run while logged in as an existing admin.
+Use `astra admin setup` for the guided administrator and model flow. It asks
+whether the MatrixOne data volume is fresh, then bootstraps or signs in before
+configuring the model. `astra admin register` and `astra admin model ...`
+remain available for automation.
 
 ```bash
 astra admin --api-url http://127.0.0.1:17001 register \
@@ -190,18 +230,22 @@ development credentials on an untrusted network.
 
 ## Images
 
-By default the stack pulls:
+The release's `.env.example` selects one tested compatibility set:
 
-- `matrixorigin/astra:latest`
-- `matrixorigin/memoria:latest`
-- `matrixorigin/matrixone:latest`
+- an exact semantic Astra version;
+- immutable multi-platform Memoria and MatrixOne manifest digests.
 
-Override image tags in `.env`, for example:
+`make stack-env` copies those selections into the local `.env`. Upgrading the
+source checkout does not silently rewrite an existing deployment. To perform a
+deliberate compatibility test, change one or more image references in `.env`,
+for example:
 
 ```dotenv
-ASTRA_IMAGE=matrixorigin/astra:0.1.0
-MEMORIA_IMAGE=matrixorigin/memoria:latest
+ASTRA_IMAGE=matrixorigin/astra:0.2.0-rc.1
 ```
+
+Avoid floating `latest` tags in reproducibility reports and production-like
+evaluations; always record the exact image references used.
 
 ## Operations
 

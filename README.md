@@ -190,7 +190,7 @@ change Astra itself. For production topologies, use the
 
 | Path | What you get | Additional prerequisites |
 | --- | --- | --- |
-| [Docker](#docker) | MatrixOne, Memoria, and `astra-server` from published images, plus prebuilt CLI and User Runner binaries | Docker Compose and OpenSSL |
+| [Docker](#docker) | MatrixOne, Memoria, and `astra-server` from published images, plus prebuilt CLI and User Runner binaries | Docker Compose, OpenSSL, and Python 3.9+ |
 | [From source](#build-from-source) | The same backbone built locally, plus the Web dashboard and CLI-local Runner capacity | Rust 1.97 and Node.js 24, both pinned in the repository |
 
 Both paths need Git, Make, and at least one supported LLM endpoint. Semantic
@@ -208,65 +208,87 @@ One checksum-verified archive installs both the `astra` CLI and the
 `astra-edge` User Runner — Linux and macOS, `amd64` and `arm64`:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh -s -- --dir "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-#### 2. Start and verify the stack
+#### 2. Run the guided setup
 
-Clone the deployment files, then choose the memory mode explicitly. This
-single command generates local secrets, starts Compose, waits for health, and
-verifies an exact memory write/retrieval round trip:
+Use the same version for the client and Server deployment, then follow one
+guided flow from embedding configuration through the first administrator and
+model. The installer prints these version-matched next steps as well:
 
 ```bash
-git clone https://github.com/matrixorigin/Astra.git
-cd Astra
+ASTRA_VERSION="$(astra --version | awk '{print $2}')"
+git clone --branch "v${ASTRA_VERSION}" --depth 1 https://github.com/matrixorigin/Astra.git "Astra-${ASTRA_VERSION}"
+cd "Astra-${ASTRA_VERSION}"
+make stack-setup
+```
 
+The guided setup validates the embedding endpoint, credentials, model, and
+vector dimension before starting containers. It detects an existing stack,
+reuses healthy services, and offers a data-preserving repair when containers or
+networks are partial. Startup and verification failures offer retry, stop, or
+leave-for-inspection choices before the administrator/model wizard begins.
+API keys are hidden while typing and the local `.env` is owner-only. Choose mock
+embeddings for deterministic evaluation; use a real OpenAI-compatible endpoint
+for production retrieval. The wizard never deletes persistent volumes.
+The released clients and full guided path support Linux, macOS, and Windows
+through WSL. Native Windows and Git Bash are not release targets yet.
+
+For a non-interactive local evaluation, use deterministic mock embeddings:
+
+```bash
 MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 ```
 
-Mock embeddings are deterministic and intended for evaluation or tests, not
-production retrieval. To exercise semantic memory instead, point the same
-one-command start at a real OpenAI-compatible embedding endpoint:
-
-```bash
-MEMORIA_EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1 \
-MEMORIA_EMBEDDING_API_KEY="$EMBEDDING_API_KEY" \
-make stack-start
-```
-
-The API key may be omitted for an unauthenticated local endpoint. Generated
-secrets remain in `deployment/all-in-one/.env`; credentials supplied as process
-environment variables are not written there. On later starts, export the same
-embedding settings again before `make stack-up`, or deliberately persist them
-in that `.env` file. Use `make stack-verify` whenever you want to repeat the
-runtime proof.
+For semantic memory, set `MEMORIA_EMBEDDING_BASE_URL` and, when required,
+`MEMORIA_EMBEDDING_API_KEY`, then run `make stack-start`. The command generates
+local secrets, starts Compose, waits for health, and verifies an exact memory
+round trip. For lower-level automation, run `make stack-env`, `make stack-up`,
+and `make stack-verify` explicitly.
 
 | Service | Default URL |
 | --- | --- |
 | HTTP API | <http://localhost:17001> |
 | Health check | <http://localhost:17001/health> |
 
+#### 3. Confirm the CLI and service
+
+The versioned stack ships the matching `astra-server`; the prebuilt `astra`
+binary installed in step 1 drives it:
+
+```bash
+astra health
+```
+
 The CLI defaults to `http://127.0.0.1:17001`, which is where the stack binds,
 so no extra configuration is needed. If you remapped `ASTRA_API_PORT`, set
 `ASTRA_API_URL` or pass `--api-url` to each command. Pass `-v <version>` to the
-installer, and set `ASTRA_IMAGE` before `make stack-up`, when you need a pinned
-CLI and server pair.
+installer to select an older or prerelease client; always use its matching Git
+tag for the deployment checkout. MatrixOne and Memoria are pinned to the
+compatibility set exercised by that Astra release instead of floating on
+`latest`.
 
-#### 3. Bootstrap the admin account
+For scripted or advanced environments, replace the guided account/model phase
+with the following two operations.
+
+##### Bootstrap the admin account
 
 ```bash
 astra admin register --username admin --password '<password>'
 ```
 
-On a fresh data volume this performs the initial admin bootstrap, prints
-`registered and logged in (initial admin)`, and stores the credentials in the
-local CLI profile.
+On a fresh data volume this creates the initial administrator and stores the
+returned credentials in the local CLI profile. After an administrator exists,
+the command must be run while logged in as an existing administrator.
 
-#### 4. Register a model
+##### Register a model
 
 ```bash
 astra admin model add MODEL_NAME openai \
-  --api-key "$LLM_API_KEY" --base-url https://your-endpoint/v1
+  --api-key "$LLM_API_KEY" --context-window 128000 \
+  --base-url https://your-endpoint/v1
 astra admin model check MODEL_NAME
 ```
 
@@ -276,7 +298,7 @@ step that tells you routing will work. For more than one model, write a
 `.models.yaml` and run
 `astra admin model load .models.yaml --update-existing`.
 
-#### 5. First agent response
+#### 4. Get the first agent response
 
 ```bash
 astra chat -m "Explain what you can and cannot do in this deployment"
@@ -291,7 +313,7 @@ MCP, and introspection are available, while file, shell, Git, build/test, and
 private-network tools stay unavailable until a Runner connects — which is what
 the answer above should tell you.
 
-#### 6. Connect a User Runner when local execution is needed
+#### 5. Connect a User Runner when local execution is needed
 
 After the CLI has stored your account credentials, expose one deliberate local
 workspace to the Server:

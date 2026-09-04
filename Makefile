@@ -97,6 +97,7 @@ help:
 	@echo ""
 	@echo "All-in-One Docker Deployment:"
 	@echo "  make stack-env          - Create .env and generate stack secrets"
+	@echo "  make stack-setup        - Interactive first-run setup (embedding, admin, model)"
 	@echo "  make stack-start        - Initialize, start, and verify the Compose stack"
 	@echo "  make stack-up           - Start MatrixOne + Memoria + API"
 	@echo "  make stack-up-server-only - Start compose stack without local edge provider"
@@ -111,7 +112,10 @@ help:
 	@echo "  make dev-start-docker   - Start deps + API in Docker"
 	@echo "  make dev-api-docker-up  - Start API server in Docker"
 	@echo "  make dev-api-docker-down - Stop API server Docker container"
-	@echo "  make release-check      - Validate release metadata (VERSION=...)"
+	@echo ""
+	@echo "Release maintenance:"
+	@echo "  make release-prepare    - Synchronize release versions (VERSION=...)"
+	@echo "  make release-check      - Run the read-only release preflight (VERSION=...)"
 
 # ============================================================================
 # Variables
@@ -144,6 +148,8 @@ STACK_ENV := $(STACK_DIR)/.env
 STACK_COMPOSE := cd $(STACK_DIR) && env UID=$$(id -u) GID=$$(id -g) docker compose --env-file $(abspath $(STACK_ENV))
 STACK_SECRET_ENV := ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_RUNTIME_ROOT_SECRET MEMORIA_MASTER_KEY
 STACK_EMBEDDING_ENV := MEMORIA_EMBEDDING_BASE_URL
+STACK_RECREATE ?= 0
+STACK_RECREATE_ARGS := $(if $(filter 1 true yes,$(STACK_RECREATE)),--force-recreate --remove-orphans,)
 
 # Per-test-case hard budget. Any case running longer than the budget is
 # killed and counted as FAIL. Nextest has no CLI override for slow-timeout
@@ -511,6 +517,14 @@ dev-api-docker-scale:
 	@cd deployment/all-in-one && docker compose --env-file ../../.env up -d --no-deps --scale api=$(REPLICAS) api
 	@echo "✅ Scaled to $(REPLICAS) replicas"
 
+.PHONY: release-prepare
+release-prepare:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "❌ VERSION is required, for example: make release-prepare VERSION=0.2.0"; \
+		exit 1; \
+	fi
+	@scripts/prepare-release-version.py "$(VERSION)"
+
 .PHONY: release-check
 release-check:
 	@if [ -z "$(VERSION)" ]; then \
@@ -518,20 +532,9 @@ release-check:
 		exit 1; \
 	fi
 	@scripts/validate-release-version.sh "$(VERSION)"
-	@if [ "$(IMAGE_SOURCE_DIRTY)" != "false" ]; then \
-		echo "❌ Release source has uncommitted tracked changes"; \
-		exit 1; \
-	fi
-	@if [ "$$(git rev-parse HEAD)" != "$$(git rev-list -n 1 "v$(IMAGE_VERSION)" 2>/dev/null)" ]; then \
-		echo "❌ HEAD must be the commit tagged v$(IMAGE_VERSION)"; \
-		exit 1; \
-	fi
-	@if [ "$$(git cat-file -t "v$(IMAGE_VERSION)" 2>/dev/null)" != "tag" ]; then \
-		echo "❌ v$(IMAGE_VERSION) must be an annotated tag"; \
-		exit 1; \
-	fi
-	@echo "✅ Release metadata and tagged source are consistent"
-	@echo "   Push v$(IMAGE_VERSION) to run the verified binary and multi-platform image workflows."
+	@python3 scripts/ci/validate_repository.py
+	@echo "✅ Release metadata, installer, artifacts, and workflow contracts are consistent"
+	@echo "   Commit and merge the reviewed version changes, then run Release Astra from main."
 
 # ============================================================================
 # Compose Stack Deployment
@@ -539,23 +542,32 @@ release-check:
 
 .PHONY: stack-env
 stack-env:
-	@if [ -f "$(STACK_ENV)" ]; then \
+	@set -eu; \
+	tmp=""; value_file=""; \
+	cleanup_stack_env() { rm -f "$${tmp:-}" "$${value_file:-}"; }; \
+	trap cleanup_stack_env EXIT HUP INT TERM; \
+	if [ -f "$(STACK_ENV)" ]; then \
 		echo "✅ $(STACK_ENV) already exists"; \
 	else \
 		cp $(STACK_DIR)/.env.example $(STACK_ENV); \
 		echo "✅ Created $(STACK_ENV)"; \
 	fi; \
-	if ! command -v openssl >/dev/null 2>&1; then \
-		echo "❌ openssl is required to generate stack secrets"; \
-		exit 1; \
-	fi; \
+	chmod 600 "$(STACK_ENV)"; \
 	. scripts/lib/env_file.sh; \
 	set_env_value() { \
 		key="$$1"; \
 		value="$$2"; \
 		tmp="$$(mktemp)"; \
-		awk -v key="$$key" -v value="$$value" ' \
-			BEGIN { done = 0 } \
+		value_file="$$(mktemp)"; \
+		chmod 600 "$$tmp" "$$value_file"; \
+		printf '%s' "$$value" > "$$value_file"; \
+		ASTRA_STACK_VALUE_FILE="$$value_file" awk -v key="$$key" ' \
+			BEGIN { \
+				value_file = ENVIRON["ASTRA_STACK_VALUE_FILE"]; \
+				if ((getline value < value_file) < 0) exit 1; \
+				close(value_file); \
+				done = 0; \
+			} \
 			{ \
 				line = $$0; \
 				sub(/^[[:space:]]*/, "", line); \
@@ -569,12 +581,18 @@ stack-env:
 			END { if (!done) print key "=" value } \
 		' "$(STACK_ENV)" > "$$tmp"; \
 		mv "$$tmp" "$(STACK_ENV)"; \
+		rm -f "$$value_file"; \
+		tmp=""; value_file=""; \
 	}; \
 	ensure_secret() { \
 		key="$$1"; \
 		if env_file_has_configured_value "$(STACK_ENV)" "$$key"; then \
 			echo "✅ $$key already configured"; \
 			return 0; \
+		fi; \
+		if ! command -v openssl >/dev/null 2>&1; then \
+			echo "❌ openssl is required to generate missing secret $$key"; \
+			exit 1; \
 		fi; \
 		value="$$(openssl rand -hex 32)"; \
 		set_env_value "$$key" "$$value"; \
@@ -584,8 +602,17 @@ stack-env:
 	ensure_secret ASTRA_TOKEN_ENCRYPTION_KEY; \
 	ensure_secret ASTRA_RUNTIME_ROOT_SECRET; \
 	ensure_secret MEMORIA_MASTER_KEY; \
-	echo "Configure a real embedding endpoint, or explicitly use MEMORIA_EMBEDDING_PROVIDER=mock for local evaluation."; \
-	echo "Then run 'make stack-start' (first start) or 'make stack-up' (subsequent starts)."
+	embedding_provider="$$(env_file_read "$(STACK_ENV)" MEMORIA_EMBEDDING_PROVIDER 2>/dev/null || true)"; \
+	embedding_provider="$$(printf '%s' "$$embedding_provider" | tr '[:upper:]' '[:lower:]')"; \
+	embedding_url="$$(env_file_read "$(STACK_ENV)" MEMORIA_EMBEDDING_BASE_URL 2>/dev/null || true)"; \
+	if [ "$$embedding_provider" = mock ]; then \
+		echo "✅ Mock embeddings configured (local evaluation)"; \
+	elif [ -n "$$embedding_url" ]; then \
+		echo "✅ Embedding endpoint configured (run make stack-setup to test it)"; \
+	else \
+		echo "Configure a real embedding endpoint, or use make stack-setup for guided configuration."; \
+	fi; \
+	trap - EXIT HUP INT TERM
 
 .PHONY: stack-check-env
 stack-check-env:
@@ -625,14 +652,13 @@ stack-start: stack-env
 	@$(MAKE) stack-verify
 	@echo ""
 	@echo "✅ Astra local stack is ready"
-	@echo "   Next: astra admin register"
-	@echo "   Then: astra admin model add MODEL_NAME openai --api-key \"\$$LLM_API_KEY\" --base-url https://your-endpoint/v1"
+	@echo "   Next: astra admin setup"
 	@echo "   Try:  astra chat -m \"Explain what you can do in this deployment\""
 
 .PHONY: stack-up
 stack-up: stack-config
 	@echo "Starting compose stack..."
-	@if ! ( $(STACK_COMPOSE) up -d --wait --wait-timeout 180 ); then \
+	@if ! ( $(STACK_COMPOSE) up -d $(STACK_RECREATE_ARGS) --wait --wait-timeout 180 ); then \
 		echo ""; \
 		echo "❌ Compose stack did not become healthy."; \
 		echo ""; \
@@ -661,6 +687,10 @@ stack-up: stack-config
 	BIND_ADDRESS=$$(env_resolve_value "$(STACK_ENV)" ASTRA_BIND_ADDRESS 2>/dev/null || true); \
 	API_HOST=$$(env_http_host_from_bind "$$BIND_ADDRESS"); \
 	echo "   API: http://$$API_HOST:$${API_PORT:-$(DEFAULT_API_PORT)}"
+
+.PHONY: stack-setup
+stack-setup:
+	@scripts/setup/stack-setup.sh
 
 .PHONY: stack-up-server-only
 stack-up-server-only:
