@@ -379,15 +379,69 @@ fn resolve_transparent_launcher(
         let executable = command_basename(word.literal().ok_or(())?);
         index += 1;
         match executable.as_str() {
-            "command" | "builtin" | "exec" | "nohup" => {
-                let Some(next) = skip_literal_options(words, index, &[])? else {
+            "command" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new("pVv", "", &[], &[], &[]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "builtin" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new("", "", &["--help"], &[], &[]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "exec" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new("cl", "a", &["--help"], &[], &[]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "nohup" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new("", "", &["--help", "--version"], &[], &[]),
+                )?
+                else {
                     return Ok(None);
                 };
                 index = next;
             }
             "env" => {
-                let Some(next) =
-                    skip_literal_options(words, index, &["-u", "--unset", "-C", "--chdir"])?
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "i0v",
+                        "uCPa",
+                        &[
+                            "--ignore-environment",
+                            "--null",
+                            "--debug",
+                            "--list-signal-handling",
+                            "--help",
+                            "--version",
+                        ],
+                        &["--unset", "--chdir", "--path", "--argv0"],
+                        &["--block-signal", "--default-signal", "--ignore-signal"],
+                    ),
+                )?
                 else {
                     return Ok(None);
                 };
@@ -400,24 +454,152 @@ fn resolve_transparent_launcher(
                     index += 1;
                 }
             }
-            "sudo" | "doas" | "pkexec" => {
-                let Some(next) = skip_literal_options(
+            "sudo" => {
+                let Some(next) = skip_launcher_options(
                     words,
                     index,
-                    &[
-                        "-u",
-                        "--user",
-                        "-g",
-                        "--group",
-                        "-h",
-                        "--host",
-                        "-p",
-                        "--prompt",
-                        "-R",
-                        "--chroot",
-                        "-C",
-                        "--close-from",
-                    ],
+                    LauncherOptionGrammar::new(
+                        "ABbEHikKlNnPSseVv",
+                        "CDghpRTUurt",
+                        &[
+                            "--askpass",
+                            "--background",
+                            "--bell",
+                            "--edit",
+                            "--set-home",
+                            "--help",
+                            "--login",
+                            "--remove-timestamp",
+                            "--reset-timestamp",
+                            "--list",
+                            "--non-interactive",
+                            "--preserve-groups",
+                            "--stdin",
+                            "--shell",
+                            "--version",
+                            "--validate",
+                        ],
+                        &[
+                            "--close-from",
+                            "--chdir",
+                            "--group",
+                            "--host",
+                            "--prompt",
+                            "--chroot",
+                            "--command-timeout",
+                            "--other-user",
+                            "--role",
+                            "--type",
+                            "--user",
+                        ],
+                        &["--preserve-env"],
+                    ),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "doas" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new("Lns", "aCu", &[], &[], &[]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "pkexec" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "",
+                        "",
+                        &["--disable-internal-agent", "--keep-cwd", "--version"],
+                        &["--user"],
+                        &[],
+                    ),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "timeout" | "gtimeout" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "fpv",
+                        "ks",
+                        &[
+                            "--foreground",
+                            "--preserve-status",
+                            "--verbose",
+                            "--help",
+                            "--version",
+                        ],
+                        &["--kill-after", "--signal"],
+                        &[],
+                    ),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(next) = skip_launcher_operands(words, next, 1)? else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "nice" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "",
+                        "n",
+                        &["--help", "--version"],
+                        &["--adjustment"],
+                        &[],
+                    )
+                    .with_legacy_numeric_short_option(),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "ionice" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "thV",
+                        "cnpPu",
+                        &["--ignore", "--help", "--version"],
+                        &["--class", "--classdata", "--pid", "--pgid", "--uid"],
+                        &[],
+                    ),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "setsid" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "cfwhV",
+                        "",
+                        &["--ctty", "--fork", "--wait", "--help", "--version"],
+                        &[],
+                        &[],
+                    ),
                 )?
                 else {
                     return Ok(None);
@@ -429,10 +611,44 @@ fn resolve_transparent_launcher(
     }
 }
 
-fn skip_literal_options(
+#[derive(Clone, Copy)]
+struct LauncherOptionGrammar {
+    short_flags: &'static str,
+    short_options_with_value: &'static str,
+    long_flags: &'static [&'static str],
+    long_options_with_value: &'static [&'static str],
+    long_options_with_optional_value: &'static [&'static str],
+    legacy_numeric_short_option: bool,
+}
+
+impl LauncherOptionGrammar {
+    const fn new(
+        short_flags: &'static str,
+        short_options_with_value: &'static str,
+        long_flags: &'static [&'static str],
+        long_options_with_value: &'static [&'static str],
+        long_options_with_optional_value: &'static [&'static str],
+    ) -> Self {
+        Self {
+            short_flags,
+            short_options_with_value,
+            long_flags,
+            long_options_with_value,
+            long_options_with_optional_value,
+            legacy_numeric_short_option: false,
+        }
+    }
+
+    const fn with_legacy_numeric_short_option(mut self) -> Self {
+        self.legacy_numeric_short_option = true;
+        self
+    }
+}
+
+fn skip_launcher_options(
     words: &[CommandWord],
     mut index: usize,
-    options_with_value: &[&str],
+    grammar: LauncherOptionGrammar,
 ) -> Result<Option<usize>, ()> {
     while let Some(word) = words.get(index) {
         let argument = word.literal().ok_or(())?;
@@ -442,16 +658,73 @@ fn skip_literal_options(
         if !argument.starts_with('-') || argument == "-" {
             return Ok(Some(index));
         }
-        let option = argument.split_once('=').map_or(argument, |(name, _)| name);
-        index += 1;
-        if options_with_value.contains(&option) && !argument.contains('=') {
-            if words.get(index).is_none() {
-                return Ok(None);
+
+        if argument.starts_with("--") {
+            let (option, inline_value) = argument
+                .split_once('=')
+                .map_or((argument, false), |(name, _)| (name, true));
+            if grammar.long_flags.contains(&option) && !inline_value
+                || grammar.long_options_with_optional_value.contains(&option)
+            {
+                index += 1;
+                continue;
+            }
+            if !grammar.long_options_with_value.contains(&option) {
+                return Err(());
             }
             index += 1;
+            if !inline_value {
+                if words.get(index).is_none() {
+                    return Ok(None);
+                }
+                index += 1;
+            }
+            continue;
         }
+
+        if grammar.legacy_numeric_short_option
+            && argument.strip_prefix('-').is_some_and(|value| {
+                !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
+            })
+        {
+            index += 1;
+            continue;
+        }
+
+        let mut flags = argument[1..].chars().peekable();
+        if flags.peek().is_none() {
+            return Ok(Some(index));
+        }
+        while let Some(flag) = flags.next() {
+            if grammar.short_flags.contains(flag) {
+                continue;
+            }
+            if !grammar.short_options_with_value.contains(flag) {
+                return Err(());
+            }
+            if flags.peek().is_none() {
+                index += 1;
+                if words.get(index).is_none() {
+                    return Ok(None);
+                }
+            }
+            break;
+        }
+        index += 1;
     }
     Ok(None)
+}
+
+fn skip_launcher_operands(
+    words: &[CommandWord],
+    index: usize,
+    count: usize,
+) -> Result<Option<usize>, ()> {
+    let command_index = index.checked_add(count).ok_or(())?;
+    if command_index > words.len() {
+        return Ok(None);
+    }
+    Ok((command_index < words.len()).then_some(command_index))
 }
 
 fn resolve_multicall_applet(
@@ -933,11 +1206,18 @@ mod tests {
             "command dd if=/dev/zero of=/dev/sda",
             "builtin dd if=/dev/zero of=/dev/sda",
             "exec dd if=/dev/zero of=/dev/sda",
+            "exec -a alias dd if=/dev/zero of=/dev/sda",
+            "exec -cla alias dd if=/dev/zero of=/dev/sda",
+            "exec -a \"$alias\" dd if=/dev/zero of=/dev/sda",
             "nohup dd if=/dev/zero of=/dev/sda",
             "sudo wipefs -a /dev/sdb",
+            "sudo -D /tmp dd if=/dev/zero of=/dev/sda",
             "doas wipefs -a /dev/sdb",
+            "doas -a passwd dd if=/dev/zero of=/dev/sda",
             "pkexec wipefs -a /dev/sdb",
+            "pkexec --user root dd if=/dev/zero of=/dev/sda",
             "env MODE=secure shred -u secrets.txt",
+            "env -u HOME dd if=/dev/zero of=/dev/sda",
             "bash -lc 'dd if=/dev/zero of=/dev/sda'",
             "bash -oc pipefail 'dd if=/dev/zero of=/dev/sda'",
             "bash -oO pipefail extglob -c 'wipefs -a /dev/sdb'",
@@ -949,6 +1229,13 @@ mod tests {
             "busybox dd if=/dev/zero of=/dev/sda",
             "toybox wipefs -a /dev/sdb",
             "sudo busybox dd if=/dev/zero of=/dev/sda",
+            "timeout 5 dd if=/dev/zero of=/dev/sda",
+            "sudo timeout -s KILL 5 dd if=/dev/zero of=/dev/sda",
+            "nice -n 5 wipefs -a /dev/sdb",
+            "nice -5 dd if=/dev/zero of=/dev/sda",
+            "ionice -c 2 dd if=/dev/zero of=/dev/sda",
+            "setsid wipefs -a /dev/sdb",
+            "setsid env MODE=secure timeout 5 sudo dd if=/dev/zero of=/dev/sda",
             "printf '%s\\n' data | xargs -n 1 dd if=/dev/zero of=/dev/sda",
             "find . -exec dd if=/dev/zero of=/dev/sda {} \\;",
             "find . -execdir sh -c 'wipefs -a /dev/sdb' {} \\;",
@@ -973,6 +1260,13 @@ mod tests {
             "bash -oc pipefail 'echo dd'",
             "bash --norc -c 'echo dd'",
             "bash --rcfile /tmp/bashrc -c 'echo dd'",
+            "exec -a alias printf '%s\\n' dd",
+            "env -u HOME printf '%s\\n' dd",
+            "sudo -u root printf '%s\\n' dd",
+            "timeout 5 printf '%s\\n' dd",
+            "nice -n 5 printf '%s\\n' dd",
+            "ionice -c 2 printf '%s\\n' dd",
+            "setsid printf '%s\\n' dd",
             "busybox echo dd",
             "printf '%s\\n' dd | xargs printf '%s\\n'",
             "printf '%s\\n' dd | xargs",
@@ -1012,6 +1306,24 @@ mod tests {
             assert!(
                 analyze_bash_risks_ast(command).contains(&CommandRisk::RemoteCodeExecution),
                 "dynamic executable position must fail closed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_launcher_options_fail_closed() {
+        for command in [
+            "exec --future-option dd if=/dev/zero of=/dev/sda",
+            "sudo --future-option dd if=/dev/zero of=/dev/sda",
+            "env -S 'dd if=/dev/zero of=/dev/sda'",
+            "timeout --future-option 5 dd if=/dev/zero of=/dev/sda",
+            "nice --future-option dd if=/dev/zero of=/dev/sda",
+            "ionice --future-option dd if=/dev/zero of=/dev/sda",
+            "setsid --future-option dd if=/dev/zero of=/dev/sda",
+        ] {
+            assert!(
+                analyze_bash_risks_ast(command).contains(&CommandRisk::RemoteCodeExecution),
+                "launcher option with unproven arity must fail closed: {command}"
             );
         }
     }
