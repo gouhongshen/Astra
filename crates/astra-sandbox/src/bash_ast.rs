@@ -59,13 +59,184 @@ fn collect_simple_commands(node: Node<'_>, source: &str, commands: &mut Vec<Vec<
 /// and avoids false positives from string literals.
 /// Returns detected risks. If the shell cannot be parsed, returns an empty vector (no substring fallback).
 pub fn analyze_bash_risks_ast(command: &str) -> Vec<CommandRisk> {
+    analyze_bash_risks_ast_inner(command, 0)
+}
+
+fn analyze_bash_risks_ast_inner(command: &str, shell_depth: usize) -> Vec<CommandRisk> {
     let Some(tree) = parse_bash(command) else {
         return Vec::new();
     };
     let root = tree.root_node();
     let mut ctx = RiskCtx::new(command);
+
+    // Destructive tools must be identified from actual command invocations,
+    // never by scanning arbitrary source text. In particular, heredoc bodies
+    // and inline interpreter programs are data from Bash's point of view.
+    let mut commands = Vec::new();
+    collect_simple_commands(root, command, &mut commands);
+    for words in commands {
+        if let Some(name) = destructive_command_name(&words) {
+            ctx.push(CommandRisk::DestructiveCommand(name.to_string()));
+        }
+        if let Some(script) = nested_shell_script(&words) {
+            // Quoted `sh -c` input is a new shell program, unlike heredoc
+            // input to Python/Node. Parse it as Bash so wrapping a real
+            // destructive command does not bypass executable detection.
+            if shell_depth >= 16 {
+                ctx.push(CommandRisk::RemoteCodeExecution);
+            } else {
+                for risk in analyze_bash_risks_ast_inner(script, shell_depth + 1) {
+                    ctx.push(risk);
+                }
+            }
+        }
+    }
+
     visit_node(root, &mut ctx);
     ctx.into_risks()
+}
+
+fn nested_shell_script(words: &[String]) -> Option<&str> {
+    let index = effective_command_index(words)?;
+    let executable = command_basename(words.get(index)?);
+    if !matches!(executable.as_str(), "bash" | "sh" | "dash" | "zsh" | "ksh") {
+        return None;
+    }
+
+    let mut argument_index = index + 1;
+    while let Some(raw) = words.get(argument_index) {
+        let argument = unquote_shell_word(raw);
+        if argument == "--" || !argument.starts_with('-') || argument == "-" {
+            return None;
+        }
+        if argument[1..].chars().any(|flag| flag == 'c') {
+            return words
+                .get(argument_index + 1)
+                .map(|script| unquote_shell_word(script));
+        }
+        argument_index += 1;
+    }
+    None
+}
+
+const DESTRUCTIVE_COMMANDS: &[&str] = &[
+    "dd",
+    "mkswap",
+    "truncate",
+    "shred",
+    "wipefs",
+    "blkdiscard",
+    "fdisk",
+    "sfdisk",
+    "parted",
+    "cryptsetup",
+    "pvremove",
+    "vgremove",
+    "lvremove",
+    "zpool",
+    "zfs",
+    "shutdown",
+    "reboot",
+    "poweroff",
+    "halt",
+    "telinit",
+];
+
+fn destructive_command_name(words: &[String]) -> Option<&'static str> {
+    let index = effective_command_index(words)?;
+    let executable = command_basename(words.get(index)?);
+    if executable == "mkfs" || executable.starts_with("mkfs.") {
+        return Some("mkfs");
+    }
+    DESTRUCTIVE_COMMANDS
+        .iter()
+        .copied()
+        .find(|candidate| executable.eq_ignore_ascii_case(candidate))
+}
+
+/// Resolve common transparent launchers without inspecting ordinary command
+/// arguments. This preserves detection for `sudo dd`, `env X=1 wipefs`, etc.,
+/// while ensuring `python -c '... dd ...'` remains interpreter input.
+fn effective_command_index(words: &[String]) -> Option<usize> {
+    let mut index = 0;
+    loop {
+        let executable = command_basename(words.get(index)?);
+        index += 1;
+        match executable.as_str() {
+            "command" | "builtin" | "exec" | "nohup" => {
+                index = skip_options(words, index, &[])?;
+            }
+            "env" => {
+                index = skip_options(words, index, &["-u", "--unset", "-C", "--chdir"])?;
+                while words.get(index).is_some_and(|word| is_assignment(word)) {
+                    index += 1;
+                }
+            }
+            "sudo" | "doas" | "pkexec" => {
+                index = skip_options(
+                    words,
+                    index,
+                    &[
+                        "-u",
+                        "--user",
+                        "-g",
+                        "--group",
+                        "-h",
+                        "--host",
+                        "-p",
+                        "--prompt",
+                        "-R",
+                        "--chroot",
+                        "-C",
+                        "--close-from",
+                    ],
+                )?;
+            }
+            _ => return Some(index - 1),
+        }
+    }
+}
+
+fn skip_options(words: &[String], mut index: usize, options_with_value: &[&str]) -> Option<usize> {
+    while let Some(raw) = words.get(index) {
+        let argument = unquote_shell_word(raw);
+        if argument == "--" {
+            return (index + 1 < words.len()).then_some(index + 1);
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            return Some(index);
+        }
+        let option = argument.split_once('=').map_or(argument, |(name, _)| name);
+        index += 1;
+        if options_with_value.contains(&option) && !argument.contains('=') {
+            index += 1;
+        }
+    }
+    None
+}
+
+fn command_basename(raw: &str) -> String {
+    unquote_shell_word(raw)
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn unquote_shell_word(raw: &str) -> &str {
+    raw.trim().trim_matches(|ch| matches!(ch, '\'' | '"'))
+}
+
+fn is_assignment(raw: &str) -> bool {
+    let raw = unquote_shell_word(raw);
+    let Some((name, _)) = raw.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 struct RiskCtx<'a> {
@@ -367,6 +538,61 @@ mod tests {
         // Env manipulation via PATH assignment
         let risks = analyze_bash_risks_ast("PATH=/evil:$PATH ls");
         assert!(risks.contains(&CommandRisk::EnvManipulation));
+    }
+
+    #[test]
+    fn destructive_commands_are_classified_from_command_nodes() {
+        for executable in
+            DESTRUCTIVE_COMMANDS
+                .iter()
+                .copied()
+                .chain(["mkfs", "mkfs.ext4", "mkfs.xfs"])
+        {
+            let command = format!("/usr/sbin/{executable} --example");
+            assert!(
+                analyze_bash_risks_ast(&command)
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::DestructiveCommand(_))),
+                "configured destructive executable must be detected: {command}"
+            );
+        }
+
+        for command in [
+            "command dd if=/dev/zero of=/dev/sda",
+            "builtin dd if=/dev/zero of=/dev/sda",
+            "exec dd if=/dev/zero of=/dev/sda",
+            "nohup dd if=/dev/zero of=/dev/sda",
+            "sudo wipefs -a /dev/sdb",
+            "doas wipefs -a /dev/sdb",
+            "pkexec wipefs -a /dev/sdb",
+            "env MODE=secure shred -u secrets.txt",
+            "bash -lc 'dd if=/dev/zero of=/dev/sda'",
+            "sudo sh -c 'wipefs -a /dev/sdb'",
+        ] {
+            assert!(
+                analyze_bash_risks_ast(command)
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::DestructiveCommand(_))),
+                "destructive command must be detected: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_words_in_data_are_not_commands() {
+        for command in [
+            "echo dd",
+            "python3 -c 'dd = 1; print(dd)'",
+            "python3 <<'PY'\ndd = {'chart': 'bar'}\nprint(dd)\nPY",
+            "bash -c 'echo dd'",
+        ] {
+            assert!(
+                !analyze_bash_risks_ast(command)
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::DestructiveCommand(_))),
+                "data must not be classified as a destructive command: {command}"
+            );
+        }
     }
 
     #[test]
