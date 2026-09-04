@@ -293,9 +293,8 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
             assert_eq!(users, expected_users, "relation: {relation:?}");
             assert_eq!(committed.first(), expected_users.first());
             assert_eq!(committed.last().unwrap()["content"], "done");
-            assert_eq!(
+            assert!(
                 committed.iter().any(|message| message["role"] == "tool"),
-                true,
                 "retained execution evidence follows the commit contract",
             );
 
