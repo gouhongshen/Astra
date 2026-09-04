@@ -6029,6 +6029,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 attempt = attempt_in_round,
                 "durable inference admission completed"
             );
+            if let Some(ref emitter) = state.messaging.progress_emitter {
+                emitter.llm_call_started(state.llm_rounds_completed as u32);
+            } else {
+                self.emit_progress_event(json!({
+                    "type": "agent_progress",
+                    "status": "llm_call_started",
+                    "turn": state.llm_rounds_completed,
+                }));
+            }
             state
                 .step_recorder
                 .begin_llm_round(&llm_cfg.model_name, state.inference_purpose);
@@ -13183,6 +13192,7 @@ mod tests {
 
         let observe_first_text = async {
             let mut visible_order = Vec::new();
+            let mut saw_llm_call_started = false;
             loop {
                 let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
                     .await
@@ -13192,11 +13202,24 @@ mod tests {
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if event_type == "agent_progress"
+                    && event.get("status").and_then(Value::as_str) == Some("llm_call_started")
+                {
+                    assert!(
+                        !provider_completed.load(Ordering::SeqCst),
+                        "LLM start waited for provider response completion"
+                    );
+                    saw_llm_call_started = true;
+                }
                 if matches!(event_type, "reasoning_delta" | "text_delta") {
                     visible_order.push(event_type.to_string());
                 }
                 if event_type == "text_delta" {
                     assert_eq!(event["content"].as_str(), Some("visible first"));
+                    assert!(
+                        saw_llm_call_started,
+                        "visible provider output arrived before the LLM start lifecycle event"
+                    );
                     assert!(
                         !provider_completed.load(Ordering::SeqCst),
                         "text-first control window waited for the full provider response"

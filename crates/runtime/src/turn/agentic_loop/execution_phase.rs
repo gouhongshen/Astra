@@ -878,10 +878,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     turn_index: usize,
     prep: TurnIterationPrep,
 ) -> Result<TurnExecutionControl, astra_core::ClassifiedError> {
-    if let Some(ref emitter) = state.messaging.progress_emitter {
-        emitter.llm_call_started(turn_index as u32);
-    }
-
     inject_polled_user_intents(host, state).await?;
 
     // Policy evidence always reaches the model. Interaction mode controls only
