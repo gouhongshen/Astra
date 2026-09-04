@@ -454,6 +454,17 @@ mod tests {
         ) -> astra_services::ServiceResult<()> {
             self.inner.finish_provider_attempt(attempt, terminal).await
         }
+
+        async fn finish_successful_provider_attempt_and_invocation(
+            &self,
+            plan: &astra_services::InferenceInvocationPlan,
+            attempt: &astra_services::InferenceProviderAttemptPlan,
+            terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> astra_services::ServiceResult<()> {
+            self.inner
+                .finish_successful_provider_attempt_and_invocation(plan, attempt, terminal)
+                .await
+        }
     }
 
     async fn spawn_summary_test_server(app: Router) -> String {

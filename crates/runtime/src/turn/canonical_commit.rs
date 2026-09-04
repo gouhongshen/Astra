@@ -2,9 +2,12 @@ use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CanonicalRewriteProof {
-    base_root: String,
+    // This is the manifest-chain root used to fence the eventual commit. It is
+    // intentionally a different hash domain from `authorized_prefix_root`.
+    base_manifest_root: String,
     base_compaction_generation: u64,
     base_prefix_len: usize,
+    base_prefix_root: String,
     authorized_prefix_len: usize,
     authorized_prefix_root: String,
     rewritten: bool,
@@ -50,21 +53,27 @@ pub(crate) fn sanitize_provider_canonical_wal_snapshot(
 }
 
 impl CanonicalRewriteProof {
-    pub(crate) fn new(
+    /// Binds a rewrite proof to history materialized from the admitted manifest.
+    ///
+    /// The caller must pass the messages returned by coordinator materialization
+    /// for `base_manifest_root`. `begin` proves that compaction starts from those
+    /// messages, while commit separately fences the manifest root.
+    pub(crate) fn from_materialized_admission(
         admitted_prefix: &[Value],
-        base_root: &str,
+        base_manifest_root: &str,
         base_compaction_generation: u64,
     ) -> Self {
         let admitted_root = astra_turn_types::canonical_conversation_root(admitted_prefix);
         Self {
-            base_root: base_root.to_string(),
+            base_manifest_root: base_manifest_root.to_string(),
             base_compaction_generation,
             base_prefix_len: admitted_prefix.len(),
+            base_prefix_root: admitted_root.clone(),
             authorized_prefix_len: admitted_prefix.len(),
-            authorized_prefix_root: admitted_root.clone(),
+            authorized_prefix_root: admitted_root,
             rewritten: false,
             pending_provider_wal_predecessor: None,
-            valid: admitted_root == base_root,
+            valid: true,
         }
     }
 
@@ -133,8 +142,8 @@ impl CanonicalRewriteProof {
             .then(|| self.base_compaction_generation.saturating_add(1))
     }
 
-    pub(crate) fn base_root(&self) -> &str {
-        &self.base_root
+    pub(crate) fn base_manifest_root(&self) -> &str {
+        &self.base_manifest_root
     }
 
     pub(crate) fn provider_wal_replacement_authorization(
@@ -145,7 +154,7 @@ impl CanonicalRewriteProof {
         let base_count = usize::try_from(durable_base.canonical.message_count).ok()?;
         let durable_predecessor = self.pending_provider_wal_predecessor.as_ref()?;
         if base_count != self.base_prefix_len
-            || durable_base.canonical.root_hash != self.base_root
+            || durable_base.canonical.root_hash != self.base_prefix_root
             || !self.authorizes(messages)
         {
             return None;
@@ -170,7 +179,7 @@ impl CanonicalRewriteProof {
                 != Some(self.base_compaction_generation.saturating_add(1))
             || usize::try_from(durable_base.canonical.message_count).ok()
                 != Some(self.base_prefix_len)
-            || durable_base.canonical.root_hash != self.base_root
+            || durable_base.canonical.root_hash != self.base_prefix_root
         {
             return Err("provider WAL replacement does not match the admitted rewrite base".into());
         }
@@ -211,7 +220,7 @@ impl CanonicalRewriteProof {
             || &transition.predecessor != expected_predecessor
             || usize::try_from(durable_base.canonical.message_count).ok()
                 != Some(self.base_prefix_len)
-            || durable_base.canonical.root_hash != self.base_root
+            || durable_base.canonical.root_hash != self.base_prefix_root
         {
             return Err("provider WAL replacement does not match the admitted rewrite base".into());
         }
@@ -383,7 +392,10 @@ mod tests {
         let wal_base =
             astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
 
-        let mut invalid = CanonicalRewriteProof::new(&durable, &base.root_hash, 4);
+        let base_manifest_root = "a".repeat(64);
+        assert_ne!(base_manifest_root, base.root_hash);
+        let mut invalid =
+            CanonicalRewriteProof::from_materialized_admission(&durable, &base_manifest_root, 4);
         let rewritten = vec![json!({
             "role": "system",
             "content": "summary with hf_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
@@ -395,7 +407,8 @@ mod tests {
             None
         );
 
-        let mut valid = CanonicalRewriteProof::new(&durable, &base.root_hash, 4);
+        let mut valid =
+            CanonicalRewriteProof::from_materialized_admission(&durable, &base_manifest_root, 4);
         let permit = valid.begin(&durable);
         valid.finish(permit, &rewritten, Some(&wal_base));
         let authorization = valid
@@ -453,7 +466,10 @@ mod tests {
         let base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
         let wal_base =
             astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
-        let mut live = CanonicalRewriteProof::new(&durable, &base.root_hash, 7);
+        let base_manifest_root = "a".repeat(64);
+        assert_ne!(base_manifest_root, base.root_hash);
+        let mut live =
+            CanonicalRewriteProof::from_materialized_admission(&durable, &base_manifest_root, 7);
         let mut source = durable.clone();
         source.push(json!({"role": "user", "content": "current"}));
         let permit = live.begin(&source);
@@ -474,7 +490,8 @@ mod tests {
 
         let mut recovered = durable.clone();
         transition.apply_to(&mut recovered).unwrap();
-        let mut restored_proof = CanonicalRewriteProof::new(&durable, &base.root_hash, 7);
+        let mut restored_proof =
+            CanonicalRewriteProof::from_materialized_admission(&durable, &base_manifest_root, 7);
         restored_proof
             .recover_provider_wal_replacement(&wal_base, &transition, &recovered)
             .unwrap();

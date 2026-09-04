@@ -67,7 +67,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlx::{MySql, Pool, Row, query};
-use tokio::sync::{RwLock, mpsc, oneshot, watch};
+use tokio::sync::{Notify, RwLock, mpsc, oneshot, watch};
 use tracing::Instrument;
 
 use super::transport::{MessageStream, MessageTransport};
@@ -348,6 +348,7 @@ pub struct DatabaseTransport {
 struct PollTaskControl {
     subscription_id: String,
     abort_handle: tokio::task::AbortHandle,
+    wake: Arc<Notify>,
 }
 
 /// Default visibility timeout (how long before an unclaimed message reappears).
@@ -638,6 +639,38 @@ impl DatabaseTransport {
 
         Ok(())
     }
+
+    fn wake_local_consumer(&self, consumer_id: &str) {
+        let controls = self
+            .poll_abort_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(control) = controls.get(consumer_id) {
+            control.wake.notify_one();
+        }
+    }
+
+    async fn wake_local_broadcast_consumers(&self, delegation_id: &str) {
+        let consumer_ids = self
+            .registrations
+            .read()
+            .await
+            .iter()
+            .filter(|(_, registered_delegation_id)| {
+                registered_delegation_id.as_deref() == Some(delegation_id)
+            })
+            .map(|(address, _)| format!("{}@{}", address.agent_id, address.run_id))
+            .collect::<Vec<_>>();
+        let controls = self
+            .poll_abort_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for consumer_id in consumer_ids {
+            if let Some(control) = controls.get(&consumer_id) {
+                control.wake.notify_one();
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -739,6 +772,7 @@ impl MessageTransport for DatabaseTransport {
         }
         let (tx, rx) = mpsc::channel(LOCAL_DELIVERY_BUFFER_CAPACITY);
         let (start_tx, start_rx) = oneshot::channel();
+        let wake = Arc::new(Notify::new());
         let subscription_id = uuid::Uuid::new_v4().to_string();
         let span_delegation_id = delegation_id.clone().unwrap_or_default();
         let poll_task = tokio::spawn(
@@ -756,6 +790,7 @@ impl MessageTransport for DatabaseTransport {
                 self.instance_id.clone(),
                 subscription_id.clone(),
                 Arc::clone(&self.poll_abort_handles),
+                Arc::clone(&wake),
                 start_rx,
             )
             .instrument(tracing::info_span!(
@@ -775,6 +810,7 @@ impl MessageTransport for DatabaseTransport {
                 PollTaskControl {
                     subscription_id,
                     abort_handle: poll_task.abort_handle(),
+                    wake,
                 },
             );
         let _ = start_tx.send(());
@@ -854,6 +890,9 @@ impl MessageTransport for DatabaseTransport {
                 self.metrics
                     .messages_sent
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let MessageTarget::Direct { address } = &msg.to {
+                    self.wake_local_consumer(&format!("{}@{}", address.agent_id, address.run_id));
+                }
                 Ok(())
             }
             Err(e) => {
@@ -887,6 +926,7 @@ impl MessageTransport for DatabaseTransport {
                 self.metrics
                     .messages_sent
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.wake_local_broadcast_consumers(delegation_id).await;
                 Ok(())
             }
             Err(e) => {
@@ -977,6 +1017,7 @@ async fn poll_loop(
     instance_id: String,
     subscription_id: String,
     poll_abort_handles: Arc<std::sync::Mutex<HashMap<String, PollTaskControl>>>,
+    wake: Arc<Notify>,
     start_rx: oneshot::Receiver<()>,
 ) {
     if start_rx.await.is_err() {
@@ -1058,29 +1099,64 @@ async fn poll_loop(
 
         // 1. Claim direct messages atomically (UPDATE then SELECT).
         //    This ensures no two consumers process the same direct message.
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let claim_token = uuid::Uuid::new_v4().to_string();
-        let claim_result = query(
-            "UPDATE agent_message_queue
+        //
+        // Most mailbox polls are idle.  MatrixOne still has to plan and lock
+        // the ordered UPDATE when it matches no rows, which turns an idle
+        // mailbox into sustained write pressure.  Probe the covering direct
+        // index first; a message racing an empty probe is observed by the next
+        // poll exactly as it was when it raced an empty UPDATE.  The UPDATE
+        // remains the sole claim authority when work exists, so competing
+        // consumers retain the existing claim-token fencing semantics.
+        let direct_pending = query(
+            "SELECT 1 AS pending
+             FROM agent_message_queue
+             WHERE to_run_id = ? AND to_agent_id = ? AND status = 'pending'
+             ORDER BY created_at ASC, message_id ASC LIMIT 1",
+        )
+        .bind(&addr.run_id)
+        .bind(&addr.agent_id)
+        .fetch_optional(&pool)
+        .await;
+
+        let direct_pending = match direct_pending {
+            Ok(row) => row.is_some(),
+            Err(error) => {
+                had_error = true;
+                metrics
+                    .poll_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                    "  ⚠ messaging: direct pending probe error for {}@{}: {:?}",
+                    addr.agent_id, addr.run_id, error
+                );
+                false
+            }
+        };
+
+        if direct_pending {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let claim_token = uuid::Uuid::new_v4().to_string();
+            let claim_result = query(
+                "UPDATE agent_message_queue
              SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, claim_token = ?,
                  attempt_count = attempt_count + 1
              WHERE to_run_id = ? AND to_agent_id = ? AND status = 'pending'
              ORDER BY created_at ASC, message_id ASC LIMIT ?",
-        )
-        .bind(&consumer_id)
-        .bind(now_ms)
-        .bind(&claim_token)
-        .bind(&addr.run_id)
-        .bind(&addr.agent_id)
-        .bind(POLL_BATCH_SIZE)
-        .execute(&pool)
-        .await;
+            )
+            .bind(&consumer_id)
+            .bind(now_ms)
+            .bind(&claim_token)
+            .bind(&addr.run_id)
+            .bind(&addr.agent_id)
+            .bind(POLL_BATCH_SIZE)
+            .execute(&pool)
+            .await;
 
-        match claim_result {
-            Ok(result) if result.rows_affected() > 0 => {
-                had_activity = true;
-                // Fetch the messages we just claimed.
-                let fetch_result = query(
+            match claim_result {
+                Ok(result) if result.rows_affected() > 0 => {
+                    had_activity = true;
+                    // Fetch the messages we just claimed.
+                    let fetch_result = query(
                     "SELECT message_id, payload_json FROM agent_message_queue
                      WHERE to_run_id = ? AND to_agent_id = ? AND status = 'claimed' AND claimed_by = ?
                        AND claim_token = ?
@@ -1094,161 +1170,162 @@ async fn poll_loop(
                 .fetch_all(&pool)
                 .await;
 
-                if let Ok(rows) = fetch_result {
-                    for row in rows {
-                        let message_id: Option<String> = row.try_get("message_id").ok();
-                        if message_id.is_none() {
-                            had_error = true;
-                            metrics
-                                .poll_errors
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if let Err(e) = release_direct_claimed_batch_for_consumer_in_pool(
-                                &pool,
-                                &consumer_id,
-                                &claim_token,
-                                max_delivery_attempts,
-                            )
-                            .await
-                            {
-                                tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                    "  ⚠ messaging: failed to release direct claimed batch after missing message_id for {}@{}: {:?}",
-                                    addr.agent_id,
-                                    addr.run_id,
-                                    e
-                                );
-                            }
-                            tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                "  ⚠ messaging: claimed direct row without message_id for {}@{}; released current claim batch",
-                                addr.agent_id,
-                                addr.run_id,
-                            );
-                            break;
-                        }
-                        let json: String = match row.try_get("payload_json") {
-                            Ok(j) => j,
-                            Err(_) => {
+                    if let Ok(rows) = fetch_result {
+                        for row in rows {
+                            let message_id: Option<String> = row.try_get("message_id").ok();
+                            if message_id.is_none() {
+                                had_error = true;
                                 metrics
-                                    .messages_dropped
+                                    .poll_errors
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                match mark_direct_failed_by_identity(
+                                if let Err(e) = release_direct_claimed_batch_for_consumer_in_pool(
                                     &pool,
-                                    message_id.as_deref(),
                                     &consumer_id,
+                                    &claim_token,
+                                    max_delivery_attempts,
                                 )
                                 .await
                                 {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        had_error = true;
-                                        metrics
-                                            .poll_errors
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                            "  ⚠ messaging: failed to dead-letter undecodable direct row (message_id: {}) for {}@{}: {:?}",
-                                            message_id.as_deref().unwrap_or("<unavailable>"),
-                                            addr.agent_id,
-                                            addr.run_id,
-                                            e
-                                        );
-                                    }
+                                    tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                        "  ⚠ messaging: failed to release direct claimed batch after missing message_id for {}@{}: {:?}",
+                                        addr.agent_id,
+                                        addr.run_id,
+                                        e
+                                    );
                                 }
-                                continue;
+                                tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                    "  ⚠ messaging: claimed direct row without message_id for {}@{}; released current claim batch",
+                                    addr.agent_id,
+                                    addr.run_id,
+                                );
+                                break;
                             }
-                        };
-
-                        match serde_json::from_str::<AgentMessage>(&json) {
-                            Ok(msg) if !msg.is_expired() => {
-                                if tx.send(Arc::new(msg)).await.is_err() {
+                            let json: String = match row.try_get("payload_json") {
+                                Ok(j) => j,
+                                Err(_) => {
                                     metrics
-                                        .poll_errors
+                                        .messages_dropped
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if let Err(e) = release_claimed_for_consumer_in_pool(
+                                    match mark_direct_failed_by_identity(
                                         &pool,
+                                        message_id.as_deref(),
                                         &consumer_id,
-                                        max_delivery_attempts,
                                     )
                                     .await
                                     {
-                                        tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                            "  ⚠ messaging: failed to release direct claims after closed channel for {}@{}: {:?}",
-                                            addr.agent_id, addr.run_id, e
-                                        );
+                                        Ok(()) => {}
+                                        Err(e) => {
+                                            had_error = true;
+                                            metrics
+                                                .poll_errors
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                                "  ⚠ messaging: failed to dead-letter undecodable direct row (message_id: {}) for {}@{}: {:?}",
+                                                message_id.as_deref().unwrap_or("<unavailable>"),
+                                                addr.agent_id,
+                                                addr.run_id,
+                                                e
+                                            );
+                                        }
                                     }
-                                    break 'poll;
+                                    continue;
                                 }
-                                metrics
-                                    .messages_received
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            Ok(_) | Err(_) => {
-                                metrics
-                                    .messages_dropped
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                match mark_direct_failed_by_identity(
-                                    &pool,
-                                    message_id.as_deref(),
-                                    &consumer_id,
-                                )
-                                .await
-                                {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        had_error = true;
+                            };
+
+                            match serde_json::from_str::<AgentMessage>(&json) {
+                                Ok(msg) if !msg.is_expired() => {
+                                    if tx.send(Arc::new(msg)).await.is_err() {
                                         metrics
                                             .poll_errors
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                                            "  ⚠ messaging: failed to dead-letter direct row (message_id: {}) for {}@{}: {:?}",
-                                            message_id.as_deref().unwrap_or("<unavailable>"),
-                                            addr.agent_id,
-                                            addr.run_id,
-                                            e
-                                        );
+                                        if let Err(e) = release_claimed_for_consumer_in_pool(
+                                            &pool,
+                                            &consumer_id,
+                                            max_delivery_attempts,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                                "  ⚠ messaging: failed to release direct claims after closed channel for {}@{}: {:?}",
+                                                addr.agent_id, addr.run_id, e
+                                            );
+                                        }
+                                        break 'poll;
+                                    }
+                                    metrics
+                                        .messages_received
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Ok(_) | Err(_) => {
+                                    metrics
+                                        .messages_dropped
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    match mark_direct_failed_by_identity(
+                                        &pool,
+                                        message_id.as_deref(),
+                                        &consumer_id,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {}
+                                        Err(e) => {
+                                            had_error = true;
+                                            metrics
+                                                .poll_errors
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                                "  ⚠ messaging: failed to dead-letter direct row (message_id: {}) for {}@{}: {:?}",
+                                                message_id.as_deref().unwrap_or("<unavailable>"),
+                                                addr.agent_id,
+                                                addr.run_id,
+                                                e
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
+                    } else {
+                        had_error = true;
+                        metrics
+                            .poll_errors
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Err(e) = release_direct_claimed_batch_for_consumer_in_pool(
+                            &pool,
+                            &consumer_id,
+                            &claim_token,
+                            max_delivery_attempts,
+                        )
+                        .await
+                        {
+                            tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                                "  ⚠ messaging: failed to release direct claimed batch after fetch error for {}@{}: {:?}",
+                                addr.agent_id,
+                                addr.run_id,
+                                e
+                            );
+                        }
+                        tracing::warn!(target: "astra_runtime::messaging::db_transport",
+                            "  ⚠ messaging: direct fetch error for {}@{}: {:?}",
+                            addr.agent_id,
+                            addr.run_id,
+                            fetch_result.unwrap_err()
+                        );
                     }
-                } else {
+                }
+                Ok(_) => {
+                    // No pending messages — normal idle.
+                }
+                Err(e) => {
                     had_error = true;
                     metrics
                         .poll_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Err(e) = release_direct_claimed_batch_for_consumer_in_pool(
-                        &pool,
-                        &consumer_id,
-                        &claim_token,
-                        max_delivery_attempts,
-                    )
-                    .await
-                    {
-                        tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                            "  ⚠ messaging: failed to release direct claimed batch after fetch error for {}@{}: {:?}",
-                            addr.agent_id,
-                            addr.run_id,
-                            e
-                        );
-                    }
                     tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                        "  ⚠ messaging: direct fetch error for {}@{}: {:?}",
-                        addr.agent_id,
-                        addr.run_id,
-                        fetch_result.unwrap_err()
+                        "  ⚠ messaging: direct claim error for {}@{}: {:?}",
+                        addr.agent_id, addr.run_id, e
                     );
                 }
-            }
-            Ok(_) => {
-                // No pending messages — normal idle.
-            }
-            Err(e) => {
-                had_error = true;
-                metrics
-                    .poll_errors
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(target: "astra_runtime::messaging::db_transport",
-                    "  ⚠ messaging: direct claim error for {}@{}: {:?}",
-                    addr.agent_id, addr.run_id, e
-                );
             }
         }
 
@@ -1415,6 +1492,7 @@ async fn poll_loop(
         // Wait with shutdown awareness.
         tokio::select! {
             _ = tokio::time::sleep(sleep_duration) => {}
+            _ = wake.notified() => {}
             _ = shutdown_rx.changed() => {
                 break;
             }
@@ -2061,6 +2139,34 @@ mod tests {
         assert!(intervals.iter().all(|value| {
             *value >= Duration::from_millis(1600) && *value <= MAX_IDLE_POLL_INTERVAL
         }));
+    }
+
+    #[tokio::test]
+    async fn local_consumer_wake_interrupts_idle_poll_wait() {
+        let pool = MySqlPoolOptions::new().connect_lazy_with(MySqlConnectOptions::new());
+        let transport = DatabaseTransport::new(pool);
+        let consumer_id = "agent-a@run-a";
+        let wake = Arc::new(Notify::new());
+        let poll_task = tokio::spawn(std::future::pending::<()>());
+        transport
+            .poll_abort_handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(
+                consumer_id.to_string(),
+                PollTaskControl {
+                    subscription_id: "subscription-a".to_string(),
+                    abort_handle: poll_task.abort_handle(),
+                    wake: Arc::clone(&wake),
+                },
+            );
+
+        transport.wake_local_consumer(consumer_id);
+
+        tokio::time::timeout(Duration::from_millis(50), wake.notified())
+            .await
+            .expect("local wake must retain a permit until the poll loop observes it");
+        poll_task.abort();
     }
 
     #[test]

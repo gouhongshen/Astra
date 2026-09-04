@@ -223,6 +223,18 @@ fn durable_settlement_fence_closed(
     control_terminal_settlement_committed == Some(true) || settlement_finished_committed
 }
 
+async fn run_owner_fenced_terminal_projections<F, Fut>(
+    owner_terminal_committed: bool,
+    projections: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if owner_terminal_committed {
+        projections().await;
+    }
+}
+
 /// A normal loop completion is not a durable completion until every provider
 /// tool attempt has one canonical terminal class. Apply this before terminal
 /// events/status are derived so storage, stream clients, and receipts share a
@@ -5161,13 +5173,18 @@ impl AgenticRunLifecycleService {
             session_id,
             astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
         );
-        let head = coordinator.load_head(&key).await.map_err(|error| {
-            error_response_coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("failed to load canonical session head: {error}"),
-                "session_head_unavailable",
-            )
-        })?;
+        let admission_snapshot =
+            coordinator
+                .load_admission_snapshot(&key)
+                .await
+                .map_err(|error| {
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("failed to load canonical session head: {error}"),
+                        "session_head_unavailable",
+                    )
+                })?;
+        let head = admission_snapshot.head;
         let prior_canonical_bytes = head.as_ref().map_or(0, |head| head.total_canonical_bytes);
         let current_bytes = fresh_request_admission_bytes(request).map_err(|error| {
             error_response_coded(
@@ -5196,64 +5213,59 @@ impl AgenticRunLifecycleService {
                     "weighted_session_admission_rejected",
                 )
             })?;
-        let distributed_permit = self
-            .distributed_weighted_admission
-            .as_ref()
-            .ok_or_else(|| {
-                error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "cross-pod weighted session admission is unavailable",
-                    "distributed_session_admission_unavailable",
-                )
-            })?
-            .try_reserve(
-                &key,
-                weighted_work,
-                Duration::from_secs(15 * 60),
-                &format!("server-run:{run_id}:weighted-admission"),
-            )
-            .await
-            .map_err(|error| {
-                let status = if matches!(
-                    &error,
-                    astra_services::DistributedAdmissionError::Capacity(_)
-                ) {
-                    StatusCode::TOO_MANY_REQUESTS
-                } else {
-                    StatusCode::SERVICE_UNAVAILABLE
-                };
-                error_response_coded(
-                    status,
-                    format!("distributed weighted session admission rejected this turn: {error}"),
-                    "distributed_session_admission_rejected",
-                )
-            })?;
-        let prior_messages = match &head {
-            Some(head) => coordinator
-                .materialize(head)
-                .await
-                .map(|materialized| materialized.messages)
-                .map_err(|error| {
+        let distributed_admission =
+            self.distributed_weighted_admission
+                .as_ref()
+                .ok_or_else(|| {
                     error_response_coded(
-                        StatusCode::CONFLICT,
-                        format!("canonical session materialization requires repair: {error}"),
-                        "session_context_needs_repair",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "cross-pod weighted session admission is unavailable",
+                        "distributed_session_admission_unavailable",
                     )
-                })?,
-            None => Vec::new(),
-        };
-        let (lease, release_writer_on_finish) =
-            if let Some(authority) = request.conversation_authority.as_ref() {
-                let active = coordinator
-                    .load_active_writer(&key)
+                })?;
+        let admission_ttl = Duration::from_secs(15 * 60);
+        let distributed_reservation_id = format!("server-run:{run_id}:weighted-admission");
+        let materialize_prior_messages = async {
+            match &head {
+                Some(head) => coordinator
+                    .materialize(head)
                     .await
+                    .map(|materialized| materialized.messages)
                     .map_err(|error| {
                         error_response_coded(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("failed to load canonical writer: {error}"),
-                            "session_writer_unavailable",
+                            StatusCode::CONFLICT,
+                            format!("canonical session materialization requires repair: {error}"),
+                            "session_context_needs_repair",
                         )
-                    })?
+                    }),
+                None => Ok(Vec::new()),
+            }
+        };
+        let map_distributed_error = |error: astra_services::DistributedAdmissionError| {
+            let status = if matches!(
+                &error,
+                astra_services::DistributedAdmissionError::Capacity(_)
+            ) {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            error_response_coded(
+                status,
+                format!("distributed weighted session admission rejected this turn: {error}"),
+                "distributed_session_admission_rejected",
+            )
+        };
+
+        let (distributed_permit, prior_messages, lease, reservation, release_writer_on_finish) =
+            if let Some(authority) = request.conversation_authority.as_ref() {
+                // Request-supplied authority already owns a writer. Avoid
+                // speculatively installing its turn reservation until the
+                // independent distributed admission and history reads have
+                // both succeeded, because this caller must not release that
+                // externally owned writer on a sibling failure.
+                let active = admission_snapshot
+                    .active_writer
                     .filter(|lease| {
                         lease.key == key
                             && lease.lease_id == authority.execution_grant.claims.lease_id
@@ -5270,19 +5282,61 @@ impl AgenticRunLifecycleService {
                             "conversation_authority_fenced",
                         )
                     })?;
-                (active, false)
-            } else {
-                let authority_epochs = coordinator
-                    .load_authority_epochs(&key)
+                let distributed_reservation = distributed_admission.try_reserve(
+                    &key,
+                    weighted_work,
+                    admission_ttl,
+                    &distributed_reservation_id,
+                );
+                let (distributed_permit, prior_messages) =
+                    tokio::join!(distributed_reservation, materialize_prior_messages);
+                let distributed_permit = distributed_permit.map_err(map_distributed_error)?;
+                let prior_messages = match prior_messages {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        let _ = distributed_permit.release().await;
+                        return Err(error);
+                    }
+                };
+                let reservation = match coordinator
+                    .reserve_turn(
+                        &active,
+                        head.as_ref().map(|head| &head.cursor),
+                        admission_ttl,
+                        &format!("server-run:{run_id}:turn"),
+                    )
                     .await
-                    .map_err(|error| {
-                        error_response_coded(
+                {
+                    Ok(astra_services::ReserveTurnOutcome::Reserved(reservation))
+                    | Ok(astra_services::ReserveTurnOutcome::AlreadyReserved(reservation)) => {
+                        reservation
+                    }
+                    Ok(astra_services::ReserveTurnOutcome::Conflict { .. }) => {
+                        let _ = distributed_permit.release().await;
+                        return Err(error_response_coded(
+                            StatusCode::CONFLICT,
+                            "canonical session cursor changed before turn reservation",
+                            "conversation_cursor_conflict",
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = distributed_permit.release().await;
+                        return Err(error_response_coded(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            format!("failed to load canonical authority epochs: {error}"),
-                            "session_authority_unavailable",
-                        )
-                    })?
-                    .unwrap_or_default();
+                            format!("failed to reserve canonical turn: {error}"),
+                            "session_turn_reservation_unavailable",
+                        ));
+                    }
+                };
+                (
+                    distributed_permit,
+                    prior_messages,
+                    active,
+                    reservation,
+                    false,
+                )
+            } else {
+                let authority_epochs = admission_snapshot.authority_epochs;
                 let actor = astra_turn_types::ActorContextV1::owner_user(
                     user_id,
                     format!("server-run:{run_id}"),
@@ -5291,69 +5345,95 @@ impl AgenticRunLifecycleService {
                     None,
                     authority_epochs,
                 );
-                let acquired = coordinator
-                    .acquire_writer(
-                        &key,
-                        head.as_ref().map(|head| &head.cursor),
-                        &actor,
-                        Duration::from_secs(15 * 60),
-                        &format!("server-run:{run_id}:writer"),
-                    )
-                    .await
-                    .map_err(|error| {
-                        error_response_coded(
+                // These three stores are independent at admission time. The
+                // database coordinator installs writer+turn facts atomically,
+                // while distributed capacity and immutable history are read in
+                // parallel. Any sibling failure releases facts acquired here.
+                let distributed_reservation = distributed_admission.try_reserve(
+                    &key,
+                    weighted_work,
+                    admission_ttl,
+                    &distributed_reservation_id,
+                );
+                let writer_idempotency_key = format!("server-run:{run_id}:writer");
+                let reservation_idempotency_key = format!("server-run:{run_id}:turn");
+                let acquire_and_reserve = coordinator.acquire_writer_and_reserve_turn(
+                    &key,
+                    head.as_ref().map(|head| &head.cursor),
+                    &actor,
+                    admission_ttl,
+                    &writer_idempotency_key,
+                    &reservation_idempotency_key,
+                );
+                let (distributed_result, prior_messages_result, canonical_result) = tokio::join!(
+                    distributed_reservation,
+                    materialize_prior_messages,
+                    acquire_and_reserve,
+                );
+                let canonical_outcome = match canonical_result {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        if let Ok(distributed_permit) = distributed_result {
+                            let _ = distributed_permit.release().await;
+                        }
+                        return Err(error_response_coded(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            format!("failed to acquire canonical writer: {error}"),
-                            "session_writer_unavailable",
-                        )
-                    })?;
-                let lease = match acquired {
-                    astra_services::AcquireWriterOutcome::Acquired(lease)
-                    | astra_services::AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
-                    astra_services::AcquireWriterOutcome::Conflict { .. } => {
+                            format!("failed to acquire canonical turn authority: {error}"),
+                            "session_turn_reservation_unavailable",
+                        ));
+                    }
+                };
+                let (lease, reservation) = match canonical_outcome {
+                    astra_services::AcquireWriterAndReserveTurnOutcome::Ready {
+                        lease,
+                        reservation,
+                    } => (lease, reservation),
+                    astra_services::AcquireWriterAndReserveTurnOutcome::WriterConflict {
+                        ..
+                    } => {
+                        if let Ok(distributed_permit) = distributed_result {
+                            let _ = distributed_permit.release().await;
+                        }
                         return Err(error_response_coded(
                             StatusCode::CONFLICT,
                             "another controller owns this canonical session branch",
                             "session_writer_conflict",
                         ));
                     }
+                    astra_services::AcquireWriterAndReserveTurnOutcome::ReservationConflict {
+                        lease,
+                        ..
+                    } => {
+                        let _ = coordinator.release_writer(&lease).await;
+                        if let Ok(distributed_permit) = distributed_result {
+                            let _ = distributed_permit.release().await;
+                        }
+                        return Err(error_response_coded(
+                            StatusCode::CONFLICT,
+                            "canonical session cursor changed before turn reservation",
+                            "conversation_cursor_conflict",
+                        ));
+                    }
                 };
-                (lease, true)
+                let distributed_permit = match distributed_result {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        let _ = coordinator.release_writer(&lease).await;
+                        return Err(map_distributed_error(error));
+                    }
+                };
+                let prior_messages = match prior_messages_result {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        let (_, _) = tokio::join!(
+                            coordinator.release_writer(&lease),
+                            distributed_permit.release(),
+                        );
+                        return Err(error);
+                    }
+                };
+                (distributed_permit, prior_messages, lease, reservation, true)
             };
-        let reservation_outcome = coordinator
-            .reserve_turn(
-                &lease,
-                head.as_ref().map(|head| &head.cursor),
-                Duration::from_secs(15 * 60),
-                &format!("server-run:{run_id}:turn"),
-            )
-            .await;
-        let reservation = match reservation_outcome {
-            Err(error) => {
-                if release_writer_on_finish {
-                    let _ = coordinator.release_writer(&lease).await;
-                }
-                let _ = distributed_permit.release().await;
-                return Err(error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("failed to reserve canonical turn: {error}"),
-                    "session_turn_reservation_unavailable",
-                ));
-            }
-            Ok(astra_services::ReserveTurnOutcome::Reserved(reservation))
-            | Ok(astra_services::ReserveTurnOutcome::AlreadyReserved(reservation)) => reservation,
-            Ok(astra_services::ReserveTurnOutcome::Conflict { .. }) => {
-                if release_writer_on_finish {
-                    let _ = coordinator.release_writer(&lease).await;
-                }
-                let _ = distributed_permit.release().await;
-                return Err(error_response_coded(
-                    StatusCode::CONFLICT,
-                    "canonical session cursor changed before turn reservation",
-                    "conversation_cursor_conflict",
-                ));
-            }
-        };
         let renewal_cancel = CancellationToken::new();
         let heartbeat_cancel = renewal_cancel.clone();
         let heartbeat_run_cancel = authority_loss_cancel;
@@ -5465,7 +5545,7 @@ impl AgenticRunLifecycleService {
                     let cursor = base.ok_or_else(|| {
                         "canonical replacement is missing its admitted base cursor".to_string()
                     })?;
-                    if proof.base_root() != cursor.canonical_root_hash {
+                    if proof.base_manifest_root() != cursor.canonical_root_hash {
                         return Err(
                             "canonical rewrite proof does not match the admitted base root".into(),
                         );
@@ -9536,25 +9616,54 @@ impl AgenticRunLifecycleService {
             .iter()
             .map(|binding| binding.binding.id.clone())
             .collect::<Vec<_>>();
-        // Tool and skill discovery are independent reads from the same
-        // provider runtime. Keep binding validation ahead of both calls, then
-        // overlap their network latency before constructing the shared prompt.
-        let (bundle, prepared_skills) = tokio::join!(
-            runtime_mcp::prepare_agent_binding_mcp_bundle(
-                &mcp_descriptor.id,
-                &mcp_endpoint_url,
-                &runtime_auth.authorization,
-                mcp_descriptor.semantic_read.as_ref(),
-            ),
-            agent_binding_skill_runtime::prepare_agent_binding_skill_resolver(
-                &skill_descriptor.id,
-                &skill_endpoint_url,
-                &runtime_auth.authorization,
-                &binding_ids,
-            ),
-        );
-        let bundle = bundle?;
-        let prepared_skills = prepared_skills?;
+        let (bundle, prepared_skills) =
+            if let Some(snapshot) = descriptors.discovery_snapshot.as_ref() {
+                if snapshot.version
+                    != astra_services::runs::RUNTIME_CAPABILITY_DISCOVERY_SNAPSHOT_VERSION
+                {
+                    return Err(error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        "unsupported runtime capability discovery snapshot version",
+                        "agent_binding_discovery_snapshot_invalid",
+                    ));
+                }
+                (
+                    runtime_mcp::prepare_agent_binding_mcp_bundle_from_snapshot(
+                        &mcp_descriptor.id,
+                        &mcp_endpoint_url,
+                        &runtime_auth.authorization,
+                        mcp_descriptor.semantic_read.as_ref(),
+                        &snapshot.tools,
+                    )?,
+                    agent_binding_skill_runtime::prepare_agent_binding_skill_resolver_from_snapshot(
+                        &skill_descriptor.id,
+                        &skill_endpoint_url,
+                        &runtime_auth.authorization,
+                        &binding_ids,
+                        &snapshot.skill_catalogs,
+                    )?,
+                )
+            } else {
+                // Tool and skill discovery are independent reads from the same
+                // provider runtime. Keep binding validation ahead of both calls,
+                // then overlap their network latency before constructing the
+                // shared prompt.
+                let (bundle, prepared_skills) = tokio::join!(
+                    runtime_mcp::prepare_agent_binding_mcp_bundle(
+                        &mcp_descriptor.id,
+                        &mcp_endpoint_url,
+                        &runtime_auth.authorization,
+                        mcp_descriptor.semantic_read.as_ref(),
+                    ),
+                    agent_binding_skill_runtime::prepare_agent_binding_skill_resolver(
+                        &skill_descriptor.id,
+                        &skill_endpoint_url,
+                        &runtime_auth.authorization,
+                        &binding_ids,
+                    ),
+                );
+                (bundle?, prepared_skills?)
+            };
         let skill_resolver =
             apply_normalized_skill_allowlist(prepared_skills.resolver, request_constraints)
                 .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
@@ -16638,7 +16747,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 // Drop event_tx — signals end-of-stream to the HTTP handler.
                 drop(event_tx);
 
-                if owner_terminal_committed {
+                run_owner_fenced_terminal_projections(owner_terminal_committed, || async {
                     persist_turn_evaluation_journal(
                         &bg_user_id,
                         &bg_session_id,
@@ -16725,7 +16834,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         )
                         .await;
                     }
-                }
+                })
+                .await;
                 if let Some(guard) = bg_root_runtime_context_guard.as_mut() {
                     guard.settle().await;
                 }

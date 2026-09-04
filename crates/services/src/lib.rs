@@ -206,6 +206,7 @@ pub use inference_execution::{
     admit_inference_invocation_with_first_provider_attempt, begin_inference_provider_attempt,
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
+    finish_successful_inference_provider_attempt_and_invocation,
     load_inference_canonical_transitions_for_session, next_inference_logical_attempt_pair_base,
     plan_inference_invocation, plan_inference_provider_attempt,
     plan_inference_provider_attempt_with_context, reconcile_inference_settlement,
@@ -324,8 +325,9 @@ pub use session_artifact_store::{
     local_owner_scope, local_owner_user_id, local_session_artifact_store,
 };
 pub use session_context_coordinator::{
-    AcquireWriterOutcome, DatabaseSessionContextCoordinator, MaterializedConversationV1,
-    RenewedTurnAuthority, ReserveTurnOutcome, SessionAuthorityEventV1, SessionContextCoordinator,
+    AcquireWriterAndReserveTurnOutcome, AcquireWriterOutcome, DatabaseSessionContextCoordinator,
+    MaterializedConversationV1, RenewedTurnAuthority, ReserveTurnOutcome,
+    SessionAdmissionSnapshotV1, SessionAuthorityEventV1, SessionContextCoordinator,
     SessionContextCoordinatorError, TransferWriterOutcome, WriterTransferConflictV1,
     WriterTransferRequestV1,
 };

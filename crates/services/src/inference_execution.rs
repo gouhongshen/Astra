@@ -948,7 +948,12 @@ async fn insert_model_request_context_event_with_expiry(
                 ModelRequestContextScope::HarnessRun(harness_run_id)
             }
         };
-        compact_model_request_context_scope(connection, &attempt.user_id, scope).await?;
+        // A normal request appends an accepted/terminal pair. Compact once at
+        // the terminal boundary; orphaned accepted rows remain covered by the
+        // existing expiry sweeper.
+        if stage == ModelRequestEventStage::Terminal {
+            compact_model_request_context_scope(connection, &attempt.user_id, scope).await?;
+        }
     }
     if let (Some(status), Some(usage)) = (event.terminal_status.as_deref(), usage) {
         sqlx::query(
@@ -4106,6 +4111,221 @@ async fn recover_provider_terminal_after_unknown_write(
             Err(original_error)
         }
     }
+}
+
+async fn combined_successful_settlement_is_durable(
+    db: &sqlx::Pool<sqlx::MySql>,
+    plan: &InferenceInvocationPlan,
+    attempt: &InferenceProviderAttemptPlan,
+    provider_wire_bytes: i64,
+    terminal: &InferenceInvocationTerminal,
+    fingerprint: &str,
+) -> ServiceResult<bool> {
+    let Some(persisted_attempt) = load_provider_attempt_fact(db, attempt).await? else {
+        return Ok(false);
+    };
+    if classify_persisted_provider_terminal(
+        &persisted_attempt,
+        attempt,
+        provider_wire_bytes,
+        terminal,
+        fingerprint,
+    )? != PersistedProviderTerminalMatch::ExactTerminal
+    {
+        return Ok(false);
+    }
+    Ok(existing_terminal_fingerprint(db, plan).await?.as_deref() == Some(fingerprint))
+}
+
+/// Atomically settle a successful physical attempt and its logical invocation.
+/// Failure and delivery-unknown outcomes retain the explicit debt protocol
+/// because they may still own retryable/open attempts.
+pub async fn finish_successful_inference_provider_attempt_and_invocation(
+    pool: &SharedPool,
+    plan: &InferenceInvocationPlan,
+    attempt: &InferenceProviderAttemptPlan,
+    terminal: &InferenceInvocationTerminal,
+) -> ServiceResult<()> {
+    validate_first_provider_attempt_binding(plan, attempt)?;
+    if terminal.status != InferenceTerminalStatus::Succeeded {
+        return Err(ServiceError::invalid(
+            "combined inference settlement requires a successful terminal",
+        ));
+    }
+    let fingerprint = terminal_fingerprint(terminal)?;
+    let terminal_state = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
+    let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
+    let owner_generation = i64::try_from(plan.owner_generation).map_err(|_| {
+        ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
+    })?;
+    let db = pool.get();
+    let mut tx = db.begin().await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "begin combined successful inference settlement",
+            error,
+        )
+    })?;
+    lock_admitted_inference_invocation(
+        &mut tx,
+        &plan.input.user_id,
+        &plan.invocation_id,
+        &plan.owner_token,
+        plan.owner_generation,
+        "commit a successful provider and logical terminal",
+    )
+    .await?;
+
+    let attempt_update = sqlx::query(
+        "UPDATE inference_provider_attempts
+         SET status = ?, terminal_fingerprint = ?, provider_response_id = ?,
+             usage_status = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
+             cache_creation_tokens = ?, error_kind = ?, error_message = ?, terminal_at = NOW(6)
+         WHERE user_id = ? AND attempt_id = ?
+           AND invocation_id = ? AND attempt_index = ? AND provider = ?
+           AND admission_token = ? AND provider_protocol = ?
+           AND provider_wire_hash = ? AND provider_wire_bytes = ?
+           AND status = 'started'",
+    )
+    .bind(&terminal_state.status)
+    .bind(&fingerprint)
+    .bind(&terminal_state.provider_response_id)
+    .bind(&terminal_state.usage_status)
+    .bind(terminal_state.input_tokens)
+    .bind(terminal_state.output_tokens)
+    .bind(terminal_state.cache_read_tokens)
+    .bind(terminal_state.cache_creation_tokens)
+    .bind(&terminal_state.error_kind)
+    .bind(&terminal_state.error_message)
+    .bind(&attempt.user_id)
+    .bind(&attempt.attempt_id)
+    .bind(&attempt.invocation_id)
+    .bind(i64::from(attempt.attempt_index))
+    .bind(&attempt.provider)
+    .bind(&attempt.admission_token)
+    .bind(&attempt.wire.protocol)
+    .bind(&attempt.wire.provider_wire_hash)
+    .bind(provider_wire_bytes)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "finish provider attempt in combined successful inference settlement",
+            error,
+        )
+    })?;
+
+    if attempt_update.rows_affected() != 1 {
+        rollback_inference_tx(tx, "classify combined successful inference settlement").await;
+        return if combined_successful_settlement_is_durable(
+            db,
+            plan,
+            attempt,
+            provider_wire_bytes,
+            terminal,
+            &fingerprint,
+        )
+        .await?
+        {
+            Ok(())
+        } else {
+            Err(ServiceError::conflict(format!(
+                "inference provider attempt {} is unavailable for combined successful settlement",
+                attempt.attempt_id
+            )))
+        };
+    }
+
+    insert_model_request_context_event(
+        &mut tx,
+        attempt,
+        ModelRequestEventStage::Terminal,
+        Some(terminal),
+    )
+    .await?;
+
+    let invocation_update = sqlx::query(
+        "UPDATE inference_invocations AS invocation
+         SET status = ?, terminal_fingerprint = ?, usage_status = ?,
+             provider_delivery_state = 'delivery_authorized',
+             input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
+             cache_creation_tokens = ?, provider_response_id = ?,
+             error_kind = ?, error_message = ?, terminal_at = NOW(6)
+         WHERE invocation.user_id = ? AND invocation.invocation_id = ?
+           AND invocation.admission_token = ? AND invocation.status = 'admitted'
+           AND invocation.owner_token = ? AND invocation.owner_generation = ?
+           AND invocation.owner_lease_expires_at > NOW(6)
+           AND EXISTS (
+                SELECT 1 FROM inference_provider_attempts AS succeeded_attempt
+                WHERE succeeded_attempt.user_id = invocation.user_id
+                  AND succeeded_attempt.invocation_id = invocation.invocation_id
+                  AND succeeded_attempt.attempt_id = ?
+                  AND succeeded_attempt.status = 'succeeded'
+                  AND succeeded_attempt.terminal_fingerprint = ?
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM inference_provider_attempts AS open_attempt
+                WHERE open_attempt.user_id = invocation.user_id
+                  AND open_attempt.invocation_id = invocation.invocation_id
+                  AND open_attempt.status = 'started'
+           )",
+    )
+    .bind(&terminal_state.status)
+    .bind(&fingerprint)
+    .bind(&terminal_state.usage_status)
+    .bind(terminal_state.input_tokens)
+    .bind(terminal_state.output_tokens)
+    .bind(terminal_state.cache_read_tokens)
+    .bind(terminal_state.cache_creation_tokens)
+    .bind(&terminal_state.provider_response_id)
+    .bind(&terminal_state.error_kind)
+    .bind(&terminal_state.error_message)
+    .bind(&plan.input.user_id)
+    .bind(&plan.invocation_id)
+    .bind(&plan.admission_token)
+    .bind(&plan.owner_token)
+    .bind(owner_generation)
+    .bind(&attempt.attempt_id)
+    .bind(&fingerprint)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "finish invocation in combined successful inference settlement",
+            error,
+        )
+    })?;
+    if invocation_update.rows_affected() != 1 {
+        rollback_inference_tx(tx, "finish combined successful inference settlement").await;
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {} is unavailable for combined successful settlement",
+            plan.invocation_id
+        )));
+    }
+
+    if let Err(error) = tx.commit().await {
+        let commit_error = ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "commit combined successful inference settlement",
+            error,
+        );
+        if combined_successful_settlement_is_durable(
+            db,
+            plan,
+            attempt,
+            provider_wire_bytes,
+            terminal,
+            &fingerprint,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        return Err(commit_error);
+    }
+    Ok(())
 }
 
 pub async fn finish_inference_provider_attempt(

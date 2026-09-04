@@ -1469,6 +1469,55 @@ where
     Ok(())
 }
 
+pub struct AgentEventEdgeInsert<'a> {
+    pub user_id: &'a str,
+    pub session_id: &'a str,
+    pub child_event_id: &'a str,
+    pub primary_parent_event_id: Option<&'a str>,
+    pub parent_event_ids: &'a [String],
+}
+
+pub async fn insert_agent_event_edges_batch<'e, E>(
+    executor: E,
+    edges: &[AgentEventEdgeInsert<'_>],
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = MySql>,
+{
+    let normalized = edges
+        .iter()
+        .flat_map(|edge| {
+            normalized_parent_event_ids(edge.primary_parent_event_id, Some(edge.parent_event_ids))
+                .into_iter()
+                .enumerate()
+                .map(move |(index, parent_event_id)| (edge, index, parent_event_id))
+        })
+        .collect::<Vec<_>>();
+    if normalized.is_empty() {
+        return Ok(());
+    }
+
+    let mut builder = QueryBuilder::<MySql>::new(
+        "INSERT INTO agent_event_edges \
+         (user_id, session_id, child_event_id, parent_event_id, relation_kind, parent_order) ",
+    );
+    builder.push_values(normalized, |mut row, (edge, index, parent_event_id)| {
+        row.push_bind(edge.user_id)
+            .push_bind(edge.session_id)
+            .push_bind(edge.child_event_id)
+            .push_bind(parent_event_id)
+            .push_bind(CAUSAL_EDGE_KIND)
+            .push_bind(i32::try_from(index).unwrap_or(i32::MAX));
+    });
+    builder.push(
+        " ON DUPLICATE KEY UPDATE \
+         session_id = VALUES(session_id), \
+         parent_order = VALUES(parent_order)",
+    );
+    builder.build().execute(executor).await?;
+    Ok(())
+}
+
 pub async fn insert_agent_event_edges<'e, E>(
     executor: E,
     user_id: &str,
@@ -1480,33 +1529,17 @@ pub async fn insert_agent_event_edges<'e, E>(
 where
     E: sqlx::Executor<'e, Database = MySql>,
 {
-    let normalized = normalized_parent_event_ids(primary_parent_event_id, Some(parent_event_ids));
-    if normalized.is_empty() {
-        return Ok(());
-    }
-
-    let mut builder = QueryBuilder::<MySql>::new(
-        "INSERT INTO agent_event_edges \
-         (user_id, session_id, child_event_id, parent_event_id, relation_kind, parent_order) ",
-    );
-    builder.push_values(
-        normalized.iter().enumerate(),
-        |mut row, (idx, parent_event_id)| {
-            row.push_bind(user_id)
-                .push_bind(session_id)
-                .push_bind(child_event_id)
-                .push_bind(parent_event_id)
-                .push_bind(CAUSAL_EDGE_KIND)
-                .push_bind(i32::try_from(idx).unwrap_or(i32::MAX));
-        },
-    );
-    builder.push(
-        " ON DUPLICATE KEY UPDATE \
-         session_id = VALUES(session_id), \
-         parent_order = VALUES(parent_order)",
-    );
-    builder.build().execute(executor).await?;
-    Ok(())
+    insert_agent_event_edges_batch(
+        executor,
+        &[AgentEventEdgeInsert {
+            user_id,
+            session_id,
+            child_event_id,
+            primary_parent_event_id,
+            parent_event_ids,
+        }],
+    )
+    .await
 }
 
 pub async fn load_agent_event_parent_ids<'e, E>(
@@ -4456,6 +4489,10 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+    sqlx::query("INSERT IGNORE INTO session_weighted_admission_gates (scope_name) VALUES (?)")
+        .bind(crate::weighted_admission::DISTRIBUTED_ADMISSION_SCOPE)
+        .execute(&pool)
+        .await?;
 
     core_schema_create!(
         pool,
