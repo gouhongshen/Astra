@@ -2595,7 +2595,7 @@ impl DatabaseSessionContextCoordinator {
                     })
                 })?;
         let manifest_insert_sql = matrixone_statement_with_null_shape(
-            "INSERT IGNORE INTO conversation_manifest_nodes
+            "INSERT INTO conversation_manifest_nodes
              (isolation_domain, owner_user_id, session_id, branch_id, manifest_root,
               parent_manifest_root, completed_turn, conversation_seq,
               compaction_generation, canonical_segment_bytes, total_canonical_bytes,
@@ -2603,7 +2603,7 @@ impl DatabaseSessionContextCoordinator {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
             [node.parent_manifest_root.is_some()],
         );
-        let result = sqlx::query(&manifest_insert_sql)
+        let manifest_already_exists = match sqlx::query(&manifest_insert_sql)
             .bind(&key.isolation_domain)
             .bind(&key.owner_user_id)
             .bind(&key.session_id)
@@ -2634,12 +2634,20 @@ impl DatabaseSessionContextCoordinator {
             .bind(database_to_json("manifest", node)?)
             .execute(&mut **tx)
             .await
-            .map_err(|source| database_error("persist_manifest", source))?;
-        if result.rows_affected() == 0 {
+        {
+            Ok(_) => false,
+            Err(source) if astra_core::is_duplicate_key_error(&source) => true,
+            Err(source) => return Err(database_error("persist_manifest", source)),
+        };
+        let existing_manifest_reachable = if manifest_already_exists {
             let stored = sqlx::query(
-                "SELECT manifest_json FROM conversation_manifest_nodes
+                "SELECT parent_manifest_root, completed_turn, conversation_seq,
+                        compaction_generation, canonical_segment_bytes,
+                        total_canonical_bytes, total_message_count, manifest_json, reachable
+                 FROM conversation_manifest_nodes
                  WHERE isolation_domain = ? AND owner_user_id = ?
-                   AND session_id = ? AND branch_id = ? AND manifest_root = ?",
+                   AND session_id = ? AND branch_id = ? AND manifest_root = ?
+                 FOR UPDATE",
             )
             .bind(&key.isolation_domain)
             .bind(&key.owner_user_id)
@@ -2648,16 +2656,32 @@ impl DatabaseSessionContextCoordinator {
             .bind(&node.manifest_root)
             .fetch_one(&mut **tx)
             .await
-            .map_err(|source| database_error("verify_existing_manifest", source))?
-            .try_get::<String, _>("manifest_json")
-            .map_err(|source| database_error("decode_existing_manifest", source))?;
-            let stored: ContextManifestNodeV1 = database_json("existing_manifest", &stored)?;
-            if stored != *node {
+            .map_err(|source| database_error("verify_existing_manifest", source))?;
+            let stored_manifest = stored
+                .try_get::<String, _>("manifest_json")
+                .map_err(|source| database_error("decode_existing_manifest", source))?;
+            let stored_manifest: ContextManifestNodeV1 =
+                database_json("existing_manifest", &stored_manifest)?;
+            let stored_parent = stored
+                .try_get::<Option<String>, _>("parent_manifest_root")
+                .map_err(|source| database_error("decode_existing_manifest_parent", source))?;
+            if stored_manifest != *node
+                || stored_parent != node.parent_manifest_root
+                || database_u64(&stored, "completed_turn")? != u64::from(node.completed_turn)
+                || database_u64(&stored, "conversation_seq")? != node.conversation_seq
+                || database_u64(&stored, "compaction_generation")? != node.compaction_generation
+                || database_u64(&stored, "canonical_segment_bytes")? != canonical_segment_bytes
+                || database_u64(&stored, "total_canonical_bytes")? != total_canonical_bytes
+                || database_u64(&stored, "total_message_count")? != total_message_count
+            {
                 return Err(SessionContextCoordinatorError::NeedsRepair(
                     "existing immutable manifest does not match its content-addressed key".into(),
                 ));
             }
-        }
+            Some(database_u64(&stored, "reachable")?)
+        } else {
+            None
+        };
 
         let mut insert_references = QueryBuilder::<MySql>::new(
             "INSERT IGNORE INTO conversation_manifest_segments
@@ -2682,7 +2706,7 @@ impl DatabaseSessionContextCoordinator {
             .execute(&mut **tx)
             .await
             .map_err(|source| database_error("persist_manifest_segment_references", source))?;
-        if result.rows_affected() == 0
+        if manifest_already_exists
             || inserted_references.rows_affected()
                 != u64::try_from(node.appended_segments.len()).unwrap_or(u64::MAX)
         {
@@ -2716,6 +2740,55 @@ impl DatabaseSessionContextCoordinator {
                 {
                     return Err(SessionContextCoordinatorError::NeedsRepair(
                         "immutable manifest segment reference does not match the manifest".into(),
+                    ));
+                }
+            }
+        }
+        if let Some(reachable) = existing_manifest_reachable {
+            match reachable {
+                0 => {
+                    let activated = sqlx::query(
+                        "UPDATE conversation_manifest_nodes SET reachable = 1
+                         WHERE isolation_domain = ? AND owner_user_id = ?
+                           AND session_id = ? AND branch_id = ? AND manifest_root = ?
+                           AND reachable = 0 AND compaction_generation = ?
+                           AND canonical_segment_bytes = ? AND total_canonical_bytes = ?
+                           AND total_message_count = ?",
+                    )
+                    .bind(&key.isolation_domain)
+                    .bind(&key.owner_user_id)
+                    .bind(&key.session_id)
+                    .bind(&key.branch_id)
+                    .bind(&node.manifest_root)
+                    .bind(i64_from_u64(
+                        "manifest compaction generation",
+                        node.compaction_generation,
+                    )?)
+                    .bind(i64_from_u64(
+                        "manifest segment bytes",
+                        canonical_segment_bytes,
+                    )?)
+                    .bind(i64_from_u64(
+                        "manifest total canonical bytes",
+                        total_canonical_bytes,
+                    )?)
+                    .bind(i64_from_u64(
+                        "manifest total message count",
+                        total_message_count,
+                    )?)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|source| database_error("activate_existing_manifest", source))?;
+                    if activated.rows_affected() != 1 {
+                        return Err(SessionContextCoordinatorError::NeedsRepair(
+                            "verified staged manifest could not be activated".into(),
+                        ));
+                    }
+                }
+                1 => {}
+                _ => {
+                    return Err(SessionContextCoordinatorError::NeedsRepair(
+                        "existing immutable manifest has an invalid reachability state".into(),
                     ));
                 }
             }
