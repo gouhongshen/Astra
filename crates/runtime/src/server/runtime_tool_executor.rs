@@ -8124,6 +8124,7 @@ esac
             _user_id: &str,
             _edge_agent_id: &str,
             _edge_id_header: &str,
+            _registration_claim_id: Option<&str>,
         ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
             Err(astra_services::multi_agent::HeartbeatError::StorageFailure(
                 "MCP tools must not heartbeat edge registry".to_string(),
@@ -8293,6 +8294,7 @@ esac
             _user_id: &str,
             _edge_agent_id: &str,
             _edge_id_header: &str,
+            _registration_claim_id: Option<&str>,
         ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
             Ok(())
         }
