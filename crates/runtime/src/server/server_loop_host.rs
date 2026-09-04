@@ -6029,9 +6029,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 attempt = attempt_in_round,
                 "durable inference admission completed"
             );
-            if let Some(ref emitter) = state.messaging.progress_emitter {
-                emitter.llm_call_started(state.llm_rounds_completed);
-            } else {
+            if state.messaging.progress_emitter.is_none() {
                 self.emit_progress_event(json!({
                     "type": "agent_progress",
                     "status": "llm_call_started",

@@ -1363,6 +1363,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         messages = pre_llm_messages.len(),
         "LLM call started"
     );
+    if let Some(ref emitter) = state.messaging.progress_emitter {
+        emitter.llm_call_started(turn_index as u32);
+    }
     let turn_result = host.execute_turn(state).await;
     // `text_only` applies to exactly one model boundary. Clear it as soon as
     // the host returns, including error paths, so a failed settlement request
