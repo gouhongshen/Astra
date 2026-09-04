@@ -197,84 +197,117 @@ fn single_user_tool_turn_remains_committable_after_real_tiered_compaction() {
 }
 
 #[test]
-fn newer_user_supersedes_compacted_head_after_real_tiered_compaction() {
-    let mut messages = vec![json!({"role": "user", "content": "review everything"})];
-    for index in 0..6 {
+fn typed_objective_relations_survive_real_tiered_compaction() {
+    use astra_turn_core::resume_hydration::objective_context_from_messages;
+    use astra_turn_types::{ObjectiveRelation, UserTurnSemantics, mark_user_turn_semantics};
+
+    for relation in [
+        None,
+        Some(ObjectiveRelation::Unknown),
+        Some(ObjectiveRelation::Acknowledge),
+        Some(ObjectiveRelation::Continue),
+        Some(ObjectiveRelation::Refine),
+        Some(ObjectiveRelation::Correct),
+        Some(ObjectiveRelation::Replace),
+    ] {
+        let mut head = json!({"role": "user", "content": "initial objective"});
+        mark_user_turn_semantics(
+            &mut head,
+            UserTurnSemantics::new(ObjectiveRelation::Replace, None),
+        );
+        let mut messages = vec![head.clone()];
+        for index in 0..6 {
+            messages.push(json!({
+                "role": "assistant", "content": null,
+                "tool_calls": [{
+                    "id": format!("call-{index}"), "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"},
+                }],
+            }));
+            messages.push(json!({
+                "role": "tool", "tool_call_id": format!("call-{index}"),
+                "content": format!("result {index}"),
+            }));
+        }
+        let mut tail = json!({"role": "user", "content": "follow-up input"});
+        if let Some(relation) = relation {
+            mark_user_turn_semantics(&mut tail, UserTurnSemantics::new(relation, None));
+        }
+        messages.push(tail.clone());
         messages.push(json!({
-            "role": "assistant",
-            "content": null,
+            "role": "assistant", "content": null,
             "tool_calls": [{
-                "id": format!("call-{index}"),
-                "type": "function",
-                "function": {
-                    "name": "bash",
-                    "arguments": format!(r#"{{"chunk":{index}}}"#),
-                },
+                "id": "tail-call", "type": "function",
+                "function": {"name": "bash", "arguments": "{}"},
             }],
         }));
-        messages.push(json!({
-            "role": "tool",
-            "tool_call_id": format!("call-{index}"),
-            "content": format!("reviewed chunk {index}"),
-        }));
+        messages
+            .push(json!({"role": "tool", "tool_call_id": "tail-call", "content": "tail result"}));
+        messages.push(json!({"role": "assistant", "content": "done"}));
+        let expected_objective = objective_context_from_messages(&messages).unwrap();
+
+        // Admit an actual prefix, then prove the real compaction rewrites it.
+        let prior = messages[..7].to_vec();
+        let manifest_root = "a".repeat(64);
+        let mut proof =
+            CanonicalRewriteProof::from_materialized_admission(&prior, &manifest_root, 0);
+        let permit = proof.begin(&messages);
+        let mut engine = crate::turn::CompactionEngine::new();
+        engine.add_layer(Box::new(crate::turn::cloud::TieredCompaction::new(2, 0.0)));
+        let outcome = engine.compress_if_needed(
+            &mut messages,
+            &crate::turn::TokenBudget {
+                max_prompt_tokens: 64_000,
+                last_measured_tokens: 100_000,
+                current_round_index: None,
+                now_secs: 10_000_000,
+            },
+        );
+        proof.finish(permit, &messages);
+
+        assert!(outcome.total_tokens_freed > 0, "real compaction must run");
+        assert_eq!(
+            messages[0], head,
+            "the compactor retains the protected head"
+        );
+        assert_eq!(messages[1]["_compact_boundary"], true);
+        assert_eq!(messages[2], tail, "typed tail survives real compaction");
+
+        {
+            let (mode, packs) =
+                canonical_commit_delta(&prior, true, &messages, Some(&proof), false)
+                    .expect("verified compacted turn")
+                    .expect("nonempty canonical delta");
+            assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
+            let committed = packs.concat();
+            let users = committed
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .cloned()
+                .collect::<Vec<_>>();
+            let expected_users = if relation == Some(ObjectiveRelation::Replace) {
+                vec![tail.clone()]
+            } else {
+                vec![head.clone(), tail.clone()]
+            };
+            assert_eq!(users, expected_users, "relation: {relation:?}");
+            assert_eq!(committed.first(), expected_users.first());
+            assert_eq!(committed.last().unwrap()["content"], "done");
+            assert_eq!(
+                committed.iter().any(|message| message["role"] == "tool"),
+                true,
+                "retained execution evidence follows the commit contract",
+            );
+
+            let serialized = serde_json::to_string(&committed).unwrap();
+            let restored: Vec<Value> = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(
+                objective_context_from_messages(&restored).unwrap(),
+                expected_objective,
+                "commit/restore must preserve typed objective semantics: {relation:?}",
+            );
+        }
     }
-    messages.push(json!({
-        "role": "user",
-        "content": "do not review; translate instead",
-    }));
-    messages.push(json!({"role": "assistant", "content": "translation complete"}));
-
-    let mut engine = crate::turn::CompactionEngine::new();
-    engine.add_layer(Box::new(crate::turn::cloud::TieredCompaction::new(2, 0.0)));
-    let outcome = engine.compress_if_needed(
-        &mut messages,
-        &crate::turn::TokenBudget {
-            max_prompt_tokens: 64_000,
-            last_measured_tokens: 100_000,
-            current_round_index: None,
-            now_secs: 10_000_000,
-        },
-    );
-
-    assert!(
-        outcome.total_tokens_freed > 0,
-        "the real pipeline must compact"
-    );
-    let boundary_index = messages
-        .iter()
-        .position(|message| message["_compact_boundary"].as_bool() == Some(true))
-        .expect("tiered compaction must leave its canonical boundary marker");
-    assert_eq!(
-        boundary_index, 1,
-        "the obsolete protected user precedes the boundary"
-    );
-    assert!(
-        messages[boundary_index + 1..].iter().any(|message| {
-            message["role"] == "user" && message["content"] == "do not review; translate instead"
-        }),
-        "the newer user goal must survive in the retained tail"
-    );
-
-    let (mode, packs) = canonical_commit_delta(&[], false, &messages, None, false)
-        .expect("a compacted multi-user turn must remain committable")
-        .expect("the turn must produce a canonical delta");
-    let committed = packs.concat();
-
-    assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
-    assert_eq!(
-        committed,
-        vec![
-            json!({
-                "role": "user",
-                "content": "do not review; translate instead",
-            }),
-            json!({
-                "role": "assistant",
-                "content": "translation complete",
-            }),
-        ],
-        "the newer user must replace the obsolete pre-boundary anchor"
-    );
 }
 
 #[test]
