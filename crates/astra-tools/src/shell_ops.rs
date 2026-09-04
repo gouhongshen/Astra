@@ -6137,6 +6137,11 @@ printf 'probe.txt:1:needle\n'
     fn validate_execute_bash_blocks_top5_security_risks() {
         for command in [
             "dd if=/dev/zero of=/dev/sda",
+            "exec -a alias dd if=/dev/zero of=/dev/sda",
+            "sudo -D /tmp dd if=/dev/zero of=/dev/sda",
+            "doas -a passwd dd if=/dev/zero of=/dev/sda",
+            "pkexec --user root dd if=/dev/zero of=/dev/sda",
+            "env -u HOME dd if=/dev/zero of=/dev/sda",
             "bash --norc -c 'dd if=/dev/zero of=/dev/sda'",
             "env MODE=secure bash --rcfile /tmp/bashrc -c 'wipefs -a /dev/sdb'",
             "busybox dd if=/dev/zero of=/dev/sda",
