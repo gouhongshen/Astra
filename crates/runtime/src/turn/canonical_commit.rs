@@ -392,7 +392,10 @@ mod tests {
         let wal_base =
             astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
 
-        let mut invalid = CanonicalRewriteProof::new(&durable, &base.root_hash, 4);
+        let base_manifest_root = "a".repeat(64);
+        assert_ne!(base_manifest_root, base.root_hash);
+        let mut invalid =
+            CanonicalRewriteProof::from_materialized_admission(&durable, &base_manifest_root, 4);
         let rewritten = vec![json!({
             "role": "system",
             "content": "summary with hf_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
@@ -404,7 +407,8 @@ mod tests {
             None
         );
 
-        let mut valid = CanonicalRewriteProof::new(&durable, &base.root_hash, 4);
+        let mut valid =
+            CanonicalRewriteProof::from_materialized_admission(&durable, &base_manifest_root, 4);
         let permit = valid.begin(&durable);
         valid.finish(permit, &rewritten, Some(&wal_base));
         let authorization = valid
@@ -462,7 +466,10 @@ mod tests {
         let base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
         let wal_base =
             astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
-        let mut live = CanonicalRewriteProof::new(&durable, &base.root_hash, 7);
+        let base_manifest_root = "a".repeat(64);
+        assert_ne!(base_manifest_root, base.root_hash);
+        let mut live =
+            CanonicalRewriteProof::from_materialized_admission(&durable, &base_manifest_root, 7);
         let mut source = durable.clone();
         source.push(json!({"role": "user", "content": "current"}));
         let permit = live.begin(&source);
@@ -483,7 +490,8 @@ mod tests {
 
         let mut recovered = durable.clone();
         transition.apply_to(&mut recovered).unwrap();
-        let mut restored_proof = CanonicalRewriteProof::new(&durable, &base.root_hash, 7);
+        let mut restored_proof =
+            CanonicalRewriteProof::from_materialized_admission(&durable, &base_manifest_root, 7);
         restored_proof
             .recover_provider_wal_replacement(&wal_base, &transition, &recovered)
             .unwrap();

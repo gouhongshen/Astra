@@ -206,13 +206,12 @@ pub use inference_execution::{
     admit_inference_invocation_with_first_provider_attempt, begin_inference_provider_attempt,
     declare_inference_attempt_settlement, declare_inference_settlement,
     finish_inference_invocation, finish_inference_provider_attempt,
+    finish_successful_inference_provider_attempt_and_invocation,
     load_inference_canonical_transitions_for_session, next_inference_logical_attempt_pair_base,
     plan_inference_invocation, plan_inference_provider_attempt,
     plan_inference_provider_attempt_with_context, reconcile_inference_settlement,
     reconcile_inference_settlements, renew_inference_invocation_owner,
-    retire_inference_canonical_transitions_through_turn,
-    finish_successful_inference_provider_attempt_and_invocation,
-    settle_uncertain_inference_admission,
+    retire_inference_canonical_transitions_through_turn, settle_uncertain_inference_admission,
 };
 pub use interaction_contract::{
     InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,

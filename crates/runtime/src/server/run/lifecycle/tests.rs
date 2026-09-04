@@ -832,8 +832,14 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
 
         // Admit an actual prefix, then prove the real compaction rewrites it.
         let prior = messages[..7].to_vec();
-        let root = astra_turn_types::canonical_conversation_root(&prior);
-        let mut proof = CanonicalRewriteProof::new(&prior, &root, 0);
+        let base_manifest_root = "a".repeat(64);
+        assert_ne!(
+            base_manifest_root,
+            astra_turn_types::canonical_conversation_root(&prior),
+            "the regression requires distinct manifest and conversation hash domains"
+        );
+        let mut proof =
+            CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
         let permit = proof.begin(&messages);
         let mut engine = crate::turn::CompactionEngine::new();
         engine.add_layer(Box::new(crate::turn::cloud::TieredCompaction::new(2, 0.0)));
