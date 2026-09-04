@@ -147,9 +147,7 @@ fn message_has_tool_calls(m: &Value) -> bool {
 
 fn retained_history_messages(messages: &[Value]) -> &[Value] {
     match messages.split_last() {
-        Some((last, history)) if last.get("role").and_then(Value::as_str) == Some("user") => {
-            history
-        }
+        Some((last, history)) if astra_turn_types::is_human_user_message(last) => history,
         _ => messages,
     }
 }
@@ -193,19 +191,38 @@ fn project_cross_session_memory_hits(
 fn build_retained_history_turns(
     messages: &[Value],
 ) -> Vec<astra_turn_core::context_assembly_trace::TurnRetention> {
-    let mut turns = Vec::new();
+    let mut turns: Vec<astra_turn_core::context_assembly_trace::TurnRetention> = Vec::new();
 
     for message in messages {
+        let content = msg_content(message);
         let role = message
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
-        let tokens = prompts::estimate_str_tokens(&msg_content(message)) as u32;
+        let tokens = prompts::estimate_str_tokens(&content) as u32;
         let has_tool_calls = message_has_tool_calls(message);
-        let preview = retained_history_preview(&role, &msg_content(message));
+        if astra_turn_types::is_runtime_owned_message(message) {
+            // Provider occupancy still includes append-only authority, but
+            // user-facing history previews and semantic role summaries must
+            // never expose or attribute runtime control payloads to a human.
+            if let Some(turn) = turns.last_mut() {
+                turn.tokens = turn.tokens.saturating_add(tokens);
+                turn.has_tool_calls |= has_tool_calls;
+            } else {
+                turns.push(astra_turn_core::context_assembly_trace::TurnRetention {
+                    turn_index: 0,
+                    role: "runtime".to_string(),
+                    tokens,
+                    has_tool_calls,
+                    content_preview: String::new(),
+                });
+            }
+            continue;
+        }
+        let preview = retained_history_preview(&role, &content);
 
-        if turns.is_empty() || role == "user" {
+        if turns.is_empty() || astra_turn_types::is_human_user_message(message) {
             turns.push(astra_turn_core::context_assembly_trace::TurnRetention {
                 turn_index: turns.len() as u32,
                 role,
@@ -217,7 +234,7 @@ fn build_retained_history_turns(
         }
 
         if let Some(turn) = turns.last_mut() {
-            turn.tokens += tokens;
+            turn.tokens = turn.tokens.saturating_add(tokens);
             turn.has_tool_calls |= has_tool_calls;
             if retained_turn_role_priority(&role) > retained_turn_role_priority(&turn.role) {
                 turn.role = role;
@@ -2351,6 +2368,7 @@ mod tests {
                 "advisories": [{"kind": "test_signal"}]
             }),
             round_index: 3,
+            attempt_leased: false,
         };
         let required: Vec<String> = Vec::new();
         let volatile_texts: Vec<String> = Vec::new();
@@ -2653,6 +2671,44 @@ mod tests {
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].role, "assistant");
         assert!(turns[0].has_tool_calls);
+    }
+
+    #[test]
+    fn retained_history_accounts_runtime_tokens_without_exposing_control_preview() {
+        use astra_runtime::prompts;
+
+        let mut authority = json!({
+            "role": "user",
+            "content": "<runtime-authority-frame>\ninternal Work settlement\n</runtime-authority-frame>"
+        });
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "final_work_synthesis",
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        );
+        let messages = vec![
+            json!({"role": "user", "content": "real request"}),
+            authority,
+            json!({"role": "assistant", "content": "visible answer"}),
+        ];
+        let expected_tokens = messages
+            .iter()
+            .map(|message| prompts::estimate_str_tokens(&msg_content(message)) as u32)
+            .fold(0_u32, u32::saturating_add);
+
+        let turns = build_retained_history_turns(&messages);
+
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].tokens, expected_tokens);
+        assert_eq!(turns[0].role, "assistant");
+        assert!(turns[0].content_preview.contains("real request"));
+        assert!(turns[0].content_preview.contains("visible answer"));
+        assert!(!turns[0].content_preview.contains("runtime-authority-frame"));
+        assert!(
+            !turns[0]
+                .content_preview
+                .contains("internal Work settlement")
+        );
     }
 
     #[test]

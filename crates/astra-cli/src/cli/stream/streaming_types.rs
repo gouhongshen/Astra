@@ -440,8 +440,7 @@ fn user_inputs_from_current_turn(
     let user_contents = messages
         .iter()
         .filter_map(|message| {
-            let role = message.get("role")?.as_str()?;
-            if role != "user" {
+            if !astra_turn_types::is_human_user_message(message) {
                 return None;
             }
             let content = message.get("content")?.as_str()?.trim();
@@ -518,6 +517,26 @@ mod user_input_tests {
 
         assert_eq!(effective_user_input_from_messages("1", &messages), "1\n\n2");
         assert_eq!(latest_user_input_from_messages("1", &messages), "2");
+    }
+
+    #[test]
+    fn effective_user_input_excludes_user_role_runtime_authority() {
+        let mut authority = json!({"role": "user", "content": "runtime settlement"});
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let messages = vec![json!({"role": "user", "content": "real task"}), authority];
+
+        assert_eq!(
+            effective_user_input_from_messages("real task", &messages),
+            "real task"
+        );
+        assert_eq!(
+            latest_user_input_from_messages("real task", &messages),
+            "real task"
+        );
     }
 
     #[test]

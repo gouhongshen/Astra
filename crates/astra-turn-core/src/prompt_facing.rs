@@ -7,7 +7,10 @@
 //! must retain raw runtime history.
 
 use crate::conversation_log::SessionStateCompact;
-use astra_turn_types::{RuntimeMessageDelivery, is_runtime_owned_message, runtime_owned_message};
+use astra_turn_types::{
+    RuntimeMessageDelivery, is_runtime_owned_message, runtime_message_delivery,
+    runtime_owned_message,
+};
 use serde_json::{Value, json};
 
 const MAX_PROMPT_FACING_MESSAGES: usize = 40;
@@ -154,8 +157,10 @@ pub fn sanitize_prompt_facing_messages_with_state(
 /// Unlike the compact prompt-facing transcript above, a continuation is fed
 /// back through the context optimizer. It therefore retains completed tool
 /// call/result groups as model evidence instead of deleting them before the
-/// optimizer can make a pressure-aware decision. Runtime-owned controls and
-/// orphaned tool frames are still removed at this trust boundary.
+/// optimizer can make a pressure-aware decision. Durable append-only required
+/// controls retain their exact position and provenance for provider-prefix
+/// reconstruction; other runtime-owned controls and orphaned tool frames are
+/// still removed at this trust boundary.
 pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
     messages: Vec<Value>,
 ) -> Result<Vec<Value>, astra_turn_types::UserTurnSemanticsError> {
@@ -197,8 +202,10 @@ fn sanitize_canonical_continuation_messages_impl(
         .into_iter()
         .skip(start)
         .filter_map(|mut message| {
+            let append_only_required = runtime_message_delivery(&message)
+                == Some(RuntimeMessageDelivery::AppendOnlyRequiredContext);
             let keep = message.get("_compact_boundary").and_then(Value::as_bool) != Some(true)
-                && !is_runtime_owned_message(&message);
+                && (append_only_required || !is_runtime_owned_message(&message));
             if !keep {
                 return None;
             }
@@ -212,6 +219,13 @@ fn sanitize_canonical_continuation_messages_impl(
     let mut has_user_context = false;
     while index < messages.len() {
         let message = &messages[index];
+        if runtime_message_delivery(message)
+            == Some(RuntimeMessageDelivery::AppendOnlyRequiredContext)
+        {
+            out.push(message.clone());
+            index += 1;
+            continue;
+        }
         let role = message.get("role").and_then(Value::as_str).unwrap_or("");
         match role {
             "user" | "system" => {
@@ -267,9 +281,16 @@ pub fn sanitize_completed_canonical_turn_messages_with_turn_semantics(
     let mut out = Vec::new();
     let mut has_user_context = false;
     for message in messages.into_iter().skip(start) {
-        if message.get("_compact_boundary").and_then(Value::as_bool) == Some(true)
-            || is_runtime_owned_message(&message)
+        if message.get("_compact_boundary").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if runtime_message_delivery(&message)
+            == Some(RuntimeMessageDelivery::AppendOnlyRequiredContext)
         {
+            out.push(message);
+            continue;
+        }
+        if is_runtime_owned_message(&message) {
             continue;
         }
         let role = message.get("role").and_then(Value::as_str).unwrap_or("");
@@ -667,11 +688,16 @@ fn trim_to_recent_messages(mut messages: Vec<Value>) -> Vec<Value> {
 mod tests {
     use super::{
         recover_canonical_continuation_messages_with_turn_semantics, runtime_recap_message,
-        sanitize_canonical_continuation_messages_with_state, sanitize_prompt_facing_messages,
-        sanitize_prompt_facing_messages_with_state, sanitize_user_visible_messages,
+        sanitize_canonical_continuation_messages_with_state,
+        sanitize_completed_canonical_turn_messages_with_turn_semantics,
+        sanitize_prompt_facing_messages, sanitize_prompt_facing_messages_with_state,
+        sanitize_user_visible_messages,
     };
     use crate::conversation_log::{DelegationCompact, SessionStateCompact};
-    use astra_turn_types::{RuntimeMessageDelivery, runtime_owned_message};
+    use astra_turn_types::{
+        RuntimeAuthorityLifetime, RuntimeMessageDelivery, mark_append_only_required_context,
+        runtime_owned_message,
+    };
     use serde_json::{Value, json};
 
     #[test]
@@ -864,6 +890,36 @@ mod tests {
             super::sanitize_completed_canonical_turn_messages_with_turn_semantics(messages)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn canonical_continuation_preserves_append_only_authority_without_making_it_user_visible() {
+        let mut authority = json!({
+            "role": "user",
+            "content": "<runtime-authority-frame>\nsettlement\n</runtime-authority-frame>"
+        });
+        mark_append_only_required_context(
+            &mut authority,
+            "final_answer_settlement",
+            RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let messages = vec![
+            json!({"role": "user", "content": "finish the change"}),
+            authority.clone(),
+            json!({"role": "assistant", "content": "I need one verification"}),
+        ];
+
+        let continuation = sanitize_canonical_continuation_messages_with_state(
+            messages.clone(),
+            &SessionStateCompact::default(),
+        )
+        .expect("valid canonical history");
+        assert_eq!(continuation[1], authority);
+        let completed =
+            sanitize_completed_canonical_turn_messages_with_turn_semantics(messages.clone())
+                .expect("valid completed history");
+        assert_eq!(completed[1], authority);
+        assert_eq!(sanitize_prompt_facing_messages(messages).len(), 2);
     }
 
     #[test]

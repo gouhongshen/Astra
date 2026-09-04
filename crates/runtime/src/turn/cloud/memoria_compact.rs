@@ -1004,7 +1004,7 @@ fn collapse_whitespace(s: &str) -> String {
 }
 
 fn message_user_text(m: &Value) -> Option<String> {
-    if m.get("role").and_then(Value::as_str) != Some("user") {
+    if !astra_turn_types::is_human_user_message(m) {
         return None;
     }
     let c = m.get("content")?;
@@ -1495,6 +1495,20 @@ mod tests {
     }
 
     #[test]
+    fn retrieve_query_ignores_user_role_runtime_authority() {
+        let mut authority = user("runtime settlement is not the task");
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let q = memoria_compact_retrieve_query(&[user("fix the parser"), authority]);
+
+        assert!(q.contains("fix the parser"));
+        assert!(!q.contains("runtime settlement"));
+    }
+
+    #[test]
     fn retrieve_query_dedupes_tool_names() {
         let tc = json!([
             {"id": "1", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
@@ -1910,8 +1924,9 @@ mod tests {
             summary_min_tier: CompactionTier::AggressivePrune,
             ..Default::default()
         };
-        let summary_client =
-            MockSummaryClient::success("User discussed OAuth then switched to JWT auth.");
+        let summary_client = MockSummaryClient::success(
+            "### Primary Request\nImplement authentication.\n### Pending Tasks\nNone.\n### Current Work\nSwitched from OAuth to JWT auth.\n### Current State\nJWT auth selected.",
+        );
 
         let result = compact_with_memoria(
             &msgs,
@@ -1926,7 +1941,7 @@ mod tests {
 
         assert_eq!(result.messages, msgs, "summary must not become history");
         assert_eq!(result.runtime_contexts.len(), 1);
-        assert!(result.runtime_contexts[0].contains("switched to JWT auth"));
+        assert!(result.runtime_contexts[0].contains("Switched from OAuth to JWT auth"));
         assert!(
             result.session_memory_context.is_none(),
             "raw legacy working text is not canonical session memory"

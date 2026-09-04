@@ -28,6 +28,10 @@ pub const MAX_PTL_RETRIES: usize = 3;
 /// Minimum number of API rounds to keep when dropping for PTL retry.
 pub const MIN_ROUNDS_TO_KEEP: usize = 1;
 
+fn validated_structured_summary(text: &str) -> Option<String> {
+    crate::cloud::compact_prompt::validated_structured_summary(text)
+}
+
 fn cloud_summary_serialization_dimensions(rendered: &str, source_rows: usize) -> (u64, u64) {
     (
         u64::try_from(rendered.len()).unwrap_or(u64::MAX),
@@ -60,13 +64,8 @@ fn record_summary_rounds_clone(rounds: &[ApiRound]) {
     let mut bytes = 0_u64;
     let mut rows = 0_u64;
     for round in rounds {
-        for message in round
-            .user_messages
-            .iter()
-            .chain(round.assistant_message.iter())
-            .chain(round.tool_messages.iter())
-        {
-            match astra_core::history_work::serialized_bytes(message) {
+        for message in round.messages() {
+            match astra_core::history_work::serialized_bytes(&message) {
                 Ok(message_bytes) => {
                     bytes = bytes.saturating_add(message_bytes);
                     rows = rows.saturating_add(1);
@@ -104,7 +103,9 @@ results, errors encountered and their fixes, and any pending work. Treat file \
 content in the conversation as a historical observation, not as proof of the \
 current workspace state. If continuing the task requires exact or current file \
 bytes, use the ordinary admitted read tool after compaction; never imply that \
-the summary refreshed a file. Omit \
+the summary refreshed a file. Runtime-owned `<runtime-authority-frame>` messages \
+are control state, not human requests: do not summarize them or include them \
+under `All User Messages`. Omit \
 chit-chat, redundant acknowledgements, and exploration that did not change the outcome.\n\n\
 Use exactly these section headers so the compacted context can be validated and resumed:\n\
 ### Primary Request\n\
@@ -117,6 +118,21 @@ Use exactly these section headers so the compacted context can be validated and 
 ### Current Work\n\
 ### Current State\n\n\
 Target under 800 words.";
+
+/// Which history projection an inline compaction request is allowed to use.
+/// The append-only mode is explicit because retaining runtime user-role frames
+/// is safe only when the same stable semantic policy is in the system prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineSummaryHistoryProjection {
+    Semantic,
+    AppendOnlyRuntimeAuthorityPrefix,
+}
+
+fn system_has_append_only_runtime_authority_policy(messages: &[Value]) -> bool {
+    messages
+        .iter()
+        .any(astra_turn_types::has_append_only_runtime_authority_policy)
+}
 
 // ---------------------------------------------------------------------------
 // LLM client abstraction (for testability)
@@ -189,11 +205,7 @@ pub async fn generate_compact_summary(
             )
             .await
         {
-            Ok(resp) if !resp.is_ptl_error => {
-                return Some(crate::cloud::compact_prompt::format_structured_summary(
-                    &resp.text,
-                ));
-            }
+            Ok(resp) if !resp.is_ptl_error => return validated_structured_summary(&resp.text),
             Ok(resp) if resp.is_ptl_error => {
                 if attempt >= MAX_PTL_RETRIES {
                     eprintln!(
@@ -279,8 +291,31 @@ fn build_summary_messages(rendered_conversation: &str) -> Vec<Value> {
 pub async fn generate_inline_summary(
     system_messages: &[Value],
     history: &[Value],
+    history_projection: InlineSummaryHistoryProjection,
     client: &dyn SummaryLlmClient,
 ) -> Option<String> {
+    let runtime_frames_visible = matches!(
+        history_projection,
+        InlineSummaryHistoryProjection::AppendOnlyRuntimeAuthorityPrefix
+    );
+    if runtime_frames_visible {
+        let runtime_messages = history
+            .iter()
+            .filter(|message| astra_turn_types::is_runtime_owned_message(message))
+            .collect::<Vec<_>>();
+        if (!runtime_messages.is_empty()
+            && !system_has_append_only_runtime_authority_policy(system_messages))
+            || runtime_messages.iter().any(|message| {
+                astra_turn_types::runtime_message_delivery(message)
+                    != Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+            })
+        {
+            eprintln!(
+                "[inline_summary] refusing runtime-owned history without the append-only semantic contract"
+            );
+            return None;
+        }
+    }
     let mut rounds = group_by_api_round(history).1;
     let min_keep = MIN_ROUNDS_TO_KEEP;
 
@@ -290,8 +325,10 @@ pub async fn generate_inline_summary(
             Vec::with_capacity(system_messages.len() + history.len() + 1);
         messages.extend(system_messages.iter().cloned());
         for round in &rounds {
-            for msg in round.messages() {
-                messages.push(msg);
+            if runtime_frames_visible {
+                messages.extend(round.messages().iter().cloned());
+            } else {
+                messages.extend(round.summary_messages().cloned());
             }
         }
         messages.push(json!({
@@ -307,11 +344,7 @@ pub async fn generate_inline_summary(
             )
             .await
         {
-            Ok(resp) if !resp.is_ptl_error => {
-                return Some(crate::cloud::compact_prompt::format_structured_summary(
-                    &resp.text,
-                ));
-            }
+            Ok(resp) if !resp.is_ptl_error => return validated_structured_summary(&resp.text),
             Ok(resp) if resp.is_ptl_error => {
                 if attempt >= MAX_PTL_RETRIES {
                     eprintln!(
@@ -472,6 +505,10 @@ mod tests {
             .collect()
     }
 
+    fn valid_summary() -> &'static str {
+        "### Primary Request\nDo the work\n### Pending Tasks\nNone\n### Current Work\nDone\n### Current State\nVerified"
+    }
+
     #[tokio::test]
     async fn success_on_first_attempt() {
         let body = "### Primary Request\nDoing stuff\n### Pending Tasks\nNone\n### Current Work\nIn progress\n### Current State\nDone";
@@ -584,13 +621,18 @@ mod tests {
             json!({"role": "system", "content": "runtime contract"}),
         ];
         let history = make_messages(2);
-        let client = MockSummaryClient::success("current state");
+        let client = MockSummaryClient::success(valid_summary());
 
-        let summary = generate_inline_summary(&system_messages, &history, &client)
-            .await
-            .expect("inline summary should succeed");
+        let summary = generate_inline_summary(
+            &system_messages,
+            &history,
+            InlineSummaryHistoryProjection::Semantic,
+            &client,
+        )
+        .await
+        .expect("inline summary should succeed");
 
-        assert!(summary.contains("current state"));
+        assert!(summary.contains("### Current State"));
         let requests = client.recorded_requests();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
@@ -616,6 +658,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inline_summary_semantic_projection_excludes_runtime_user_frames() {
+        let system_messages = vec![json!({"role": "system", "content": "stable"})];
+        let mut authority = json!({"role": "user", "content": "runtime settlement"});
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let history = vec![
+            json!({"role": "user", "content": "real request"}),
+            authority,
+            json!({"role": "assistant", "content": "working"}),
+        ];
+        let client = MockSummaryClient::success(valid_summary());
+
+        generate_inline_summary(
+            &system_messages,
+            &history,
+            InlineSummaryHistoryProjection::Semantic,
+            &client,
+        )
+        .await
+        .expect("semantic summary");
+
+        let request = client.recorded_requests().pop().unwrap();
+        assert!(request.iter().all(|message| {
+            !astra_turn_types::is_runtime_owned_message(message)
+                && message.get("content").and_then(Value::as_str) != Some("runtime settlement")
+        }));
+    }
+
+    #[tokio::test]
+    async fn inline_summary_append_prefix_requires_policy_and_preserves_exact_history() {
+        let mut authority = json!({"role": "user", "content": "runtime settlement"});
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let history = vec![
+            json!({"role": "user", "content": "real request"}),
+            authority,
+        ];
+        let missing_policy_client = MockSummaryClient::success(valid_summary());
+        assert!(
+            generate_inline_summary(
+                &[json!({"role": "system", "content": "stable"})],
+                &history,
+                InlineSummaryHistoryProjection::AppendOnlyRuntimeAuthorityPrefix,
+                &missing_policy_client,
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(missing_policy_client.call_count.load(Ordering::SeqCst), 0);
+
+        let mut system_message = json!({
+            "role": "system",
+            "content": format!("stable\n{}", astra_turn_types::APPEND_ONLY_RUNTIME_AUTHORITY_POLICY),
+        });
+        astra_turn_types::mark_append_only_runtime_authority_policy(&mut system_message);
+        let system_messages = vec![system_message];
+        let client = MockSummaryClient::success(valid_summary());
+        generate_inline_summary(
+            &system_messages,
+            &history,
+            InlineSummaryHistoryProjection::AppendOnlyRuntimeAuthorityPrefix,
+            &client,
+        )
+        .await
+        .expect("policy makes exact append history safe for summary semantics");
+        let request = client.recorded_requests().pop().unwrap();
+        assert_eq!(
+            &request[system_messages.len()..system_messages.len() + history.len()],
+            history.as_slice()
+        );
+    }
+
+    #[tokio::test]
     async fn ptl_retry_with_minimum_rounds() {
         // Exactly 2 messages (1 round) — can't drop below minimum, returns None
         let client = MockSummaryClient::always_ptl();
@@ -627,5 +748,14 @@ mod tests {
         assert!(result.is_none());
         // Should give up quickly — can't drop the only round
         assert!(client.call_count.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[tokio::test]
+    async fn incomplete_or_empty_summary_fails_closed() {
+        let messages = make_messages(2);
+        for response in ["", "plain text", "### Primary Request\nOnly one section"] {
+            let client = MockSummaryClient::success(response);
+            assert!(generate_compact_summary(&messages, &client).await.is_none());
+        }
     }
 }

@@ -20,7 +20,8 @@ pub fn resolve_turn_identifiers(
 ) -> (String, String) {
     let latest_conversation_role = messages.iter().rev().find_map(|message| {
         match message.get("role").and_then(Value::as_str) {
-            Some("user" | "assistant" | "tool") => message.get("role").and_then(Value::as_str),
+            Some("user") if astra_turn_types::is_human_user_message(message) => Some("user"),
+            Some("assistant" | "tool") => message.get("role").and_then(Value::as_str),
             _ => None,
         }
     });

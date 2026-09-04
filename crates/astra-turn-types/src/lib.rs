@@ -13,6 +13,7 @@ mod inference;
 mod memory_ranking;
 mod memory_structure;
 mod phase_receipt;
+mod provider_canonical_transition;
 mod provider_contract;
 mod result_quality;
 mod resume;
@@ -59,6 +60,14 @@ pub use phase_receipt::{
     TURN_PHASE_EVENT_TYPE, TURN_PHASE_SCHEMA_VERSION, TurnPhaseKindV1, TurnPhaseOutcomeV1,
     TurnPhaseReceiptV1,
 };
+pub use provider_canonical_transition::{
+    CanonicalPrefixIdentityV1, MAX_PROVIDER_CANONICAL_RECOVERY_BYTES,
+    MAX_PROVIDER_CANONICAL_TRANSITION_BYTES, MAX_PROVIDER_CANONICAL_TRANSITION_DURABLE_BYTES,
+    MAX_PROVIDER_CANONICAL_WAL_BYTES, MAX_PROVIDER_CANONICAL_WAL_ENTRIES,
+    PROVIDER_CANONICAL_TRANSITION_SCHEMA_VERSION, ProviderCanonicalHistoryIdentityV2,
+    ProviderCanonicalRecoveryModeV2, ProviderCanonicalTransitionApply,
+    ProviderCanonicalTransitionError, ProviderCanonicalTransitionV2, ProviderCanonicalWalBaseV2,
+};
 pub use provider_contract::{
     DescriptorVersion, NativeToolId, PROVIDER_INTERACTION_REQUEST_METADATA_KEY,
     PROVIDER_INTERACTION_RESPONSE_METADATA_KEY, ProviderBindingRef, ProviderCallOutcome,
@@ -83,8 +92,16 @@ pub use resume::{
     ResumeSourceV1, cursor_relation, select_resume_bundle, select_resume_candidate_index,
 };
 pub use runtime_scaffolding::{
-    RUNTIME_MESSAGE_PROVENANCE_FIELD, RuntimeMessageDelivery, is_runtime_owned_message,
-    mark_runtime_owned_message, runtime_message_delivery, runtime_owned_message,
+    APPEND_ONLY_RUNTIME_AUTHORITY_POLICY, APPEND_ONLY_RUNTIME_AUTHORITY_POLICY_FIELD,
+    ParsedRuntimeAuthorityFrame, RUNTIME_MESSAGE_PROVENANCE_FIELD, RuntimeAuthorityFrameError,
+    RuntimeAuthorityLifetime, RuntimeMessageDelivery,
+    active_append_only_authority_protected_suffix_start, append_only_runtime_authority_is_active,
+    has_append_only_runtime_authority_policy, is_human_user_message, is_runtime_owned_message,
+    is_runtime_owned_provenance, mark_append_only_required_context,
+    mark_append_only_runtime_authority_policy, mark_runtime_owned_message,
+    parse_append_only_runtime_authority_frame, render_append_only_runtime_authority_frame,
+    runtime_authority_kind, runtime_authority_lifetime, runtime_message_delivery,
+    runtime_message_delivery_from_provenance, runtime_owned_message,
 };
 pub use semantic_read_cache::{
     SEMANTIC_READ_CACHE_CONTRACT_VERSION, SEMANTIC_READ_CONDITION_ACK_METADATA_KEY,

@@ -100,8 +100,7 @@ pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
                     .delta
                     .iter()
                     .chain(view.full.iter())
-                    .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
-                    .and_then(|m| m.get("content").and_then(|v| v.as_str()))
+                    .find_map(human_user_text)
                     .unwrap_or("(unknown)")
                     .to_string(),
                 tokens_in: 0,
@@ -172,6 +171,12 @@ pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
         }
         inspect_turn(turn_n, &turns[turn_n - 1], view.as_ref(), &session_id);
     }
+}
+
+fn human_user_text(message: &serde_json::Value) -> Option<&str> {
+    astra_turn_types::is_human_user_message(message)
+        .then(|| message.get("content").and_then(serde_json::Value::as_str))
+        .flatten()
 }
 
 // ── Overview ──────────────────────────────────────────────────────────────────
@@ -1126,7 +1131,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_turn_messages_view, list_heavy_checkpoints, load_journal_turns,
+        build_turn_messages_view, human_user_text, list_heavy_checkpoints, load_journal_turns,
         load_messages_from_heavy_path, message_delta, resolve_session_id, truncate,
     };
     use serde_json::json;
@@ -1392,6 +1397,20 @@ mod tests {
         assert_eq!(v.delta.len(), 1);
         assert_eq!(v.full.len(), 2);
         assert_eq!(v.warning, None);
+    }
+
+    #[test]
+    fn checkpoint_fallback_preview_excludes_runtime_user_frame() {
+        let human = json!({"role": "user", "content": "real request"});
+        let mut runtime = json!({"role": "user", "content": "runtime control"});
+        astra_turn_types::mark_append_only_required_context(
+            &mut runtime,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+
+        assert_eq!(human_user_text(&human), Some("real request"));
+        assert_eq!(human_user_text(&runtime), None);
     }
 
     // ── format_tool_display_from_preview ──────────────────────────────

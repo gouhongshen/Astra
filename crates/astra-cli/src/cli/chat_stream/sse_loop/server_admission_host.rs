@@ -723,7 +723,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         let effective_model_owned = self.model.map(str::to_owned);
         let effective_model = effective_model_owned.as_deref();
         let effective_offering_id = self.offering_id.as_deref();
-        let runtime_volatile_injections = state.take_volatile_pending();
+        let runtime_volatile_injections = state.lease_volatile_pending()?;
         let runtime_volatile_texts = self
             .input_runtime_volatile_texts
             .iter()

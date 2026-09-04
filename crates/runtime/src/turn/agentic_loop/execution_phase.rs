@@ -428,6 +428,8 @@ pub(crate) fn successful_post_mutation_observation(state: &AgenticLoopState) -> 
                 state.hooks.workspace_root_hint.as_deref(),
             )
         });
+        let full_scope_explicit_verification =
+            super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(record);
         // Executing the delivered artifact is useful behavioral evidence even
         // when the interpreter emits incidental files (for example Python
         // bytecode), but an opaque script writer cannot prove its own change.
@@ -458,7 +460,9 @@ pub(crate) fn successful_post_mutation_observation(state: &AgenticLoopState) -> 
                 });
         if record.ok
             && super::lifecycle::record_can_observe_bound_workspace(state, record)
-            && (literal_script_command.is_none() || latest_epoch_delivered_artifact)
+            && (full_scope_explicit_verification
+                || literal_script_command.is_none()
+                || latest_epoch_delivered_artifact)
         {
             // A compound shell invocation may contain both the mutation and
             // its post-mutation receipt.  Count the receipt before closing
@@ -3808,8 +3812,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
     let mut turn_result = match turn_result {
-        Ok(turn_result) => turn_result,
+        Ok(turn_result) => {
+            state.commit_volatile_attempt_lease();
+            turn_result
+        }
         Err(error) => {
+            state.restore_volatile_attempt_lease();
             fold_provider_completion_error_usage(state, &error);
             if schedule_safe_provider_recovery(state, &error) {
                 tracing::warn!(
@@ -7829,6 +7837,209 @@ mod tests {
             !successful_post_mutation_observation(&unbound),
             "literal artifact identity must fail closed without a bound workspace root"
         );
+    }
+
+    fn typed_writer_record(path: &str) -> ToolCallRecord {
+        let args = serde_json::json!({"path": path, "content": "updated"}).to_string();
+        let mut record = executed_record("write_file", true, Some(&args));
+        record.runtime_args_full = Some(args);
+        record
+    }
+
+    fn full_scope_verify_record() -> ToolCallRecord {
+        let args = serde_json::json!({
+            "command": "ls -la /app/program.py /app/requirements.txt && python3 /app/program.py",
+            "mode": "verify",
+        })
+        .to_string();
+        let fields = astra_tools::workspace_observation::explicit_workspace_verification_receipt();
+        ToolCallRecord {
+            name: "bash".into(),
+            ok: true,
+            disposition: Some(ToolCallDisposition::Executed),
+            args_full: Some(args.clone()),
+            runtime_args_full: Some(args),
+            workspace_mutation_scope: Some(
+                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
+            ),
+            workspace_mutation_receipt: fields
+                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                .cloned(),
+            ..ToolCallRecord::default()
+        }
+    }
+
+    #[test]
+    fn live_full_scope_verify_receipt_settles_multi_file_mutation_batch_in_either_order() {
+        for paths in [
+            ["/app/program.py", "/app/requirements.txt"],
+            ["/app/requirements.txt", "/app/program.py"],
+        ] {
+            let mut state = make_state();
+            mark_must_mutate(&mut state);
+            state.hooks.workspace_root_hint = Some("/app".into());
+            state.stall.tool_call_records = vec![
+                typed_writer_record(paths[0]),
+                typed_writer_record(paths[1]),
+                full_scope_verify_record(),
+            ];
+            state.hooks.completion_settlement.completion_action_window =
+                Some(super::super::host::CompletionActionWindow {
+                    action: CompletionAction::PostMutationObservation,
+                    attempts_remaining: 0,
+                    mismatch_corrections_remaining: 0,
+                    consumed: true,
+                    matched: true,
+                });
+
+            assert!(has_concrete_workspace_mutation(&state));
+            assert!(successful_post_mutation_observation(&state));
+            assert_eq!(pending_completion_action(&state), None);
+            assert_eq!(
+                enforce_completion_action_window_before_text_completion(&mut state),
+                CompletionActionBoundary::Settled
+            );
+            assert!(state.interruption.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn edge_callback_v2_metadata_survives_record_ingestion_and_settles_completion() {
+        let mut program_write = make_edge_tool("write_file", "program written");
+        program_write.request_id = "edge-write-program".into();
+        program_write.args = serde_json::json!({
+            "path": "/app/program.py",
+            "content": "print('ok')",
+        });
+        let mut requirements_write = make_edge_tool("write_file", "requirements written");
+        requirements_write.request_id = "edge-write-requirements".into();
+        requirements_write.args = serde_json::json!({
+            "path": "/app/requirements.txt",
+            "content": "dependency>=1",
+        });
+
+        let mut verify = make_edge_tool("bash", "program and requirements verified");
+        verify.request_id = "edge-verify-workspace".into();
+        verify.args = serde_json::json!({
+            "command": "ls -la /app/program.py /app/requirements.txt && python3 /app/program.py",
+            "mode": "verify",
+        });
+        verify
+            .tool_result_fields
+            .as_mut()
+            .expect("edge callback fixture carries owner metadata")
+            .extend(astra_tools::workspace_observation::explicit_workspace_verification_receipt());
+
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![program_write, requirements_write], 20, 10, Some(30)),
+            text_result("The files are ready.", 20, 10, Some(30)),
+            edge_tool_result(vec![verify], 20, 10, Some(30)),
+            text_result("The files are ready and verified.", 20, 10, Some(30)),
+        ])
+        .with_valid_tools(&["write_file", "bash"]);
+        let mut state = make_state();
+        mark_must_mutate(&mut state);
+        state.hooks.workspace_root_hint = Some("/app".into());
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .expect("typed edge receipt should settle the run");
+
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+        assert_eq!(host.turn_count(), 4);
+        let verify_record = state
+            .stall
+            .tool_call_records
+            .iter()
+            .find(|record| record.tool_call_id.as_deref() == Some("edge-verify-workspace"))
+            .expect("edge callback must become a tool record");
+        assert!(verify_record.runtime_args_full.is_some());
+        assert!(
+            super::super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(
+                verify_record
+            )
+        );
+        assert!(successful_post_mutation_observation(&state));
+        assert_eq!(pending_completion_action(&state), None);
+        assert!(state.interruption.is_none());
+        assert_eq!(state.final_text, "The files are ready and verified.");
+    }
+
+    #[test]
+    fn full_scope_verify_receipt_fails_closed_on_invalid_or_stale_authority() {
+        fn state_with(record: ToolCallRecord) -> AgenticLoopState {
+            let mut state = make_state();
+            mark_must_mutate(&mut state);
+            state.hooks.workspace_root_hint = Some("/app".into());
+            state.stall.tool_call_records = vec![
+                typed_writer_record("/app/program.py"),
+                typed_writer_record("/app/requirements.txt"),
+                record,
+            ];
+            state
+        }
+
+        let mut missing_receipt = full_scope_verify_record();
+        missing_receipt.workspace_mutation_receipt = None;
+
+        let mut wrong_scope = full_scope_verify_record();
+        wrong_scope.workspace_mutation_scope = Some("declared_external_state".into());
+
+        let mut wrong_args = full_scope_verify_record();
+        let args = serde_json::json!({
+            "command": "ls -la /app/program.py /app/requirements.txt && python3 /app/program.py",
+        })
+        .to_string();
+        wrong_args.args_full = Some(args.clone());
+        wrong_args.runtime_args_full = Some(args);
+
+        let mut failed = full_scope_verify_record();
+        failed.ok = false;
+
+        let mut changed = full_scope_verify_record();
+        changed.workspace_mutation_observed = Some(true);
+
+        let mut restored = full_scope_verify_record();
+        restored.runtime_args_full = None;
+
+        for (record, reason) in [
+            (missing_receipt, "missing v2 receipt"),
+            (wrong_scope, "wrong observation scope"),
+            (wrong_args, "wrong invocation arguments"),
+            (failed, "failed verification"),
+            (changed, "contradictory changed workspace"),
+            (
+                restored,
+                "restored receipt without live invocation authority",
+            ),
+        ] {
+            let state = state_with(record);
+            assert!(!successful_post_mutation_observation(&state), "{reason}");
+            assert_eq!(
+                pending_completion_action(&state),
+                Some(CompletionAction::PostMutationObservation),
+                "{reason}"
+            );
+        }
+
+        let mut stale = state_with(full_scope_verify_record());
+        stale
+            .stall
+            .tool_call_records
+            .push(typed_writer_record("/app/later.txt"));
+        assert!(!successful_post_mutation_observation(&stale));
+        assert_eq!(
+            pending_completion_action(&stale),
+            Some(CompletionAction::PostMutationObservation)
+        );
+
+        let mut quarantined = state_with(full_scope_verify_record());
+        quarantined.stall.workspace_observation_quarantine = Some(
+            astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::partial_workspace_mutation(
+                Some("unsettled-call".into()),
+            ),
+        );
+        assert!(!successful_post_mutation_observation(&quarantined));
     }
 
     #[tokio::test]

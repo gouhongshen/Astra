@@ -243,9 +243,7 @@ fn record_current_user_turn_semantics(state: &mut AgenticLoopState, intent: &Tur
         .enumerate()
         .rev()
         .find_map(|(index, message)| {
-            if message.get("role").and_then(Value::as_str) != Some("user")
-                || astra_turn_types::is_runtime_owned_message(message)
-            {
+            if !astra_turn_types::is_human_user_message(message) {
                 return None;
             }
             let content = astra_turn_core::prompt_facing::extract_text_content(message)?;
@@ -988,17 +986,41 @@ pub(crate) fn record_has_typed_workspace_observation_receipt(
         .unwrap_or(&Value::Null);
     record.was_executed()
         && record.ok
+        // An invocation cannot truthfully be both an unchanged observation
+        // and a workspace mutation. Fail closed on contradictory executor
+        // metadata instead of letting the observation half settle a newer
+        // mutation epoch.
+        && record.workspace_mutation_observed != Some(true)
         && ((astra_tools::workspace_observation::is_typed_workspace_observer(&record.name)
             && astra_tools::workspace_observation::is_typed_workspace_observation_receipt(receipt))
-            || (astra_tools::workspace_observation::is_explicit_workspace_verification_request(
-                &record.name,
-                &args,
-            )
+            || (record.runtime_args_full.is_some()
+                && astra_tools::workspace_observation::is_explicit_workspace_verification_request(
+                    &record.name,
+                    &args,
+                )
                 && astra_tools::workspace_observation::is_explicit_workspace_verification_receipt(
                     receipt,
                 )))
         && record.workspace_mutation_scope.as_deref()
             == Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE)
+}
+
+/// An executor-owned Bash verification receipt covers the whole bound
+/// workspace for the live invocation that minted it.  Keep this typed lane
+/// distinct from legacy shell-shape observations: the latter may need an
+/// exact delivered-artifact correlation, while a v2 receipt was produced only
+/// after the owner held the workspace observation lease and proved an
+/// unchanged pre/post fingerprint.
+pub(crate) fn record_has_full_scope_explicit_workspace_verification_receipt(
+    record: &astra_services::session_journal::ToolCallRecord,
+) -> bool {
+    record_has_typed_workspace_observation_receipt(record)
+        && astra_tools::workspace_observation::is_explicit_workspace_verification_receipt(
+            record
+                .workspace_mutation_receipt
+                .as_ref()
+                .unwrap_or(&Value::Null),
+        )
 }
 
 fn recent_turns_are_repetitive(state: &AgenticLoopState) -> bool {
@@ -4860,6 +4882,49 @@ mod tests {
             ..Default::default()
         };
         assert!(record_has_typed_workspace_observation_receipt(&record));
+        assert!(record_has_full_scope_explicit_workspace_verification_receipt(&record));
+
+        record.runtime_args_full = None;
+        assert!(!record_has_typed_workspace_observation_receipt(&record));
+        record.runtime_args_full = record.args_full.clone();
+
+        record.workspace_mutation_observed = Some(true);
+        assert!(!record_has_typed_workspace_observation_receipt(&record));
+        record.workspace_mutation_observed = None;
+
+        let typed_observer_receipt =
+            astra_tools::workspace_observation::typed_workspace_observation_receipt();
+        let typed_observer = ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+            args_full: Some(json!({"path": "/workspace/result"}).to_string()),
+            runtime_args_full: Some(json!({"path": "/workspace/result"}).to_string()),
+            workspace_mutation_scope: Some(
+                astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into(),
+            ),
+            workspace_mutation_receipt: typed_observer_receipt
+                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                .cloned(),
+            ..Default::default()
+        };
+        assert!(record_has_typed_workspace_observation_receipt(
+            &typed_observer
+        ));
+        assert!(
+            !record_has_full_scope_explicit_workspace_verification_receipt(&typed_observer),
+            "a typed read receipt must not be promoted to full-scope Bash verification"
+        );
+
+        let mut wrong_tool_v2 = typed_observer;
+        wrong_tool_v2.workspace_mutation_receipt = record.workspace_mutation_receipt.clone();
+        assert!(!record_has_typed_workspace_observation_receipt(
+            &wrong_tool_v2
+        ));
+        assert!(
+            !record_has_full_scope_explicit_workspace_verification_receipt(&wrong_tool_v2),
+            "the v2 payload alone must not authorize a non-Bash tool"
+        );
 
         record.args_full = Some(json!({"command": "pytest -q"}).to_string());
         record.runtime_args_full = record.args_full.clone();

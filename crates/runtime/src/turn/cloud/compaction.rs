@@ -271,17 +271,17 @@ fn truncate_tool_results_to_serialized_budget(
 }
 
 fn prune_oldest_conversation_span(messages: &mut Vec<Value>) -> bool {
+    let protected_suffix_start =
+        astra_turn_types::active_append_only_authority_protected_suffix_start(messages);
     let first_user_idx = messages
         .iter()
-        .position(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+        .position(astra_turn_types::is_human_user_message);
     let conversation_indices: Vec<usize> = messages
         .iter()
         .enumerate()
         .filter_map(|(index, message)| {
-            matches!(
-                message.get("role").and_then(Value::as_str),
-                Some("user" | "assistant")
-            )
+            (astra_turn_types::is_human_user_message(message)
+                || message.get("role").and_then(Value::as_str) == Some("assistant"))
             .then_some(index)
         })
         .collect();
@@ -302,11 +302,16 @@ fn prune_oldest_conversation_span(messages: &mut Vec<Value>) -> bool {
         .unwrap_or_default();
     let Some(next_tail_start) = conversation_indices.iter().copied().find(|index| {
         *index > tail_start
-            && (tail_role != "user"
-                || messages[*index].get("role").and_then(Value::as_str) == Some("user"))
+            && (tail_role != "user" || astra_turn_types::is_human_user_message(&messages[*index]))
     }) else {
         return false;
     };
+    if protected_suffix_start.is_some_and(|protected| next_tail_start > protected) {
+        // The proposed drain would split the current human turn from active
+        // append-only authority. The provider prefix and Work/control
+        // semantics require this suffix to survive as one ordered span.
+        return false;
+    }
 
     let before = messages.len();
     *messages = messages
@@ -640,15 +645,18 @@ pub(crate) fn compact_tiered_impl(
     }
 
     if tier == CompactionTier::AggressivePrune {
+        let protected_suffix_start =
+            astra_turn_types::active_append_only_authority_protected_suffix_start(&compacted);
         let first_user_idx = compacted
             .iter()
-            .position(|m| m.get("role").and_then(Value::as_str) == Some("user"));
+            .position(astra_turn_types::is_human_user_message);
         let conv_indices: Vec<usize> = compacted
             .iter()
             .enumerate()
             .filter_map(|(i, m)| {
-                let role = m.get("role").and_then(Value::as_str).unwrap_or("");
-                (role == "user" || role == "assistant").then_some(i)
+                (astra_turn_types::is_human_user_message(m)
+                    || m.get("role").and_then(Value::as_str) == Some("assistant"))
+                .then_some(i)
             })
             .collect();
         let keep_count = keep_recent_turns * 2;
@@ -657,7 +665,11 @@ pub(crate) fn compact_tiered_impl(
             // messages in isolation. Tool results live between those control
             // messages; retaining them while deleting their assistant
             // `tool_calls` frame produces provider-invalid history.
-            let tail_start = conv_indices[conv_indices.len() - keep_count.max(1)];
+            let tail_start = protected_suffix_start
+                .map(|protected| {
+                    protected.min(conv_indices[conv_indices.len() - keep_count.max(1)])
+                })
+                .unwrap_or_else(|| conv_indices[conv_indices.len() - keep_count.max(1)]);
             compacted = compacted
                 .into_iter()
                 .enumerate()
@@ -815,6 +827,97 @@ mod tests {
                 result.messages
             );
         }
+    }
+
+    fn append_authority(
+        content: &str,
+        kind: &str,
+        lifetime: astra_turn_types::RuntimeAuthorityLifetime,
+    ) -> Value {
+        let mut message = json!({"role": "user", "content": content});
+        astra_turn_types::mark_append_only_required_context(&mut message, kind, lifetime);
+        message
+    }
+
+    #[test]
+    fn aggressive_prune_preserves_active_append_authority_with_its_human_turn() {
+        let mut messages = vec![
+            user("current human goal"),
+            append_authority(
+                "active Work contract",
+                "active_work_attempt_start",
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            ),
+        ];
+        for index in 0..12 {
+            messages.push(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("active-{index}"),
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }));
+            messages.push(tool_with_id(
+                &format!("active-{index}"),
+                &format!("evidence {index}: {}", "x".repeat(500)),
+            ));
+        }
+
+        let result =
+            compact_tiered_with_result(&messages, 1, 100, CompactionTier::AggressivePrune, 2);
+
+        let human_index = result
+            .messages
+            .iter()
+            .position(|message| {
+                message.get("content").and_then(Value::as_str) == Some("current human goal")
+            })
+            .expect("human turn anchor survives");
+        let authority_index = result
+            .messages
+            .iter()
+            .position(|message| {
+                astra_turn_types::runtime_authority_kind(message)
+                    == Some("active_work_attempt_start")
+            })
+            .expect("active authority survives");
+        assert!(human_index < authority_index);
+        assert_eq!(
+            astra_turn_types::active_append_only_authority_protected_suffix_start(&result.messages),
+            Some(human_index)
+        );
+        assert!(
+            !prune_oldest_conversation_span(&mut result.messages.clone()),
+            "repeated budget pruning must stop before splitting the protected current-turn suffix"
+        );
+    }
+
+    #[test]
+    fn aggressive_prune_may_remove_append_authority_expired_by_later_human_turn() {
+        let messages = vec![
+            user("session anchor"),
+            user("old goal"),
+            append_authority(
+                "expired control",
+                "old_work",
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            ),
+            assistant("old answer"),
+            user("current goal"),
+            assistant("current answer"),
+        ];
+
+        let result =
+            compact_tiered_with_result(&messages, 1, 100, CompactionTier::AggressivePrune, 1);
+
+        assert!(result.messages.iter().all(|message| {
+            message.get("content").and_then(Value::as_str) != Some("expired control")
+        }));
+        assert!(result.messages.iter().any(|message| {
+            message.get("content").and_then(Value::as_str) == Some("current goal")
+        }));
     }
 
     // --- CompactResult / CompactBoundary tests ---

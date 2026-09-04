@@ -305,9 +305,9 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             .as_deref()
             .map(|model| astra_turn_core::thinking_config::resolve_model_thinking(model).1)
             .unwrap_or_default();
-        let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
-            effective_model.as_deref().unwrap_or(""),
-        );
+        // The model alias does not establish a cache protocol. The admitted
+        // server execution owns provider-specific request shaping.
+        let compact_strategy = astra_turn_core::microcompact::CompactStrategy::default();
         // Resolve per-model workflow-guard policy up front; `effective_model`
         // is moved into the SubRunHost below.
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
@@ -496,6 +496,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
             current_run_owner_generation: None,
+            provider_canonical_wal_head: None,
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
@@ -624,6 +625,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
+            provider_canonical_wal_base: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,

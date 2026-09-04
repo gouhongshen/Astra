@@ -991,7 +991,7 @@ fn restored_recent_turn_previews(
     for message in restored.resume_messages() {
         let role = message.get("role").and_then(serde_json::Value::as_str);
         match role {
-            Some("user") => {
+            Some("user") if astra_turn_types::is_human_user_message(message) => {
                 pending_user = extract_text_content(message);
             }
             Some("assistant") => {
@@ -1446,7 +1446,7 @@ mod tests {
         EventPreview, analysis_view_recent_event_previews, build_reflect_response,
         cli_provider_visible_tool_names, event_preview_has_adverse_signal, event_preview_summary,
         execute_self_command, persist_config_override, replace_json_path, resolve_session_id,
-        session_agent_delivery_summary, verify_runtime_config,
+        restored_recent_turn_previews, session_agent_delivery_summary, verify_runtime_config,
     };
     use crate::cli::cli_config::cli_args::{SelfCmd, SelfReflectArgs, SelfSessionArgs};
     use crate::cli::cli_config::cli_utils::{
@@ -1487,6 +1487,43 @@ mod tests {
         ] {
             assert!(summary.contains(evidence), "{summary}");
         }
+    }
+
+    #[test]
+    fn restored_preview_does_not_show_runtime_authority_as_user_input() {
+        let mut runtime = serde_json::json!({"role": "user", "content": "runtime control"});
+        astra_turn_types::mark_append_only_required_context(
+            &mut runtime,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "real request"}),
+            runtime,
+            serde_json::json!({"role": "assistant", "content": "answer"}),
+        ];
+        let artifacts = astra_services::self_surface::LoadedSelfSurfaceArtifacts {
+            session_id: "sid".to_string(),
+            workspace: None,
+            restored: Some(astra_services::session_restore::RestoredSession {
+                session_id: "sid".to_string(),
+                resume_bundle: Some(typed_resume_bundle("sid", 1, messages)),
+                ..Default::default()
+            }),
+            journal_events: Vec::new(),
+            latest_full_context_trace: None,
+        };
+
+        let previews = restored_recent_turn_previews(&artifacts, 4);
+        assert_eq!(previews.len(), 1);
+        assert_eq!(
+            previews[0].user_input_preview.as_deref(),
+            Some("real request")
+        );
+        assert_eq!(
+            previews[0].assistant_output_preview.as_deref(),
+            Some("answer")
+        );
     }
 
     #[test]

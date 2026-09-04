@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-08-25-v67";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-04-v70";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1469,6 +1469,55 @@ where
     Ok(())
 }
 
+pub struct AgentEventEdgeInsert<'a> {
+    pub user_id: &'a str,
+    pub session_id: &'a str,
+    pub child_event_id: &'a str,
+    pub primary_parent_event_id: Option<&'a str>,
+    pub parent_event_ids: &'a [String],
+}
+
+pub async fn insert_agent_event_edges_batch<'e, E>(
+    executor: E,
+    edges: &[AgentEventEdgeInsert<'_>],
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = MySql>,
+{
+    let normalized = edges
+        .iter()
+        .flat_map(|edge| {
+            normalized_parent_event_ids(edge.primary_parent_event_id, Some(edge.parent_event_ids))
+                .into_iter()
+                .enumerate()
+                .map(move |(index, parent_event_id)| (edge, index, parent_event_id))
+        })
+        .collect::<Vec<_>>();
+    if normalized.is_empty() {
+        return Ok(());
+    }
+
+    let mut builder = QueryBuilder::<MySql>::new(
+        "INSERT INTO agent_event_edges \
+         (user_id, session_id, child_event_id, parent_event_id, relation_kind, parent_order) ",
+    );
+    builder.push_values(normalized, |mut row, (edge, index, parent_event_id)| {
+        row.push_bind(edge.user_id)
+            .push_bind(edge.session_id)
+            .push_bind(edge.child_event_id)
+            .push_bind(parent_event_id)
+            .push_bind(CAUSAL_EDGE_KIND)
+            .push_bind(i32::try_from(index).unwrap_or(i32::MAX));
+    });
+    builder.push(
+        " ON DUPLICATE KEY UPDATE \
+         session_id = VALUES(session_id), \
+         parent_order = VALUES(parent_order)",
+    );
+    builder.build().execute(executor).await?;
+    Ok(())
+}
+
 pub async fn insert_agent_event_edges<'e, E>(
     executor: E,
     user_id: &str,
@@ -1480,33 +1529,17 @@ pub async fn insert_agent_event_edges<'e, E>(
 where
     E: sqlx::Executor<'e, Database = MySql>,
 {
-    let normalized = normalized_parent_event_ids(primary_parent_event_id, Some(parent_event_ids));
-    if normalized.is_empty() {
-        return Ok(());
-    }
-
-    let mut builder = QueryBuilder::<MySql>::new(
-        "INSERT INTO agent_event_edges \
-         (user_id, session_id, child_event_id, parent_event_id, relation_kind, parent_order) ",
-    );
-    builder.push_values(
-        normalized.iter().enumerate(),
-        |mut row, (idx, parent_event_id)| {
-            row.push_bind(user_id)
-                .push_bind(session_id)
-                .push_bind(child_event_id)
-                .push_bind(parent_event_id)
-                .push_bind(CAUSAL_EDGE_KIND)
-                .push_bind(i32::try_from(idx).unwrap_or(i32::MAX));
-        },
-    );
-    builder.push(
-        " ON DUPLICATE KEY UPDATE \
-         session_id = VALUES(session_id), \
-         parent_order = VALUES(parent_order)",
-    );
-    builder.build().execute(executor).await?;
-    Ok(())
+    insert_agent_event_edges_batch(
+        executor,
+        &[AgentEventEdgeInsert {
+            user_id,
+            session_id,
+            child_event_id,
+            primary_parent_event_id,
+            parent_event_ids,
+        }],
+    )
+    .await
 }
 
 pub async fn load_agent_event_parent_ids<'e, E>(
@@ -2440,6 +2473,34 @@ fn inference_provider_attempt_schema_mismatches(
         None => reasons.push("missing nullable column context_expired_at".to_string()),
     }
 
+    for (name, expected_type, expected_width) in [
+        ("canonical_transition_id", "char", Some(64_i64)),
+        ("canonical_parent_transition_id", "char", Some(64_i64)),
+        ("canonical_transition_hash", "char", Some(64_i64)),
+    ] {
+        let Some(column) = columns.get(name) else {
+            reasons.push(format!("missing nullable column {name}"));
+            continue;
+        };
+        if !column.nullable {
+            reasons.push(format!("non-nullable column {name}"));
+        }
+        if !column.data_type.eq_ignore_ascii_case(expected_type) {
+            reasons.push(format!(
+                "column {name} has type {}, expected {expected_type}",
+                column.data_type
+            ));
+        }
+        if let Some(expected_width) = expected_width
+            && column.character_maximum_length != Some(expected_width)
+        {
+            reasons.push(format!(
+                "column {name} has width {:?}, expected {expected_width}",
+                column.character_maximum_length
+            ));
+        }
+    }
+
     for (name, expected_columns) in [
         ("PRIMARY", &["user_id", "attempt_id"][..]),
         (
@@ -2468,6 +2529,198 @@ fn inference_provider_attempt_schema_mismatches(
         }
     }
     reasons
+}
+
+fn inference_canonical_transition_head_schema_mismatches(
+    columns: &BTreeMap<String, ObservedColumnShape>,
+    indexes: &BTreeMap<String, ObservedIndexShape>,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for (name, expected_type, expected_width) in [
+        ("user_id", "varchar", Some(128_i64)),
+        ("session_id", "varchar", Some(64_i64)),
+        ("turn_index", "bigint", None),
+        ("head_transition_id", "char", Some(64_i64)),
+        ("head_attempt_id", "varchar", Some(64_i64)),
+        ("head_result_count", "bigint", None),
+        ("head_result_root_hash", "char", Some(64_i64)),
+        ("chain_length", "bigint", None),
+        ("chain_payload_bytes", "bigint", None),
+        ("updated_at", "datetime", None),
+    ] {
+        let Some(column) = columns.get(name) else {
+            reasons.push(format!("missing NOT NULL column {name}"));
+            continue;
+        };
+        if column.nullable {
+            reasons.push(format!("nullable column {name}"));
+        }
+        if !column.data_type.eq_ignore_ascii_case(expected_type) {
+            reasons.push(format!(
+                "column {name} has type {}, expected {expected_type}",
+                column.data_type
+            ));
+        }
+        if let Some(expected_width) = expected_width
+            && column.character_maximum_length != Some(expected_width)
+        {
+            reasons.push(format!(
+                "column {name} has width {:?}, expected {expected_width}",
+                column.character_maximum_length
+            ));
+        }
+    }
+    for (name, expected_columns) in [
+        ("PRIMARY", &["user_id", "session_id", "turn_index"][..]),
+        (
+            "uq_inference_canonical_head_attempt",
+            &["user_id", "head_attempt_id"][..],
+        ),
+    ] {
+        let Some(index) = indexes.get(name) else {
+            reasons.push(format!("missing unique constraint {name}"));
+            continue;
+        };
+        if index.non_unique {
+            reasons.push(format!("constraint {name} is not unique"));
+        }
+        if !index
+            .columns
+            .iter()
+            .map(String::as_str)
+            .eq(expected_columns.iter().copied())
+        {
+            reasons.push(format!(
+                "constraint {name} has columns ({}), expected ({})",
+                index.columns.join(", "),
+                expected_columns.join(", ")
+            ));
+        }
+    }
+    reasons
+}
+
+fn inference_canonical_transition_wal_schema_mismatches(
+    columns: &BTreeMap<String, ObservedColumnShape>,
+    indexes: &BTreeMap<String, ObservedIndexShape>,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for (name, expected_type, expected_width, nullable) in [
+        ("user_id", "varchar", Some(128_i64), false),
+        ("session_id", "varchar", Some(64_i64), false),
+        ("turn_index", "bigint", None, false),
+        ("round_index", "bigint", None, false),
+        ("logical_attempt", "bigint", None, false),
+        ("physical_attempt", "bigint", None, false),
+        ("transition_id", "char", Some(64_i64), false),
+        ("parent_transition_id", "char", Some(64_i64), true),
+        ("attempt_id", "varchar", Some(64_i64), false),
+        ("payload_hash", "char", Some(64_i64), false),
+        ("payload_bytes", "bigint", None, false),
+        ("predecessor_count", "bigint", None, false),
+        ("predecessor_root_hash", "char", Some(64_i64), false),
+        ("result_count", "bigint", None, false),
+        ("result_root_hash", "char", Some(64_i64), false),
+        ("recovery_mode", "varchar", Some(32_i64), false),
+        ("created_at", "datetime", None, false),
+    ] {
+        let Some(column) = columns.get(name) else {
+            reasons.push(format!("missing column {name}"));
+            continue;
+        };
+        if column.nullable != nullable {
+            reasons.push(format!(
+                "column {name} has nullable={}, expected {nullable}",
+                column.nullable
+            ));
+        }
+        if !column.data_type.eq_ignore_ascii_case(expected_type) {
+            reasons.push(format!(
+                "column {name} has type {}, expected {expected_type}",
+                column.data_type
+            ));
+        }
+        if let Some(expected_width) = expected_width
+            && column.character_maximum_length != Some(expected_width)
+        {
+            reasons.push(format!(
+                "column {name} has width {:?}, expected {expected_width}",
+                column.character_maximum_length
+            ));
+        }
+    }
+    match columns.get("payload_json") {
+        Some(column)
+            if !column.nullable
+                && (column.data_type.eq_ignore_ascii_case("text")
+                    || column.data_type.eq_ignore_ascii_case("longtext")) => {}
+        Some(column) if column.nullable => {
+            reasons.push("nullable column payload_json".to_string());
+        }
+        Some(column) => reasons.push(format!(
+            "column payload_json has type {}, expected text-compatible storage",
+            column.data_type
+        )),
+        None => reasons.push("missing NOT NULL column payload_json".to_string()),
+    }
+    for (name, expected_columns, expected_non_unique) in [
+        (
+            "PRIMARY",
+            &["user_id", "session_id", "turn_index", "transition_id"][..],
+            false,
+        ),
+        (
+            "uq_inference_canonical_wal_attempt",
+            &["user_id", "attempt_id"][..],
+            false,
+        ),
+        (
+            "idx_inference_canonical_wal_parent",
+            &[
+                "user_id",
+                "session_id",
+                "turn_index",
+                "parent_transition_id",
+            ][..],
+            true,
+        ),
+    ] {
+        let Some(index) = indexes.get(name) else {
+            reasons.push(format!("missing index {name}"));
+            continue;
+        };
+        if index.non_unique != expected_non_unique {
+            reasons.push(format!(
+                "index {name} has non_unique={}, expected {expected_non_unique}",
+                index.non_unique
+            ));
+        }
+        if !index
+            .columns
+            .iter()
+            .map(String::as_str)
+            .eq(expected_columns.iter().copied())
+        {
+            reasons.push(format!(
+                "index {name} has columns ({}), expected ({})",
+                index.columns.join(", "),
+                expected_columns.join(", ")
+            ));
+        }
+    }
+    reasons
+}
+
+fn inference_canonical_transition_wal_definition_mismatches(create_sql: &str) -> Vec<String> {
+    let normalized = create_sql.to_ascii_lowercase();
+    if normalized.contains("'checkpoint_from_parent'") {
+        Vec::new()
+    } else {
+        vec![
+            "recovery-mode CHECK does not admit checkpoint_from_parent; rebuild this pre-release WAL table before startup"
+                .to_string(),
+        ]
+    }
 }
 
 fn inference_invocation_schema_mismatches(
@@ -2632,6 +2885,179 @@ async fn verify_inference_provider_attempt_schema_contract(
     }
 
     let reasons = inference_provider_attempt_schema_mismatches(&columns, &indexes);
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    Err(sqlx::Error::Protocol(format!(
+        "obsolete core schema table {table} requires manual migration before startup: {}",
+        reasons.join(", ")
+    )))
+}
+
+async fn verify_inference_canonical_transition_head_schema_contract(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    let table = "inference_canonical_transition_heads";
+    let column_rows = query(
+        "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut columns = BTreeMap::new();
+    for row in column_rows {
+        let name: String = row.try_get("COLUMN_NAME")?;
+        let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
+            "YES" => true,
+            "NO" => false,
+            value => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
+                )));
+            }
+        };
+        columns.insert(
+            name,
+            ObservedColumnShape {
+                data_type: row.try_get("DATA_TYPE")?,
+                character_maximum_length: row.try_get("CHARACTER_MAXIMUM_LENGTH")?,
+                nullable,
+            },
+        );
+    }
+    let index_rows = query(
+        "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME
+         FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+           AND INDEX_NAME IN ('PRIMARY', 'uq_inference_canonical_head_attempt')
+         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut indexes = BTreeMap::<String, ObservedIndexShape>::new();
+    for row in index_rows {
+        let name: String = row.try_get("INDEX_NAME")?;
+        let non_unique = match row.try_get::<i64, _>("NON_UNIQUE")? {
+            0 => false,
+            1 => true,
+            value => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "schema constraint {table}.{name} has invalid NON_UNIQUE value {value}"
+                )));
+            }
+        };
+        let column: String = row.try_get("COLUMN_NAME")?;
+        let index = indexes
+            .entry(name.clone())
+            .or_insert_with(|| ObservedIndexShape {
+                columns: Vec::new(),
+                non_unique,
+            });
+        if index.non_unique != non_unique {
+            return Err(sqlx::Error::Protocol(format!(
+                "schema constraint {table}.{name} reports inconsistent uniqueness"
+            )));
+        }
+        index.columns.push(column);
+    }
+    let reasons = inference_canonical_transition_head_schema_mismatches(&columns, &indexes);
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    Err(sqlx::Error::Protocol(format!(
+        "obsolete core schema table {table} requires manual migration before startup: {}",
+        reasons.join(", ")
+    )))
+}
+
+async fn verify_inference_canonical_transition_wal_schema_contract(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    let table = "inference_canonical_transition_wal";
+    let column_rows = query(
+        "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut columns = BTreeMap::new();
+    for row in column_rows {
+        let name: String = row.try_get("COLUMN_NAME")?;
+        let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
+            "YES" => true,
+            "NO" => false,
+            value => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
+                )));
+            }
+        };
+        columns.insert(
+            name,
+            ObservedColumnShape {
+                data_type: row.try_get("DATA_TYPE")?,
+                character_maximum_length: row.try_get("CHARACTER_MAXIMUM_LENGTH")?,
+                nullable,
+            },
+        );
+    }
+    let index_rows = query(
+        "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME
+         FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+           AND INDEX_NAME IN ('PRIMARY', 'uq_inference_canonical_wal_attempt',
+                              'idx_inference_canonical_wal_parent')
+         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut indexes = BTreeMap::<String, ObservedIndexShape>::new();
+    for row in index_rows {
+        let name: String = row.try_get("INDEX_NAME")?;
+        let non_unique = match row.try_get::<i64, _>("NON_UNIQUE")? {
+            0 => false,
+            1 => true,
+            value => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "schema constraint {table}.{name} has invalid NON_UNIQUE value {value}"
+                )));
+            }
+        };
+        let column: String = row.try_get("COLUMN_NAME")?;
+        let index = indexes
+            .entry(name.clone())
+            .or_insert_with(|| ObservedIndexShape {
+                columns: Vec::new(),
+                non_unique,
+            });
+        if index.non_unique != non_unique {
+            return Err(sqlx::Error::Protocol(format!(
+                "schema constraint {table}.{name} reports inconsistent uniqueness"
+            )));
+        }
+        index.columns.push(column);
+    }
+    let mut reasons = inference_canonical_transition_wal_schema_mismatches(&columns, &indexes);
+    let show_create = format!("SHOW CREATE TABLE `{database}`.`{table}`");
+    let create_row = query(&show_create).fetch_one(pool).await?;
+    let create_sql: String = create_row.try_get(1_usize)?;
+    reasons.extend(inference_canonical_transition_wal_definition_mismatches(
+        &create_sql,
+    ));
     if reasons.is_empty() {
         return Ok(());
     }
@@ -3044,7 +3470,14 @@ async fn ensure_core_schema_while_leased(
     if core_schema_contract_is_current(&pool).await? {
         verify_core_schema_catalog(&pool, &settings.database).await?;
         verify_inference_invocation_schema_contract(&pool, &settings.database).await?;
-        return verify_inference_provider_attempt_schema_contract(&pool, &settings.database).await;
+        verify_inference_provider_attempt_schema_contract(&pool, &settings.database).await?;
+        verify_inference_canonical_transition_head_schema_contract(&pool, &settings.database)
+            .await?;
+        return verify_inference_canonical_transition_wal_schema_contract(
+            &pool,
+            &settings.database,
+        )
+        .await;
     }
 
     // Existing deployments may still have UUID-sized identity columns. Widen
@@ -4056,6 +4489,10 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+    sqlx::query("INSERT IGNORE INTO session_weighted_admission_gates (scope_name) VALUES (?)")
+        .bind(crate::weighted_admission::DISTRIBUTED_ADMISSION_SCOPE)
+        .execute(&pool)
+        .await?;
 
     core_schema_create!(
         pool,
@@ -6450,6 +6887,9 @@ async fn ensure_core_schema_while_leased(
             provider_protocol VARCHAR(32) NOT NULL,
             provider_wire_hash CHAR(64) NOT NULL,
             provider_wire_bytes BIGINT NOT NULL,
+            canonical_transition_id CHAR(64) NULL,
+            canonical_parent_transition_id CHAR(64) NULL,
+            canonical_transition_hash CHAR(64) NULL,
             status VARCHAR(32) NOT NULL,
             terminal_fingerprint CHAR(64) NULL,
             usage_status VARCHAR(32) NOT NULL,
@@ -6479,6 +6919,62 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_harness_started (user_id, harness_run_id, started_at, attempt_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "inference_canonical_transition_heads",
+        "CREATE TABLE IF NOT EXISTS inference_canonical_transition_heads (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            turn_index BIGINT NOT NULL,
+            head_transition_id CHAR(64) NOT NULL,
+            head_attempt_id VARCHAR(64) NOT NULL,
+            head_result_count BIGINT NOT NULL,
+            head_result_root_hash CHAR(64) NOT NULL,
+            chain_length BIGINT NOT NULL,
+            chain_payload_bytes BIGINT NOT NULL,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id, turn_index),
+            UNIQUE KEY uq_inference_canonical_head_attempt (user_id, head_attempt_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "inference_canonical_transition_wal",
+        "CREATE TABLE IF NOT EXISTS inference_canonical_transition_wal (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            turn_index BIGINT NOT NULL,
+            round_index BIGINT NOT NULL,
+            logical_attempt BIGINT NOT NULL,
+            physical_attempt BIGINT NOT NULL,
+            transition_id CHAR(64) NOT NULL,
+            parent_transition_id CHAR(64) NULL,
+            attempt_id VARCHAR(64) NOT NULL,
+            payload_json LONGTEXT NOT NULL,
+            payload_hash CHAR(64) NOT NULL,
+            payload_bytes BIGINT NOT NULL,
+            predecessor_count BIGINT NOT NULL,
+            predecessor_root_hash CHAR(64) NOT NULL,
+            result_count BIGINT NOT NULL,
+            result_root_hash CHAR(64) NOT NULL,
+            recovery_mode VARCHAR(32) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id, turn_index, transition_id),
+            UNIQUE KEY uq_inference_canonical_wal_attempt (user_id, attempt_id),
+            INDEX idx_inference_canonical_wal_parent
+                (user_id, session_id, turn_index, parent_transition_id),
+            CONSTRAINT chk_inference_canonical_wal_recovery_mode
+                CHECK (recovery_mode IN ('append_from_durable_base', 'checkpoint_from_parent', 'replace_from_durable_base')),
+            CONSTRAINT chk_inference_canonical_wal_bounds
+                CHECK (payload_bytes > 0 AND predecessor_count >= 0 AND result_count >= 0)
         )",
     )
     .execute(&pool)
@@ -6761,6 +7257,8 @@ async fn ensure_core_schema_while_leased(
     .await?;
     verify_inference_invocation_schema_contract(&pool, &settings.database).await?;
     verify_inference_provider_attempt_schema_contract(&pool, &settings.database).await?;
+    verify_inference_canonical_transition_head_schema_contract(&pool, &settings.database).await?;
+    verify_inference_canonical_transition_wal_schema_contract(&pool, &settings.database).await?;
     for (table, nullable_columns) in [
         (
             "inference_routes",
@@ -9053,6 +9551,30 @@ mod tests {
                 },
             ),
             (
+                "canonical_transition_id",
+                ObservedColumnShape {
+                    data_type: "char".to_string(),
+                    character_maximum_length: Some(64),
+                    nullable: true,
+                },
+            ),
+            (
+                "canonical_parent_transition_id",
+                ObservedColumnShape {
+                    data_type: "char".to_string(),
+                    character_maximum_length: Some(64),
+                    nullable: true,
+                },
+            ),
+            (
+                "canonical_transition_hash",
+                ObservedColumnShape {
+                    data_type: "char".to_string(),
+                    character_maximum_length: Some(64),
+                    nullable: true,
+                },
+            ),
+            (
                 "usage_status",
                 ObservedColumnShape {
                     data_type: "varchar".to_string(),
@@ -9092,6 +9614,125 @@ mod tests {
         .collect()
     }
 
+    fn canonical_transition_head_columns() -> BTreeMap<String, ObservedColumnShape> {
+        [
+            ("user_id", "varchar", Some(128), false),
+            ("session_id", "varchar", Some(64), false),
+            ("turn_index", "bigint", None, false),
+            ("head_transition_id", "char", Some(64), false),
+            ("head_attempt_id", "varchar", Some(64), false),
+            ("head_result_count", "bigint", None, false),
+            ("head_result_root_hash", "char", Some(64), false),
+            ("chain_length", "bigint", None, false),
+            ("chain_payload_bytes", "bigint", None, false),
+            ("updated_at", "datetime", None, false),
+        ]
+        .into_iter()
+        .map(|(name, data_type, character_maximum_length, nullable)| {
+            (
+                name.to_string(),
+                ObservedColumnShape {
+                    data_type: data_type.to_string(),
+                    character_maximum_length,
+                    nullable,
+                },
+            )
+        })
+        .collect()
+    }
+
+    fn canonical_transition_head_indexes() -> BTreeMap<String, ObservedIndexShape> {
+        [
+            ("PRIMARY", vec!["user_id", "session_id", "turn_index"]),
+            (
+                "uq_inference_canonical_head_attempt",
+                vec!["user_id", "head_attempt_id"],
+            ),
+        ]
+        .into_iter()
+        .map(|(name, columns)| {
+            (
+                name.to_string(),
+                ObservedIndexShape {
+                    columns: columns.into_iter().map(str::to_string).collect(),
+                    non_unique: false,
+                },
+            )
+        })
+        .collect()
+    }
+
+    fn canonical_transition_wal_columns() -> BTreeMap<String, ObservedColumnShape> {
+        [
+            ("user_id", "varchar", Some(128), false),
+            ("session_id", "varchar", Some(64), false),
+            ("turn_index", "bigint", None, false),
+            ("round_index", "bigint", None, false),
+            ("logical_attempt", "bigint", None, false),
+            ("physical_attempt", "bigint", None, false),
+            ("transition_id", "char", Some(64), false),
+            ("parent_transition_id", "char", Some(64), true),
+            ("attempt_id", "varchar", Some(64), false),
+            ("payload_json", "text", None, false),
+            ("payload_hash", "char", Some(64), false),
+            ("payload_bytes", "bigint", None, false),
+            ("predecessor_count", "bigint", None, false),
+            ("predecessor_root_hash", "char", Some(64), false),
+            ("result_count", "bigint", None, false),
+            ("result_root_hash", "char", Some(64), false),
+            ("recovery_mode", "varchar", Some(32), false),
+            ("created_at", "datetime", None, false),
+        ]
+        .into_iter()
+        .map(|(name, data_type, character_maximum_length, nullable)| {
+            (
+                name.to_string(),
+                ObservedColumnShape {
+                    data_type: data_type.to_string(),
+                    character_maximum_length,
+                    nullable,
+                },
+            )
+        })
+        .collect()
+    }
+
+    fn canonical_transition_wal_indexes() -> BTreeMap<String, ObservedIndexShape> {
+        [
+            (
+                "PRIMARY",
+                vec!["user_id", "session_id", "turn_index", "transition_id"],
+                false,
+            ),
+            (
+                "uq_inference_canonical_wal_attempt",
+                vec!["user_id", "attempt_id"],
+                false,
+            ),
+            (
+                "idx_inference_canonical_wal_parent",
+                vec![
+                    "user_id",
+                    "session_id",
+                    "turn_index",
+                    "parent_transition_id",
+                ],
+                true,
+            ),
+        ]
+        .into_iter()
+        .map(|(name, columns, non_unique)| {
+            (
+                name.to_string(),
+                ObservedIndexShape {
+                    columns: columns.into_iter().map(str::to_string).collect(),
+                    non_unique,
+                },
+            )
+        })
+        .collect()
+    }
+
     #[test]
     fn provider_attempt_schema_contract_accepts_the_exact_wire_shape() {
         assert!(
@@ -9100,6 +9741,103 @@ mod tests {
                 &canonical_provider_attempt_indexes(),
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn canonical_transition_head_schema_contract_is_exact_and_fail_closed() {
+        let exact_columns = canonical_transition_head_columns();
+        let exact_indexes = canonical_transition_head_indexes();
+        assert!(
+            inference_canonical_transition_head_schema_mismatches(&exact_columns, &exact_indexes,)
+                .is_empty()
+        );
+
+        let mut missing_id = exact_columns.clone();
+        missing_id.remove("head_transition_id");
+        assert!(
+            inference_canonical_transition_head_schema_mismatches(&missing_id, &exact_indexes)
+                .iter()
+                .any(|reason| reason.contains("missing NOT NULL column head_transition_id"))
+        );
+
+        let mut wrong_width = exact_columns.clone();
+        wrong_width
+            .get_mut("head_transition_id")
+            .unwrap()
+            .character_maximum_length = Some(32);
+        assert!(
+            inference_canonical_transition_head_schema_mismatches(&wrong_width, &exact_indexes)
+                .iter()
+                .any(|reason| reason.contains("head_transition_id has width Some(32)"))
+        );
+
+        let mut wrong_primary = exact_indexes;
+        wrong_primary.get_mut("PRIMARY").unwrap().columns.swap(1, 2);
+        assert!(
+            inference_canonical_transition_head_schema_mismatches(&exact_columns, &wrong_primary)
+                .iter()
+                .any(|reason| reason.contains("constraint PRIMARY has columns"))
+        );
+    }
+
+    #[test]
+    fn canonical_transition_wal_schema_contract_is_exact_and_fail_closed() {
+        let exact_columns = canonical_transition_wal_columns();
+        let exact_indexes = canonical_transition_wal_indexes();
+        assert!(
+            inference_canonical_transition_wal_schema_mismatches(&exact_columns, &exact_indexes,)
+                .is_empty()
+        );
+        assert!(
+            inference_canonical_transition_wal_definition_mismatches(
+                "CONSTRAINT chk CHECK (recovery_mode IN ('append_from_durable_base', 'checkpoint_from_parent', 'replace_from_durable_base'))"
+            )
+            .is_empty()
+        );
+        assert!(
+            inference_canonical_transition_wal_definition_mismatches(
+                "CONSTRAINT chk CHECK (recovery_mode IN ('append_from_durable_base', 'replace_from_durable_base'))"
+            )
+            .iter()
+            .any(|reason| reason.contains("does not admit checkpoint_from_parent"))
+        );
+
+        let mut nullable_owner = exact_columns.clone();
+        nullable_owner.get_mut("user_id").unwrap().nullable = true;
+        assert!(
+            inference_canonical_transition_wal_schema_mismatches(&nullable_owner, &exact_indexes,)
+                .iter()
+                .any(|reason| reason.contains("user_id has nullable=true"))
+        );
+
+        let mut wrong_parent_index = exact_indexes.clone();
+        wrong_parent_index
+            .get_mut("idx_inference_canonical_wal_parent")
+            .unwrap()
+            .columns
+            .remove(0);
+        assert!(
+            inference_canonical_transition_wal_schema_mismatches(
+                &exact_columns,
+                &wrong_parent_index,
+            )
+            .iter()
+            .any(|reason| reason.contains("idx_inference_canonical_wal_parent has columns"))
+        );
+
+        let mut non_unique_attempt = exact_indexes;
+        non_unique_attempt
+            .get_mut("uq_inference_canonical_wal_attempt")
+            .unwrap()
+            .non_unique = true;
+        assert!(
+            inference_canonical_transition_wal_schema_mismatches(
+                &exact_columns,
+                &non_unique_attempt,
+            )
+            .iter()
+            .any(|reason| reason.contains("uq_inference_canonical_wal_attempt has non_unique=true"))
         );
     }
 
@@ -9224,6 +9962,58 @@ mod tests {
         columns.get_mut("provider_wire_bytes").unwrap().data_type = "int".to_string();
         cases.push((
             "provider_wire_bytes has type int",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns.remove("canonical_transition_id");
+        cases.push((
+            "missing nullable column canonical_transition_id",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns
+            .get_mut("canonical_parent_transition_id")
+            .unwrap()
+            .nullable = false;
+        cases.push((
+            "non-nullable column canonical_parent_transition_id",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns
+            .get_mut("canonical_transition_id")
+            .unwrap()
+            .character_maximum_length = Some(32);
+        cases.push((
+            "canonical_transition_id has width Some(32)",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns
+            .get_mut("canonical_transition_hash")
+            .unwrap()
+            .nullable = false;
+        cases.push((
+            "non-nullable column canonical_transition_hash",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns
+            .get_mut("canonical_transition_hash")
+            .unwrap()
+            .character_maximum_length = Some(32);
+        cases.push((
+            "canonical_transition_hash has width Some(32)",
             columns,
             exact_indexes.clone(),
         ));

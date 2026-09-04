@@ -698,11 +698,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 
         // Use the working directory from config (may be a worktree)
         let effective_root = config.working_dir.clone();
-        let compact_strategy = config
-            .model
-            .as_deref()
-            .map(astra_turn_core::microcompact::CompactStrategy::from_provider_hint)
-            .unwrap_or_default();
+        // This local sub-run input carries a model alias but no authoritative
+        // deployment capability. Use the neutral deterministic strategy; the
+        // server applies the admitted provider capability at inference time.
+        let compact_strategy = astra_turn_core::microcompact::CompactStrategy::default();
 
         // Resolve the freshest token at spawn time. Without this,
         // sub-agents fail with 401 in long-running sessions after the
@@ -945,6 +944,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             current_session_id: server_session_id,
             current_run_id: Some(config.run_id.clone()),
             current_run_owner_generation: None,
+            provider_canonical_wal_head: None,
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
@@ -1052,6 +1052,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
+            provider_canonical_wal_base: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,

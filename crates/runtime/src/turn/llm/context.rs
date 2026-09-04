@@ -43,11 +43,22 @@ pub(crate) fn cache_capability_from_model_metadata(
         astra_services::PromptCacheVolatilePlacementData::TailSuffix => {
             astra_turn_core::cache_placement::VolatilePlacement::TailSuffix
         }
+        astra_services::PromptCacheVolatilePlacementData::AppendOnlyUserTail => {
+            astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+        }
         astra_services::PromptCacheVolatilePlacementData::CurrentUserOnly => {
             astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
         }
         astra_services::PromptCacheVolatilePlacementData::Free => {
             astra_turn_core::cache_placement::VolatilePlacement::Free
+        }
+    };
+    let volatile_delivery = match value.volatile_delivery {
+        astra_services::PromptCacheVolatileDeliveryData::All => {
+            astra_turn_core::cache_placement::VolatileDeliveryPolicy::All
+        }
+        astra_services::PromptCacheVolatileDeliveryData::RequiredOnly => {
+            astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly
         }
     };
     let reuse_scope = value.reuse_scope.map(|scope| match scope {
@@ -61,8 +72,21 @@ pub(crate) fn cache_capability_from_model_metadata(
     Some(astra_turn_core::cache_placement::CacheCapability {
         protocol,
         volatile_placement,
+        volatile_delivery,
         reuse_scope,
     })
+}
+
+pub(crate) fn compact_strategy_from_model_metadata(
+    value: Option<astra_services::PromptCacheCapabilityData>,
+    provider: &str,
+) -> astra_turn_core::microcompact::CompactStrategy {
+    let explicit = cache_capability_from_model_metadata(value);
+    astra_turn_core::microcompact::ProviderCacheStrategy::from_explicit_or_provider(
+        explicit,
+        Some(provider),
+    )
+    .compact_strategy
 }
 
 fn estimate_json_tokens(value: &Value) -> u32 {
@@ -484,6 +508,11 @@ pub(crate) fn augment_manifest_trace_with_provider_attempts(
                     let terminal = attempt.terminal.as_ref();
                     json!({
                         "authority": "exact_serialized_provider_body_v1",
+                        "transport_stage": if attempt.dispatch_started {
+                            "dispatch_started"
+                        } else {
+                            "prepared_and_admitted"
+                        },
                         "request_id": request.request_id,
                         "request_hash": request.request_hash,
                         "round": round,
@@ -513,6 +542,15 @@ pub(crate) fn augment_manifest_trace_with_provider_attempts(
                             "system": request.composition.system_items,
                             "conversation": request.composition.conversation_items,
                             "tool_schema": request.composition.tool_schema_items,
+                        },
+                        "provider_final_fingerprints": {
+                            "message_sequence_sha256": request.fingerprints.message_sequence_sha256,
+                            "system_sequence_sha256": request.fingerprints.system_sequence_sha256,
+                            "cache_key_system_sha256": request.fingerprints.cache_key_system_sha256,
+                            "conversation_sequence_sha256": request.fingerprints.conversation_sequence_sha256,
+                            "tool_schema_sequence_sha256": request.fingerprints.tool_schema_sequence_sha256,
+                            "cache_key_tool_schema_sequence_sha256": request.fingerprints.cache_key_tool_schema_sequence_sha256,
+                            "cache_capability": request.fingerprints.cache_capability,
                         },
                     })
                 })
@@ -1139,11 +1177,8 @@ pub(crate) fn assemble_context_pipeline(
         })
         .collect();
     let tool_names: Vec<&str> = tool_names_owned.iter().map(String::as_str).collect();
-    let cache_cap = CacheCapability::from_explicit_or_provider_model(
-        input.cache_capability,
-        input.provider,
-        input.model_name,
-    );
+    let cache_cap =
+        CacheCapability::from_explicit_or_provider(input.cache_capability, input.provider);
     if state.pipeline_session.is_none() {
         return Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::InvalidRequest,
@@ -1191,7 +1226,29 @@ pub(crate) fn assemble_context_pipeline(
             input.model_name,
         ));
     external.session_memory_entry = input.runtime_signals.session_memory_entry.clone();
-    let turn_state = build_turn_state(state, input.user_content);
+    let required_runtime_texts = astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
+        input.runtime_signals.edge_profile,
+        astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
+    );
+    let runtime_volatile_injections =
+        astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
+            input.runtime_signals.edge_profile,
+        );
+    let mut turn_state = build_turn_state(state, input.user_content);
+    let rehomed_append_only_authority = if matches!(
+        cache_cap.volatile_placement,
+        VolatilePlacement::AppendOnlyUserTail
+    ) {
+        Vec::new()
+    } else {
+        crate::turn::wire_assembly::rehome_append_only_runtime_authority(&mut turn_state.messages)
+            .map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                error.to_string(),
+            )
+        })?
+    };
     // `AgenticLoopState::max_turn_input_tokens` is an input-budget/wind-down
     // cap, and `0` is its legacy "unlimited" sentinel. The pipeline's
     // `SessionContext::model_limit` is different: it must be the concrete
@@ -1226,7 +1283,14 @@ pub(crate) fn assemble_context_pipeline(
     if !input.tool_surface.deferred_tools_block.is_empty() {
         session_ctx.deferred_tools_block = input.tool_surface.deferred_tools_block.to_string();
     }
-    let statics = crate::prompts::build_pipeline_static_sections();
+    // Prompt overrides are stable within one pipeline session, but a newly
+    // created/restored session must observe the current override files. Cache
+    // the compiled sections on PipelineSession rather than for the process.
+    let statics = state
+        .pipeline_session
+        .as_mut()
+        .expect("pipeline_session checked before context assembly")
+        .static_sections_or_init(crate::prompts::build_pipeline_static_sections);
     let agent = AgentContext {
         tool_schemas: effective_tools,
         ..Default::default()
@@ -1318,7 +1382,7 @@ pub(crate) fn assemble_context_pipeline(
     let round_within_turn = state.current_round_index;
     let inject_volatile = cache_cap.should_inject_volatile_on_round(round_within_turn);
 
-    let (system_messages, mut volatile_preamble) = match cache_cap.volatile_placement {
+    let (mut system_messages, mut volatile_preamble) = match cache_cap.volatile_placement {
         VolatilePlacement::MarkerIsolated => {
             let stable_content: Vec<Value> = pipeline_output
                 .serialized
@@ -1371,7 +1435,9 @@ pub(crate) fn assemble_context_pipeline(
             let preamble = volatile_preamble_from_text(volatile_text, inject_volatile);
             (system, preamble)
         }
-        VolatilePlacement::TailSuffix | VolatilePlacement::Free => {
+        VolatilePlacement::TailSuffix
+        | VolatilePlacement::AppendOnlyUserTail
+        | VolatilePlacement::Free => {
             let mut stable_text = String::new();
             let mut volatile_text = String::new();
             for block in &pipeline_output.serialized.system_blocks {
@@ -1386,42 +1452,35 @@ pub(crate) fn assemble_context_pipeline(
             (system, preamble)
         }
     };
-    let mut required_runtime_texts = astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
-        input.runtime_signals.edge_profile,
-        astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
-    );
-    required_runtime_texts.extend(
-        astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
-            input.runtime_signals.edge_profile,
-        )
-        .into_iter()
-        .filter(|injection| {
-            injection.delivery_class
-                == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
-        })
-        .filter_map(|injection| injection.render_for_prompt()),
-    );
+    if matches!(
+        cache_cap.volatile_placement,
+        VolatilePlacement::AppendOnlyUserTail
+    ) {
+        crate::turn::wire_assembly::ensure_append_only_runtime_authority_policy(
+            &mut system_messages,
+        );
+    }
+    volatile_preamble.splice(0..0, rehomed_append_only_authority);
     if let Some(required_text) = crate::turn::wire_assembly::required_runtime_preamble_message(
         &required_runtime_texts.join("\n\n"),
+        crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+        astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
     ) {
         volatile_preamble.push(required_text);
     }
-    let decision_feedback =
-        astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
-            input.runtime_signals.edge_profile,
-        )
-        .into_iter()
+    volatile_preamble.extend(
+        runtime_volatile_injections.into_iter()
         .filter(|injection| {
-            injection.delivery_class
-                == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::DecisionFeedback
+            matches!(
+                injection.delivery_class,
+                astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+                    | astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::DecisionFeedback
+            )
         })
-        .filter_map(|injection| injection.render_for_prompt())
-        .collect::<Vec<_>>();
-    if let Some(feedback) = crate::turn::wire_assembly::decision_feedback_preamble_message(
-        &decision_feedback.join("\n\n"),
-    ) {
-        volatile_preamble.push(feedback);
-    }
+        .filter_map(|injection| {
+            crate::turn::wire_assembly::runtime_volatile_preamble_message(&injection)
+        }),
+    );
     let stable_system_message_count = system_messages.len();
     let volatile_preamble_count = volatile_preamble.len();
     let system_prompt_tokens = system_messages
@@ -1534,7 +1593,9 @@ fn classify_pipeline_abort(
 /// This centralizes state-derived post-compaction attachments so CLI and web
 /// paths can share the same message ordering and cache-sensitive volatile
 /// placement instead of each host rebuilding this logic.
-pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Value> {
+pub(crate) fn assemble_wire_messages(
+    input: LlmWireAssemblyInput<'_>,
+) -> Result<Vec<Value>, astra_core::ClassifiedError> {
     // The real user message is already in prompt history after the first
     // boundary. Repeating the full goal plus a changing round id on every
     // tool round creates an avoidable uncached suffix. Re-emit it for a
@@ -1543,7 +1604,7 @@ pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Val
     if input.state.current_round_index == 0 || input.compaction_boundary_hit {
         queue_active_turn_frame(input.state);
     }
-    let drained = input.state.take_volatile_pending();
+    let drained = input.state.lease_volatile_pending()?;
 
     let mut skills: Vec<_> = input.state.skills.invoked.values().collect();
     skills.sort_by_key(|skill| std::cmp::Reverse(skill.invoked_at_turn));
@@ -1556,19 +1617,37 @@ pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Val
         .collect();
     let attachments = crate::turn::wire_assembly::PostCompactAttachments { invoked_skills };
 
-    crate::turn::wire_assembly::assemble_llm_messages_with_cache_capability(
-        input.system_messages,
-        input.volatile_preamble,
-        drained,
-        input.compacted_messages,
-        &attachments,
-        input.session_id,
-        input.provider,
-        input.model_name,
-        input.thinking,
-        input.cache_capability,
-        input.cache_cfg,
-    )
+    let assembly =
+        match crate::turn::wire_assembly::assemble_llm_messages_with_cache_capability_output(
+            input.system_messages,
+            input.volatile_preamble,
+            drained,
+            input.compacted_messages,
+            &attachments,
+            input.session_id,
+            input.provider,
+            input.model_name,
+            input.thinking,
+            input.cache_capability,
+            input.cache_cfg,
+        ) {
+            Ok(assembly) => assembly,
+            Err(error) => {
+                input.state.restore_volatile_attempt_lease();
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    error.to_string(),
+                ));
+            }
+        };
+    if let Err(error) = input
+        .state
+        .extend_append_only_runtime_messages(assembly.new_append_only_runtime_messages)
+    {
+        input.state.restore_volatile_attempt_lease();
+        return Err(error);
+    }
+    Ok(assembly.messages)
 }
 
 fn queue_active_turn_frame(state: &mut AgenticLoopState) {
@@ -1597,6 +1676,7 @@ fn immediate_prior_user_request(messages: &[Value], latest_user_message: &str) -
     let user_messages = messages
         .iter()
         .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .filter(|message| !astra_turn_types::is_runtime_owned_message(message))
         .filter_map(prompt_message_text)
         .collect::<Vec<_>>();
     let prior_index = match user_messages
@@ -1822,12 +1902,18 @@ pub(crate) fn augment_manifest_trace_with_wire_detail(
     let mut conversation_role_counts = BTreeMap::<String, usize>::new();
     let mut conversation_message_count = 0_usize;
     let mut system_messages = Vec::new();
+    let mut leading_system_messages = Vec::new();
+    let mut leading_system_prefix_open = true;
     for message in messages {
         let role = message_role(message);
         *message_role_counts.entry(role.clone()).or_default() += 1;
         if role == "system" {
             system_messages.push(message.clone());
+            if leading_system_prefix_open {
+                leading_system_messages.push(message.clone());
+            }
         } else {
+            leading_system_prefix_open = false;
             conversation_message_count = conversation_message_count.saturating_add(1);
             *conversation_role_counts.entry(role).or_default() += 1;
         }
@@ -1836,7 +1922,7 @@ pub(crate) fn augment_manifest_trace_with_wire_detail(
         astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
         &system_messages,
     );
-    let stable_system_prefix = stable_cache_prefix(&system_messages);
+    let stable_system_prefix = stable_cache_prefix(&leading_system_messages);
     let stable_tool_prefix = stable_cache_prefix(tool_schemas);
     let cache_layout = if message_cache_control_count + tool_cache_control_count > 0 {
         "explicit-breakpoints-v1"
@@ -1852,12 +1938,13 @@ pub(crate) fn augment_manifest_trace_with_wire_detail(
 
     if let Some(trace_obj) = trace.as_object_mut() {
         let mut wire = serde_json::json!({
-            "projection_authority": "pre_provider_messages_and_tools_v1",
+            "projection_authority": "planned_pre_client_projection_v1",
             "trace_detail": match detail {
                 WireTraceDetail::MetricsOnly => "metrics_only",
                 WireTraceDetail::Debug => "debug",
             },
             "message_count": messages.len(),
+            "leading_system_message_count": leading_system_messages.len(),
             "tool_schema_count": tool_schemas.len(),
             "message_role_counts": message_role_counts,
             "message_cache_control_count": message_cache_control_count,
@@ -2082,6 +2169,54 @@ mod context_cache_contract_tests {
         }
     }
 
+    #[test]
+    fn normalized_volatile_delivery_maps_without_behavior_guessing() {
+        let capability =
+            cache_capability_from_model_metadata(Some(astra_services::PromptCacheCapabilityData {
+                protocol: astra_services::PromptCacheProtocolData::StrictHistoryMatch,
+                volatile_placement:
+                    astra_services::PromptCacheVolatilePlacementData::CurrentUserOnly,
+                volatile_delivery: astra_services::PromptCacheVolatileDeliveryData::All,
+                reuse_scope: None,
+            }))
+            .expect("declared capability");
+
+        assert_eq!(
+            capability.volatile_delivery,
+            astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+            "runtime must map the total metadata value without inferring a behavior policy"
+        );
+    }
+
+    #[test]
+    fn declared_volatile_delivery_survives_model_metadata_mapping() {
+        let capability =
+            cache_capability_from_model_metadata(Some(astra_services::PromptCacheCapabilityData {
+                protocol: astra_services::PromptCacheProtocolData::OpenAiAutoPrefix,
+                volatile_placement: astra_services::PromptCacheVolatilePlacementData::TailSuffix,
+                volatile_delivery: astra_services::PromptCacheVolatileDeliveryData::RequiredOnly,
+                reuse_scope: Some(astra_services::PromptCacheReuseScopeData::ConversationTurns),
+            }))
+            .expect("declared capability");
+
+        assert_eq!(
+            capability.protocol,
+            astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix
+        );
+        assert_eq!(
+            capability.volatile_placement,
+            astra_turn_core::cache_placement::VolatilePlacement::TailSuffix
+        );
+        assert_eq!(
+            capability.volatile_delivery,
+            astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly
+        );
+        assert_eq!(
+            capability.reuse_scope,
+            Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns)
+        );
+    }
+
     fn tool_with_parameter_insert_order(name: &str, parameter_names: &[&str]) -> Value {
         let mut properties = Map::new();
         for parameter_name in parameter_names {
@@ -2114,6 +2249,8 @@ mod context_cache_contract_tests {
             protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
             volatile_placement:
                 astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
             reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
         }
     }
@@ -2259,6 +2396,8 @@ mod context_cache_contract_tests {
             protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
             volatile_placement:
                 astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
             reuse_scope: None,
         };
 
@@ -2456,7 +2595,7 @@ mod context_cache_contract_tests {
             json!({"role": "user", "content": "相关的测试够硬核吗？"}),
         ];
         let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
-        let cache_cfg = PromptCacheConfig::latch("openai", "gpt-4");
+        let cache_cfg = PromptCacheConfig::latch("openai");
 
         let messages = assemble_wire_messages(LlmWireAssemblyInput {
             system_messages: vec![json!({"role": "system", "content": "sys"})],
@@ -2470,7 +2609,8 @@ mod context_cache_contract_tests {
             model_name: "gpt-4",
             cache_capability: None,
             cache_cfg: &cache_cfg,
-        });
+        })
+        .unwrap();
 
         let user_text = messages
             .iter()
@@ -2489,10 +2629,85 @@ mod context_cache_contract_tests {
         assert!(runtime_system_text.contains("\"turn_id\":7"));
         assert!(runtime_system_text.contains("\"round_id\":3"));
         assert!(!message_text(&messages[0]).contains("<runtime-required-context>"));
-        assert!(
-            state.volatile_pending.is_empty(),
-            "active frame must be one-shot per LLM request"
+        assert_eq!(state.volatile_pending.len(), 1);
+        assert!(state.volatile_pending[0].attempt_leased);
+        state.commit_volatile_attempt_lease();
+        assert!(state.volatile_pending.is_empty());
+    }
+
+    #[test]
+    fn failed_wire_assembly_restores_pending_authority_transactionally() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.current_round_index = 1;
+        state.message = "finish".to_string();
+        state.messages = vec![json!({"role": "user", "content": "finish"})];
+        state.push_volatile_payload(
+            crate::turn::agentic_loop::host::VolatileKind::FinalAnswerSettlement,
+            json!({"reason": "post_mutation_observation_required"}),
         );
+        let pending_before = state.volatile_pending.clone();
+        let canonical_before = state.messages.clone();
+        let capability = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        };
+        let cache_cfg = PromptCacheConfig::from_cache_capability(Some(capability), "openai");
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let malformed = crate::turn::wire_assembly::runtime_system_context_message(
+            "missing typed authority kind",
+            true,
+        )
+        .unwrap();
+
+        let error = assemble_wire_messages(LlmWireAssemblyInput {
+            system_messages: vec![json!({"role": "system", "content": "sys"})],
+            volatile_preamble: vec![malformed],
+            compacted_messages: state.messages.clone(),
+            state: &mut state,
+            compaction_boundary_hit: false,
+            thinking: &thinking,
+            session_id: "sid",
+            provider: "openai",
+            model_name: "alias",
+            cache_capability: Some(capability),
+            cache_cfg: &cache_cfg,
+        })
+        .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert_eq!(state.messages, canonical_before);
+        assert_eq!(state.volatile_pending.len(), pending_before.len());
+        assert_eq!(state.volatile_pending[0].kind, pending_before[0].kind);
+        assert_eq!(state.volatile_pending[0].payload, pending_before[0].payload);
+        assert!(!state.volatile_pending[0].attempt_leased);
+
+        let wire = assemble_wire_messages(LlmWireAssemblyInput {
+            system_messages: vec![json!({"role": "system", "content": "sys"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: state.messages.clone(),
+            state: &mut state,
+            compaction_boundary_hit: false,
+            thinking: &thinking,
+            session_id: "sid",
+            provider: "openai",
+            model_name: "alias",
+            cache_capability: Some(capability),
+            cache_cfg: &cache_cfg,
+        })
+        .expect("retry must retain and deliver the original authority");
+        assert_eq!(state.volatile_pending.len(), 1);
+        assert!(state.volatile_pending[0].attempt_leased);
+        assert!(state.messages.iter().any(|message| {
+            astra_turn_types::runtime_authority_kind(message) == Some("final_answer_settlement")
+        }));
+        assert!(wire.iter().any(|message| {
+            message_text(message).contains("post_mutation_observation_required")
+        }));
+        state.commit_volatile_attempt_lease();
+        assert!(state.volatile_pending.is_empty());
     }
 
     #[test]
@@ -2508,6 +2723,8 @@ mod context_cache_contract_tests {
             json!({"role": "user", "content": "问题总结？"}),
         ];
         let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let cache_capability = strict_history_cache_capability();
+        let cache_cfg = PromptCacheConfig::from_cache_capability(Some(cache_capability), "openai");
         let messages = assemble_wire_messages(LlmWireAssemblyInput {
             system_messages: vec![json!({"role": "system", "content": "sys"})],
             volatile_preamble: Vec::new(),
@@ -2517,28 +2734,113 @@ mod context_cache_contract_tests {
             thinking: &thinking,
             session_id: "sid",
             provider: "openai",
-            model_name: "deepseek-v4-flash",
-            cache_capability: None,
-            cache_cfg: &PromptCacheConfig::latch("openai", "deepseek-v4-flash"),
-        });
+            model_name: "deployment-alias",
+            cache_capability: Some(cache_capability),
+            cache_cfg: &cache_cfg,
+        })
+        .unwrap();
 
         assert_eq!(
             messages.last(),
             Some(&json!({"role": "user", "content": "问题总结？"})),
             "runtime focus context must not be appended to user speech"
         );
-        let frame = messages
+        let focus_policy = messages
             .iter()
             .rev()
             .find(|message| {
                 message.get("role").and_then(Value::as_str) == Some("system")
-                    && message_text(message).contains("<runtime-required-context>")
+                    && message_text(message).contains("<runtime-focus-policy>")
             })
             .map(message_text)
-            .expect("typed active-turn frame");
-        assert!(frame.contains("不要修改，只读 review uncommitted changes"));
-        assert!(!frame.contains("immediate_prior_user_request\":\"分析整个 task 系统"));
-        assert!(frame.contains("whole session only when the user explicitly asks"));
+            .expect("stable strict-history focus policy");
+        assert!(focus_policy.contains("immediately preceding user-assistant exchange"));
+        assert!(focus_policy.contains("explicitly broadens the scope"));
+        assert!(!focus_policy.contains("问题总结？"));
+        assert!(!focus_policy.contains("不要修改，只读 review uncommitted changes"));
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message_text(message) == "不要修改，只读 review uncommitted changes"
+        }));
+    }
+
+    #[test]
+    fn edge_profile_active_turn_frame_cannot_churn_strict_provider_prefix() {
+        fn provider_messages(frame_value: &str) -> Vec<Value> {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            state.messages = vec![
+                json!({"role": "user", "content": "review the current change"}),
+                json!({"role": "assistant", "content": "I found one issue"}),
+                json!({"role": "user", "content": "summarize it"}),
+            ];
+            let mut edge_profile = serde_json::Map::new();
+            edge_profile.insert(
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
+                    .to_string(),
+                json!([astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+                    kind: "active_turn_frame".to_string(),
+                    delivery_class: astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
+                    payload: json!({"latest_user_message": frame_value, "turn_id": frame_value}),
+                    round_index: 1,
+                }]),
+            );
+            let visible_tools = vec![tool("bash")];
+            let restricted_tools = HashSet::new();
+            let cache_cfg = PromptCacheConfig::latch("openai");
+            let strict_history = strict_history_cache_capability();
+            let output = assemble_context_pipeline(LlmContextAssemblyInput {
+                state: &mut state,
+                session_id: "sid-edge-frame",
+                tool_surface: ToolSurfacePlan::from_visible_tools(
+                    &visible_tools,
+                    &restricted_tools,
+                ),
+                runtime_signals: RuntimeSignals::new(&edge_profile, None),
+                cache_cfg: &cache_cfg,
+                provider: "openai",
+                model_name: "deepseek-v4-flash",
+                context_window: Some(200_000),
+                max_completion_tokens: Some(16_384),
+                cache_capability: Some(strict_history),
+                user_content: "summarize it",
+                query_source: "test",
+            })
+            .expect("context pipeline should assemble");
+            let wire = crate::turn::wire_assembly::assemble_llm_messages_with_cache_capability(
+                output.system_messages,
+                output.volatile_preamble,
+                Vec::new(),
+                output.messages,
+                &crate::turn::wire_assembly::PostCompactAttachments::default(),
+                "sid-edge-frame",
+                "openai",
+                "deepseek-v4-flash",
+                &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                Some(strict_history),
+                &cache_cfg,
+            );
+            crate::turn::llm::client::consolidate_system_messages_for_provider(
+                &wire,
+                "openai",
+                Some(strict_history),
+            )
+        }
+
+        let first = provider_messages("frame-alpha-dynamic-value");
+        let second = provider_messages("frame-beta-dynamic-value");
+        assert_eq!(first[0]["role"], "system");
+        assert_eq!(
+            first[0], second[0],
+            "typed edge-profile frames must not alter the consolidated strict-provider prefix"
+        );
+        let system = message_text(&first[0]);
+        assert!(system.contains("active_turn_focus_policy.v1"));
+        assert!(!system.contains("frame-alpha-dynamic-value"));
+        assert!(!message_text(&second[0]).contains("frame-beta-dynamic-value"));
+        assert!(first.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message_text(message) == "summarize it"
+        }));
     }
 
     #[test]
@@ -2554,6 +2856,27 @@ mod context_cache_contract_tests {
         assert_eq!(
             immediate_prior_user_request(&messages, "问题总结？").as_deref(),
             Some("CURSOR-BETA review")
+        );
+    }
+
+    #[test]
+    fn immediate_prior_user_request_excludes_append_only_runtime_authority() {
+        let mut runtime = json!({"role": "user", "content": "runtime settlement"});
+        astra_turn_types::mark_append_only_required_context(
+            &mut runtime,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let messages = vec![
+            json!({"role": "user", "content": "actual prior goal"}),
+            runtime,
+            json!({"role": "assistant", "content": "checked"}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+
+        assert_eq!(
+            immediate_prior_user_request(&messages, "continue").as_deref(),
+            Some("actual prior goal")
         );
     }
 
@@ -2580,8 +2903,9 @@ mod context_cache_contract_tests {
             provider: "openai",
             model_name: "gpt-4",
             cache_capability: None,
-            cache_cfg: &PromptCacheConfig::latch("openai", "gpt-4"),
-        });
+            cache_cfg: &PromptCacheConfig::latch("openai"),
+        })
+        .unwrap();
 
         assert!(
             messages
@@ -2598,7 +2922,7 @@ mod context_cache_contract_tests {
         state.message = "continue".to_string();
         state.current_round_index = 1;
         let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
-        let cache_cfg = PromptCacheConfig::latch("openai", "gpt-4");
+        let cache_cfg = PromptCacheConfig::latch("openai");
 
         let without_boundary = assemble_wire_messages(LlmWireAssemblyInput {
             system_messages: vec![json!({"role": "system", "content": "sys"})],
@@ -2612,7 +2936,8 @@ mod context_cache_contract_tests {
             model_name: "gpt-4",
             cache_capability: None,
             cache_cfg: &cache_cfg,
-        });
+        })
+        .unwrap();
         assert!(
             !without_boundary
                 .iter()
@@ -2631,7 +2956,8 @@ mod context_cache_contract_tests {
             model_name: "gpt-4",
             cache_capability: None,
             cache_cfg: &cache_cfg,
-        });
+        })
+        .unwrap();
         assert!(
             with_boundary.iter().any(|message| {
                 message_text(message).contains("\"kind\":\"active_turn_frame\"")
@@ -2660,7 +2986,8 @@ mod context_cache_contract_tests {
             model_name: "gpt-4",
             cache_capability: None,
             cache_cfg: &cache_cfg,
-        });
+        })
+        .unwrap();
         assert!(
             with_second_boundary.iter().any(|message| {
                 message_text(message).contains("\"kind\":\"active_turn_frame\"")
@@ -2687,6 +3014,8 @@ mod context_cache_contract_tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                volatile_delivery:
+                    astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
@@ -2756,6 +3085,8 @@ mod context_cache_contract_tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                volatile_delivery:
+                    astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
@@ -2780,6 +3111,8 @@ mod context_cache_contract_tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                volatile_delivery:
+                    astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
@@ -3170,7 +3503,9 @@ mod context_cache_contract_tests {
                     protocol: wire.protocol,
                     provider_wire_bytes: wire.provider_wire_bytes,
                     composition: wire.composition.clone(),
+                    fingerprints: wire.fingerprints.clone(),
                 },
+                dispatch_started: true,
                 terminal: Some(astra_services::InferenceInvocationTerminal {
                     status,
                     usage,
@@ -3201,6 +3536,11 @@ mod context_cache_contract_tests {
             );
             assert_eq!(projected["request_id"], attempt.request.request_id);
             assert_eq!(projected["request_hash"], attempt.request.request_hash);
+            assert_eq!(projected["transport_stage"], "dispatch_started");
+            assert_eq!(
+                projected["provider_final_fingerprints"]["message_sequence_sha256"],
+                attempt.request.fingerprints.message_sequence_sha256
+            );
         }
         assert_ne!(
             trace["provider_request_attempts"][0]["request_hash"],
@@ -3267,8 +3607,8 @@ mod context_cache_contract_tests {
             "provider-success"
         );
         assert_eq!(
-            trace["wire"]["projection_authority"], "pre_provider_messages_and_tools_v1",
-            "the pre-provider projection remains explicitly distinct from exact body facts"
+            trace["wire"]["projection_authority"], "planned_pre_client_projection_v1",
+            "the planned projection remains explicitly distinct from exact body facts"
         );
 
         clear_manifest_provider_request(&mut trace);
@@ -3302,7 +3642,7 @@ mod context_cache_contract_tests {
         assert_eq!(trace["wire"]["message_count"], 2);
         assert_eq!(
             trace["wire"]["projection_authority"],
-            "pre_provider_messages_and_tools_v1"
+            "planned_pre_client_projection_v1"
         );
         assert_eq!(trace["wire"]["tool_schema_count"], 1);
         assert_eq!(trace["wire"]["message_cache_control_count"], 1);
@@ -3388,6 +3728,38 @@ mod context_cache_contract_tests {
         assert!(
             trace.to_string().len() < 2_048,
             "metrics trace size must not grow with message count"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_identity_hashes_only_the_contiguous_leading_system_prefix() {
+        let mut baseline = json!({});
+        let mut with_later_runtime_system = json!({});
+        augment_manifest_trace_with_wire(
+            &mut baseline,
+            &[
+                json!({"role": "system", "content": "stable"}),
+                json!({"role": "user", "content": "work"}),
+            ],
+            &[],
+        );
+        augment_manifest_trace_with_wire(
+            &mut with_later_runtime_system,
+            &[
+                json!({"role": "system", "content": "stable"}),
+                json!({"role": "user", "content": "work"}),
+                json!({"role": "system", "content": "volatile settlement"}),
+            ],
+            &[],
+        );
+
+        assert_eq!(
+            baseline["wire"]["fingerprint"]["prompt_cache_identity"]["stable_system_prefix_hash"],
+            with_later_runtime_system["wire"]["fingerprint"]["prompt_cache_identity"]["stable_system_prefix_hash"]
+        );
+        assert_ne!(
+            baseline["wire"]["fingerprint"]["system_message_sequence_sha256"],
+            with_later_runtime_system["wire"]["fingerprint"]["system_message_sequence_sha256"]
         );
     }
 

@@ -1375,6 +1375,20 @@ fi
             "export DEBIAN_FRONTEND=noninteractive",
         )
 
+    def test_post_scoring_exit_status_assignment_is_not_a_static_binding(self):
+        """Verifier bookkeeping after scoring is outside the no-score plan."""
+        script = (
+            "pytest /tests/test_outputs.py\n"
+            "EXIT_STATUS=$?\n"
+            "if [ $EXIT_STATUS -eq 0 ]; then\n"
+            "  echo 1 > /logs/verifier/reward.txt\n"
+            "fi\n"
+        )
+        plan = readiness.build_dependency_setup_plan(script, Path("test.sh"))
+
+        self.assertEqual(plan.runner_family, "pytest")
+        self.assertEqual(plan.steps, ())
+
     def test_fixture_stage_rejects_non_tests_source_and_unsafe_options(self):
         rejected = (
             "cp /tmp/input.csv .\npytest /tests/x.py\n",

@@ -3,12 +3,12 @@ pub use astra_services::storage::*;
 use std::time::Duration;
 
 use serde_json::Value;
-use sqlx::{MySql, query};
+use sqlx::{MySql, QueryBuilder, Row, query};
 
 use astra_core::canonical_names::{
     metadata_duration_ms, metadata_tool_call_id, metadata_tool_name,
 };
-use astra_core::matrixone_statement_with_null_shape;
+use astra_core::{matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnDecisionAuditRecord, TurnSkillSelectionRecord, TurnToolEventRecord,
 };
@@ -211,68 +211,148 @@ fn trace_event_insert_values(event: &TraceEvent) -> Result<TraceEventInsertValue
     })
 }
 
-pub(crate) async fn insert_trace_event(
+fn new_trace_event_indices(
+    events: &[TraceEvent],
+    existing_ids: &std::collections::BTreeSet<String>,
+) -> Vec<usize> {
+    let mut new_ids = std::collections::BTreeSet::new();
+    events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            (!existing_ids.contains(&event.event_id) && new_ids.insert(&event.event_id))
+                .then_some(index)
+        })
+        .collect()
+}
+
+pub(crate) async fn insert_trace_events(
     tx: &mut sqlx::Transaction<'_, MySql>,
-    event: &TraceEvent,
-) -> Result<bool, sqlx::Error> {
-    let values = trace_event_insert_values(event)?;
-    let insert_sql = matrixone_statement_with_null_shape(
-        "INSERT IGNORE INTO agent_events \
-         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
-          parent_event_id, causal_chain_id, run_id, parent_run_id, turn_id, turn_seq, \
-          round_index, tool_call_id, parent_agent_id, trace_kind, token_usage, \
-          llm_model_used, reasoning_content, token_input, token_output, token_total, \
-          meta_tool_name, meta_duration_ms, metadata, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        values.nullable_shape(event),
-    );
-    let result = query(&insert_sql)
-        .bind(&event.event_id)
-        .bind(&event.session_id)
-        .bind(&event.user_id)
-        .bind(event.agent_id.as_deref().unwrap_or("astra-server"))
-        .bind(env!("CARGO_PKG_VERSION"))
-        .bind(&event.event_type)
-        .bind(&event.content)
-        .bind(&event.parent_event_id)
-        .bind(&event.causal_chain_id)
-        .bind(&event.run_id)
-        .bind(&event.parent_run_id)
-        .bind(&event.turn_id)
-        .bind(event.turn_seq)
-        .bind(event.round_index)
-        .bind(&event.tool_call_id)
-        .bind(&event.parent_agent_id)
-        .bind(&event.trace_kind)
-        .bind(values.token_usage_json)
-        .bind(&event.llm_model_used)
-        .bind(&event.reasoning_content)
-        .bind(values.token_input)
-        .bind(values.token_output)
-        .bind(values.token_total)
-        .bind(&event.meta_tool_name)
-        .bind(event.meta_duration_ms)
-        .bind(values.metadata_json)
-        .bind(values.created_at)
-        .execute(&mut **tx)
-        .await?;
-    let inserted = result.rows_affected() > 0;
-    if inserted {
-        insert_agent_event_edges(
-            &mut **tx,
-            &event.user_id,
-            &event.session_id,
-            &event.event_id,
-            event.parent_event_id.as_deref(),
-            event
-                .parent_event_id
-                .as_ref()
-                .map(|id| std::slice::from_ref(id))
-                .unwrap_or(&[]),
-        )
-        .await?;
+    events: &[TraceEvent],
+) -> Result<(u64, Option<String>), sqlx::Error> {
+    let Some(first) = events.first() else {
+        return Ok((0, None));
+    };
+    if events
+        .iter()
+        .any(|event| event.user_id != first.user_id || event.session_id != first.session_id)
+    {
+        return Err(sqlx::Error::Protocol(
+            "trace event batch must belong to one user session".to_string(),
+        ));
     }
-    Ok(inserted)
+
+    // `admit_session_event_write` holds the session write fence for this
+    // transaction before this function is called. Resolve replayed identities
+    // once, then retain only the first occurrence of each new event id. This
+    // preserves one batched insert while making the returned tail identify the
+    // final row actually inserted by this delta.
+    let mut existing_query = QueryBuilder::<MySql>::new(
+        "SELECT event_id, session_id FROM agent_events WHERE user_id = ",
+    );
+    existing_query
+        .push_bind(&first.user_id)
+        .push(" AND event_id IN (");
+    {
+        let mut ids = existing_query.separated(", ");
+        for event in events {
+            ids.push_bind(&event.event_id);
+        }
+    }
+    existing_query.push(")");
+    let existing_rows = existing_query.build().fetch_all(&mut **tx).await?;
+    let mut existing_ids = std::collections::BTreeSet::new();
+    for row in existing_rows {
+        let event_id = row.try_get::<String, _>("event_id")?;
+        let existing_session_id = row.try_get::<String, _>("session_id")?;
+        if existing_session_id != first.session_id {
+            return Err(sqlx::Error::Protocol(format!(
+                "trace event id {event_id} already belongs to another session"
+            )));
+        }
+        existing_ids.insert(event_id);
+    }
+    let prepared = new_trace_event_indices(events, &existing_ids)
+        .into_iter()
+        .map(|index| trace_event_insert_values(&events[index]).map(|values| (index, values)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (inserted, last_inserted_event_id) = if prepared.is_empty() {
+        (0, None)
+    } else {
+        let mut insert = QueryBuilder::<MySql>::new(
+            "INSERT INTO agent_events \
+             (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
+              parent_event_id, causal_chain_id, run_id, parent_run_id, turn_id, turn_seq, \
+              round_index, tool_call_id, parent_agent_id, trace_kind, token_usage, \
+              llm_model_used, reasoning_content, token_input, token_output, token_total, \
+              meta_tool_name, meta_duration_ms, metadata, created_at) ",
+        );
+        insert.push_values(prepared.iter(), |mut row, (index, values)| {
+            let event = &events[*index];
+            row.push_bind(&event.event_id)
+                .push_bind(&event.session_id)
+                .push_bind(&event.user_id)
+                .push_bind(event.agent_id.as_deref().unwrap_or("astra-server"))
+                .push_bind(env!("CARGO_PKG_VERSION"))
+                .push_bind(&event.event_type)
+                .push_bind(&event.content)
+                .push_bind(&event.parent_event_id)
+                .push_bind(&event.causal_chain_id)
+                .push_bind(&event.run_id)
+                .push_bind(&event.parent_run_id)
+                .push_bind(&event.turn_id)
+                .push_bind(event.turn_seq)
+                .push_bind(event.round_index)
+                .push_bind(&event.tool_call_id)
+                .push_bind(&event.parent_agent_id)
+                .push_bind(&event.trace_kind)
+                .push_bind(&values.token_usage_json)
+                .push_bind(&event.llm_model_used)
+                .push_bind(&event.reasoning_content)
+                .push_bind(values.token_input)
+                .push_bind(values.token_output)
+                .push_bind(values.token_total)
+                .push_bind(&event.meta_tool_name)
+                .push_bind(event.meta_duration_ms)
+                .push_bind(&values.metadata_json)
+                .push_bind(&values.created_at);
+        });
+        insert.push(matrixone_null_shape_comment(
+            prepared
+                .iter()
+                .flat_map(|(index, values)| values.nullable_shape(&events[*index])),
+        ));
+        let inserted = insert.build().execute(&mut **tx).await?.rows_affected();
+        if inserted != prepared.len() as u64 {
+            return Err(sqlx::Error::Protocol(format!(
+                "trace event batch inserted {inserted} rows, expected {} under the session write fence",
+                prepared.len()
+            )));
+        }
+        let last_inserted_event_id = prepared
+            .last()
+            .map(|(index, _)| events[*index].event_id.clone());
+        (inserted, last_inserted_event_id)
+    };
+
+    // Both immutable event rows and their edge projection are idempotent
+    // inserts. Sending the complete deterministic batch lets MatrixOne report
+    // the number of newly inserted events and removes the preceding existence
+    // read. Replayed edges are ignored by their unique key, while a partial
+    // replay still repairs any missing edge rows.
+    let edge_inputs = events
+        .iter()
+        .map(|event| astra_services::storage::AgentEventEdgeInsert {
+            user_id: &event.user_id,
+            session_id: &event.session_id,
+            child_event_id: &event.event_id,
+            primary_parent_event_id: event.parent_event_id.as_deref(),
+            parent_event_ids: event.parent_event_id.as_slice(),
+        })
+        .collect::<Vec<_>>();
+    astra_services::storage::insert_agent_event_edges_batch(&mut **tx, &edge_inputs).await?;
+
+    Ok((inserted, last_inserted_event_id))
 }
 
 pub(crate) async fn insert_core_turn_event(
@@ -429,7 +509,7 @@ pub(crate) async fn insert_turn_decision_audit(
 mod tests {
     use super::{
         INSERT_CORE_TURN_EVENT_SQL, core_turn_event_insert_values, metadata_string,
-        metadata_tool_name, trace_event_insert_values,
+        metadata_tool_name, new_trace_event_indices, trace_event_insert_values,
     };
     use astra_core::matrixone_statement_with_null_shape;
     use astra_turn_core::contracts::TurnCoreEventRecord;
@@ -560,6 +640,31 @@ mod tests {
         assert_eq!(persisted["cache_read"], 4);
         assert_eq!(persisted["cache_write"], 3);
         assert_eq!(persisted["total"], 22);
+    }
+
+    #[test]
+    fn trace_batch_identifies_the_last_new_event_across_mixed_replays() {
+        let event = |id| TraceEvent::new(id, "session-1", "user-1", "trace", "runtime");
+
+        let existing_first = std::collections::BTreeSet::from(["existing".to_string()]);
+        let existing_then_new = vec![event("existing"), event("new")];
+        assert_eq!(
+            new_trace_event_indices(&existing_then_new, &existing_first),
+            vec![1]
+        );
+
+        let new_then_existing = vec![event("new"), event("existing")];
+        assert_eq!(
+            new_trace_event_indices(&new_then_existing, &existing_first),
+            vec![0]
+        );
+
+        let repeated_new = vec![event("first"), event("last"), event("first")];
+        assert_eq!(
+            new_trace_event_indices(&repeated_new, &std::collections::BTreeSet::new()),
+            vec![0, 1],
+            "the repeated tail id must not replace the final row actually inserted"
+        );
     }
 
     #[test]

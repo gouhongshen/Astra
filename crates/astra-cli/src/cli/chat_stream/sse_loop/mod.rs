@@ -519,8 +519,7 @@ pub(crate) async fn stream_chat_sse(
     // preceding prompt history is inherited context, not a new conversation
     // item for this run.
     let root_initial_transcript_item = messages.last().and_then(|message| {
-        (message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
-            .then(|| message.clone())
+        astra_turn_types::is_human_user_message(message).then(|| message.clone())
     });
 
     // ─── Context pre-fetch (disabled) ─────────────────────────────────────
@@ -828,6 +827,7 @@ pub(crate) async fn stream_chat_sse(
         current_session_id,
         current_run_id: Some(parent_turn_run_id.clone()),
         current_run_owner_generation: None,
+        provider_canonical_wal_head: None,
         inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
         context_manifest_pool: None,
         context_manifest_user_id: persist_session_artifacts.then_some(current_user_id),
@@ -1016,6 +1016,7 @@ pub(crate) async fn stream_chat_sse(
         budget_wrapup_injected: false,
         context_compression_triggered: false,
         canonical_rewrite_state: Default::default(),
+        provider_canonical_wal_base: None,
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
         skill_produced_output: false,
@@ -1031,8 +1032,8 @@ pub(crate) async fn stream_chat_sse(
         session_facts: Default::default(),
         // Canonical Server execution is the sole per-turn memory producer.
         memory_extraction_service: None,
-        compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_and_model(
-            p.provider, p.model,
+        compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_explicit_or_provider(
+            None, p.provider,
         ),
         approval_overrides: initial_approval_overrides,
         confidence_trend: Default::default(),

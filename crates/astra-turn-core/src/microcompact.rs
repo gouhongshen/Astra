@@ -84,90 +84,29 @@ impl ProviderCacheStrategy {
         }
     }
 
-    /// Derive provider cache capabilities from a provider or model hint.
-    ///
-    /// This is intentionally capability-shaped rather than placeholder-shaped:
-    /// OpenAI-compatible providers keep stable local placeholders for prefix
-    /// caching, while Anthropic-compatible providers prefer protocol-level
-    /// cache metadata and minimal local mutation.
-    pub fn from_provider_hint(provider_or_model: &str) -> Self {
-        let lower = provider_or_model.to_ascii_lowercase();
-        if lower.contains("claude") || lower.contains("anthropic") {
-            Self {
-                prompt_cache_protocol: PromptCacheProtocol::AnthropicCacheControl,
-                compact_strategy: CompactStrategy::Minimal,
-                supports_cache_control: true,
-            }
-        } else {
-            Self::default()
-        }
-    }
-
-    /// Derive provider cache capabilities with an explicit provider taking
-    /// precedence over model name. This avoids misclassifying OpenAI-compatible
-    /// proxies that serve Claude-named models.
-    pub fn from_provider_and_model(provider: Option<&str>, model: Option<&str>) -> Self {
-        if let Some(provider) = provider.filter(|value| !value.trim().is_empty()) {
-            let from_provider = Self::from_provider_hint(provider);
-            // If the provider is explicitly Anthropic, trust it.
-            if from_provider.prompt_cache_protocol == PromptCacheProtocol::AnthropicCacheControl {
-                return from_provider;
-            }
-            // If the provider is a known non-Anthropic API (OpenAI, Gemini, etc.),
-            // respect that even when the model name contains "claude" — the caller
-            // is explicitly routing through a non-Anthropic endpoint.
-            // Unknown providers (e.g. openrouter, litellm) fall through to model
-            // detection so that Claude models served via proxy get the right protocol.
-            let lower = provider.to_ascii_lowercase();
-            let is_known_non_anthropic = lower.contains("openai")
-                || lower.contains("gemini")
-                || lower.contains("google")
-                || lower.contains("mistral")
-                || lower.contains("cohere")
-                || lower.contains("groq")
-                || lower.contains("together")
-                || lower.contains("deepseek")
-                || lower.contains("qwen")
-                || lower.contains("ollama");
-            if is_known_non_anthropic {
-                return from_provider;
-            }
-        }
-        model.map(Self::from_provider_hint).unwrap_or_default()
-    }
-
+    /// Resolve compaction behavior from an explicit deployment capability or
+    /// the provider transport baseline. Model aliases are intentionally absent:
+    /// they do not prove the cache protocol used by a concrete endpoint.
     #[must_use]
-    pub fn from_explicit_or_provider_model(
+    pub fn from_explicit_or_provider(
         explicit: Option<crate::cache_placement::CacheCapability>,
         provider: Option<&str>,
-        model: Option<&str>,
     ) -> Self {
-        explicit
-            .map(Self::from_cache_capability)
-            .unwrap_or_else(|| Self::from_provider_and_model(provider, model))
+        let capability = crate::cache_placement::CacheCapability::from_explicit_or_provider(
+            explicit,
+            provider.unwrap_or_default(),
+        );
+        Self::from_cache_capability(capability)
     }
 }
 
 impl CompactStrategy {
-    /// Derive strategy from provider/model name.
-    /// Anthropic (claude) → Minimal; everything else → Normalized.
-    pub fn from_provider_hint(provider_or_model: &str) -> Self {
-        ProviderCacheStrategy::from_provider_hint(provider_or_model).compact_strategy
-    }
-
-    /// Derive strategy from explicit provider plus model fallback.
-    pub fn from_provider_and_model(provider: Option<&str>, model: Option<&str>) -> Self {
-        ProviderCacheStrategy::from_provider_and_model(provider, model).compact_strategy
-    }
-
     #[must_use]
-    pub fn from_explicit_or_provider_model(
+    pub fn from_explicit_or_provider(
         explicit: Option<crate::cache_placement::CacheCapability>,
         provider: Option<&str>,
-        model: Option<&str>,
     ) -> Self {
-        ProviderCacheStrategy::from_explicit_or_provider_model(explicit, provider, model)
-            .compact_strategy
+        ProviderCacheStrategy::from_explicit_or_provider(explicit, provider).compact_strategy
     }
 }
 
@@ -902,15 +841,15 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cache_capability_overrides_provider_model_strategy() {
-        let strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+    fn explicit_cache_capability_overrides_provider_transport_baseline() {
+        let strategy = ProviderCacheStrategy::from_explicit_or_provider(
             Some(crate::cache_placement::CacheCapability {
                 protocol: crate::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement: crate::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: crate::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(crate::cache_placement::CacheReuseScope::ConversationTurns),
             }),
             Some("openai"),
-            Some("proxy-claude"),
         );
         assert_eq!(
             strategy.prompt_cache_protocol,
@@ -2395,36 +2334,25 @@ mod tests {
     // ── Provider-aware strategy tests ──
 
     #[test]
-    fn strategy_from_provider_hint() {
+    fn strategy_uses_provider_transport_not_model_alias() {
         assert_eq!(
-            CompactStrategy::from_provider_hint("claude-sonnet-4-20250514"),
-            CompactStrategy::Minimal
+            CompactStrategy::from_explicit_or_provider(None, Some("anthropic")),
+            CompactStrategy::Minimal,
         );
         assert_eq!(
-            CompactStrategy::from_provider_hint("anthropic"),
-            CompactStrategy::Minimal
+            CompactStrategy::from_explicit_or_provider(None, Some("openai")),
+            CompactStrategy::Normalized,
         );
         assert_eq!(
-            CompactStrategy::from_provider_hint("gpt-4o"),
-            CompactStrategy::Normalized
-        );
-        assert_eq!(
-            CompactStrategy::from_provider_hint("glm-4-plus"),
-            CompactStrategy::Normalized
-        );
-        assert_eq!(
-            CompactStrategy::from_provider_hint("deepseek-chat"),
-            CompactStrategy::Normalized
-        );
-        assert_eq!(
-            CompactStrategy::from_provider_hint(""),
-            CompactStrategy::Normalized
+            CompactStrategy::from_explicit_or_provider(None, Some("claude-shaped-alias")),
+            CompactStrategy::Normalized,
+            "an opaque provider alias must not be reinterpreted as a model family",
         );
     }
 
     #[test]
     fn provider_cache_strategy_exposes_provider_capabilities() {
-        let anthropic = ProviderCacheStrategy::from_provider_hint("anthropic/claude-sonnet-4");
+        let anthropic = ProviderCacheStrategy::from_explicit_or_provider(None, Some("anthropic"));
         assert_eq!(
             anthropic.prompt_cache_protocol,
             PromptCacheProtocol::AnthropicCacheControl
@@ -2432,33 +2360,19 @@ mod tests {
         assert_eq!(anthropic.compact_strategy, CompactStrategy::Minimal);
         assert!(anthropic.supports_cache_control);
 
-        let openai = ProviderCacheStrategy::from_provider_hint("openai/gpt-4o");
+        let openai = ProviderCacheStrategy::from_explicit_or_provider(None, Some("openai"));
         assert_eq!(openai.prompt_cache_protocol, PromptCacheProtocol::Prefix);
         assert_eq!(openai.compact_strategy, CompactStrategy::Normalized);
         assert!(!openai.supports_cache_control);
     }
 
     #[test]
-    fn explicit_provider_takes_precedence_over_claude_named_model() {
-        // Known non-Anthropic providers override model name
-        assert_eq!(
-            CompactStrategy::from_provider_and_model(Some("openai"), Some("claude-sonnet-4")),
-            CompactStrategy::Normalized
-        );
-        assert_eq!(
-            ProviderCacheStrategy::from_provider_and_model(Some("anthropic"), Some("gpt-4o"))
-                .prompt_cache_protocol,
-            PromptCacheProtocol::AnthropicCacheControl
-        );
-        // Unknown proxy providers (openrouter, litellm) fall through to model detection
-        assert_eq!(
-            ProviderCacheStrategy::from_provider_and_model(
-                Some("openrouter"),
-                Some("claude-sonnet-4-20250514")
-            )
-            .prompt_cache_protocol,
-            PromptCacheProtocol::AnthropicCacheControl
-        );
+    fn unknown_provider_does_not_gain_cache_semantics_from_its_name() {
+        let strategy =
+            ProviderCacheStrategy::from_explicit_or_provider(None, Some("openrouter-claude-route"));
+        assert_eq!(strategy.prompt_cache_protocol, PromptCacheProtocol::Prefix);
+        assert_eq!(strategy.compact_strategy, CompactStrategy::Normalized);
+        assert!(!strategy.supports_cache_control);
     }
 
     #[test]

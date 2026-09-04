@@ -42,7 +42,7 @@ pub fn is_memory_tool_message(message: &Value) -> bool {
 }
 
 fn is_user_turn_start(message: &Value) -> bool {
-    message.get("role").and_then(Value::as_str) == Some("user")
+    astra_turn_types::is_human_user_message(message)
         && !message
             .get("content")
             .and_then(Value::as_array)
@@ -68,12 +68,20 @@ pub fn filter_memory_operation_turns(messages: &[Value]) -> Vec<Value> {
 
     let mut filtered = Vec::with_capacity(messages.len());
     let mut segment_start = 0usize;
+    let append_observer_safe_segment = |filtered: &mut Vec<Value>, segment: &[Value]| {
+        filtered.extend(
+            segment
+                .iter()
+                .filter(|message| !astra_turn_types::is_runtime_owned_message(message))
+                .cloned(),
+        );
+    };
 
     for (index, message) in messages.iter().enumerate() {
         if index > segment_start && is_user_turn_start(message) {
             let segment = &messages[segment_start..index];
             if !segment.iter().any(is_memory_tool_message) {
-                filtered.extend_from_slice(segment);
+                append_observer_safe_segment(&mut filtered, segment);
             }
             segment_start = index;
         }
@@ -81,7 +89,7 @@ pub fn filter_memory_operation_turns(messages: &[Value]) -> Vec<Value> {
 
     let segment = &messages[segment_start..];
     if !segment.iter().any(is_memory_tool_message) {
-        filtered.extend_from_slice(segment);
+        append_observer_safe_segment(&mut filtered, segment);
     }
 
     filtered
@@ -199,6 +207,29 @@ mod tests {
 
         let filtered = filter_memory_operation_turns(&messages);
         assert_eq!(filtered, messages);
+    }
+
+    #[test]
+    fn runtime_owned_user_role_messages_never_reach_the_observer() {
+        let mut authority = serde_json::json!({
+            "role": "user",
+            "content": "runtime settlement"
+        });
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+        let messages = vec![
+            serde_json::json!({"role":"user","content":"real task"}),
+            authority,
+            serde_json::json!({"role":"assistant","content":"done"}),
+        ];
+
+        let filtered = filter_memory_operation_turns(&messages);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0]["content"], "real task");
+        assert_eq!(filtered[1]["content"], "done");
     }
 
     #[test]

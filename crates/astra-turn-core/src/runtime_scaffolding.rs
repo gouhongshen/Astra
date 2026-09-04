@@ -23,16 +23,32 @@ pub fn normalize_prompt_facing_runtime_messages(
             continue;
         }
 
-        if let Some(delivery) = runtime_message_delivery(&message) {
-            if delivery == RuntimeMessageDelivery::RequiredContext
-                && let Some(content) = message.get("content").and_then(Value::as_str)
-                && !content.trim().is_empty()
-            {
-                normalized
-                    .required_runtime_texts
-                    .push(content.trim().to_string());
+        if is_runtime_owned_message(&message) {
+            let Some(delivery) = runtime_message_delivery(&message) else {
+                // Unknown runtime protocol data is never conversational user
+                // input. Provider assembly reports the contract violation;
+                // prompt-facing projections fail closed by excluding it.
+                continue;
+            };
+            match delivery {
+                RuntimeMessageDelivery::RequiredContext => {
+                    if let Some(content) = message.get("content").and_then(Value::as_str)
+                        && !content.trim().is_empty()
+                    {
+                        normalized
+                            .required_runtime_texts
+                            .push(content.trim().to_string());
+                    }
+                    continue;
+                }
+                RuntimeMessageDelivery::AppendOnlyRequiredContext => {
+                    normalized.messages.push(message);
+                    continue;
+                }
+                RuntimeMessageDelivery::EphemeralControl | RuntimeMessageDelivery::Projection => {
+                    continue;
+                }
             }
-            continue;
         }
 
         normalized.messages.push(message);
@@ -47,7 +63,10 @@ pub fn sanitize_recoverable_runtime_messages(messages: Vec<Value>) -> Vec<Value>
         messages
             .into_iter()
             .filter(|message| {
-                !is_runtime_owned_message(message) && !is_internal_skill_auto_route_message(message)
+                runtime_message_delivery(message)
+                    == Some(RuntimeMessageDelivery::AppendOnlyRequiredContext)
+                    || (!is_runtime_owned_message(message)
+                        && !is_internal_skill_auto_route_message(message))
             })
             .collect(),
     )
@@ -247,11 +266,20 @@ mod tests {
             "another arbitrary payload",
             RuntimeMessageDelivery::EphemeralControl,
         );
+        let append_only = runtime_owned_message(
+            "user",
+            "durable runtime authority",
+            RuntimeMessageDelivery::AppendOnlyRequiredContext,
+        );
 
-        let got =
-            normalize_prompt_facing_runtime_messages(vec![ordinary.clone(), required, ephemeral]);
+        let got = normalize_prompt_facing_runtime_messages(vec![
+            ordinary.clone(),
+            required,
+            ephemeral,
+            append_only.clone(),
+        ]);
 
-        assert_eq!(got.messages, vec![ordinary]);
+        assert_eq!(got.messages, vec![ordinary, append_only]);
         assert_eq!(
             got.required_runtime_texts,
             vec!["required payload without a magic prefix"]
@@ -271,6 +299,44 @@ mod tests {
             sanitize_recoverable_runtime_messages(vec![ordinary.clone(), owned]),
             vec![ordinary]
         );
+    }
+
+    #[test]
+    fn recovery_preserves_append_only_required_context_in_place() {
+        let first = json!({"role": "user", "content": "do the work"});
+        let runtime = runtime_owned_message(
+            "user",
+            "<runtime-required-context>\nlatest authority\n</runtime-required-context>",
+            RuntimeMessageDelivery::AppendOnlyRequiredContext,
+        );
+        let assistant = json!({"role": "assistant", "content": "continuing"});
+
+        assert_eq!(
+            sanitize_recoverable_runtime_messages(vec![
+                first.clone(),
+                runtime.clone(),
+                assistant.clone(),
+            ]),
+            vec![first, runtime, assistant]
+        );
+    }
+
+    #[test]
+    fn prompt_facing_normalization_drops_unknown_runtime_delivery() {
+        let malformed = json!({
+            "role": "user",
+            "content": "future runtime control",
+            astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD: {
+                "producer": "runtime",
+                "delivery": "future_delivery",
+            },
+        });
+        let human = json!({"role": "user", "content": "real request"});
+
+        let got = normalize_prompt_facing_runtime_messages(vec![malformed, human.clone()]);
+
+        assert_eq!(got.messages, vec![human]);
+        assert!(got.required_runtime_texts.is_empty());
     }
 
     #[test]

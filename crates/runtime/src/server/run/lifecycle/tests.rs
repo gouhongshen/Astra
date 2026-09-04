@@ -601,8 +601,8 @@ fn admitted_proof_allows_successful_turn_to_normalize_prior_execution_scratch() 
         json!({"role": "user", "content": "new request"}),
         json!({"role": "assistant", "content": "new result"}),
     ]);
-    let base_root = astra_turn_types::canonical_conversation_root(&prior);
-    let proof = CanonicalRewriteProof::new(&prior, &base_root, 0);
+    let base_manifest_root = "a".repeat(64);
+    let proof = CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
 
     let (mode, packs) = canonical_commit_delta(&prior, true, &messages, Some(&proof), false)
         .unwrap()
@@ -658,20 +658,27 @@ fn missing_proof_cannot_replace_prior_execution_scratch() {
 #[test]
 fn compaction_commits_the_complete_replacement_projection() {
     let prior = vec![json!({"role": "user", "content": "old"})];
-    let base_root = astra_turn_types::canonical_conversation_root(&prior);
-    let mut proof = CanonicalRewriteProof::new(&prior, &base_root, 0);
+    let base_manifest_root = "a".repeat(64);
+    assert_ne!(
+        base_manifest_root,
+        astra_turn_types::canonical_conversation_root(&prior),
+        "the regression requires distinct manifest and conversation hash domains"
+    );
+    let mut proof =
+        CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
     let permit = proof.begin(&prior);
     let compacted = vec![
         json!({"role": "user", "content": "summary"}),
         json!({"role": "assistant", "content": "current"}),
     ];
-    proof.finish(permit, &compacted);
+    proof.finish(permit, &compacted, None);
     let (mode, packs) = canonical_commit_delta(&prior, true, &compacted, Some(&proof), false)
         .unwrap()
         .unwrap();
 
     assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
     assert_eq!(packs.concat(), compacted);
+    assert_eq!(proof.base_manifest_root(), base_manifest_root);
 }
 
 #[test]
@@ -825,8 +832,14 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
 
         // Admit an actual prefix, then prove the real compaction rewrites it.
         let prior = messages[..7].to_vec();
-        let root = astra_turn_types::canonical_conversation_root(&prior);
-        let mut proof = CanonicalRewriteProof::new(&prior, &root, 0);
+        let base_manifest_root = "a".repeat(64);
+        assert_ne!(
+            base_manifest_root,
+            astra_turn_types::canonical_conversation_root(&prior),
+            "the regression requires distinct manifest and conversation hash domains"
+        );
+        let mut proof =
+            CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
         let permit = proof.begin(&messages);
         let mut engine = crate::turn::CompactionEngine::new();
         engine.add_layer(Box::new(crate::turn::cloud::TieredCompaction::new(2, 0.0)));
@@ -839,7 +852,7 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
                 now_secs: 10_000_000,
             },
         );
-        proof.finish(permit, &messages);
+        proof.finish(permit, &messages, None);
 
         assert!(outcome.total_tokens_freed > 0, "real compaction must run");
         assert_eq!(
@@ -905,10 +918,11 @@ fn unexplained_canonical_prefix_shrink_remains_rejected() {
 fn unrelated_prefix_mutation_after_compaction_is_rejected() {
     let prior = vec![json!({"role": "user", "content": "committed"})];
     let compacted = vec![json!({"role": "system", "content": "summary"})];
-    let base_root = astra_turn_types::canonical_conversation_root(&prior);
-    let mut proof = CanonicalRewriteProof::new(&prior, &base_root, 0);
+    let base_manifest_root = "a".repeat(64);
+    let mut proof =
+        CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
     let permit = proof.begin(&prior);
-    proof.finish(permit, &compacted);
+    proof.finish(permit, &compacted, None);
 
     let mutated = vec![json!({"role": "system", "content": "unrelated mutation"})];
     let error = canonical_commit_delta(&prior, true, &mutated, Some(&proof), false).unwrap_err();
@@ -921,10 +935,11 @@ fn compaction_cannot_authorize_an_already_mutated_prefix() {
     let prior = vec![json!({"role": "user", "content": "committed"})];
     let mutated_before_compaction = vec![json!({"role": "user", "content": "unrelated mutation"})];
     let compacted = vec![json!({"role": "system", "content": "summary"})];
-    let base_root = astra_turn_types::canonical_conversation_root(&prior);
-    let mut proof = CanonicalRewriteProof::new(&prior, &base_root, 0);
+    let base_manifest_root = "a".repeat(64);
+    let mut proof =
+        CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
     let permit = proof.begin(&mutated_before_compaction);
-    proof.finish(permit, &compacted);
+    proof.finish(permit, &compacted, None);
 
     let error = canonical_commit_delta(&prior, true, &compacted, Some(&proof), false).unwrap_err();
 
@@ -7936,15 +7951,25 @@ async fn root_live_terminal_precedes_blocked_remote_descendant_convergence() {
     );
     let blocked = descendant_entered.notified();
     tokio::pin!(blocked);
-    assert!(
-        AgenticRunLifecycleService::schedule_durable_user_cancelled_run_descendants(
-            engine.clone(),
-            "user-1",
-            session_id,
-            root_id,
-            false,
-        )
+    // A process-global scheduler is bound to the production runtime's
+    // lifetime. Unit tests create and destroy independent Tokio runtimes, so
+    // sharing that singleton across tests can leave a supervisor attached to
+    // an already-closed runtime. Exercise the same scheduler contract with an
+    // explicitly owned test instance.
+    let scheduler = DescendantCancellationScheduler::new(
+        DESCENDANT_CANCELLATION_JOB_CONCURRENCY,
+        DESCENDANT_CANCELLATION_QUEUE_CAPACITY,
+        DESCENDANT_CANCELLATION_JOB_DEADLINE,
     );
+    assert!(scheduler.enqueue(DescendantCancellationJob {
+        key: DescendantCancellationJobKey {
+            user_id: "user-1".to_string(),
+            session_id: session_id.to_string(),
+            parent_run_id: root_id.to_string(),
+        },
+        run_engine: engine.clone(),
+        verify_outermost_scope: false,
+    }));
     tokio::time::timeout(Duration::from_secs(2), &mut blocked)
         .await
         .expect("background durable descendant sweep must reach the remote row");
@@ -12775,6 +12800,7 @@ fn authorized_edge_dispatch_request() -> astra_services::runs::ChatRequestData {
             mcp: None,
             skills: None,
             edge_agent: Some(descriptor),
+            discovery_snapshot: None,
         });
     request
 }
@@ -12981,6 +13007,7 @@ async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_
             mcp: None,
             skills: None,
             edge_agent: None,
+            discovery_snapshot: None,
         });
 
     let prepared = service
@@ -13024,6 +13051,7 @@ async fn validate_request_constraints_rejects_descriptor_without_provider_author
             mcp: None,
             skills: None,
             edge_agent: None,
+            discovery_snapshot: None,
         });
 
     let err = service
@@ -15126,6 +15154,30 @@ fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
     assert_eq!(persisted[4]["event_type"], "text_done");
     assert_eq!(persisted[5]["event_type"], "run_error");
     assert_eq!(persisted[6]["event_type"], "run_finished");
+}
+
+#[tokio::test]
+async fn superseded_terminal_skips_all_owner_derived_projections() {
+    let journal_calls = Arc::new(AtomicUsize::new(0));
+    let transcript_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let observed = (
+        Arc::clone(&journal_calls),
+        Arc::clone(&transcript_calls),
+        Arc::clone(&hook_calls),
+    );
+
+    // A Superseded terminal transition leaves owner_terminal_committed false.
+    run_owner_fenced_terminal_projections(false, move || async move {
+        observed.0.fetch_add(1, Ordering::SeqCst);
+        observed.1.fetch_add(1, Ordering::SeqCst);
+        observed.2.fetch_add(1, Ordering::SeqCst);
+    })
+    .await;
+
+    assert_eq!(journal_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(transcript_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]

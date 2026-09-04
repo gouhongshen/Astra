@@ -134,8 +134,11 @@ pub trait ResourceGovernor: Send + Sync + 'static {
     /// run. Counting every run as a newly-created session would make a normal
     /// conversation exhaust the daily session cap.
     async fn check_run_start(&self, user_id: &str) -> LimitCheck {
-        let limits = self.get_limits(user_id).await;
-        let usage = self.get_usage(user_id).await;
+        // Limits and usage are independent snapshots. A quota update or usage
+        // write may race either read regardless of ordering, so serializing
+        // them provides no stronger admission guarantee and adds a complete
+        // database round trip to every turn.
+        let (limits, usage) = tokio::join!(self.get_limits(user_id), self.get_usage(user_id));
 
         if limits.max_concurrent_sessions > 0
             && usage.active_sessions >= limits.max_concurrent_sessions
@@ -174,11 +177,13 @@ pub trait ResourceGovernor: Send + Sync + 'static {
     /// Check whether the user's daily token budget allows further LLM calls.
     /// Called before each LLM invocation for mid-session enforcement.
     async fn check_token_budget(&self, user_id: &str) -> LimitCheck {
-        let limits = self.get_limits(user_id).await;
+        // Read both independent snapshots together. Even when the effective
+        // limit is unlimited, avoiding the usage read would make the latency
+        // depend on which snapshot happens to arrive first.
+        let (limits, usage) = tokio::join!(self.get_limits(user_id), self.get_usage(user_id));
         if limits.max_tokens_per_day == 0 {
             return LimitCheck::Allowed;
         }
-        let usage = self.get_usage(user_id).await;
         if usage.tokens_consumed >= limits.max_tokens_per_day {
             LimitCheck::Denied {
                 limit: ResourceLimitKind::DailyTokens,
@@ -331,17 +336,18 @@ impl ResourceGovernor for DatabaseResourceGovernor {
 
     async fn get_usage(&self, user_id: &str) -> ResourceUsage {
         let today = Self::today();
-        let row: Option<(i32, i64, i64)> = sqlx::query_as(
+        let usage = sqlx::query_as(
             "SELECT sessions_created, tool_calls, tokens_consumed \
              FROM resource_usage WHERE user_id = ? AND usage_date = ?",
         )
         .bind(user_id)
         .bind(&today)
-        .fetch_optional(self.pool.get())
-        .await
-        .unwrap_or(None);
-
-        let active = self.count_active_sessions(user_id).await;
+        .fetch_optional(self.pool.get());
+        // Daily counters and the active-run count live in different tables
+        // and are observational snapshots. Fetching them concurrently keeps
+        // the exact fail-open behavior while removing one serialized query.
+        let (row, active) = tokio::join!(usage, self.count_active_sessions(user_id));
+        let row: Option<(i32, i64, i64)> = row.unwrap_or(None);
 
         match row {
             Some((sc, tc, tk)) => ResourceUsage {
@@ -354,6 +360,100 @@ impl ResourceGovernor for DatabaseResourceGovernor {
                 active_sessions: active,
                 ..Default::default()
             },
+        }
+    }
+
+    async fn check_run_start(&self, user_id: &str) -> LimitCheck {
+        // Run admission needs three authoritative facts, but not the rest of
+        // ResourceUsage. Fetch them in one statement so a remote database does
+        // not turn an observational quota check into three network round trips.
+        let today = Self::today();
+        let row: Result<(i32, i64, i64, i64), sqlx::Error> = sqlx::query_as(
+            "SELECT \
+                CAST(COALESCE((SELECT max_concurrent_sessions FROM resource_limits WHERE user_id = ?), ?) AS SIGNED), \
+                CAST(COALESCE((SELECT max_tokens_per_day FROM resource_limits WHERE user_id = ?), ?) AS SIGNED), \
+                CAST(COALESCE((SELECT tokens_consumed FROM resource_usage WHERE user_id = ? AND usage_date = ?), 0) AS SIGNED), \
+                CAST((SELECT COUNT(DISTINCT session_id) FROM agent_runs WHERE user_id = ? AND status IN ('running', 'paused', 'waiting')) AS SIGNED)",
+        )
+        .bind(user_id)
+        .bind(ResourceLimits::DEFAULT_MAX_CONCURRENT_SESSIONS as i32)
+        .bind(user_id)
+        .bind(ResourceLimits::DEFAULT_MAX_TOKENS_PER_DAY as i64)
+        .bind(user_id)
+        .bind(&today)
+        .bind(user_id)
+        .fetch_one(self.pool.get())
+        .await;
+        let (max_concurrent_sessions, max_tokens_per_day, tokens_consumed, active_sessions) =
+            match row {
+                Ok(row) => row,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_services::resource_governor",
+                        user_id,
+                        error = %error,
+                        "failed to read run-start quota snapshot; preserving fail-open admission"
+                    );
+                    return LimitCheck::Allowed;
+                }
+            };
+
+        if max_concurrent_sessions > 0 && active_sessions >= i64::from(max_concurrent_sessions) {
+            return LimitCheck::Denied {
+                limit: ResourceLimitKind::ConcurrentSessions,
+                reason: format!(
+                    "concurrent session limit reached ({active_sessions}/{max_concurrent_sessions})"
+                ),
+            };
+        }
+        if max_tokens_per_day > 0 && tokens_consumed >= max_tokens_per_day {
+            return LimitCheck::Denied {
+                limit: ResourceLimitKind::DailyTokens,
+                reason: format!(
+                    "daily token budget exhausted ({tokens_consumed}/{max_tokens_per_day})"
+                ),
+            };
+        }
+        LimitCheck::Allowed
+    }
+
+    async fn check_token_budget(&self, user_id: &str) -> LimitCheck {
+        // Mid-turn enforcement only depends on the token limit and today's
+        // token counter. In particular it must not count active sessions.
+        let today = Self::today();
+        let row: Result<(i64, i64), sqlx::Error> = sqlx::query_as(
+            "SELECT \
+                CAST(COALESCE((SELECT max_tokens_per_day FROM resource_limits WHERE user_id = ?), ?) AS SIGNED), \
+                CAST(COALESCE((SELECT tokens_consumed FROM resource_usage WHERE user_id = ? AND usage_date = ?), 0) AS SIGNED)",
+        )
+        .bind(user_id)
+        .bind(ResourceLimits::DEFAULT_MAX_TOKENS_PER_DAY as i64)
+        .bind(user_id)
+        .bind(&today)
+        .fetch_one(self.pool.get())
+        .await;
+        let (max_tokens_per_day, tokens_consumed) = match row {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_services::resource_governor",
+                    user_id,
+                    error = %error,
+                    "failed to read token quota snapshot; preserving fail-open admission"
+                );
+                return LimitCheck::Allowed;
+            }
+        };
+
+        if max_tokens_per_day > 0 && tokens_consumed >= max_tokens_per_day {
+            LimitCheck::Denied {
+                limit: ResourceLimitKind::DailyTokens,
+                reason: format!(
+                    "daily token budget exhausted ({tokens_consumed}/{max_tokens_per_day})"
+                ),
+            }
+        } else {
+            LimitCheck::Allowed
         }
     }
 

@@ -170,6 +170,8 @@ mod tests {
                 session_current_date: Some("2026-05-25".to_string()),
                 turns_completed: 0,
                 latest_runtime_feedback: None,
+                provider_cache_observed_since_feedback: false,
+                pending_provider_cache_break: None,
             },
             "1999-12-31",
         );
@@ -294,6 +296,8 @@ mod tests {
                 session_current_date: Some("2026-05-25".to_string()),
                 turns_completed: 0,
                 latest_runtime_feedback: None,
+                provider_cache_observed_since_feedback: false,
+                pending_provider_cache_break: None,
             },
             "1999-12-31",
         );

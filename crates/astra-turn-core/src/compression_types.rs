@@ -276,6 +276,7 @@ impl From<Message> for Value {
                     k.as_str(),
                     astra_turn_types::USER_TURN_SEMANTICS_FIELD
                         | astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD
+                        | astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD
                 )
             {
                 map.insert(k, v);
@@ -289,6 +290,13 @@ impl Message {
     /// Returns `true` when this is a real user task message (not synthetic, not a tool_result array).
     pub fn is_plain_user_task(&self) -> bool {
         if self.role != "user" {
+            return false;
+        }
+        if self
+            .extra
+            .get(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD)
+            .is_some_and(astra_turn_types::is_runtime_owned_provenance)
+        {
             return false;
         }
         // Anthropic tool_result arrays are never real user tasks.
@@ -754,6 +762,40 @@ mod tests {
         let mut m = mk_msg("user", Some("real content"));
         m.is_synthetic = true;
         assert!(!m.is_plain_user_task());
+    }
+
+    #[test]
+    fn append_only_runtime_user_preserves_provenance_and_is_not_a_user_task() {
+        let mut value = json!({"role": "user", "content": "runtime authority"});
+        astra_turn_types::mark_append_only_required_context(
+            &mut value,
+            "final_answer_settlement",
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        );
+
+        let message = Message::from(value);
+        assert!(!message.is_plain_user_task());
+        let round_trip = Value::from(message);
+        assert!(astra_turn_types::is_runtime_owned_message(&round_trip));
+        assert!(!astra_turn_types::is_human_user_message(&round_trip));
+    }
+
+    #[test]
+    fn unknown_runtime_delivery_round_trips_without_becoming_a_user_task() {
+        let value = json!({
+            "role": "user",
+            "content": "future runtime control",
+            astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD: {
+                "producer": "runtime",
+                "delivery": "future_delivery",
+            },
+        });
+
+        let message = Message::from(value);
+        assert!(!message.is_plain_user_task());
+        let round_trip = Value::from(message);
+        assert!(astra_turn_types::is_runtime_owned_message(&round_trip));
+        assert!(!astra_turn_types::is_human_user_message(&round_trip));
     }
 
     #[test]

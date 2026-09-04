@@ -632,12 +632,12 @@ pub(crate) fn build_session_context(
     user_id: Option<&str>,
 ) -> SessionContext {
     let provider_policy =
-        super::prompt_cache::provider_cache_policy_for(cache_capability, provider, model_name);
-    let provider_strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+        super::prompt_cache::provider_cache_policy_for(cache_capability, provider);
+    let capability = astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
         cache_capability,
-        Some(provider),
-        Some(model_name),
+        provider,
     );
+    let provider_strategy = ProviderCacheStrategy::from_cache_capability(capability);
     SessionContext {
         session_id: session_id.to_string(),
         run_id: run_id.unwrap_or_default().to_string(),
@@ -745,6 +745,12 @@ mod tests {
     #[test]
     fn session_context_picks_anthropic_policy_for_bedrock_provider() {
         let ep = serde_json::Map::new();
+        let declared_cache_capability = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::BedrockCachePoint,
+            volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+            volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+            reuse_scope: None,
+        };
         let ctx = build_session_context(
             "sid",
             None,
@@ -753,12 +759,13 @@ mod tests {
             &ep,
             "bedrock",
             None,
-            None,
+            Some(declared_cache_capability),
             "2026-05-25",
             None,
         );
-        // Bedrock Claude translates cache_control → cachePoint downstream,
-        // so the pipeline still emits Anthropic-style markers.
+        // Bedrock multiplexes model families, so the provider name alone is
+        // insufficient. A deployment-declared cachePoint capability selects
+        // the Anthropic-style pipeline markers translated by the adapter.
         assert!(
             ctx.provider_policy.max_markers > 0,
             "bedrock must use anthropic policy — Bedrock Converse translates cache_control \
@@ -867,6 +874,7 @@ mod tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
@@ -1197,6 +1205,7 @@ mod tests {
             Some(astra_turn_core::cache_placement::CacheCapability {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
                 volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::TailSuffix,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::IntraTurnRounds,
                 ),
@@ -2416,6 +2425,7 @@ mod tests {
             Some(astra_turn_core::cache_placement::CacheCapability {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
                 volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::TailSuffix,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::IntraTurnRounds,
                 ),
@@ -2443,6 +2453,7 @@ mod tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: None,
             }),
         );

@@ -195,6 +195,110 @@ fn dsml_tool_calls_close_regex() -> &'static Regex {
     })
 }
 
+/// Incrementally removes explicit DSML tool-call envelopes from text shown to
+/// users while leaving the original provider response available to the
+/// fallback parser.
+///
+/// Providers may split the opening or closing tag at any UTF-8 boundary. The
+/// filter therefore retains only a possible tag suffix between chunks and
+/// suppresses everything from a confirmed opening envelope through its
+/// closing envelope. An unfinished envelope is dropped by [`Self::finish`].
+#[derive(Debug, Default)]
+pub struct DsmlToolCallStreamFilter {
+    pending: String,
+    suppressing: bool,
+}
+
+impl DsmlToolCallStreamFilter {
+    /// Consume one provider text chunk and return only bytes safe to publish.
+    pub fn push(&mut self, chunk: &str) -> String {
+        self.pending.push_str(chunk);
+        let mut visible = String::new();
+
+        loop {
+            if self.suppressing {
+                if let Some(close) = dsml_tool_calls_close_regex().find(&self.pending) {
+                    self.pending.drain(..close.end());
+                    self.suppressing = false;
+                    continue;
+                }
+                if let Some(start) = possible_dsml_envelope_suffix_start(&self.pending, true) {
+                    self.pending.drain(..start);
+                } else {
+                    self.pending.clear();
+                }
+                break;
+            }
+
+            if let Some(open) = dsml_tool_calls_open_regex().find(&self.pending) {
+                visible.push_str(&self.pending[..open.start()]);
+                self.pending.drain(..open.end());
+                self.suppressing = true;
+                continue;
+            }
+
+            if let Some(start) = possible_dsml_envelope_suffix_start(&self.pending, false) {
+                visible.push_str(&self.pending[..start]);
+                self.pending.drain(..start);
+            } else {
+                visible.push_str(&self.pending);
+                self.pending.clear();
+            }
+            break;
+        }
+
+        visible
+    }
+
+    /// Finish the stream. Visible text held only because it resembled a tag
+    /// prefix is released; an incomplete confirmed DSML envelope is discarded.
+    pub fn finish(&mut self) -> String {
+        if self.suppressing {
+            self.pending.clear();
+            String::new()
+        } else {
+            std::mem::take(&mut self.pending)
+        }
+    }
+}
+
+fn possible_dsml_envelope_suffix_start(text: &str, closing: bool) -> Option<usize> {
+    const OPEN_FULLWIDTH: &str = "<｜｜dsml｜｜tool_calls>";
+    const OPEN_ASCII: &str = "<||dsml||tool_calls>";
+    const CLOSE_FULLWIDTH: &str = "</｜｜dsml｜｜tool_calls>";
+    const CLOSE_ASCII: &str = "</||dsml||tool_calls>";
+    let candidates = if closing {
+        [CLOSE_FULLWIDTH, CLOSE_ASCII]
+    } else {
+        [OPEN_FULLWIDTH, OPEN_ASCII]
+    };
+
+    text.char_indices().rev().find_map(|(start, ch)| {
+        if ch != '<' {
+            return None;
+        }
+        let compact = text[start..]
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        candidates
+            .iter()
+            .any(|candidate| candidate.starts_with(&compact))
+            .then_some(start)
+    })
+}
+
+/// Remove explicit DSML envelopes from a complete or partial provider payload
+/// before it is rendered or embedded in an interruption message.
+#[must_use]
+pub fn filter_dsml_tool_call_markup_for_display(text: &str) -> String {
+    let mut filter = DsmlToolCallStreamFilter::default();
+    let mut visible = filter.push(text);
+    visible.push_str(&filter.finish());
+    visible
+}
+
 // ─── <tool_call> Fallback ────────────────────────────────────────────────────
 
 /// Try to extract tool calls from `<tool_call>` blocks in `text`.
@@ -754,7 +858,8 @@ pub fn strip_degraded_tool_calls(text: &str) -> String {
     let parsed = parse_degraded_response(text);
     let after_accepted = remove_ranges(text, &parsed.strip_ranges);
     let after_truncated_tail = strip_truncated_degraded_tool_call_tail(&after_accepted);
-    strip_residual_xml_fragments(&after_truncated_tail)
+    let after_residual_fragments = strip_residual_xml_fragments(&after_truncated_tail);
+    filter_dsml_tool_call_markup_for_display(&after_residual_fragments)
 }
 
 fn strip_truncated_degraded_tool_call_tail(text: &str) -> String {
@@ -893,6 +998,51 @@ fn extract_attr(tag: &str, attr: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dsml_stream_filter_hides_envelope_across_chunk_boundaries() {
+        let mut filter = DsmlToolCallStreamFilter::default();
+        let chunks = [
+            "visible before <｜｜DS",
+            "ML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">secret",
+            "</｜｜DSML｜｜invoke></｜｜DSML",
+            "｜｜tool_calls> visible after",
+        ];
+        let mut visible = chunks
+            .into_iter()
+            .map(|chunk| filter.push(chunk))
+            .collect::<String>();
+        visible.push_str(&filter.finish());
+
+        assert_eq!(visible, "visible before  visible after");
+        assert!(!visible.contains("DSML"));
+        assert!(!visible.contains("secret"));
+    }
+
+    #[test]
+    fn dsml_stream_filter_hides_ascii_and_unfinished_envelopes() {
+        let complete = "before< ||DSML||tool_calls >< ||DSML||invoke name=\"bash\">hidden</ ||DSML||invoke></ ||DSML||tool_calls >after";
+        assert_eq!(
+            filter_dsml_tool_call_markup_for_display(complete),
+            "beforeafter"
+        );
+
+        let incomplete =
+            "safe prefix<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">hidden";
+        assert_eq!(
+            filter_dsml_tool_call_markup_for_display(incomplete),
+            "safe prefix"
+        );
+    }
+
+    #[test]
+    fn dsml_stream_filter_preserves_non_protocol_angle_brackets() {
+        assert_eq!(
+            filter_dsml_tool_call_markup_for_display("explain <tool_calls> literally"),
+            "explain <tool_calls> literally"
+        );
+        assert_eq!(filter_dsml_tool_call_markup_for_display("2 <"), "2 <");
+    }
 
     #[test]
     fn parse_single_invoke_with_params() {

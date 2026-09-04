@@ -40,7 +40,10 @@ pub(crate) fn build_turn_intent_judge_context(
         let Some(content) = entry.get("content").and_then(serde_json::Value::as_str) else {
             continue;
         };
-        if role == "user" && !skipped_current_user && content.trim() == message.trim() {
+        if astra_turn_types::is_human_user_message(entry)
+            && !skipped_current_user
+            && content.trim() == message.trim()
+        {
             skipped_current_user = true;
             continue;
         }
@@ -48,7 +51,7 @@ pub(crate) fn build_turn_intent_judge_context(
             prior_assistant_message = Some(bounded_message(content));
             continue;
         }
-        if role == "user" && prior_assistant_message.is_some() {
+        if astra_turn_types::is_human_user_message(entry) && prior_assistant_message.is_some() {
             prior_user_message = Some(bounded_message(content));
             break;
         }

@@ -697,9 +697,7 @@ fn materialize_terminal_text_message(state: &mut AgenticLoopState) {
     let current_turn_start = state
         .messages
         .iter()
-        .rposition(|message| {
-            message.get("role").and_then(serde_json::Value::as_str) == Some("user")
-        })
+        .rposition(astra_turn_types::is_human_user_message)
         .unwrap_or(0);
     let already_materialized = state.messages[current_turn_start..]
         .iter()

@@ -1,4 +1,4 @@
-use crate::data_layer::storage::{insert_trace_event, touch_agent_session_activity};
+use crate::data_layer::storage::{insert_trace_events, touch_agent_session_activity};
 use crate::server::run::lifecycle::{
     TranscriptPersistItem, TranscriptPersistPayload, persist_session_transcript_items_inner_in_tx,
 };
@@ -502,17 +502,23 @@ impl DatabaseTraceEventWriter {
         )
         .await
         .map_err(TraceWriteError::Persist)?;
+        let mut by_session = std::collections::BTreeMap::<(String, String), Vec<TraceEvent>>::new();
+        for event in events {
+            by_session
+                .entry((event.user_id.clone(), event.session_id.clone()))
+                .or_default()
+                .push(event);
+        }
         let mut deltas = SessionEventDeltas::new();
-        for event in &events {
-            if insert_trace_event(tx, event)
+        for ((user_id, session_id), events) in by_session {
+            let (inserted, last_event_id) = insert_trace_events(tx, &events)
                 .await
-                .map_err(|error| TraceWriteError::Persist(error.to_string()))?
-            {
-                let entry = deltas
-                    .entry((event.user_id.clone(), event.session_id.clone()))
-                    .or_default();
-                entry.0 += 1;
-                entry.1 = Some(event.event_id.clone());
+                .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
+            if inserted > 0 {
+                deltas.insert(
+                    (user_id, session_id),
+                    (i64::try_from(inserted).unwrap_or(i64::MAX), last_event_id),
+                );
             }
         }
         // Session summary updates are deliberately deferred until the owning
@@ -1065,6 +1071,10 @@ mod tests {
         }
     }
 
+    fn trace_event(event_id: &str, user_id: &str, session_id: &str) -> TraceEvent {
+        TraceEvent::new(event_id, session_id, user_id, "trace", "runtime")
+    }
+
     fn tool_event(
         event_id: &str,
         user_id: &str,
@@ -1319,6 +1329,103 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup event count fixture agent_sessions");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn trace_batch_tail_tracks_the_last_new_event_in_both_replay_orders() {
+        let shared = setup_live_pool_for_test().await;
+        let pool = shared.get().clone();
+        let settings = MatrixOneSettings::from_env();
+        let suffix = Uuid::new_v4().to_string();
+        let user_id = format!("trace-tail-user-{suffix}");
+        let existing_first_session = format!("trace-tail-existing-first-{suffix}");
+        let existing_last_session = format!("trace-tail-existing-last-{suffix}");
+        let existing_first = format!("trace-existing-first-{suffix}");
+        let new_after = format!("trace-new-after-{suffix}");
+        let new_before = format!("trace-new-before-{suffix}");
+        let existing_last = format!("trace-existing-last-{suffix}");
+
+        for session_id in [&existing_first_session, &existing_last_session] {
+            sqlx::query(
+                "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+                 VALUES (?, ?, 'trace-tail-it', 'active', 0)",
+            )
+            .bind(session_id)
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("insert trace-tail session");
+        }
+
+        let writer = DatabaseTraceEventWriter::new(settings).with_pool(shared);
+        writer
+            .write(trace_event(
+                &existing_first,
+                &user_id,
+                &existing_first_session,
+            ))
+            .await
+            .expect("persist existing-first fixture");
+        writer
+            .write_many(vec![
+                trace_event(&existing_first, &user_id, &existing_first_session),
+                trace_event(&new_after, &user_id, &existing_first_session),
+            ])
+            .await
+            .expect("persist existing-then-new batch");
+
+        writer
+            .write(trace_event(
+                &existing_last,
+                &user_id,
+                &existing_last_session,
+            ))
+            .await
+            .expect("persist existing-last fixture");
+        writer
+            .write_many(vec![
+                trace_event(&new_before, &user_id, &existing_last_session),
+                trace_event(&existing_last, &user_id, &existing_last_session),
+            ])
+            .await
+            .expect("persist new-then-existing batch");
+
+        for (session_id, expected_tail) in [
+            (&existing_first_session, &new_after),
+            (&existing_last_session, &new_before),
+        ] {
+            let row = sqlx::query(
+                "SELECT event_count, last_event_id FROM agent_sessions \
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&user_id)
+            .bind(session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load trace-tail session summary");
+            assert_eq!(row.try_get::<i64, _>("event_count").unwrap(), 2);
+            assert_eq!(
+                row.try_get::<String, _>("last_event_id").unwrap(),
+                *expected_tail
+            );
+        }
+
+        sqlx::query("DELETE FROM agent_event_edges WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup trace-tail edges");
+        sqlx::query("DELETE FROM agent_events WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup trace-tail events");
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup trace-tail sessions");
     }
 
     /// Verify that all Database*Writer structs fail instantly when no pool is

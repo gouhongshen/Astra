@@ -71,9 +71,10 @@
 //! [`provider_cache_policy_for`] determines the caching strategy from three sources in
 //! priority order:
 //!
-//! 1. **Explicit** `CacheCapability` marker (highest priority — overrides everything)
-//! 2. **Provider heuristics** (Anthropic direct, Bedrock Claude, other)
-//! 3. **Environment override** (`ASTRA_TEST_PROMPT_CACHE_DISABLED`)
+//! 1. **Explicit deployment metadata** (`CacheCapability`)
+//! 2. **Provider transport baseline** when metadata is absent (never a model-name guess)
+//! 3. **Environment enablement** (`ASTRA_TEST_PROMPT_CACHE_DISABLED`) controls whether
+//!    admitted annotations are emitted; it does not reclassify the protocol
 //!
 //! ## Public Interface
 //!
@@ -136,24 +137,25 @@ fn saturating_usize_to_u32(value: usize) -> u32 {
 }
 
 impl PromptCacheConfig {
-    /// Latch config from environment and provider info. Call once at session start.
-    pub fn latch(provider: &str, model_name: &str) -> Self {
-        Self::from_cache_capability(None, provider, model_name)
+    /// Latch config from environment and provider transport. Call once at
+    /// session start.
+    pub fn latch(provider: &str) -> Self {
+        Self::from_cache_capability(None, provider)
     }
 
     pub fn from_cache_capability(
         cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
         provider: &str,
-        model_name: &str,
     ) -> Self {
         let cache_enabled = !std::env::var("ASTRA_TEST_PROMPT_CACHE_DISABLED")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-        let provider_strategy =
-            astra_turn_core::microcompact::ProviderCacheStrategy::from_explicit_or_provider_model(
+        let capability =
+            astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
                 cache_capability,
-                Some(provider),
-                Some(model_name),
+                provider,
             );
+        let provider_strategy =
+            astra_turn_core::microcompact::ProviderCacheStrategy::from_cache_capability(capability);
         let is_anthropic = provider_strategy.prompt_cache_protocol
             == astra_turn_core::microcompact::PromptCacheProtocol::AnthropicCacheControl;
         Self {
@@ -217,13 +219,12 @@ pub(crate) struct EphemeralPipelineOutcome {
 pub(crate) fn provider_cache_policy_for(
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     provider: &str,
-    model_name: &str,
 ) -> ProviderCachePolicy {
-    let strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+    let capability = astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
         cache_capability,
-        Some(provider),
-        Some(model_name),
+        provider,
     );
+    let strategy = ProviderCacheStrategy::from_cache_capability(capability);
     if strategy.prompt_cache_protocol == PromptCacheProtocol::AnthropicCacheControl {
         ProviderCachePolicy::anthropic()
     } else {
@@ -276,6 +277,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
     tool_names: &[&str],
     extra_dynamic_sections: &[prompts::PromptSection],
     cache_cfg: &PromptCacheConfig,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     session_id: &str,
     model_id: &str,
     provider: &str,
@@ -291,7 +293,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
         None,
         None,
         cache_cfg,
-        None,
+        cache_capability,
         session_id,
         model_id,
         None,
@@ -513,12 +515,12 @@ pub(crate) fn assemble_ephemeral_pipeline_outcome_with_messages(
         extra_dynamic_sections: volatile,
     };
 
-    let provider_policy = provider_cache_policy_for(cache_capability, provider, model_id);
-    let provider_strategy = ProviderCacheStrategy::from_explicit_or_provider_model(
+    let provider_policy = provider_cache_policy_for(cache_capability, provider);
+    let capability = astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
         cache_capability,
-        Some(provider),
-        Some(model_id),
+        provider,
     );
+    let provider_strategy = ProviderCacheStrategy::from_cache_capability(capability);
     let session_ctx = SessionContext {
         session_id: session_id.to_string(),
         run_id: String::new(),
@@ -915,12 +917,21 @@ mod tests {
         );
     }
 
+    fn bedrock_cache_capability() -> astra_turn_core::cache_placement::CacheCapability {
+        astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::BedrockCachePoint,
+            volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+            volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        }
+    }
+
     #[test]
-    fn prompt_cache_latch_prefers_provider_over_claude_named_model() {
-        let openai_proxy = PromptCacheConfig::latch("openai", "claude-sonnet-4");
+    fn prompt_cache_latch_uses_provider_transport_only() {
+        let openai_proxy = PromptCacheConfig::latch("openai");
         assert!(!openai_proxy.is_anthropic);
 
-        let anthropic_provider = PromptCacheConfig::latch("anthropic", "gpt-4o");
+        let anthropic_provider = PromptCacheConfig::latch("anthropic");
         assert!(anthropic_provider.is_anthropic);
     }
 
@@ -931,12 +942,12 @@ mod tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
             }),
             "openai",
-            "proxy-claude",
         );
         assert!(cfg.is_anthropic);
     }
@@ -1680,6 +1691,8 @@ mod tests {
             protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
             volatile_placement:
                 astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
             reuse_scope: None,
         };
 
@@ -1763,6 +1776,7 @@ mod tests {
             &["bash", "read_file"],
             &[],
             &cache_cfg,
+            Some(bedrock_cache_capability()),
             "test-session",
             "claude-sonnet-4-6",
             "bedrock",
@@ -1820,6 +1834,7 @@ mod tests {
             &["bash"],
             &[],
             &cache_cfg,
+            Some(bedrock_cache_capability()),
             "session",
             "claude-sonnet-4-6",
             "bedrock",
@@ -1830,6 +1845,7 @@ mod tests {
             &["bash", "tool_search"],
             &[],
             &cache_cfg,
+            Some(bedrock_cache_capability()),
             "session",
             "claude-sonnet-4-6",
             "bedrock",
@@ -1876,6 +1892,7 @@ mod tests {
             &["bash", "read_file"],
             &[],
             &cache_cfg,
+            None,
             "sid",
             "gpt-4o",
             "openai",
@@ -1931,6 +1948,7 @@ mod tests {
             &["bash"],
             &extra,
             &cache_cfg,
+            Some(bedrock_cache_capability()),
             "sid",
             "claude-sonnet-4-6",
             "bedrock",
@@ -1991,6 +2009,7 @@ mod tests {
                     prompts::PromptTokenBucket::Environment,
                 )],
                 &cache_cfg,
+                Some(bedrock_cache_capability()),
                 "sid",
                 "claude-sonnet-4-6",
                 "bedrock",
@@ -2021,6 +2040,7 @@ mod tests {
             &["bash", "read_file"],
             &[],
             &cache_cfg,
+            Some(bedrock_cache_capability()),
             "sid",
             "claude-sonnet-4-6",
             "bedrock",
@@ -2076,6 +2096,7 @@ mod tests {
                 cache_enabled: true,
                 is_anthropic: true,
             },
+            Some(bedrock_cache_capability()),
             "sid",
             "claude-sonnet-4-6",
             "bedrock",
@@ -2120,6 +2141,7 @@ mod tests {
             &["bash"],
             &[],
             &PromptCacheConfig::default(),
+            None,
             "sid",
             "gpt-4",
             "openai",
@@ -2134,6 +2156,7 @@ mod tests {
             &["bash"],
             &[],
             &PromptCacheConfig::default(),
+            None,
             "sid",
             "gpt-4",
             "openai",
@@ -2163,6 +2186,7 @@ mod tests {
             &["bash"],
             &[],
             &PromptCacheConfig::default(),
+            None,
             "sid",
             "gpt-4",
             "openai",
@@ -2182,6 +2206,7 @@ mod tests {
             &["bash"],
             &[],
             &PromptCacheConfig::default(),
+            None,
             "sid",
             "gpt-4",
             "openai",
@@ -2252,26 +2277,37 @@ mod tests {
     }
 
     #[test]
-    fn latch_enables_anthropic_style_cache_for_bedrock_claude() {
+    fn declared_capability_enables_anthropic_style_cache_for_bedrock() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        let cfg = PromptCacheConfig::latch("bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
+        let cfg = PromptCacheConfig::from_cache_capability(
+            Some(astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::BedrockCachePoint,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            }),
+            "bedrock",
+        );
         assert!(cfg.cache_enabled);
         assert!(cfg.is_anthropic);
     }
 
     #[test]
-    fn latch_keeps_non_claude_bedrock_on_openai_style_cache() {
+    fn undeclared_bedrock_stays_on_unmarked_cache_path() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED");
-        let cfg = PromptCacheConfig::latch("bedrock", "us.amazon.nova-micro-v1:0");
+        let cfg = PromptCacheConfig::latch("bedrock");
         assert!(cfg.cache_enabled);
         assert!(!cfg.is_anthropic);
     }
 
     #[test]
     fn ephemeral_provider_policy_keeps_non_claude_bedrock_prefix_only() {
-        let policy = provider_cache_policy_for(None, "bedrock", "us.amazon.nova-micro-v1:0");
+        let policy = provider_cache_policy_for(None, "bedrock");
 
         assert_eq!(
             policy.protocol,
@@ -2283,9 +2319,19 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_provider_policy_enables_anthropic_for_bedrock_claude() {
-        let policy =
-            provider_cache_policy_for(None, "bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
+    fn ephemeral_provider_policy_honors_declared_bedrock_cachepoint() {
+        let policy = provider_cache_policy_for(
+            Some(astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::BedrockCachePoint,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            }),
+            "bedrock",
+        );
 
         assert_eq!(
             policy.protocol,
@@ -2314,6 +2360,7 @@ mod tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
@@ -2350,12 +2397,12 @@ mod tests {
                 protocol: astra_turn_core::cache_placement::CacheProtocol::MarkerExplicit,
                 volatile_placement:
                     astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated,
+                volatile_delivery: astra_turn_core::cache_placement::VolatileDeliveryPolicy::All,
                 reuse_scope: Some(
                     astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
                 ),
             }),
             "openai",
-            "proxy-claude",
         );
         assert_eq!(
             policy.protocol,

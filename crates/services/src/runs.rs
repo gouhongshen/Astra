@@ -554,6 +554,28 @@ pub struct RuntimeCapabilityDescriptorsRequest {
     // the edge agent identified by id via the existing edge WebSocket registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_agent: Option<RuntimeCapabilityDescriptorRequest>,
+    /// Immutable discovery view frozen by the provider for this turn. Endpoint
+    /// descriptors remain authoritative for actual calls and lazy Skill reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_snapshot: Option<RuntimeCapabilityDiscoverySnapshotRequest>,
+}
+
+pub const RUNTIME_CAPABILITY_DISCOVERY_SNAPSHOT_VERSION: &str =
+    "moi-runtime-capability-discovery-v1";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCapabilityDiscoverySnapshotRequest {
+    pub version: String,
+    pub tools: Vec<serde_json::Value>,
+    pub skill_catalogs: Vec<RuntimeCapabilitySkillCatalogSnapshotRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCapabilitySkillCatalogSnapshotRequest {
+    pub agent_binding_id: String,
+    pub skills: Vec<serde_json::Value>,
 }
 
 /// Request-scoped provider authorization exposed to each bash subprocess on

@@ -308,7 +308,7 @@ fn drop_oldest_rounds(messages: &mut Vec<Value>, pressure: f64) -> u32 {
             .and_then(Value::as_str)
             .filter(|turn_chain_id| !turn_chain_id.is_empty());
         let starts_unit = units.is_empty()
-            || (role == Some("user")
+            || (astra_turn_types::is_human_user_message(message)
                 && (turn_provenance.is_none() || turn_provenance != active_turn_chain));
         if starts_unit {
             units.push(Vec::new());

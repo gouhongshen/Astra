@@ -1781,19 +1781,22 @@ def build_dependency_setup_plan(
     used_bindings: set[str] = set()
     authoritative_tests = tests_source_dir or test_path.parent
     for sequence, unit in enumerate(units):
-        binding = _parse_static_binding_declaration(unit)
-        fixture = _classify_fixture_stage(
-            unit, authoritative_tests, sequence, len(steps)
-        )
+        # The readiness plan deliberately stops at the official scorer.  Shell
+        # bookkeeping after that boundary (for example ``status=$?`` before
+        # writing reward.txt) must not be interpreted as a pre-scoring static
+        # dependency binding.  We still reject a post-boundary dependency
+        # action, but do not parse or execute any other scorer-following unit.
         if scoring_boundary:
-            if binding is not None or fixture is not None:
-                raise ReadinessContractError("plan_static_binding_disallowed")
             if _contains_dependency_intent(unit):
                 raise ReadinessError(
                     "dependency setup appears after the scoring boundary"
                 )
             continue
 
+        binding = _parse_static_binding_declaration(unit)
+        fixture = _classify_fixture_stage(
+            unit, authoritative_tests, sequence, len(steps)
+        )
         if binding is not None:
             if binding.name in bindings:
                 raise ReadinessContractError("plan_static_binding_disallowed")

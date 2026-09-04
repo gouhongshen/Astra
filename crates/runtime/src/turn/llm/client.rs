@@ -125,6 +125,14 @@ impl LlmProviderProtocol {
             Self::BedrockConverse => "bedrock_converse",
         }
     }
+
+    /// Whether the concrete request builder preserves each appended provider
+    /// message as a distinct wire item. Append-only caching is invalid for
+    /// transports that merge adjacent roles and thereby rewrite the old tail.
+    #[must_use]
+    pub(crate) fn preserves_appended_message_boundaries(self) -> bool {
+        matches!(self, Self::OpenAiCompatible)
+    }
 }
 
 pub(crate) fn llm_provider_protocol(provider: &str) -> LlmProviderProtocol {
@@ -146,6 +154,244 @@ pub(crate) struct ProviderWireRequestIdentity {
     pub provider_wire_hash: String,
     pub provider_wire_bytes: u64,
     pub composition: ProviderWireComposition,
+    /// Hashes of the provider-final, already-sanitized payload components.
+    /// These are computed from the same JSON value serialized into `body`;
+    /// diagnostics therefore never need to approximate the dispatched shape
+    /// from an earlier logical message/tool projection.
+    pub fingerprints: ProviderWireFingerprints,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProviderWireFingerprints {
+    pub message_sequence_sha256: String,
+    pub system_sequence_sha256: String,
+    pub cache_key_system_sha256: String,
+    pub conversation_sequence_sha256: String,
+    pub tool_schema_sequence_sha256: String,
+    pub cache_key_tool_schema_sequence_sha256: String,
+    pub cache_capability: Option<CacheCapability>,
+    pub cache_key_tool_schema_items:
+        Vec<astra_turn_core::cache_diagnostics::ProviderFinalToolFingerprint>,
+}
+
+impl ProviderWireFingerprints {
+    fn from_body(
+        body: &Value,
+        protocol: LlmProviderProtocol,
+        cache_capability: Option<CacheCapability>,
+    ) -> Result<Self, astra_core::ClassifiedError> {
+        let (messages, system, conversation, tools) = match protocol {
+            LlmProviderProtocol::OpenAiCompatible => {
+                let messages = body
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                (
+                    messages.iter().collect::<Vec<_>>(),
+                    messages
+                        .iter()
+                        .filter(|message| {
+                            message.get("role").and_then(Value::as_str) == Some("system")
+                        })
+                        .collect::<Vec<_>>(),
+                    messages
+                        .iter()
+                        .filter(|message| {
+                            message.get("role").and_then(Value::as_str) != Some("system")
+                        })
+                        .collect::<Vec<_>>(),
+                    provider_wire_items(body.get("tools")),
+                )
+            }
+            LlmProviderProtocol::AnthropicMessages => (
+                provider_wire_items(body.get("messages")),
+                provider_wire_items(body.get("system")),
+                provider_wire_items(body.get("messages")),
+                provider_wire_items(body.get("tools")),
+            ),
+            LlmProviderProtocol::BedrockConverse => (
+                provider_wire_items(body.get("messages")),
+                provider_wire_items(body.get("system")),
+                provider_wire_items(body.get("messages")),
+                provider_wire_items(body.pointer("/toolConfig/tools")),
+            ),
+        };
+        let cache_key_tools = provider_cache_key_tool_items(body, protocol, cache_capability);
+        let cache_key_tool_schema_items = cache_key_tools
+            .iter()
+            .map(|tool| {
+                Ok(
+                    astra_turn_core::cache_diagnostics::ProviderFinalToolFingerprint {
+                        name: provider_wire_tool_name(protocol, tool).map(str::to_string),
+                        sha256: serialized_item_sha256(tool)?,
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, astra_core::ClassifiedError>>()?;
+        let cache_key_system = provider_cache_key_system_items(body, protocol, cache_capability);
+        Ok(Self {
+            message_sequence_sha256: serialized_sequence_sha256(&messages)?,
+            system_sequence_sha256: serialized_sequence_sha256(&system)?,
+            cache_key_system_sha256: serialized_sequence_sha256(&cache_key_system)?,
+            conversation_sequence_sha256: serialized_sequence_sha256(&conversation)?,
+            tool_schema_sequence_sha256: serialized_sequence_sha256(&tools)?,
+            cache_key_tool_schema_sequence_sha256: serialized_sequence_sha256(&cache_key_tools)?,
+            cache_capability,
+            cache_key_tool_schema_items,
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn cache_diagnostic_fingerprint(
+        &self,
+    ) -> Option<astra_turn_core::cache_diagnostics::ProviderFinalPromptFingerprint> {
+        let cache_capability = self.cache_capability?;
+        Some(
+            astra_turn_core::cache_diagnostics::ProviderFinalPromptFingerprint {
+                message_sequence_sha256: self.message_sequence_sha256.clone(),
+                system_sequence_sha256: self.system_sequence_sha256.clone(),
+                cache_key_system_sha256: self.cache_key_system_sha256.clone(),
+                conversation_sequence_sha256: self.conversation_sequence_sha256.clone(),
+                tool_schema_sequence_sha256: self.tool_schema_sequence_sha256.clone(),
+                cache_key_tool_schema_sequence_sha256: self
+                    .cache_key_tool_schema_sequence_sha256
+                    .clone(),
+                cache_capability,
+                cache_key_tool_schema_items: self.cache_key_tool_schema_items.clone(),
+            },
+        )
+    }
+}
+
+fn provider_cache_key_system_items(
+    body: &Value,
+    protocol: LlmProviderProtocol,
+    cache_capability: Option<CacheCapability>,
+) -> Vec<&Value> {
+    use astra_turn_core::cache_placement::{CacheProtocol, VolatilePlacement};
+
+    let mut system = match protocol {
+        LlmProviderProtocol::OpenAiCompatible => {
+            let messages = body
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            match cache_capability.map(|capability| capability.volatile_placement) {
+                Some(VolatilePlacement::Free) => Vec::new(),
+                Some(VolatilePlacement::TailSuffix | VolatilePlacement::AppendOnlyUserTail) => {
+                    messages
+                        .iter()
+                        .take_while(|message| {
+                            message.get("role").and_then(Value::as_str) == Some("system")
+                        })
+                        .collect()
+                }
+                _ => messages
+                    .iter()
+                    .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+                    .collect(),
+            }
+        }
+        LlmProviderProtocol::AnthropicMessages => provider_wire_items(body.get("system")),
+        LlmProviderProtocol::BedrockConverse => provider_wire_items(body.get("system")),
+    };
+
+    let marker_protocol = cache_capability
+        .map(|capability| capability.protocol)
+        .filter(|protocol| {
+            matches!(
+                protocol,
+                CacheProtocol::MarkerExplicit | CacheProtocol::BedrockCachePoint
+            )
+        });
+    if let Some(marker_protocol) = marker_protocol {
+        let last_marker = system.iter().rposition(|item| match marker_protocol {
+            CacheProtocol::MarkerExplicit => item.get("cache_control").is_some(),
+            CacheProtocol::BedrockCachePoint => item.get("cachePoint").is_some(),
+            _ => false,
+        });
+        system.truncate(last_marker.map_or(0, |index| index.saturating_add(1)));
+    }
+    system
+}
+
+fn provider_cache_key_tool_items(
+    body: &Value,
+    protocol: LlmProviderProtocol,
+    cache_capability: Option<CacheCapability>,
+) -> Vec<&Value> {
+    use astra_turn_core::cache_placement::CacheProtocol;
+
+    let mut tools = match protocol {
+        LlmProviderProtocol::OpenAiCompatible | LlmProviderProtocol::AnthropicMessages => {
+            provider_wire_items(body.get("tools"))
+        }
+        LlmProviderProtocol::BedrockConverse => {
+            provider_wire_items(body.pointer("/toolConfig/tools"))
+        }
+    };
+    let Some(cache_capability) = cache_capability else {
+        return tools;
+    };
+    match cache_capability.protocol {
+        CacheProtocol::None => Vec::new(),
+        CacheProtocol::MarkerExplicit => {
+            let last_marker = tools
+                .iter()
+                .rposition(|tool| tool.get("cache_control").is_some());
+            tools.truncate(last_marker.map_or(0, |index| index.saturating_add(1)));
+            tools
+        }
+        CacheProtocol::BedrockCachePoint => {
+            let last_marker = tools
+                .iter()
+                .rposition(|tool| tool.get("cachePoint").is_some());
+            tools.truncate(last_marker.map_or(0, |index| index.saturating_add(1)));
+            tools
+        }
+        CacheProtocol::OpenAiAutoPrefix | CacheProtocol::StrictHistoryMatch => tools,
+    }
+}
+
+fn provider_wire_tool_name(protocol: LlmProviderProtocol, tool: &Value) -> Option<&str> {
+    let pointer = match protocol {
+        LlmProviderProtocol::OpenAiCompatible => "/function/name",
+        LlmProviderProtocol::AnthropicMessages => "/name",
+        LlmProviderProtocol::BedrockConverse => "/toolSpec/name",
+    };
+    tool.pointer(pointer).and_then(Value::as_str)
+}
+
+fn provider_wire_items(value: Option<&Value>) -> Vec<&Value> {
+    match value {
+        Some(Value::Array(values)) => values.iter().collect(),
+        Some(value) => vec![value],
+        None => Vec::new(),
+    }
+}
+
+fn serialized_sequence_sha256(values: &[&Value]) -> Result<String, astra_core::ClassifiedError> {
+    serde_json::to_vec(values)
+        .map(|encoded| format!("{:x}", Sha256::digest(encoded)))
+        .map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("serialize provider wire fingerprint sequence: {error}"),
+            )
+        })
+}
+
+fn serialized_item_sha256(value: &Value) -> Result<String, astra_core::ClassifiedError> {
+    serde_json::to_vec(value)
+        .map(|encoded| format!("{:x}", Sha256::digest(encoded)))
+        .map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("serialize provider wire fingerprint item: {error}"),
+            )
+        })
 }
 
 /// Mutually exclusive byte zones from the exact serialized provider body.
@@ -310,9 +556,18 @@ pub(crate) struct PreparedProviderRequest {
 }
 
 impl PreparedProviderRequest {
+    #[cfg(test)]
     pub(crate) fn from_json(
         body: &Value,
         protocol: LlmProviderProtocol,
+    ) -> Result<Self, astra_core::ClassifiedError> {
+        Self::from_json_with_cache_capability(body, protocol, None)
+    }
+
+    pub(crate) fn from_json_with_cache_capability(
+        body: &Value,
+        protocol: LlmProviderProtocol,
+        cache_capability: Option<CacheCapability>,
     ) -> Result<Self, astra_core::ClassifiedError> {
         let encoded = serde_json::to_vec(body).map_err(|error| {
             astra_core::history_work::record_serialization_failure(
@@ -333,6 +588,7 @@ impl PreparedProviderRequest {
         }
         let provider_wire_hash = format!("{:x}", Sha256::digest(&encoded));
         let composition = ProviderWireComposition::from_body(body, protocol, provider_wire_bytes)?;
+        let fingerprints = ProviderWireFingerprints::from_body(body, protocol, cache_capability)?;
         Ok(Self {
             body: Bytes::from(encoded),
             identity: ProviderWireRequestIdentity {
@@ -340,6 +596,7 @@ impl PreparedProviderRequest {
                 provider_wire_hash,
                 provider_wire_bytes,
                 composition,
+                fingerprints,
             },
         })
     }
@@ -738,6 +995,11 @@ pub(crate) trait ProviderAttemptObserver: Send + Sync {
         attempt_index: u32,
         terminal: &astra_services::InferenceInvocationTerminal,
     ) -> Result<(), astra_core::ClassifiedError>;
+
+    /// Synchronous boundary when the HTTP send future is first polled.
+    /// Durable diagnostics use it to distinguish an admitted plan from a
+    /// request that actually crossed into transport execution.
+    fn note_dispatch_started(&self, _attempt_index: u32) {}
 }
 
 struct ControlledProviderAttemptObserver<'a> {
@@ -847,6 +1109,10 @@ impl ProviderAttemptObserver for ControlledProviderAttemptObserver<'_> {
                 Err(self.ledger_deadline_error("terminalization", Some(terminal)))
             },
         }
+    }
+
+    fn note_dispatch_started(&self, attempt_index: u32) {
+        self.inner.note_dispatch_started(attempt_index);
     }
 }
 
@@ -2009,6 +2275,129 @@ pub(crate) fn repair_openai_tool_pairing(messages: &[Value]) -> Vec<Value> {
     repaired
 }
 
+fn append_only_history_contract_error(message: &'static str) -> astra_core::ClassifiedError {
+    astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+}
+
+/// Validate the exact OpenAI-compatible conversation shape used by an
+/// append-only cache deployment.
+///
+/// Ordinary transports may repair interrupted tool groups. An append-only
+/// transport cannot: a later suffix must never cause a previously sent
+/// assistant or synthetic tool message to be replaced. Malformed/incomplete
+/// groups therefore fail before provider I/O and remain recoverable through
+/// the canonical lifecycle instead of silently changing the cache prefix.
+fn validate_append_only_openai_history(
+    messages: &[Value],
+) -> Result<(), astra_core::ClassifiedError> {
+    let mut pending_tool_ids = HashSet::<&str>::new();
+    for message in messages {
+        match message.get("role").and_then(Value::as_str) {
+            Some("assistant") => {
+                if !pending_tool_ids.is_empty() {
+                    return Err(append_only_history_contract_error(
+                        "append-only history contains an incomplete assistant tool group",
+                    ));
+                }
+                let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) else {
+                    continue;
+                };
+                for tool_call in tool_calls {
+                    let Some(id) = tool_call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    else {
+                        return Err(append_only_history_contract_error(
+                            "append-only history contains a tool call without a stable id",
+                        ));
+                    };
+                    if !pending_tool_ids.insert(id) {
+                        return Err(append_only_history_contract_error(
+                            "append-only history contains duplicate tool call ids",
+                        ));
+                    }
+                    let Some(function) = tool_call.get("function") else {
+                        return Err(append_only_history_contract_error(
+                            "append-only history contains a tool call without a function",
+                        ));
+                    };
+                    let Some(name) = function.get("name").and_then(Value::as_str) else {
+                        return Err(append_only_history_contract_error(
+                            "append-only history contains a tool call without a function name",
+                        ));
+                    };
+                    if canonical_valid_tool_name(name) != Some(name)
+                        || !function.get("arguments").is_some_and(Value::is_string)
+                    {
+                        return Err(append_only_history_contract_error(
+                            "append-only history contains a non-canonical tool call",
+                        ));
+                    }
+                }
+            }
+            Some("tool") => {
+                let Some(id) = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                else {
+                    return Err(append_only_history_contract_error(
+                        "append-only history contains a tool result without a stable id",
+                    ));
+                };
+                if !pending_tool_ids.remove(id) {
+                    return Err(append_only_history_contract_error(
+                        "append-only history contains an orphaned or duplicate tool result",
+                    ));
+                }
+                if matches!(
+                    message.get("content"),
+                    None | Some(Value::Null | Value::Object(_))
+                ) {
+                    return Err(append_only_history_contract_error(
+                        "append-only history contains non-canonical tool result content",
+                    ));
+                }
+            }
+            _ if !pending_tool_ids.is_empty() => {
+                return Err(append_only_history_contract_error(
+                    "append-only history interrupts an assistant tool group",
+                ));
+            }
+            _ => {}
+        }
+    }
+    if !pending_tool_ids.is_empty() {
+        return Err(append_only_history_contract_error(
+            "append-only history ends with an incomplete assistant tool group",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_append_only_transport_history(
+    messages: &[Value],
+    provider: &str,
+    cache_capability: Option<CacheCapability>,
+) -> Result<(), astra_core::ClassifiedError> {
+    let capability = CacheCapability::from_explicit_or_provider(cache_capability, provider);
+    if !matches!(
+        capability.volatile_placement,
+        VolatilePlacement::AppendOnlyUserTail
+    ) {
+        return Ok(());
+    }
+    if !capability.is_valid()
+        || !llm_provider_protocol(provider).preserves_appended_message_boundaries()
+    {
+        return Err(append_only_history_contract_error(
+            "append-only cache capability is incompatible with the selected transport",
+        ));
+    }
+    validate_append_only_openai_history(messages)
+}
+
 fn anthropic_tool_use_ids(msg: &Value) -> Vec<String> {
     msg.get("content")
         .map(anthropic_content_as_blocks)
@@ -2684,12 +3073,40 @@ pub(crate) fn build_provider_request_body_with_overrides(
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
     request_body_overrides: Option<&Map<String, Value>>,
 ) -> Value {
+    build_provider_request_body_with_cache_capability(
+        messages,
+        tools,
+        model_name,
+        provider,
+        max_output_tokens,
+        temperature,
+        streaming,
+        thinking,
+        request_body_overrides,
+        None,
+    )
+}
+
+fn build_provider_request_body_with_cache_capability(
+    messages: &[Value],
+    tools: &[Value],
+    model_name: &str,
+    provider: &str,
+    max_output_tokens: Option<usize>,
+    temperature: Option<f64>,
+    streaming: bool,
+    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
+    request_body_overrides: Option<&Map<String, Value>>,
+    cache_capability: Option<CacheCapability>,
+) -> Value {
     let sanitized_overrides =
         sanitize_request_body_overrides_for_thinking(thinking, request_body_overrides);
     let marker_stripped_messages;
     let messages = if messages.iter().any(|message| {
         crate::turn::wire_assembly::is_required_runtime_preamble(message)
             || crate::turn::wire_assembly::is_runtime_system_context(message)
+            || astra_turn_types::is_runtime_owned_message(message)
+            || astra_turn_types::has_append_only_runtime_authority_policy(message)
     }) {
         marker_stripped_messages = {
             astra_core::history_work::record_serialized_value(
@@ -2713,10 +3130,27 @@ pub(crate) fn build_provider_request_body_with_overrides(
     // thinking, no prior reasoning) yields a no-op policy. We skip the
     // `messages.to_vec()` clone in that case using `Cow::Borrowed`, falling
     // back to an owned clone only when the policy may actually mutate.
-    let policy = astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
-        messages, thinking, provider, model_name,
-    );
-    let reasoning_repaired: std::borrow::Cow<'_, [Value]> = if policy.is_no_op() {
+    let preserve_exact_history = cache_capability.is_some_and(|capability| {
+        matches!(
+            capability.volatile_placement,
+            VolatilePlacement::AppendOnlyUserTail
+        )
+    });
+    let policy = (!preserve_exact_history).then(|| {
+        astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
+            messages, thinking, provider, model_name,
+        )
+    });
+    let reasoning_repaired: std::borrow::Cow<'_, [Value]> = if policy
+        .as_ref()
+        .is_none_or(astra_turn_core::edge_ledger::ReasoningReplayPolicy::is_no_op)
+    {
+        // Cache placement is not a reasoning-wire capability. Append-only
+        // deployments therefore preserve assistant fields exactly as
+        // captured: no pruning, placeholder inference, or field backfill.
+        // A deployment which requires synthetic replay fields must declare a
+        // separate typed reasoning capability before such normalization can
+        // be admitted here.
         std::borrow::Cow::Borrowed(messages)
     } else {
         astra_core::history_work::record_serialized_value(
@@ -2724,7 +3158,10 @@ pub(crate) fn build_provider_request_body_with_overrides(
             messages,
         );
         let mut owned = messages.to_vec();
-        astra_turn_core::edge_ledger::strip_stale_reasoning_with_policy(&mut owned, &policy);
+        astra_turn_core::edge_ledger::strip_stale_reasoning_with_policy(
+            &mut owned,
+            policy.as_ref().expect("non-no-op reasoning policy"),
+        );
         std::borrow::Cow::Owned(owned)
     };
     match llm_provider_protocol(provider) {
@@ -2821,8 +3258,15 @@ pub(crate) fn build_provider_request_body_with_overrides(
                 );
                 return body;
             }
-            let repaired = repair_openai_tool_pairing(&reasoning_repaired);
-            let normalized_messages = normalize_openai_tool_message_content(&repaired);
+            let normalized_messages = if preserve_exact_history {
+                // Append-only transport admits only already-valid canonical
+                // tool groups. Suffix-dependent recovery would let a later
+                // tool result rewrite a message that has already been sent.
+                reasoning_repaired.to_vec()
+            } else {
+                let repaired = repair_openai_tool_pairing(&reasoning_repaired);
+                normalize_openai_tool_message_content(&repaired)
+            };
             let mut body = json!({
                 "model": model_name,
                 "messages": normalized_messages,
@@ -2925,18 +3369,24 @@ fn apply_no_tool_choice(
     provider: &str,
     tools: &[Value],
 ) -> Result<(), astra_core::ClassifiedError> {
-    if tools.is_empty() {
-        return Ok(());
-    }
     match llm_provider_protocol(provider) {
         LlmProviderProtocol::OpenAiCompatible => {
+            // Keep the explicit terminal instruction even when the repair
+            // request physically removed every schema. OpenAI-compatible
+            // models can otherwise infer the tool protocol from conversation
+            // history and emit a degraded text call despite an empty `tools`
+            // array.
             body["tool_choice"] = Value::String("none".to_string());
             Ok(())
         }
         LlmProviderProtocol::AnthropicMessages => {
+            if tools.is_empty() {
+                return Ok(());
+            }
             body["tool_choice"] = json!({"type": "none"});
             Ok(())
         }
+        LlmProviderProtocol::BedrockConverse if tools.is_empty() => Ok(()),
         LlmProviderProtocol::BedrockConverse => Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::ContractViolation,
             "Bedrock Converse cannot preserve a non-empty tool surface at a no-tool settlement boundary",
@@ -3005,6 +3455,40 @@ fn apply_request_body_overrides(
     let keys: Vec<&String> = overrides.keys().collect();
     tracing::debug!(?keys, "applying request body overrides");
     merge_json_object(body, overrides);
+}
+
+fn validate_request_body_overrides(
+    request_body_overrides: Option<&Map<String, Value>>,
+) -> Result<(), astra_core::ClassifiedError> {
+    const RUNTIME_OWNED_FIELDS: &[&str] = &[
+        "model",
+        "messages",
+        "system",
+        "tools",
+        "toolConfig",
+        "tool_choice",
+        "stream",
+        "stream_options",
+    ];
+    let Some(overrides) = request_body_overrides else {
+        return Ok(());
+    };
+    let mut conflicts = RUNTIME_OWNED_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| overrides.contains_key(*field))
+        .collect::<Vec<_>>();
+    conflicts.sort_unstable();
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    Err(astra_core::ClassifiedError::new(
+        astra_core::ErrorKind::ContractViolation,
+        format!(
+            "request_body_overrides cannot replace runtime-owned provider fields: {}",
+            conflicts.join(", ")
+        ),
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -3163,28 +3647,31 @@ pub(crate) fn strip_empty_assistant_tool_calls(messages: &mut [Value]) {
 
 #[cfg(test)]
 pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
-    consolidate_system_messages_inner(messages, false)
+    consolidate_system_messages_inner(messages, false, true)
 }
 
 pub(crate) fn consolidate_system_messages_for_provider(
     messages: &[Value],
     provider: &str,
-    model_name: &str,
     explicit_cache_capability: Option<CacheCapability>,
 ) -> Vec<Value> {
     let protocol = llm_provider_protocol(provider);
-    let cache_cap = CacheCapability::from_explicit_or_provider_model(
-        explicit_cache_capability,
-        provider,
-        model_name,
-    );
+    let cache_cap = CacheCapability::from_explicit_or_provider(explicit_cache_capability, provider);
     let preserve_runtime_system_tail = matches!(protocol, LlmProviderProtocol::AnthropicMessages)
         || (matches!(protocol, LlmProviderProtocol::OpenAiCompatible)
             && !matches!(
                 cache_cap.volatile_placement,
                 VolatilePlacement::CurrentUserOnly
             ));
-    consolidate_system_messages_inner(messages, preserve_runtime_system_tail)
+    let allow_suffix_dependent_history_repair = !matches!(
+        cache_cap.volatile_placement,
+        VolatilePlacement::AppendOnlyUserTail
+    );
+    consolidate_system_messages_inner(
+        messages,
+        preserve_runtime_system_tail,
+        allow_suffix_dependent_history_repair,
+    )
 }
 
 fn strip_internal_runtime_markers(messages: &mut [Value]) {
@@ -3192,6 +3679,7 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
         crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
         if let Some(object) = message.as_object_mut() {
             object.remove(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD);
+            object.remove(astra_turn_types::APPEND_ONLY_RUNTIME_AUTHORITY_POLICY_FIELD);
             object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
             object.remove(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD);
             object.remove("_compact_boundary");
@@ -3206,14 +3694,58 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
     }
 }
 
+/// Project canonical messages through the metadata-only portion of the
+/// provider boundary.
+///
+/// Canonical history retains typed provenance so intent, recovery, and
+/// append-only authority consumers can distinguish runtime-owned messages.
+/// Provider requests deliberately remove that metadata.  Any equality check
+/// across those two representations must therefore compare this projection,
+/// while preserving roles, content, ordering, and every provider-visible
+/// field exactly.
+fn project_provider_message_metadata(messages: &[Value]) -> Vec<Value> {
+    let mut projected = messages.to_vec();
+    for message in &mut projected {
+        crate::turn::wire_assembly::strip_required_runtime_preamble_marker(message);
+    }
+    strip_internal_runtime_markers(&mut projected);
+    projected
+}
+
+/// Return whether the request ends in the exact provider-visible projection
+/// of a staged canonical append.
+///
+/// This is intentionally a shape check, not a content classifier: the only
+/// differences ignored are the same typed internal metadata fields removed
+/// at the provider boundary.
+pub(crate) fn provider_request_preserves_projected_canonical_suffix(
+    provider_messages: &[Value],
+    canonical_appended: &[Value],
+) -> bool {
+    if canonical_appended.is_empty() {
+        return true;
+    }
+    let Some(suffix_start) = provider_messages
+        .len()
+        .checked_sub(canonical_appended.len())
+    else {
+        return false;
+    };
+    let provider_suffix = &provider_messages[suffix_start..];
+    project_provider_message_metadata(provider_suffix)
+        == project_provider_message_metadata(canonical_appended)
+}
+
 fn consolidate_system_messages_inner(
     messages: &[Value],
     preserve_runtime_system_tail: bool,
+    allow_suffix_dependent_history_repair: bool,
 ) -> Vec<Value> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut system_blocks: Vec<Value> = Vec::new();
     let mut structured_system = false;
     let mut rest: Vec<Value> = Vec::new();
+    let mut primary_system_seen = false;
 
     let flush_string_parts_into_blocks = |blocks: &mut Vec<Value>, parts: &mut Vec<String>| {
         for part in parts.drain(..) {
@@ -3228,8 +3760,9 @@ fn consolidate_system_messages_inner(
         let is_system = msg.get("role").and_then(|r| r.as_str()) == Some("system");
         let preserve_runtime_control = preserve_runtime_system_tail
             && is_system
-            && crate::turn::wire_assembly::is_runtime_system_context(msg);
+            && (primary_system_seen || crate::turn::wire_assembly::is_runtime_system_context(msg));
         if is_system && !preserve_runtime_control {
+            primary_system_seen = true;
             match msg.get("content") {
                 Some(Value::String(text)) => {
                     if text.is_empty() {
@@ -3282,6 +3815,10 @@ fn consolidate_system_messages_inner(
     }
     out.extend(rest);
     strip_internal_runtime_markers(&mut out);
+
+    if !allow_suffix_dependent_history_repair {
+        return out;
+    }
 
     // Sanitize assistant messages: remove empty tool_calls arrays and fix
     // tool_calls with empty function names.
@@ -4100,6 +4637,7 @@ async fn call_llm_and_collect_with_total_budget(
     let model_key = model_name;
     // `upstream_name` is what goes in the outbound request body + URL.
     let upstream_name = wire_model_name.unwrap_or(model_name);
+    validate_request_body_overrides(request_body_overrides)?;
 
     let started = Instant::now();
     let controlled_attempt_observer =
@@ -4116,16 +4654,16 @@ async fn call_llm_and_collect_with_total_budget(
         .map(|observer| observer as &dyn ProviderAttemptObserver);
     let client = global_llm_client();
 
-    // Consolidate system messages: merge all system-role messages into the first
-    // one, converting extras to a single leading system message. Some providers
-    // (e.g. MiniMax) reject system messages after the first position.
-    let messages =
-        consolidate_system_messages_for_provider(messages, provider, model_name, cache_capability);
+    // Project system messages according to the declared transport/cache shape.
+    // A current-user-only capability consolidates them at the head; protocols
+    // that admit a runtime system suffix preserve that boundary.
+    let messages = consolidate_system_messages_for_provider(messages, provider, cache_capability);
+    validate_append_only_transport_history(&messages, provider, cache_capability)?;
 
     // All providers stream — including Bedrock (via converse-stream +
     // AWS vnd.amazon.eventstream). The body builder and URL builder flip
     // to the streaming variant for every supported provider.
-    let mut body = build_provider_request_body_with_overrides(
+    let mut body = build_provider_request_body_with_cache_capability(
         &messages,
         tools,
         upstream_name,
@@ -4135,6 +4673,7 @@ async fn call_llm_and_collect_with_total_budget(
         true,
         thinking,
         request_body_overrides,
+        cache_capability,
     );
     // `ThinkingConfig::Off` is provider-agnostic; native OpenAI-compatible
     // endpoints still need their typed suppression field to honor it. Apply
@@ -4155,8 +4694,11 @@ async fn call_llm_and_collect_with_total_budget(
             .collect::<HashSet<_>>(),
         RuntimeToolChoice::None => HashSet::new(),
     };
-    let prepared_request =
-        PreparedProviderRequest::from_json(&body, llm_provider_protocol(provider))?;
+    let prepared_request = PreparedProviderRequest::from_json_with_cache_capability(
+        &body,
+        llm_provider_protocol(provider),
+        cache_capability,
+    )?;
 
     let url = llm_request_url(
         base_url,
@@ -4302,6 +4844,17 @@ async fn call_llm_and_collect_with_total_budget(
             model_name,
             "LLM request sending"
         );
+        // Keep the dispatch marker inside the future selected below. If a
+        // cancellation branch wins before the send future is ever polled,
+        // diagnostics must not claim that transport execution started.
+        let send_request = async {
+            if let Some(attempt_index) = observed_attempt {
+                attempt_observer
+                    .expect("observed attempt requires observer")
+                    .note_dispatch_started(attempt_index);
+            }
+            req.body(prepared_request.body()).send().await
+        };
         let send_result = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
@@ -4317,10 +4870,7 @@ async fn call_llm_and_collect_with_total_budget(
                 .await?;
                 return Err(error);
             }
-            result = tokio::time::timeout(
-                request_deadline,
-                req.body(prepared_request.body()).send(),
-            ) => result,
+            result = tokio::time::timeout(request_deadline, send_request) => result,
         };
         let response = match send_result {
             Err(_) => {
@@ -5135,6 +5685,10 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     let mut made_progress = false;
     let mut yield_state = StreamYieldState::new(TokioInstant::now());
     let mut hidden_reasoning_state = HiddenReasoningStreamState::default();
+    let mut visible_text_filter =
+        astra_turn_core::xml_tool_call_fallback::DsmlToolCallStreamFilter::default();
+    let mut visible_reasoning_filter =
+        astra_turn_core::xml_tool_call_fallback::DsmlToolCallStreamFilter::default();
     let partial_result = |response_id: &Option<String>,
                           full_text: &String,
                           reasoning: &String,
@@ -5149,8 +5703,14 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             .collect();
         LlmCallResult {
             response_id: response_id.clone(),
-            full_text: full_text.clone(),
-            reasoning: reasoning.clone(),
+            full_text:
+                astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
+                    full_text,
+                ),
+            reasoning:
+                astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
+                    reasoning,
+                ),
             reasoning_signature: String::new(),
             tool_calls,
             usage: usage.clone(),
@@ -5383,14 +5943,20 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 if is_reasoning {
                     reasoning.push_str(&chunk);
                     yield_state.observe_reasoning_activity(&chunk, TokioInstant::now());
-                    if let Some(callback) = stream_callback.as_deref_mut() {
-                        callback(LlmStreamUpdate::Reasoning(chunk));
+                    let visible = visible_reasoning_filter.push(&chunk);
+                    if !visible.is_empty()
+                        && let Some(callback) = stream_callback.as_deref_mut()
+                    {
+                        callback(LlmStreamUpdate::Reasoning(visible));
                     }
                 } else {
                     full_text.push_str(&chunk);
                     yield_state.observe_text(&chunk, TokioInstant::now());
-                    if let Some(callback) = stream_callback.as_deref_mut() {
-                        callback(LlmStreamUpdate::Text(chunk));
+                    let visible = visible_text_filter.push(&chunk);
+                    if !visible.is_empty()
+                        && let Some(callback) = stream_callback.as_deref_mut()
+                    {
+                        callback(LlmStreamUpdate::Text(visible));
                     }
                 }
             }
@@ -5419,8 +5985,11 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
             }
             reasoning.push_str(r);
             yield_state.observe_reasoning_activity(r, TokioInstant::now());
-            if let Some(callback) = stream_callback.as_deref_mut() {
-                callback(LlmStreamUpdate::Reasoning(r.to_string()));
+            let visible = visible_reasoning_filter.push(r);
+            if !visible.is_empty()
+                && let Some(callback) = stream_callback.as_deref_mut()
+            {
+                callback(LlmStreamUpdate::Reasoning(visible));
             }
             made_progress = true;
         }
@@ -5536,15 +6105,34 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     for (chunk, is_reasoning) in finish_hidden_reasoning_chunks(&mut hidden_reasoning_state) {
         if is_reasoning {
             reasoning.push_str(&chunk);
-            if let Some(callback) = stream_callback.as_deref_mut() {
-                callback(LlmStreamUpdate::Reasoning(chunk));
+            let visible = visible_reasoning_filter.push(&chunk);
+            if !visible.is_empty()
+                && let Some(callback) = stream_callback.as_deref_mut()
+            {
+                callback(LlmStreamUpdate::Reasoning(visible));
             }
         } else {
             full_text.push_str(&chunk);
-            if let Some(callback) = stream_callback.as_deref_mut() {
-                callback(LlmStreamUpdate::Text(chunk));
+            let visible = visible_text_filter.push(&chunk);
+            if !visible.is_empty()
+                && let Some(callback) = stream_callback.as_deref_mut()
+            {
+                callback(LlmStreamUpdate::Text(visible));
             }
         }
+    }
+
+    let trailing_visible_text = visible_text_filter.finish();
+    if !trailing_visible_text.is_empty()
+        && let Some(callback) = stream_callback.as_deref_mut()
+    {
+        callback(LlmStreamUpdate::Text(trailing_visible_text));
+    }
+    let trailing_visible_reasoning = visible_reasoning_filter.finish();
+    if !trailing_visible_reasoning.is_empty()
+        && let Some(callback) = stream_callback
+    {
+        callback(LlmStreamUpdate::Reasoning(trailing_visible_reasoning));
     }
 
     if !yield_state.is_terminal() {
@@ -5570,20 +6158,22 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
 
     // Degraded tool-call fallback: some models emit <invoke> XML or <tool_call>
     // tags in content instead of structured tool_calls. Recover them.
-    if tool_calls.is_empty() {
-        if let Some(parsed) =
-            astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
-        {
+    if let Some(parsed) =
+        astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
+    {
+        if tool_calls.is_empty() {
             astra_core::agent_warn!(
                 "llm",
                 "recovered {} tool call(s) from degraded text in content (stream)",
                 parsed.len()
             );
-            full_text =
-                astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
             tool_calls = parsed;
         }
     }
+    full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+    reasoning = astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
+        &reasoning,
+    );
     canonicalize_provider_tool_calls(&mut tool_calls);
 
     // Extract <think>...</think> blocks from content into reasoning.
@@ -6235,7 +6825,30 @@ pub(crate) async fn call_llm_nonstream(
     call: LlmCall<'_>,
     timeout: std::time::Duration,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
-    call_llm_nonstream_with_attempt_observer(client, call, timeout, None).await
+    call_llm_nonstream_with_attempt_observer_and_tool_choice(
+        client,
+        call,
+        timeout,
+        None,
+        RuntimeToolChoice::Auto,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn call_llm_nonstream_no_tool_choice(
+    client: &reqwest::Client,
+    call: LlmCall<'_>,
+    timeout: std::time::Duration,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_nonstream_with_attempt_observer_and_tool_choice(
+        client,
+        call,
+        timeout,
+        None,
+        RuntimeToolChoice::None,
+    )
+    .await
 }
 
 pub(crate) async fn call_llm_nonstream_with_attempt_observer(
@@ -6243,6 +6856,23 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     call: LlmCall<'_>,
     timeout: std::time::Duration,
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
+) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call_llm_nonstream_with_attempt_observer_and_tool_choice(
+        client,
+        call,
+        timeout,
+        attempt_observer,
+        RuntimeToolChoice::Auto,
+    )
+    .await
+}
+
+async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
+    client: &reqwest::Client,
+    call: LlmCall<'_>,
+    timeout: std::time::Duration,
+    attempt_observer: Option<&dyn ProviderAttemptObserver>,
+    tool_choice: RuntimeToolChoice,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let logical_timeout = timeout;
     let timeout = logical_timeout.saturating_sub(llm_mandatory_settlement_reserve(logical_timeout));
@@ -6282,11 +6912,12 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         .as_ref()
         .map(|observer| observer as &dyn ProviderAttemptObserver);
     let upstream_name = wire_model_name.unwrap_or(model_name);
+    validate_request_body_overrides(request_body_overrides)?;
 
-    let messages =
-        consolidate_system_messages_for_provider(messages, provider, model_name, cache_capability);
+    let messages = consolidate_system_messages_for_provider(messages, provider, cache_capability);
+    validate_append_only_transport_history(&messages, provider, cache_capability)?;
 
-    let mut body = build_provider_request_body_with_overrides(
+    let mut body = build_provider_request_body_with_cache_capability(
         &messages,
         tools,
         upstream_name,
@@ -6296,11 +6927,18 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         false,
         thinking,
         request_body_overrides,
+        cache_capability,
     );
     thinking.apply_openai_suppression(&mut body, provider, base_url);
+    if matches!(tool_choice, RuntimeToolChoice::None) {
+        apply_no_tool_choice(&mut body, provider, tools)?;
+    }
     let wire_output_limit = provider_request_output_limit(&body);
-    let prepared_request =
-        PreparedProviderRequest::from_json(&body, llm_provider_protocol(provider))?;
+    let prepared_request = PreparedProviderRequest::from_json_with_cache_capability(
+        &body,
+        llm_provider_protocol(provider),
+        cache_capability,
+    )?;
 
     let url = llm_request_url(
         base_url,
@@ -6341,12 +6979,18 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         model_name,
         "LLM non-stream request sending"
     );
-    let resp = match req
-        .timeout(effective_timeout)
-        .body(prepared_request.body())
-        .send()
-        .await
-    {
+    let send_request = async {
+        if let Some(attempt_index) = observed_attempt {
+            attempt_observer
+                .expect("observed attempt requires observer")
+                .note_dispatch_started(attempt_index);
+        }
+        req.timeout(effective_timeout)
+            .body(prepared_request.body())
+            .send()
+            .await
+    };
+    let resp = match send_request.await {
         Ok(response) => response,
         Err(e) => {
             let elapsed = started.elapsed();
@@ -6659,20 +7303,22 @@ fn parse_openai_compatible_nonstream_response(
         .map(String::from);
 
     // Degraded tool-call fallback: same recovery for non-stream responses.
-    if tool_calls.is_empty() {
-        if let Some(parsed) =
-            astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
-        {
+    if let Some(parsed) =
+        astra_turn_core::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text)
+    {
+        if tool_calls.is_empty() {
             astra_core::agent_warn!(
                 "llm",
                 "recovered {} tool call(s) from degraded text in content (non-stream)",
                 parsed.len()
             );
-            full_text =
-                astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
             tool_calls = parsed;
         }
     }
+    full_text = astra_turn_core::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
+    reasoning = astra_turn_core::xml_tool_call_fallback::filter_dsml_tool_call_markup_for_display(
+        &reasoning,
+    );
     canonicalize_provider_tool_calls(&mut tool_calls);
 
     if reasoning.is_empty() {
@@ -9431,6 +10077,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_llm_stream_never_publishes_degraded_dsml_markup() {
+        let d1 = json!({"choices":[{"delta":{"content":"visible before\n<｜｜DS"}}]});
+        let d2 = json!({"choices":[{"delta":{"content":"ML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">"}}]});
+        let d3 = json!({"choices":[{"delta":{"content":"<｜｜DSML｜｜parameter name=\"command\" string=\"true\">echo ok</｜｜DSML｜｜parameter>"}}]});
+        let d4 = json!({"choices":[{"delta":{"content":"</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls><｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\">"}}]});
+        let d5 = json!({"choices":[{"delta":{"content":"<｜｜DSML｜｜parameter name=\"command\" string=\"true\">pwd</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>\nvisible after"}}]});
+        let body = format!(
+            "data: {d1}\n\ndata: {d2}\n\ndata: {d3}\n\ndata: {d4}\n\ndata: {d5}\n\ndata: [DONE]\n\n"
+        );
+        let stream = stream::iter(vec![Ok(Bytes::from(body))]);
+        let mut updates = Vec::new();
+        let mut callback = |update| updates.push(update);
+
+        let result = collect_llm_stream(
+            stream,
+            "deepseek-test",
+            Instant::now(),
+            LlmCancel::None,
+            stream_idle_timeout(),
+            stream_idle_timeout_after_progress(),
+            Some(&mut callback),
+        )
+        .await
+        .expect("collect");
+
+        assert_eq!(result.full_text, "visible before\n\nvisible after");
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0]["function"]["name"], "bash");
+        assert_eq!(result.tool_calls[1]["function"]["name"], "bash");
+        let published = updates
+            .iter()
+            .filter_map(|update| match update {
+                LlmStreamUpdate::Text(text) | LlmStreamUpdate::Reasoning(text) => Some(text),
+                LlmStreamUpdate::ToolCall { .. } => None,
+            })
+            .cloned()
+            .collect::<String>();
+        assert_eq!(published, "visible before\n\nvisible after");
+        assert!(!published.contains("DSML"));
+        assert!(!published.contains("echo ok"));
+        assert!(!published.contains("pwd"));
+    }
+
+    #[tokio::test]
     async fn collect_llm_stream_extracts_finish_reason_stop() {
         let d1 = json!({"choices":[{"delta":{"content":"Hello"}}]});
         let done = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
@@ -9856,6 +10546,54 @@ mod tests {
         assert_eq!(details["deadline"]["scope"], "inference_ledger");
         assert_eq!(details["deadline"]["phase"], "provider_attempt_admission");
         assert_eq!(inner.began.load(Ordering::SeqCst), 1);
+        assert!(!inner.dispatched.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn durable_admission_timeout_never_starts_provider_transport() {
+        reset_rate_limit_cooldown_for_tests();
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route("/chat/completions", post(mock_500_once))
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let messages = vec![json!({"role":"user","content":"x"})];
+        let observer = PendingAttemptObserver::default();
+
+        let error = call_llm_and_collect_with_total_budget(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url: &base,
+                    provider: "openai",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+            None,
+            Some(&observer),
+            RuntimeToolChoice::Auto,
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .expect_err("durable admission timeout must stop before provider transport");
+
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert!(!observer.dispatched.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -9997,6 +10735,7 @@ mod tests {
     #[derive(Default)]
     struct PendingAttemptObserver {
         began: AtomicU32,
+        dispatched: AtomicBool,
     }
 
     struct PendingFinishAttemptObserver;
@@ -10017,6 +10756,10 @@ mod tests {
             _terminal: &astra_services::InferenceInvocationTerminal,
         ) -> Result<(), astra_core::ClassifiedError> {
             std::future::pending().await
+        }
+
+        fn note_dispatch_started(&self, _attempt_index: u32) {
+            self.dispatched.store(true, Ordering::SeqCst);
         }
     }
 
@@ -10137,6 +10880,424 @@ mod tests {
     }
 
     #[test]
+    fn ordered_message_fingerprint_preserves_system_conversation_interleaving() {
+        let first = json!({
+            "messages": [
+                {"role": "system", "content": "s1"},
+                {"role": "user", "content": "u1"},
+                {"role": "system", "content": "s2"},
+                {"role": "assistant", "content": "a1"}
+            ]
+        });
+        let second = json!({
+            "messages": [
+                {"role": "system", "content": "s1"},
+                {"role": "user", "content": "u1"},
+                {"role": "assistant", "content": "a1"},
+                {"role": "system", "content": "s2"}
+            ]
+        });
+        let first =
+            PreparedProviderRequest::from_json(&first, LlmProviderProtocol::OpenAiCompatible)
+                .expect("first request");
+        let second =
+            PreparedProviderRequest::from_json(&second, LlmProviderProtocol::OpenAiCompatible)
+                .expect("second request");
+
+        assert_eq!(
+            first.identity().fingerprints.system_sequence_sha256,
+            second.identity().fingerprints.system_sequence_sha256
+        );
+        assert_eq!(
+            first.identity().fingerprints.conversation_sequence_sha256,
+            second.identity().fingerprints.conversation_sequence_sha256
+        );
+        assert_ne!(
+            first.identity().fingerprints.message_sequence_sha256,
+            second.identity().fingerprints.message_sequence_sha256,
+            "provider-final diagnostics must detect changes in role interleaving"
+        );
+    }
+
+    #[test]
+    fn provider_final_cache_key_system_identity_obeys_typed_capability() {
+        use astra_turn_core::cache_placement::{
+            CacheProtocol, CacheReuseScope, VolatileDeliveryPolicy, VolatilePlacement,
+        };
+
+        let tail = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::TailSuffix,
+            volatile_delivery: VolatileDeliveryPolicy::All,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        };
+        let tail_body = |stable: &str, volatile: &str| {
+            json!({
+                "messages": [
+                    {"role": "system", "content": stable},
+                    {"role": "user", "content": "task"},
+                    {"role": "system", "content": volatile}
+                ]
+            })
+        };
+        let first = PreparedProviderRequest::from_json_with_cache_capability(
+            &tail_body("stable", "round 1"),
+            LlmProviderProtocol::OpenAiCompatible,
+            Some(tail),
+        )
+        .expect("first tail request");
+        let second = PreparedProviderRequest::from_json_with_cache_capability(
+            &tail_body("stable", "round 2"),
+            LlmProviderProtocol::OpenAiCompatible,
+            Some(tail),
+        )
+        .expect("second tail request");
+        assert_ne!(
+            first.identity().fingerprints.system_sequence_sha256,
+            second.identity().fingerprints.system_sequence_sha256,
+            "the raw provider receipt must retain the changed suffix"
+        );
+        assert_eq!(
+            first.identity().fingerprints.cache_key_system_sha256,
+            second.identity().fingerprints.cache_key_system_sha256,
+            "a typed TailSuffix excludes system messages after conversation"
+        );
+        let changed_leading = PreparedProviderRequest::from_json_with_cache_capability(
+            &tail_body("changed", "round 2"),
+            LlmProviderProtocol::OpenAiCompatible,
+            Some(tail),
+        )
+        .expect("changed leading request");
+        assert_ne!(
+            second.identity().fingerprints.cache_key_system_sha256,
+            changed_leading
+                .identity()
+                .fingerprints
+                .cache_key_system_sha256
+        );
+
+        let marker = CacheCapability {
+            protocol: CacheProtocol::MarkerExplicit,
+            volatile_placement: VolatilePlacement::MarkerIsolated,
+            volatile_delivery: VolatileDeliveryPolicy::All,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        };
+        let marker_body = |stable: &str, volatile: &str| {
+            json!({
+                "system": [
+                    {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": volatile}
+                ],
+                "messages": [{"role": "user", "content": "task"}]
+            })
+        };
+        let marker_first = PreparedProviderRequest::from_json_with_cache_capability(
+            &marker_body("stable", "round 1"),
+            LlmProviderProtocol::AnthropicMessages,
+            Some(marker),
+        )
+        .expect("first marker request");
+        let marker_second = PreparedProviderRequest::from_json_with_cache_capability(
+            &marker_body("stable", "round 2"),
+            LlmProviderProtocol::AnthropicMessages,
+            Some(marker),
+        )
+        .expect("second marker request");
+        assert_eq!(
+            marker_first.identity().fingerprints.cache_key_system_sha256,
+            marker_second
+                .identity()
+                .fingerprints
+                .cache_key_system_sha256
+        );
+        let marker_changed = PreparedProviderRequest::from_json_with_cache_capability(
+            &marker_body("changed", "round 2"),
+            LlmProviderProtocol::AnthropicMessages,
+            Some(marker),
+        )
+        .expect("changed marker request");
+        assert_ne!(
+            marker_second
+                .identity()
+                .fingerprints
+                .cache_key_system_sha256,
+            marker_changed
+                .identity()
+                .fingerprints
+                .cache_key_system_sha256
+        );
+
+        let marker_tool_body = |stable_description: &str, dynamic_name: &str| {
+            json!({
+                "system": [
+                    {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}}
+                ],
+                "messages": [{"role": "user", "content": "task"}],
+                "tools": [
+                    {
+                        "name": "stable_tool",
+                        "description": stable_description,
+                        "input_schema": {"type": "object"},
+                        "cache_control": {"type": "ephemeral"}
+                    },
+                    {
+                        "name": dynamic_name,
+                        "input_schema": {"type": "object"}
+                    }
+                ]
+            })
+        };
+        let marker_tools_first = PreparedProviderRequest::from_json_with_cache_capability(
+            &marker_tool_body("stable", "dynamic_one"),
+            LlmProviderProtocol::AnthropicMessages,
+            Some(marker),
+        )
+        .expect("first marker tool request");
+        let marker_tools_second = PreparedProviderRequest::from_json_with_cache_capability(
+            &marker_tool_body("stable", "dynamic_two"),
+            LlmProviderProtocol::AnthropicMessages,
+            Some(marker),
+        )
+        .expect("second marker tool request");
+        assert_ne!(
+            marker_tools_first
+                .identity()
+                .fingerprints
+                .tool_schema_sequence_sha256,
+            marker_tools_second
+                .identity()
+                .fingerprints
+                .tool_schema_sequence_sha256
+        );
+        assert_eq!(
+            marker_tools_first
+                .identity()
+                .fingerprints
+                .cache_key_tool_schema_sequence_sha256,
+            marker_tools_second
+                .identity()
+                .fingerprints
+                .cache_key_tool_schema_sequence_sha256,
+            "typed marker capability excludes dynamic tools after the last marker"
+        );
+        let marker_tools_changed = PreparedProviderRequest::from_json_with_cache_capability(
+            &marker_tool_body("changed", "dynamic_two"),
+            LlmProviderProtocol::AnthropicMessages,
+            Some(marker),
+        )
+        .expect("changed marker tool request");
+        assert_ne!(
+            marker_tools_second
+                .identity()
+                .fingerprints
+                .cache_key_tool_schema_sequence_sha256,
+            marker_tools_changed
+                .identity()
+                .fingerprints
+                .cache_key_tool_schema_sequence_sha256
+        );
+
+        let append = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::ConversationTurns),
+        };
+        let append_first_body = json!({
+            "messages": [
+                {"role": "system", "content": "stable"},
+                {"role": "user", "content": "task"},
+                {"role": "user", "content": "runtime authority 1"}
+            ]
+        });
+        let append_second_body = json!({
+            "messages": [
+                {"role": "system", "content": "stable"},
+                {"role": "user", "content": "task"},
+                {"role": "user", "content": "runtime authority 1"},
+                {"role": "assistant", "content": "progress"},
+                {"role": "user", "content": "runtime authority 2"}
+            ]
+        });
+        let prefix = append_first_body["messages"]
+            .as_array()
+            .expect("first messages");
+        let extension = append_second_body["messages"]
+            .as_array()
+            .expect("second messages");
+        assert!(
+            extension.starts_with(prefix),
+            "append-only provider body must preserve the exact ordered message prefix"
+        );
+        let append_first = PreparedProviderRequest::from_json_with_cache_capability(
+            &append_first_body,
+            LlmProviderProtocol::OpenAiCompatible,
+            Some(append),
+        )
+        .expect("first append request");
+        let append_second = PreparedProviderRequest::from_json_with_cache_capability(
+            &append_second_body,
+            LlmProviderProtocol::OpenAiCompatible,
+            Some(append),
+        )
+        .expect("second append request");
+        assert_eq!(
+            append_first.identity().fingerprints.cache_key_system_sha256,
+            append_second
+                .identity()
+                .fingerprints
+                .cache_key_system_sha256
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_attempt_receipt_matches_sanitized_http_body() {
+        #[derive(Clone, Default)]
+        struct CapturedBody(Arc<Mutex<Vec<Value>>>);
+
+        async fn handler(
+            State(captured): State<CapturedBody>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> Response {
+            captured.0.lock().expect("capture lock").push(body);
+            let payload = json!({"choices":[{"delta":{"content":"ok"}}]});
+            Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(Body::from(format!("data: {payload}\n\ndata: [DONE]\n\n")))
+                .expect("response")
+        }
+
+        fn has_internal_schema_extension(value: &Value) -> bool {
+            match value {
+                Value::Array(values) => values.iter().any(has_internal_schema_extension),
+                Value::Object(values) => {
+                    values.keys().any(|key| key.starts_with("x-astra-"))
+                        || values.values().any(has_internal_schema_extension)
+                }
+                _ => false,
+            }
+        }
+
+        reset_rate_limit_cooldown_for_tests();
+        let captured = CapturedBody::default();
+        let app = Router::new()
+            .route("/chat/completions", post(handler))
+            .with_state(captured.clone());
+        let base = spawn_local_http_server(app).await;
+        let observer = RecordingAttemptObserver::default();
+        let messages = [json!({"role": "user", "content": "run"})];
+        let tools_first = [json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "x-astra-discovery-summary": "internal-one"
+                }
+            }
+        })];
+        let mut tools_second = tools_first.clone();
+        tools_second[0]["function"]["parameters"]["x-astra-discovery-summary"] =
+            Value::String("internal-two".to_string());
+        let cache_capability = CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: astra_turn_core::cache_placement::VolatilePlacement::TailSuffix,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        };
+
+        for tools in [&tools_first[..], &tools_second[..]] {
+            call_llm_and_collect_with_stream_callback(
+                LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &messages,
+                    tools,
+                    cache_capability: Some(cache_capability),
+                    route: LlmExecutionRoute {
+                        model_name: "m",
+                        wire_model_name: None,
+                        api_key: "k",
+                        base_url: &base,
+                        provider: "openai",
+                        header_overrides: None,
+                        request_body_overrides: None,
+                        completions_url_override: None,
+                        request_timeout: None,
+                    },
+                    max_output_tokens: Some(128),
+                    temperature: None,
+                    has_fallback: false,
+                    thinking: &ThinkingConfig::Off,
+                },
+                LlmCancel::None,
+                None,
+                Some(&observer),
+            )
+            .await
+            .expect("provider call");
+        }
+
+        let bodies = captured.0.lock().expect("capture lock").clone();
+        assert_eq!(bodies.len(), 2);
+        assert!(
+            bodies
+                .iter()
+                .all(|body| !has_internal_schema_extension(body))
+        );
+        assert_eq!(
+            bodies[0], bodies[1],
+            "internal schema metadata must not alter the provider-final body"
+        );
+        let wires = observer.wires.lock().expect("wire receipts");
+        assert_eq!(wires.len(), 2);
+        for (wire, body) in wires.iter().zip(&bodies) {
+            let actual = PreparedProviderRequest::from_json_with_cache_capability(
+                body,
+                LlmProviderProtocol::OpenAiCompatible,
+                Some(cache_capability),
+            )
+            .expect("captured provider request");
+            assert_eq!(wire.fingerprints, actual.identity().fingerprints);
+        }
+        assert_eq!(wires[0].fingerprints, wires[1].fingerprints);
+
+        let mut detector = astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
+        for (index, wire) in wires.iter().enumerate() {
+            let mut snapshot = astra_turn_core::cache_diagnostics::PromptStateSnapshot::capture(
+                "planned-only",
+                &[],
+                "m",
+                0,
+            );
+            snapshot.attach_provider_final_fingerprint(
+                wire.fingerprints
+                    .cache_diagnostic_fingerprint()
+                    .expect("resolved cache capability"),
+            );
+            let (accepted, event) = detector.record_provider_attempt_for_source(
+                "main",
+                &astra_turn_core::cache_diagnostics::ProviderAttemptCacheIdentity {
+                    request_id: format!("request-{index}"),
+                    attempt: u32::try_from(index).expect("bounded test attempt"),
+                },
+                snapshot,
+                Some(if index == 0 { 0 } else { 1 }),
+            );
+            assert!(accepted);
+            assert!(
+                event.is_none(),
+                "sanitized-equal final receipts cannot produce a structural cache break"
+            );
+        }
+        assert_eq!(detector.stats.total_turns, 2);
+        assert_eq!(detector.stats.cache_hits, 1);
+    }
+
+    #[test]
     fn required_tool_choice_uses_each_provider_native_wire_shape() {
         let messages = [json!({"role": "user", "content": "run"})];
         let tools = [json!({
@@ -10227,6 +11388,16 @@ mod tests {
             );
             assert!(provider_supports_no_tool_choice(provider));
         }
+    }
+
+    #[test]
+    fn openai_no_tool_choice_remains_explicit_with_empty_schema_surface() {
+        let mut body = json!({"model": "test-model", "messages": []});
+        apply_no_tool_choice(&mut body, "openai", &[])
+            .expect("empty repair surface still supports an explicit no-tool choice");
+
+        assert_eq!(body["tool_choice"], "none");
+        assert!(body.get("tools").is_none());
     }
 
     #[test]
@@ -12499,7 +13670,7 @@ mod tests {
         runtime["_timestamp"] = json!(1234);
         runtime["_synthetic"] = json!(true);
 
-        let out = consolidate_system_messages_for_provider(&[runtime], "openai", "gpt-4o", None);
+        let out = consolidate_system_messages_for_provider(&[runtime], "openai", None);
 
         assert_eq!(out[0]["content"], "model-visible required context");
         assert!(
@@ -12524,9 +13695,77 @@ mod tests {
     }
 
     #[test]
+    fn canonical_suffix_check_compares_the_exact_provider_metadata_projection() {
+        let mut assistant = json!({"role": "assistant", "content": "tool result accepted"});
+        assert!(astra_turn_types::mark_turn_message(
+            &mut assistant,
+            "turn-chain-1"
+        ));
+        let work_frame =
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                "establish the admitted work graph",
+                crate::turn::wire_assembly::RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap()
+            .unwrap();
+        let budget_frame =
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                "finish before the admitted deadline",
+                crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap()
+            .unwrap();
+        let canonical_appended = vec![assistant, work_frame, budget_frame.clone()];
+
+        // The main assembly was already consolidated, while the dispatch-time
+        // budget frame was appended afterward. This mixed representation is
+        // the real provider-attempt boundary that exposed the regression.
+        let mut provider_messages = vec![
+            json!({"role": "system", "content": "stable policy"}),
+            json!({"role": "user", "content": "do the task"}),
+        ];
+        provider_messages.extend(project_provider_message_metadata(
+            &canonical_appended[..canonical_appended.len() - 1],
+        ));
+        provider_messages.push(budget_frame);
+
+        assert!(!provider_messages.ends_with(&canonical_appended));
+        assert!(provider_request_preserves_projected_canonical_suffix(
+            &provider_messages,
+            &canonical_appended,
+        ));
+
+        let mut changed_content = canonical_appended.clone();
+        changed_content[0]["content"] = Value::String("different response".to_string());
+        assert!(!provider_request_preserves_projected_canonical_suffix(
+            &provider_messages,
+            &changed_content,
+        ));
+
+        let mut reordered = canonical_appended.clone();
+        reordered.swap(0, 1);
+        assert!(!provider_request_preserves_projected_canonical_suffix(
+            &provider_messages,
+            &reordered,
+        ));
+        assert!(!provider_request_preserves_projected_canonical_suffix(
+            &provider_messages[..2],
+            &canonical_appended,
+        ));
+        assert!(provider_request_preserves_projected_canonical_suffix(
+            &provider_messages,
+            &[],
+        ));
+    }
+
+    #[test]
     fn consolidate_for_openai_preserves_runtime_system_at_current_turn_boundary() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
         )
         .expect("runtime message");
         let msgs = vec![
@@ -12537,7 +13776,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
         ];
 
-        let out = consolidate_system_messages_for_provider(&msgs, "openai", "gpt-4o", None);
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", None);
 
         assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
@@ -12555,9 +13794,45 @@ mod tests {
     }
 
     #[test]
-    fn consolidate_for_strict_history_openai_moves_required_runtime_to_initial_system() {
+    fn provider_system_consolidation_is_idempotent_with_runtime_tail() {
+        let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
+            "completion settlement",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::FinalWorkSynthesis,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .expect("runtime message");
+        let input = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "answer"}),
+            runtime,
+        ];
+
+        let once = consolidate_system_messages_for_provider(&input, "openai", None);
+        let twice = consolidate_system_messages_for_provider(&once, "openai", None);
+
+        assert_eq!(once, twice);
+        assert_eq!(once[0]["content"], "stable");
+        assert_eq!(
+            once.last()
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            once.last()
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_str),
+            Some("completion settlement")
+        );
+    }
+
+    #[test]
+    fn declared_strict_history_shape_moves_required_runtime_to_initial_system() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
         )
         .expect("runtime message");
         let msgs = vec![
@@ -12568,7 +13843,14 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
         ];
 
-        let out = consolidate_system_messages_for_provider(&msgs, "openai", "MiniMax-M2.7", None);
+        let capability = CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement: VolatilePlacement::CurrentUserOnly,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: None,
+        };
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", Some(capability));
 
         assert_eq!(out.len(), 4);
         assert_eq!(out[0]["role"], "system");
@@ -12582,9 +13864,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_current_user_only_capability_overrides_provider_model_heuristic() {
+    fn explicit_current_user_only_capability_overrides_provider_baseline() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
         )
         .expect("runtime message");
         let msgs = vec![
@@ -12597,15 +13881,12 @@ mod tests {
         let explicit = CacheCapability {
             protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
             volatile_placement: VolatilePlacement::CurrentUserOnly,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
             reuse_scope: None,
         };
 
-        let out = consolidate_system_messages_for_provider(
-            &msgs,
-            "openai",
-            "metadata-defined-alias",
-            Some(explicit),
-        );
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", Some(explicit));
 
         assert_eq!(out.len(), 4);
         assert_eq!(out[0]["role"], "system");
@@ -12622,6 +13903,8 @@ mod tests {
     fn consolidate_for_anthropic_preserves_runtime_system_boundary_for_body_builder() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
         )
         .expect("runtime message");
         let msgs = vec![
@@ -12632,8 +13915,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
         ];
 
-        let out =
-            consolidate_system_messages_for_provider(&msgs, "anthropic", "claude-sonnet-4", None);
+        let out = consolidate_system_messages_for_provider(&msgs, "anthropic", None);
 
         assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
@@ -14472,6 +15754,8 @@ mod tests {
     fn build_anthropic_body_keeps_runtime_system_tail_out_of_cached_prefix_block() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
         )
         .expect("runtime message");
         let messages = vec![
@@ -14486,12 +15770,7 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
             runtime,
         ];
-        let messages = consolidate_system_messages_for_provider(
-            &messages,
-            "anthropic",
-            "claude-sonnet-4",
-            None,
-        );
+        let messages = consolidate_system_messages_for_provider(&messages, "anthropic", None);
         let body = build_provider_request_body(
             &messages,
             &[],
@@ -15596,6 +16875,291 @@ mod tests {
         );
         assert_eq!(body["model"], "claude-test");
         assert_eq!(body["stream"], json!(true));
+    }
+
+    #[test]
+    fn request_body_overrides_cannot_replace_runtime_owned_wire_shape() {
+        for field in [
+            "model",
+            "messages",
+            "system",
+            "tools",
+            "toolConfig",
+            "tool_choice",
+            "stream",
+            "stream_options",
+        ] {
+            let overrides = Map::from_iter([(field.to_string(), json!([]))]);
+            let error = validate_request_body_overrides(Some(&overrides))
+                .expect_err("runtime-owned request fields must fail closed");
+            assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+            assert!(error.message.contains(field));
+        }
+        assert!(
+            validate_request_body_overrides(Some(&Map::from_iter([(
+                "context_management".to_string(),
+                json!({"edits": []}),
+            )])))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn append_only_capability_matches_final_transport_message_boundaries() {
+        let frame = |seconds: u64| {
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                &format!("remaining_seconds={seconds}"),
+                crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .expect("valid typed frame")
+            .expect("non-empty frame")
+        };
+        let first = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "do the work"}),
+            frame(10),
+        ];
+        // A transport failure has no assistant response. Retrying appends a
+        // fresher typed authority directly after the prior user-role frame.
+        let mut second = first.clone();
+        second.push(frame(8));
+
+        let openai_first = build_provider_request_body(
+            &first,
+            &[],
+            "deployment",
+            "openai",
+            Some(128),
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+        let openai_second = build_provider_request_body(
+            &second,
+            &[],
+            "deployment",
+            "openai",
+            Some(128),
+            None,
+            true,
+            &ThinkingConfig::Off,
+        );
+        let first_wire = openai_first["messages"].as_array().unwrap();
+        let second_wire = openai_second["messages"].as_array().unwrap();
+        assert!(second_wire.starts_with(first_wire));
+        assert!(second_wire.iter().all(|message| {
+            message
+                .get(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD)
+                .is_none()
+        }));
+        assert!(llm_provider_protocol("openai").preserves_appended_message_boundaries());
+
+        for provider in ["anthropic", "bedrock"] {
+            let first_body = build_provider_request_body(
+                &first,
+                &[],
+                "deployment",
+                provider,
+                Some(128),
+                None,
+                true,
+                &ThinkingConfig::Off,
+            );
+            let second_body = build_provider_request_body(
+                &second,
+                &[],
+                "deployment",
+                provider,
+                Some(128),
+                None,
+                true,
+                &ThinkingConfig::Off,
+            );
+            let first_wire = first_body["messages"].as_array().unwrap();
+            let second_wire = second_body["messages"].as_array().unwrap();
+            assert!(
+                !second_wire.starts_with(first_wire),
+                "{provider} merges consecutive roles and must not advertise append-only boundaries"
+            );
+            assert!(!llm_provider_protocol(provider).preserves_appended_message_boundaries());
+        }
+    }
+
+    #[test]
+    fn append_only_reasoning_replay_never_rewrites_the_sent_prefix() {
+        use astra_turn_core::cache_placement::{
+            CacheProtocol, CacheReuseScope, VolatileDeliveryPolicy,
+        };
+
+        let capability = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::IntraTurnRounds),
+        };
+        let thinking = ThinkingConfig::Enabled {
+            budget_tokens: 1024,
+        };
+        let first = vec![
+            json!({"role": "user", "content": "work"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "reasoning_content": "first decision",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"},
+                }],
+            }),
+            json!({"role": "tool", "tool_call_id": "call-1", "content": "ok"}),
+        ];
+        let mut second = first.clone();
+        second.push(json!({
+            "role": "assistant",
+            "content": "continue",
+            "reasoning_content": "second decision",
+        }));
+
+        let assemble = |history: Vec<Value>| {
+            let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+            state.current_round_index = 1;
+            state.messages = history.clone();
+            crate::turn::llm::context::assemble_wire_messages(
+                crate::turn::llm::context::LlmWireAssemblyInput {
+                    system_messages: vec![json!({"role": "system", "content": "stable"})],
+                    volatile_preamble: Vec::new(),
+                    compacted_messages: history,
+                    state: &mut state,
+                    compaction_boundary_hit: false,
+                    thinking: &thinking,
+                    session_id: "session",
+                    provider: "openai",
+                    model_name: "deployment",
+                    cache_capability: Some(capability),
+                    cache_cfg: &crate::turn::prompt_cache::PromptCacheConfig::default(),
+                },
+            )
+            .expect("production wire assembly")
+        };
+        let first = assemble(first);
+        let second = assemble(second);
+
+        let first_body = build_provider_request_body_with_cache_capability(
+            &first,
+            &[],
+            "deployment",
+            "openai",
+            Some(128),
+            None,
+            true,
+            &thinking,
+            None,
+            Some(capability),
+        );
+        let second_body = build_provider_request_body_with_cache_capability(
+            &second,
+            &[],
+            "deployment",
+            "openai",
+            Some(128),
+            None,
+            true,
+            &thinking,
+            None,
+            Some(capability),
+        );
+
+        let first_wire = first_body["messages"].as_array().unwrap();
+        let second_wire = second_body["messages"].as_array().unwrap();
+        assert!(
+            second_wire.starts_with(first_wire),
+            "a later reasoning response must only extend the immutable provider prefix"
+        );
+        assert_eq!(
+            second_wire[2]["reasoning_content"], "first decision",
+            "historical reasoning must not be rewritten after a later response"
+        );
+    }
+
+    #[test]
+    fn append_only_cache_shape_does_not_invent_reasoning_wire_fields() {
+        use astra_turn_core::cache_placement::{
+            CacheProtocol, CacheReuseScope, VolatileDeliveryPolicy,
+        };
+
+        let capability = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::IntraTurnRounds),
+        };
+        let messages = vec![
+            json!({"role": "user", "content": "work"}),
+            json!({"role": "assistant", "content": "prior answer"}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+
+        let body = build_provider_request_body_with_cache_capability(
+            &messages,
+            &[],
+            "strict-openai-compatible-deployment",
+            "openai",
+            Some(128),
+            None,
+            true,
+            &ThinkingConfig::Enabled {
+                budget_tokens: 1024,
+            },
+            None,
+            Some(capability),
+        );
+
+        assert!(
+            body["messages"].as_array().unwrap().iter().all(|message| {
+                message.get("role").and_then(Value::as_str) != Some("assistant")
+                    || message.get("reasoning_content").is_none()
+            }),
+            "cache placement alone must not add a non-standard assistant field"
+        );
+    }
+
+    #[test]
+    fn append_only_history_rejects_suffix_dependent_tool_repairs() {
+        let incomplete = vec![json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "shell", "arguments": "{}"},
+            }],
+        })];
+        let error = validate_append_only_openai_history(&incomplete)
+            .expect_err("an incomplete group would require a synthetic suffix rewrite");
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+
+        let late_name_recovery = vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {"name": "", "arguments": "{}"},
+                }],
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-2",
+                "name": "shell",
+                "content": "ok",
+            }),
+        ];
+        let error = validate_append_only_openai_history(&late_name_recovery)
+            .expect_err("a later result name must never rewrite a sent assistant message");
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
     }
 
     #[test]

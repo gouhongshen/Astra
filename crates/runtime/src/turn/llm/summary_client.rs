@@ -11,7 +11,7 @@ use super::client::{LlmCall, OwnedLlmExecutionRoute};
 use super::durable::DurableInferenceLedger;
 
 #[cfg(test)]
-use super::client::{call_llm_nonstream, global_llm_client, llm_nonstream_timeout};
+use super::client::{global_llm_client, llm_nonstream_timeout};
 
 #[derive(Clone)]
 struct DurableSummaryExecution {
@@ -96,6 +96,8 @@ enum SummaryExecution {
 pub(crate) struct RuntimeSummaryClient {
     route: OwnedLlmExecutionRoute,
     max_output_tokens: usize,
+    prompt_cache_tools: Vec<Value>,
+    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     execution: SummaryExecution,
 }
 
@@ -126,12 +128,28 @@ impl RuntimeSummaryClient {
         Self {
             route,
             max_output_tokens,
+            prompt_cache_tools: Vec::new(),
+            cache_capability: None,
             execution: SummaryExecution::Durable(Box::new(DurableSummaryExecution {
                 ledger,
                 base_scope,
                 attempt_allocator,
             })),
         }
+    }
+
+    /// Reuse the main inference request's stable tool projection and exact
+    /// deployment cache capability for an inline compaction call. Auxiliary
+    /// callers that do not share a main-request prefix keep the empty default.
+    #[must_use]
+    pub(crate) fn with_prompt_cache_context(
+        mut self,
+        tools: Vec<Value>,
+        cache_capability: astra_turn_core::cache_placement::CacheCapability,
+    ) -> Self {
+        self.prompt_cache_tools = tools;
+        self.cache_capability = Some(cache_capability);
+        self
     }
 
     /// Auxiliary semantic decisions need a short, predictable response. Some
@@ -182,6 +200,8 @@ impl RuntimeSummaryClient {
         Self {
             route,
             max_output_tokens,
+            prompt_cache_tools: Vec::new(),
+            cache_capability: None,
             execution: SummaryExecution::Direct,
         }
     }
@@ -224,13 +244,13 @@ impl SummaryLlmClient for RuntimeSummaryClient {
                     let requested_logical_attempt = attempt_allocator
                         .reserve_pair_at_least(&allocator_scope_key, durable_pair_base)?;
                     let outcome = ledger
-                        .execute_stream(
+                        .execute_stream_no_tool_choice(
                             base_scope.with_logical_attempt(requested_logical_attempt),
                             LlmCall {
                                 purpose,
                                 messages,
-                                tools: &[],
-                                cache_capability: None,
+                                tools: &self.prompt_cache_tools,
+                                cache_capability: self.cache_capability,
                                 route: self.route.borrowed(),
                                 max_output_tokens: Some(self.max_output_tokens),
                                 temperature: Self::temperature_for(purpose, &thinking),
@@ -254,13 +274,13 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             }
             #[cfg(test)]
             SummaryExecution::Direct => {
-                call_llm_nonstream(
+                crate::turn::llm::client::call_llm_nonstream_no_tool_choice(
                     global_llm_client(),
                     LlmCall {
                         purpose,
                         messages,
-                        tools: &[],
-                        cache_capability: None,
+                        tools: &self.prompt_cache_tools,
+                        cache_capability: self.cache_capability,
                         route: self.route.borrowed(),
                         max_output_tokens: Some(self.max_output_tokens),
                         temperature: Self::temperature_for(purpose, &thinking),
@@ -273,6 +293,13 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             }
         };
         match result {
+            Ok(result) if !result.tool_calls.is_empty() => Err(format!(
+                "summary inference returned {} tool call(s) instead of structured text",
+                result.tool_calls.len()
+            )),
+            Ok(result) if result.full_text.trim().is_empty() => {
+                Err("summary inference returned empty text".to_string())
+            }
             Ok(result) => Ok(SummaryResponse {
                 text: result.full_text,
                 is_ptl_error: false,
@@ -426,6 +453,17 @@ mod tests {
             terminal: &astra_services::InferenceInvocationTerminal,
         ) -> astra_services::ServiceResult<()> {
             self.inner.finish_provider_attempt(attempt, terminal).await
+        }
+
+        async fn finish_successful_provider_attempt_and_invocation(
+            &self,
+            plan: &astra_services::InferenceInvocationPlan,
+            attempt: &astra_services::InferenceProviderAttemptPlan,
+            terminal: &astra_services::InferenceInvocationTerminal,
+        ) -> astra_services::ServiceResult<()> {
+            self.inner
+                .finish_successful_provider_attempt_and_invocation(plan, attempt, terminal)
+                .await
         }
     }
 
@@ -624,6 +662,74 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[tokio::test]
+    async fn summary_transport_preserves_cache_tools_but_forbids_tool_selection() {
+        let captured_body = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let captured_body_for_handler = captured_body.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let captured_body = captured_body_for_handler.clone();
+                async move {
+                    *captured_body
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body);
+                    let response = serde_json::json!({
+                        "id": "summary-response",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "structured summary"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+                    });
+                    Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(Body::from(response.to_string()))
+                        .expect("summary provider response")
+                }
+            }),
+        );
+        let execution = summary_execution(spawn_summary_test_server(app).await);
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run a command",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let cache_capability = astra_turn_core::cache_placement::CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement:
+                astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery:
+                astra_turn_core::cache_placement::VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
+        };
+        let client = RuntimeSummaryClient::new_direct_for_test(summary_route(&execution), 64)
+            .with_prompt_cache_context(tools.clone(), cache_capability);
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "stable prefix"}),
+            serde_json::json!({"role": "user", "content": "summarize"}),
+        ];
+
+        let summary = client
+            .summarize(InferencePurpose::RequiredCompaction, &messages)
+            .await
+            .expect("the no-tool transport must return summary text");
+        assert_eq!(summary.text, "structured summary");
+
+        let body = captured_body
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("captured request body");
+        assert_eq!(body.get("messages"), Some(&Value::Array(messages)));
+        assert_eq!(body.get("tools"), Some(&Value::Array(tools)));
+        assert_eq!(body.get("tool_choice"), Some(&Value::String("none".into())));
     }
 
     #[test]

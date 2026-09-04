@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, query};
@@ -181,8 +181,17 @@ pub enum PromptCacheProtocolData {
 pub enum PromptCacheVolatilePlacementData {
     MarkerIsolated,
     TailSuffix,
+    AppendOnlyUserTail,
     CurrentUserOnly,
     Free,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheVolatileDeliveryData {
+    #[default]
+    All,
+    RequiredOnly,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,12 +220,107 @@ impl PromptCacheReuseScopeData {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+const PROMPT_CACHE_CAPABILITY_SCHEMA_VERSION: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PromptCacheCapabilityData {
     pub protocol: PromptCacheProtocolData,
     pub volatile_placement: PromptCacheVolatilePlacementData,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Total delivery policy after deserialization. New serializations always
+    /// write this field. Legacy payload migration happens only in the custom
+    /// deserializer below, never in runtime placement decisions.
+    pub volatile_delivery: PromptCacheVolatileDeliveryData,
     pub reuse_scope: Option<PromptCacheReuseScopeData>,
+}
+
+impl Serialize for PromptCacheCapabilityData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if matches!(
+            self.volatile_placement,
+            PromptCacheVolatilePlacementData::AppendOnlyUserTail
+        ) && (!matches!(
+            self.volatile_delivery,
+            PromptCacheVolatileDeliveryData::RequiredOnly
+        ) || !matches!(self.protocol, PromptCacheProtocolData::OpenAiAutoPrefix))
+        {
+            return Err(serde::ser::Error::custom(
+                "append_only_user_tail requires open_ai_auto_prefix with volatile_delivery=required_only",
+            ));
+        }
+        let mut state = serializer.serialize_struct(
+            "PromptCacheCapabilityData",
+            4 + usize::from(self.reuse_scope.is_some()),
+        )?;
+        state.serialize_field("schema_version", &PROMPT_CACHE_CAPABILITY_SCHEMA_VERSION)?;
+        state.serialize_field("protocol", &self.protocol)?;
+        state.serialize_field("volatile_placement", &self.volatile_placement)?;
+        state.serialize_field("volatile_delivery", &self.volatile_delivery)?;
+        if let Some(reuse_scope) = self.reuse_scope {
+            state.serialize_field("reuse_scope", &reuse_scope)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for PromptCacheCapabilityData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireCapability {
+            #[serde(default)]
+            schema_version: Option<u8>,
+            protocol: PromptCacheProtocolData,
+            volatile_placement: PromptCacheVolatilePlacementData,
+            #[serde(default)]
+            volatile_delivery: Option<PromptCacheVolatileDeliveryData>,
+            #[serde(default)]
+            reuse_scope: Option<PromptCacheReuseScopeData>,
+        }
+
+        let wire = WireCapability::deserialize(deserializer)?;
+        if let Some(schema_version) = wire.schema_version
+            && schema_version != PROMPT_CACHE_CAPABILITY_SCHEMA_VERSION
+        {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported prompt-cache capability schema version {schema_version}; expected {PROMPT_CACHE_CAPABILITY_SCHEMA_VERSION}"
+            )));
+        }
+        let volatile_delivery = match (wire.schema_version, wire.volatile_delivery) {
+            (_, Some(delivery)) => delivery,
+            (Some(_), None) => {
+                return Err(serde::de::Error::missing_field("volatile_delivery"));
+            }
+            // Before the delivery axis existed, every admitted volatile block
+            // was delivered. The neutral legacy meaning is therefore `all`.
+            // Placement cannot determine delivery: a65 also serialized an
+            // explicit `all` by omitting this field, so guessing from shape
+            // would irreversibly rewrite valid data.
+            (None, None) => PromptCacheVolatileDeliveryData::All,
+        };
+        if matches!(
+            wire.volatile_placement,
+            PromptCacheVolatilePlacementData::AppendOnlyUserTail
+        ) && (!matches!(
+            volatile_delivery,
+            PromptCacheVolatileDeliveryData::RequiredOnly
+        ) || !matches!(wire.protocol, PromptCacheProtocolData::OpenAiAutoPrefix))
+        {
+            return Err(serde::de::Error::custom(
+                "append_only_user_tail requires open_ai_auto_prefix with volatile_delivery=required_only",
+            ));
+        }
+        Ok(Self {
+            protocol: wire.protocol,
+            volatile_placement: wire.volatile_placement,
+            volatile_delivery,
+            reuse_scope: wire.reuse_scope,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -5124,6 +5228,7 @@ mod tests {
             prompt_cache_capability: Some(PromptCacheCapabilityData {
                 protocol: PromptCacheProtocolData::StrictHistoryMatch,
                 volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                volatile_delivery: PromptCacheVolatileDeliveryData::RequiredOnly,
                 reuse_scope: Some(PromptCacheReuseScopeData::ConversationTurns),
             }),
             ..QuirksData::default()
@@ -5221,6 +5326,7 @@ mod tests {
             prompt_cache_capability: Some(PromptCacheCapabilityData {
                 protocol: PromptCacheProtocolData::StrictHistoryMatch,
                 volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                volatile_delivery: PromptCacheVolatileDeliveryData::RequiredOnly,
                 reuse_scope: Some(PromptCacheReuseScopeData::IntraTurnRounds),
             }),
             request_body_overrides: Some(Map::from_iter([(
@@ -5261,6 +5367,7 @@ mod tests {
   prompt_cache_capability:
     protocol: openai_auto_prefix
     volatile_placement: tail_suffix
+    volatile_delivery: required_only
     reuse_scope: intra_turn_rounds
 - name: deepseek-v4-flash
   quirks:
@@ -5276,6 +5383,7 @@ mod tests {
             Some(PromptCacheCapabilityData {
                 protocol: PromptCacheProtocolData::OpenAiAutoPrefix,
                 volatile_placement: PromptCacheVolatilePlacementData::TailSuffix,
+                volatile_delivery: PromptCacheVolatileDeliveryData::RequiredOnly,
                 reuse_scope: Some(PromptCacheReuseScopeData::IntraTurnRounds),
             })
         );
@@ -5284,6 +5392,10 @@ mod tests {
             Some(PromptCacheCapabilityData {
                 protocol: PromptCacheProtocolData::StrictHistoryMatch,
                 volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+                // This fixture intentionally omits the delivery axis. The
+                // pre-axis schema delivered all volatile context; placement
+                // must never be used to guess a different behavior.
+                volatile_delivery: PromptCacheVolatileDeliveryData::All,
                 reuse_scope: None,
             })
         );
@@ -5291,6 +5403,87 @@ mod tests {
             prompt_cache_capability_from_models_yaml("missing", Some(&nested)),
             None
         );
+    }
+
+    #[test]
+    fn prompt_cache_legacy_delivery_defaults_to_pre_axis_all_without_shape_inference() {
+        let strict: PromptCacheCapabilityData = serde_json::from_value(serde_json::json!({
+            "protocol": "strict_history_match",
+            "volatile_placement": "current_user_only",
+        }))
+        .unwrap();
+        assert_eq!(
+            strict.volatile_delivery,
+            PromptCacheVolatileDeliveryData::All
+        );
+
+        let prefix: PromptCacheCapabilityData = serde_json::from_value(serde_json::json!({
+            "protocol": "openai_auto_prefix",
+            "volatile_placement": "tail_suffix",
+        }))
+        .unwrap();
+        assert_eq!(
+            prefix.volatile_delivery,
+            PromptCacheVolatileDeliveryData::All
+        );
+    }
+
+    #[test]
+    fn prompt_cache_serialization_never_recreates_legacy_delivery_ambiguity() {
+        let capability = PromptCacheCapabilityData {
+            protocol: PromptCacheProtocolData::StrictHistoryMatch,
+            volatile_placement: PromptCacheVolatilePlacementData::CurrentUserOnly,
+            volatile_delivery: PromptCacheVolatileDeliveryData::All,
+            reuse_scope: None,
+        };
+
+        let encoded = serde_json::to_value(capability).unwrap();
+        assert_eq!(
+            encoded["schema_version"],
+            PROMPT_CACHE_CAPABILITY_SCHEMA_VERSION
+        );
+        assert_eq!(encoded["volatile_delivery"], "all");
+        assert_eq!(
+            serde_json::from_value::<PromptCacheCapabilityData>(encoded).unwrap(),
+            capability
+        );
+    }
+
+    #[test]
+    fn versioned_prompt_cache_capability_requires_explicit_delivery() {
+        let error = serde_json::from_value::<PromptCacheCapabilityData>(serde_json::json!({
+            "schema_version": PROMPT_CACHE_CAPABILITY_SCHEMA_VERSION,
+            "protocol": "strict_history_match",
+            "volatile_placement": "current_user_only",
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("volatile_delivery"));
+    }
+
+    #[test]
+    fn append_only_prompt_cache_capability_requires_prefix_protocol_and_required_delivery() {
+        for value in [
+            serde_json::json!({
+                "protocol": "openai_auto_prefix",
+                "volatile_placement": "append_only_user_tail",
+            }),
+            serde_json::json!({
+                "schema_version": PROMPT_CACHE_CAPABILITY_SCHEMA_VERSION,
+                "protocol": "openai_auto_prefix",
+                "volatile_placement": "append_only_user_tail",
+                "volatile_delivery": "all",
+            }),
+            serde_json::json!({
+                "schema_version": PROMPT_CACHE_CAPABILITY_SCHEMA_VERSION,
+                "protocol": "marker_explicit",
+                "volatile_placement": "append_only_user_tail",
+                "volatile_delivery": "required_only",
+            }),
+        ] {
+            let error = serde_json::from_value::<PromptCacheCapabilityData>(value).unwrap_err();
+            assert!(error.to_string().contains("append_only_user_tail"));
+        }
     }
 
     // -- ModelListItemResponse / conversions --

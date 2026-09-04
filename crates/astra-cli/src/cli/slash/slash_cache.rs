@@ -305,6 +305,7 @@ mod tests {
             round,
             provider: "openai".into(),
             model: "test-model".into(),
+            cache_capability: None,
             cache_read_tokens,
             cache_creation_tokens: 0,
             tool_count: 0,
@@ -432,6 +433,7 @@ mod tests {
             Some(PromptCacheCapabilityData {
                 protocol: astra_services::PromptCacheProtocolData::OpenAiAutoPrefix,
                 volatile_placement: astra_services::PromptCacheVolatilePlacementData::TailSuffix,
+                volatile_delivery: astra_services::PromptCacheVolatileDeliveryData::All,
                 reuse_scope: Some(PromptCacheReuseScopeData::ConversationTurns),
             }),
             &turns,
@@ -452,6 +454,7 @@ mod tests {
             Some(PromptCacheCapabilityData {
                 protocol: astra_services::PromptCacheProtocolData::OpenAiAutoPrefix,
                 volatile_placement: astra_services::PromptCacheVolatilePlacementData::TailSuffix,
+                volatile_delivery: astra_services::PromptCacheVolatileDeliveryData::All,
                 reuse_scope: Some(PromptCacheReuseScopeData::ConversationTurns),
             }),
             &[],
