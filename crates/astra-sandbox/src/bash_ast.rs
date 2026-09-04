@@ -78,17 +78,21 @@ fn analyze_bash_risks_ast_inner(command: &str, shell_depth: usize) -> Vec<Comman
         if let Some(name) = destructive_command_name(&words) {
             ctx.push(CommandRisk::DestructiveCommand(name.to_string()));
         }
-        if let Some(script) = nested_shell_script(&words) {
-            // Quoted `sh -c` input is a new shell program, unlike heredoc
-            // input to Python/Node. Parse it as Bash so wrapping a real
-            // destructive command does not bypass executable detection.
-            if shell_depth >= 16 {
-                ctx.push(CommandRisk::RemoteCodeExecution);
-            } else {
+        match nested_shell_script(&words) {
+            NestedShellScript::Script(script) if shell_depth < 16 => {
+                // Quoted `sh -c` input is a new shell program, unlike heredoc
+                // input to Python/Node. Parse it as Bash so wrapping a real
+                // destructive command does not bypass executable detection.
                 for risk in analyze_bash_risks_ast_inner(script, shell_depth + 1) {
                     ctx.push(risk);
                 }
             }
+            NestedShellScript::Script(_) | NestedShellScript::Ambiguous => {
+                // An unbounded nesting depth or an option sequence whose
+                // command-string boundary is unclear cannot be authorized.
+                ctx.push(CommandRisk::RemoteCodeExecution);
+            }
+            NestedShellScript::None => {}
         }
     }
 
@@ -96,27 +100,100 @@ fn analyze_bash_risks_ast_inner(command: &str, shell_depth: usize) -> Vec<Comman
     ctx.into_risks()
 }
 
-fn nested_shell_script(words: &[String]) -> Option<&str> {
-    let index = effective_command_index(words)?;
-    let executable = command_basename(words.get(index)?);
+enum NestedShellScript<'a> {
+    None,
+    Script(&'a str),
+    Ambiguous,
+}
+
+const SHELL_LONG_OPTIONS: &[&str] = &[
+    "--debug",
+    "--debugger",
+    "--dump-po-strings",
+    "--dump-strings",
+    "--help",
+    "--login",
+    "--noediting",
+    "--noprofile",
+    "--norc",
+    "--posix",
+    "--pretty-print",
+    "--restricted",
+    "--verbose",
+    "--version",
+];
+const SHELL_LONG_OPTIONS_WITH_VALUE: &[&str] = &["--init-file", "--rcfile"];
+const SHELL_SHORT_OPTIONS: &str = "abefhiklmnprstuvxBCEHPTDqVE";
+
+fn nested_shell_script(words: &[String]) -> NestedShellScript<'_> {
+    let Some(index) = effective_command_index(words) else {
+        return NestedShellScript::None;
+    };
+    let Some(executable) = words.get(index).map(|word| command_basename(word)) else {
+        return NestedShellScript::None;
+    };
     if !matches!(executable.as_str(), "bash" | "sh" | "dash" | "zsh" | "ksh") {
-        return None;
+        return NestedShellScript::None;
     }
 
     let mut argument_index = index + 1;
     while let Some(raw) = words.get(argument_index) {
         let argument = unquote_shell_word(raw);
-        if argument == "--" || !argument.starts_with('-') || argument == "-" {
-            return None;
+        if argument == "--"
+            || argument == "-"
+            || (!argument.starts_with('-') && !argument.starts_with('+'))
+        {
+            return NestedShellScript::None;
         }
-        if argument[1..].chars().any(|flag| flag == 'c') {
+
+        if argument.starts_with("--") {
+            let (option, inline_value) = argument
+                .split_once('=')
+                .map_or((argument, false), |(option, _)| (option, true));
+            if SHELL_LONG_OPTIONS.contains(&option) && !inline_value {
+                argument_index += 1;
+                continue;
+            }
+            if SHELL_LONG_OPTIONS_WITH_VALUE.contains(&option) {
+                if !inline_value {
+                    if words.get(argument_index + 1).is_none() {
+                        return NestedShellScript::Ambiguous;
+                    }
+                    argument_index += 1;
+                }
+                argument_index += 1;
+                continue;
+            }
+            return NestedShellScript::Ambiguous;
+        }
+
+        let Some(flags) = argument.get(1..) else {
+            return NestedShellScript::Ambiguous;
+        };
+        if flags.is_empty()
+            || flags
+                .chars()
+                .any(|flag| !SHELL_SHORT_OPTIONS.contains(flag) && !matches!(flag, 'c' | 'o' | 'O'))
+        {
+            return NestedShellScript::Ambiguous;
+        }
+        if argument.starts_with('+') && flags.contains('c') {
+            return NestedShellScript::Ambiguous;
+        }
+        let option_name_count = flags.matches(['o', 'O']).count();
+        if flags.contains('c') {
             return words
-                .get(argument_index + 1)
-                .map(|script| unquote_shell_word(script));
+                .get(argument_index + 1 + option_name_count)
+                .map_or(NestedShellScript::Ambiguous, |script| {
+                    NestedShellScript::Script(unquote_shell_word(script))
+                });
         }
-        argument_index += 1;
+        if words.len() < argument_index + 1 + option_name_count {
+            return NestedShellScript::Ambiguous;
+        }
+        argument_index += 1 + option_name_count;
     }
-    None
+    NestedShellScript::None
 }
 
 const DESTRUCTIVE_COMMANDS: &[&str] = &[
@@ -567,7 +644,13 @@ mod tests {
             "pkexec wipefs -a /dev/sdb",
             "env MODE=secure shred -u secrets.txt",
             "bash -lc 'dd if=/dev/zero of=/dev/sda'",
+            "bash -oc pipefail 'dd if=/dev/zero of=/dev/sda'",
+            "bash -oO pipefail extglob -c 'wipefs -a /dev/sdb'",
             "sudo sh -c 'wipefs -a /dev/sdb'",
+            "bash --norc -c 'dd if=/dev/zero of=/dev/sda'",
+            "bash --rcfile /tmp/bashrc -c 'wipefs -a /dev/sdb'",
+            "sudo bash --norc -c 'dd if=/dev/zero of=/dev/sda'",
+            "env MODE=secure bash --rcfile /tmp/bashrc -c 'wipefs -a /dev/sdb'",
         ] {
             assert!(
                 analyze_bash_risks_ast(command)
@@ -585,12 +668,29 @@ mod tests {
             "python3 -c 'dd = 1; print(dd)'",
             "python3 <<'PY'\ndd = {'chart': 'bar'}\nprint(dd)\nPY",
             "bash -c 'echo dd'",
+            "bash -oc pipefail 'echo dd'",
+            "bash --norc -c 'echo dd'",
+            "bash --rcfile /tmp/bashrc -c 'echo dd'",
         ] {
             assert!(
                 !analyze_bash_risks_ast(command)
                     .iter()
                     .any(|risk| matches!(risk, CommandRisk::DestructiveCommand(_))),
                 "data must not be classified as a destructive command: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_shell_options_fail_closed() {
+        for command in [
+            "bash --unknown-option -c 'echo safe'",
+            "bash +c 'echo safe'",
+            "bash --rcfile",
+        ] {
+            assert!(
+                analyze_bash_risks_ast(command).contains(&CommandRisk::RemoteCodeExecution),
+                "ambiguous shell invocation must fail closed: {command}"
             );
         }
     }
