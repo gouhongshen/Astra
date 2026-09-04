@@ -52,6 +52,90 @@ fn collect_simple_commands(node: Node<'_>, source: &str, commands: &mut Vec<Vec<
     }
 }
 
+#[derive(Debug)]
+enum CommandWord {
+    Literal(String),
+    Dynamic,
+}
+
+impl CommandWord {
+    fn literal(&self) -> Option<&str> {
+        match self {
+            Self::Literal(value) => Some(value),
+            Self::Dynamic => None,
+        }
+    }
+}
+
+fn command_words(node: Node<'_>, source: &str) -> Option<Vec<CommandWord>> {
+    if !matches!(node.kind(), "command" | "simple_command") || node.has_error() {
+        return None;
+    }
+    let mut words = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let word_node = match child.kind() {
+            "command_name" => child.named_child(0)?,
+            "word" | "number" | "string" | "raw_string" | "concatenation" => child,
+            "variable_assignment"
+            | "file_redirect"
+            | "heredoc_redirect"
+            | "herestring_redirect" => continue,
+            _ => {
+                words.push(CommandWord::Dynamic);
+                continue;
+            }
+        };
+        words.push(
+            literal_command_word(word_node, source)
+                .map(CommandWord::Literal)
+                .unwrap_or(CommandWord::Dynamic),
+        );
+    }
+    (!words.is_empty()).then_some(words)
+}
+
+fn literal_command_word(node: Node<'_>, source: &str) -> Option<String> {
+    let mut stack = vec![node];
+    while let Some(candidate) = stack.pop() {
+        if matches!(
+            candidate.kind(),
+            "expansion"
+                | "simple_expansion"
+                | "command_substitution"
+                | "process_substitution"
+                | "arithmetic_expansion"
+        ) {
+            return None;
+        }
+        let mut cursor = candidate.walk();
+        stack.extend(candidate.named_children(&mut cursor));
+    }
+
+    let raw = node.utf8_text(source.as_bytes()).ok()?.trim();
+    if raw.is_empty() || raw.contains(['*', '?', '[', '`']) || raw.starts_with('~') {
+        return None;
+    }
+    let raw = raw
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .or_else(|| {
+            raw.strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap_or(raw);
+    let mut value = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            value.push(chars.next()?);
+        } else {
+            value.push(ch);
+        }
+    }
+    Some(value)
+}
+
 /// AST-level bash risk analysis.
 ///
 /// This is intentionally conservative: it focuses on high-signal primitives
@@ -69,31 +153,35 @@ fn analyze_bash_risks_ast_inner(command: &str, shell_depth: usize) -> Vec<Comman
     let root = tree.root_node();
     let mut ctx = RiskCtx::new(command);
 
-    // Destructive tools must be identified from actual command invocations,
-    // never by scanning arbitrary source text. In particular, heredoc bodies
-    // and inline interpreter programs are data from Bash's point of view.
-    let mut commands = Vec::new();
-    collect_simple_commands(root, command, &mut commands);
-    for words in commands {
-        if let Some(name) = destructive_command_name(&words) {
-            ctx.push(CommandRisk::DestructiveCommand(name.to_string()));
-        }
-        match nested_shell_script(&words) {
-            NestedShellScript::Script(script) if shell_depth < 16 => {
-                // Quoted `sh -c` input is a new shell program, unlike heredoc
-                // input to Python/Node. Parse it as Bash so wrapping a real
-                // destructive command does not bypass executable detection.
-                for risk in analyze_bash_risks_ast_inner(script, shell_depth + 1) {
-                    ctx.push(risk);
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if let Some(words) = command_words(node, command) {
+            match resolve_destructive_command(&words, shell_depth) {
+                DestructiveCommandResolution::Destructive(name) => {
+                    ctx.push(CommandRisk::DestructiveCommand(name));
                 }
+                DestructiveCommandResolution::Ambiguous => {
+                    ctx.push(CommandRisk::RemoteCodeExecution);
+                }
+                DestructiveCommandResolution::Safe => {}
             }
-            NestedShellScript::Script(_) | NestedShellScript::Ambiguous => {
-                // An unbounded nesting depth or an option sequence whose
-                // command-string boundary is unclear cannot be authorized.
-                ctx.push(CommandRisk::RemoteCodeExecution);
+            match nested_shell_script(&words) {
+                NestedShellScript::Script(script) if shell_depth < 16 => {
+                    // Quoted `sh -c` input is a new shell program, unlike
+                    // heredoc input to Python/Node. Parse it as Bash so a real
+                    // destructive command cannot hide behind a shell wrapper.
+                    for risk in analyze_bash_risks_ast_inner(script, shell_depth + 1) {
+                        ctx.push(risk);
+                    }
+                }
+                NestedShellScript::Script(_) | NestedShellScript::Ambiguous => {
+                    ctx.push(CommandRisk::RemoteCodeExecution);
+                }
+                NestedShellScript::None => {}
             }
-            NestedShellScript::None => {}
         }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
     }
 
     visit_node(root, &mut ctx);
@@ -125,20 +213,28 @@ const SHELL_LONG_OPTIONS: &[&str] = &[
 const SHELL_LONG_OPTIONS_WITH_VALUE: &[&str] = &["--init-file", "--rcfile"];
 const SHELL_SHORT_OPTIONS: &str = "abefhiklmnprstuvxBCEHPTDqVE";
 
-fn nested_shell_script(words: &[String]) -> NestedShellScript<'_> {
-    let Some(index) = effective_command_index(words) else {
-        return NestedShellScript::None;
+fn nested_shell_script(words: &[CommandWord]) -> NestedShellScript<'_> {
+    let index = match resolve_transparent_launcher(words, 0) {
+        Ok(Some(index)) => index,
+        Ok(None) => return NestedShellScript::None,
+        Err(()) => return NestedShellScript::Ambiguous,
     };
-    let Some(executable) = words.get(index).map(|word| command_basename(word)) else {
-        return NestedShellScript::None;
+    let Some(executable) = words
+        .get(index)
+        .and_then(CommandWord::literal)
+        .map(command_basename)
+    else {
+        return NestedShellScript::Ambiguous;
     };
     if !matches!(executable.as_str(), "bash" | "sh" | "dash" | "zsh" | "ksh") {
         return NestedShellScript::None;
     }
 
     let mut argument_index = index + 1;
-    while let Some(raw) = words.get(argument_index) {
-        let argument = unquote_shell_word(raw);
+    while let Some(word) = words.get(argument_index) {
+        let Some(argument) = word.literal() else {
+            return NestedShellScript::Ambiguous;
+        };
         if argument == "--"
             || argument == "-"
             || (!argument.starts_with('-') && !argument.starts_with('+'))
@@ -184,9 +280,8 @@ fn nested_shell_script(words: &[String]) -> NestedShellScript<'_> {
         if flags.contains('c') {
             return words
                 .get(argument_index + 1 + option_name_count)
-                .map_or(NestedShellScript::Ambiguous, |script| {
-                    NestedShellScript::Script(unquote_shell_word(script))
-                });
+                .and_then(CommandWord::literal)
+                .map_or(NestedShellScript::Ambiguous, NestedShellScript::Script);
         }
         if words.len() < argument_index + 1 + option_name_count {
             return NestedShellScript::Ambiguous;
@@ -219,38 +314,94 @@ const DESTRUCTIVE_COMMANDS: &[&str] = &[
     "telinit",
 ];
 
-fn destructive_command_name(words: &[String]) -> Option<&'static str> {
-    let index = effective_command_index(words)?;
-    let executable = command_basename(words.get(index)?);
+enum DestructiveCommandResolution {
+    Safe,
+    Destructive(String),
+    Ambiguous,
+}
+
+fn resolve_destructive_command(
+    words: &[CommandWord],
+    shell_depth: usize,
+) -> DestructiveCommandResolution {
+    let index = match resolve_transparent_launcher(words, 0) {
+        Ok(Some(index)) => index,
+        Ok(None) => return DestructiveCommandResolution::Safe,
+        Err(()) => return DestructiveCommandResolution::Ambiguous,
+    };
+    let Some(executable) = words.get(index).and_then(CommandWord::literal) else {
+        return DestructiveCommandResolution::Ambiguous;
+    };
+    let executable = command_basename(executable);
     if executable == "mkfs" || executable.starts_with("mkfs.") {
-        return Some("mkfs");
+        return DestructiveCommandResolution::Destructive("mkfs".to_string());
     }
-    DESTRUCTIVE_COMMANDS
+    if let Some(name) = DESTRUCTIVE_COMMANDS
         .iter()
         .copied()
         .find(|candidate| executable.eq_ignore_ascii_case(candidate))
+    {
+        return DestructiveCommandResolution::Destructive(name.to_string());
+    }
+    match nested_shell_script(words) {
+        NestedShellScript::Script(_) if shell_depth >= 16 => {
+            return DestructiveCommandResolution::Ambiguous;
+        }
+        NestedShellScript::Script(script) => {
+            let nested_risks = analyze_bash_risks_ast_inner(script, shell_depth + 1);
+            if let Some(name) = nested_risks.into_iter().find_map(|risk| match risk {
+                CommandRisk::DestructiveCommand(name) => Some(name),
+                _ => None,
+            }) {
+                return DestructiveCommandResolution::Destructive(name);
+            }
+        }
+        NestedShellScript::Ambiguous => return DestructiveCommandResolution::Ambiguous,
+        NestedShellScript::None => {}
+    }
+
+    match executable.as_str() {
+        "busybox" | "toybox" => resolve_multicall_applet(&words[index + 1..], shell_depth),
+        "xargs" => resolve_xargs_command(&words[index + 1..], shell_depth),
+        "find" => resolve_find_commands(&words[index + 1..], shell_depth),
+        _ => DestructiveCommandResolution::Safe,
+    }
 }
 
-/// Resolve common transparent launchers without inspecting ordinary command
-/// arguments. This preserves detection for `sudo dd`, `env X=1 wipefs`, etc.,
-/// while ensuring `python -c '... dd ...'` remains interpreter input.
-fn effective_command_index(words: &[String]) -> Option<usize> {
-    let mut index = 0;
+fn resolve_transparent_launcher(
+    words: &[CommandWord],
+    mut index: usize,
+) -> Result<Option<usize>, ()> {
     loop {
-        let executable = command_basename(words.get(index)?);
+        let Some(word) = words.get(index) else {
+            return Ok(None);
+        };
+        let executable = command_basename(word.literal().ok_or(())?);
         index += 1;
         match executable.as_str() {
             "command" | "builtin" | "exec" | "nohup" => {
-                index = skip_options(words, index, &[])?;
+                let Some(next) = skip_literal_options(words, index, &[])? else {
+                    return Ok(None);
+                };
+                index = next;
             }
             "env" => {
-                index = skip_options(words, index, &["-u", "--unset", "-C", "--chdir"])?;
-                while words.get(index).is_some_and(|word| is_assignment(word)) {
+                let Some(next) =
+                    skip_literal_options(words, index, &["-u", "--unset", "-C", "--chdir"])?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+                while words
+                    .get(index)
+                    .and_then(CommandWord::literal)
+                    .is_some_and(is_assignment)
+                {
                     index += 1;
                 }
             }
             "sudo" | "doas" | "pkexec" => {
-                index = skip_options(
+                let Some(next) = skip_literal_options(
                     words,
                     index,
                     &[
@@ -267,45 +418,189 @@ fn effective_command_index(words: &[String]) -> Option<usize> {
                         "-C",
                         "--close-from",
                     ],
-                )?;
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
             }
-            _ => return Some(index - 1),
+            _ => return Ok(Some(index - 1)),
         }
     }
 }
 
-fn skip_options(words: &[String], mut index: usize, options_with_value: &[&str]) -> Option<usize> {
-    while let Some(raw) = words.get(index) {
-        let argument = unquote_shell_word(raw);
+fn skip_literal_options(
+    words: &[CommandWord],
+    mut index: usize,
+    options_with_value: &[&str],
+) -> Result<Option<usize>, ()> {
+    while let Some(word) = words.get(index) {
+        let argument = word.literal().ok_or(())?;
         if argument == "--" {
-            return (index + 1 < words.len()).then_some(index + 1);
+            return Ok((index + 1 < words.len()).then_some(index + 1));
         }
         if !argument.starts_with('-') || argument == "-" {
-            return Some(index);
+            return Ok(Some(index));
         }
         let option = argument.split_once('=').map_or(argument, |(name, _)| name);
         index += 1;
         if options_with_value.contains(&option) && !argument.contains('=') {
+            if words.get(index).is_none() {
+                return Ok(None);
+            }
             index += 1;
         }
     }
-    None
+    Ok(None)
+}
+
+fn resolve_multicall_applet(
+    words: &[CommandWord],
+    shell_depth: usize,
+) -> DestructiveCommandResolution {
+    let Some(applet) = words.first().and_then(CommandWord::literal) else {
+        return if words.is_empty() {
+            DestructiveCommandResolution::Safe
+        } else {
+            DestructiveCommandResolution::Ambiguous
+        };
+    };
+    if applet.starts_with('-') {
+        return if matches!(
+            applet,
+            "--help" | "--list" | "--list-full" | "--install" | "--show"
+        ) {
+            DestructiveCommandResolution::Safe
+        } else {
+            DestructiveCommandResolution::Ambiguous
+        };
+    }
+    resolve_destructive_command(words, shell_depth)
+}
+
+fn resolve_xargs_command(
+    words: &[CommandWord],
+    shell_depth: usize,
+) -> DestructiveCommandResolution {
+    const OPTIONS_WITH_VALUE: &[&str] = &[
+        "-E",
+        "--eof",
+        "-I",
+        "--replace",
+        "-L",
+        "--max-lines",
+        "-n",
+        "--max-args",
+        "-P",
+        "--max-procs",
+        "-s",
+        "--max-chars",
+        "--process-slot-var",
+        "-a",
+        "--arg-file",
+        "-d",
+        "--delimiter",
+    ];
+    const OPTIONS_WITH_ATTACHED_VALUE: &[&str] = &["-E", "-I", "-L", "-n", "-P", "-s", "-a", "-d"];
+    const FLAGS: &[&str] = &[
+        "-0",
+        "--null",
+        "-p",
+        "--interactive",
+        "-r",
+        "--no-run-if-empty",
+        "-t",
+        "--verbose",
+        "-x",
+        "--exit",
+        "--show-limits",
+        "--help",
+        "--version",
+    ];
+
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        let Some(argument) = word.literal() else {
+            return DestructiveCommandResolution::Ambiguous;
+        };
+        if argument == "--" {
+            index += 1;
+            break;
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            break;
+        }
+        let option = argument.split_once('=').map_or(argument, |(name, _)| name);
+        if OPTIONS_WITH_VALUE.contains(&option) {
+            index += 1;
+            if !argument.contains('=') {
+                if words.get(index).is_none() {
+                    return DestructiveCommandResolution::Ambiguous;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        if OPTIONS_WITH_ATTACHED_VALUE
+            .iter()
+            .any(|prefix| argument.starts_with(prefix) && argument.len() > prefix.len())
+            || FLAGS.contains(&argument)
+            || argument
+                .strip_prefix('-')
+                .is_some_and(|flags| flags.chars().all(|flag| "0prtx".contains(flag)))
+        {
+            index += 1;
+            continue;
+        }
+        return DestructiveCommandResolution::Ambiguous;
+    }
+
+    if index == words.len() {
+        DestructiveCommandResolution::Safe
+    } else {
+        resolve_destructive_command(&words[index..], shell_depth)
+    }
+}
+
+fn resolve_find_commands(
+    words: &[CommandWord],
+    shell_depth: usize,
+) -> DestructiveCommandResolution {
+    let mut index = 0;
+    while index < words.len() {
+        let Some(argument) = words[index].literal() else {
+            index += 1;
+            continue;
+        };
+        if !matches!(argument, "-exec" | "-execdir" | "-ok" | "-okdir") {
+            index += 1;
+            continue;
+        }
+        let command_start = index + 1;
+        let Some(command_end) = (command_start..words.len()).find(|candidate| {
+            words[*candidate]
+                .literal()
+                .is_some_and(|word| matches!(word, ";" | "+"))
+        }) else {
+            return DestructiveCommandResolution::Ambiguous;
+        };
+        match resolve_destructive_command(&words[command_start..command_end], shell_depth) {
+            DestructiveCommandResolution::Safe => {}
+            result => return result,
+        }
+        index = command_end + 1;
+    }
+    DestructiveCommandResolution::Safe
 }
 
 fn command_basename(raw: &str) -> String {
-    unquote_shell_word(raw)
-        .rsplit(['/', '\\'])
+    raw.rsplit(['/', '\\'])
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase()
 }
 
-fn unquote_shell_word(raw: &str) -> &str {
-    raw.trim().trim_matches(|ch| matches!(ch, '\'' | '"'))
-}
-
 fn is_assignment(raw: &str) -> bool {
-    let raw = unquote_shell_word(raw);
     let Some((name, _)) = raw.split_once('=') else {
         return false;
     };
@@ -651,6 +946,13 @@ mod tests {
             "bash --rcfile /tmp/bashrc -c 'wipefs -a /dev/sdb'",
             "sudo bash --norc -c 'dd if=/dev/zero of=/dev/sda'",
             "env MODE=secure bash --rcfile /tmp/bashrc -c 'wipefs -a /dev/sdb'",
+            "busybox dd if=/dev/zero of=/dev/sda",
+            "toybox wipefs -a /dev/sdb",
+            "sudo busybox dd if=/dev/zero of=/dev/sda",
+            "printf '%s\\n' data | xargs -n 1 dd if=/dev/zero of=/dev/sda",
+            "find . -exec dd if=/dev/zero of=/dev/sda {} \\;",
+            "find . -execdir sh -c 'wipefs -a /dev/sdb' {} \\;",
+            "printf data | xargs sh -c 'dd if=/dev/zero of=/dev/sda'",
         ] {
             assert!(
                 analyze_bash_risks_ast(command)
@@ -671,6 +973,10 @@ mod tests {
             "bash -oc pipefail 'echo dd'",
             "bash --norc -c 'echo dd'",
             "bash --rcfile /tmp/bashrc -c 'echo dd'",
+            "busybox echo dd",
+            "printf '%s\\n' dd | xargs printf '%s\\n'",
+            "printf '%s\\n' dd | xargs",
+            "find . -name dd -print",
         ] {
             assert!(
                 !analyze_bash_risks_ast(command)
@@ -691,6 +997,21 @@ mod tests {
             assert!(
                 analyze_bash_risks_ast(command).contains(&CommandRisk::RemoteCodeExecution),
                 "ambiguous shell invocation must fail closed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_dispatched_executables_fail_closed() {
+        for command in [
+            "tool=dd; \"$tool\" if=/dev/zero of=/dev/sda",
+            "busybox \"$tool\" if=/dev/zero of=/dev/sda",
+            "printf data | xargs \"$tool\" if=/dev/zero of=/dev/sda",
+            "find . -exec \"$tool\" if=/dev/zero of=/dev/sda {} \\;",
+        ] {
+            assert!(
+                analyze_bash_risks_ast(command).contains(&CommandRisk::RemoteCodeExecution),
+                "dynamic executable position must fail closed: {command}"
             );
         }
     }
