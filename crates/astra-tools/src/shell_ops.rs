@@ -6157,8 +6157,14 @@ printf 'probe.txt:1:needle\n'
             "chroot /mnt dd if=/dev/zero of=/dev/sda",
             "unshare --fork truncate -s 0 important.db",
             "printf data | xargs dd if=/dev/zero of=/dev/sda",
+            "printf '' | xargs --eof dd if=/dev/zero of=important.db count=1",
+            "printf '' | xargs --replace wipefs -a /dev/sdb",
             "find . -exec wipefs -a /dev/sdb {} \\;",
             "find_args='-exec truncate -s 0 important.db {} ;'; find . $find_args",
+            "opts='/tmp/rc -c reboot'; bash --rcfile $opts printf",
+            "spec='HOME dd'; env -u $spec if=/dev/zero of=important.db count=1",
+            "spec='STOP dd'; printf '' | xargs -E $spec if=/dev/zero of=important.db count=1",
+            "duration='5 dd'; timeout $duration if=/dev/zero of=important.db count=1",
             "tool=dd; \"$tool\" if=/dev/zero of=/dev/sda",
             "cat ~/.ssh/id_rsa",
             "echo data > ../outside.txt",
@@ -6194,6 +6200,20 @@ printf 'probe.txt:1:needle\n'
         assert!(validate_execute_bash_command("chroot /mnt printf '%s\\n' dd").is_ok());
         assert!(validate_execute_bash_command("unshare --fork printf '%s\\n' dd").is_ok());
         assert!(validate_execute_bash_command("root=src; find \"$root\" -name dd -print").is_ok());
+        assert!(
+            validate_execute_bash_command(
+                "opts=/tmp/bashrc; bash --rcfile \"$opts\" -c 'printf safe'"
+            )
+            .is_ok()
+        );
+        assert!(validate_execute_bash_command("spec=HOME; env -u \"$spec\" printf safe").is_ok());
+        assert!(
+            validate_execute_bash_command("printf '' | xargs --eof=STOP printf '%s\\n' dd").is_ok()
+        );
+        assert!(
+            validate_execute_bash_command("printf '' | xargs --replace=ITEM printf '%s\\n' dd")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -6205,6 +6225,8 @@ printf 'probe.txt:1:needle\n'
             "sudo --help dd",
             "timeout --help dd",
             "ionice -p 123 dd",
+            "xargs --help dd",
+            "xargs --version dd",
         ] {
             assert!(
                 validate_execute_bash_command(command).is_ok(),
