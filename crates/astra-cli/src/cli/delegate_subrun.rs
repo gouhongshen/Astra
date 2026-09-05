@@ -11,9 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use astra_pipeline::{step_protocol::InMemoryIdempotencyCache, step_recorder::StepRecorder};
 use astra_runtime::{
-    pipeline::step_protocol::InMemoryIdempotencyCache,
-    pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     server::delegation::engine::{SubRunConfig, SubRunExecutor},
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
@@ -634,7 +633,6 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             runtime_tool_executor: None,
             interruption: None,

@@ -69,7 +69,9 @@ def main() -> None:
         Path("scripts/ci/test_interactive_setup_contract.sh"),
         Path("scripts/ops/test_production_env_contract.sh"),
         Path("scripts/ci/test_release_contract.sh"),
+        Path("scripts/ci/test_github_release_lookup.sh"),
         Path("scripts/ci/test_release_manifest_contract.sh"),
+        Path("scripts/ci/test_release_build_shells.py"),
         Path("scripts/ci/test_sccache_fallback.sh"),
     ]
     for contract_script in contract_scripts:
@@ -136,10 +138,12 @@ def main() -> None:
         "Reject conflicting Docker version before creating the tag",
         "Resolve publication continuation state",
         "Release-Run:",
-        "Could not safely determine whether GitHub Release",
         "Recovery cannot adopt manual or legacy tags",
         "Recovery will not trust an unverifiable release owner",
         'run.get("path", "")',
+        "scripts/resolve-github-release.sh",
+        "release_id=${release_id}",
+        "steps.stage_release.outputs.id",
         "Create or validate the immutable release tag",
         "Stage GitHub Release and verified assets",
         "Create or verify the immutable Docker version manifest",
@@ -150,6 +154,21 @@ def main() -> None:
         if required not in release_controller:
             errors.append(
                 f".github/workflows/release.yml: missing unified release contract ({required})"
+            )
+
+    release_lookup = Path("scripts/resolve-github-release.sh").read_text(
+        encoding="utf-8"
+    )
+    for required in (
+        "Could not safely determine whether GitHub Release",
+        "--paginate",
+        ".tag_name, .draft, .id",
+        "refusing an ambiguous publication",
+    ):
+        if required not in release_lookup:
+            errors.append(
+                "scripts/resolve-github-release.sh: missing draft-aware, fail-closed "
+                f"release lookup contract ({required})"
             )
 
     docker_manifest = release_controller.find(
@@ -288,9 +307,8 @@ def main() -> None:
                 f"must be immutable ({dependency_image})"
             )
 
-    stack_compose = Path("deployment/all-in-one/docker-compose.yml").read_text(
-        encoding="utf-8"
-    )
+    stack_compose_path = Path("deployment/all-in-one/docker-compose.yml")
+    stack_compose = stack_compose_path.read_text(encoding="utf-8")
     for image_variable in ("ASTRA_IMAGE", "MEMORIA_IMAGE", "MATRIXONE_IMAGE"):
         if f"${{{image_variable}:-" in stack_compose:
             errors.append(
@@ -298,10 +316,27 @@ def main() -> None:
                 f"the compatibility pin for {image_variable} instead of silently falling back"
             )
 
+    for compose_path in (
+        stack_compose_path,
+        Path("deployment/all-in-one/docker-compose.deps.yml"),
+    ):
+        compose = compose_path.read_text(encoding="utf-8")
+        if (
+            "/dev/tcp/127.0.0.1/8100" not in compose
+            or "GET /health HTTP/1.1" not in compose
+            or "/proc/1/cmdline" in compose
+        ):
+            errors.append(
+                f"{compose_path}: Memoria healthcheck must probe its HTTP readiness "
+                "boundary instead of only checking that the process exists"
+            )
+
     makefile = Path("Makefile").read_text(encoding="utf-8")
     for required in (
         "release-prepare:",
         'scripts/prepare-release-version.py "$(VERSION)"',
+        "release-publish:",
+        "gh workflow run release.yml --repo matrixorigin/Astra --ref main",
         "stack-start: stack-env",
         "$(MAKE) stack-up",
         "$(MAKE) stack-verify",

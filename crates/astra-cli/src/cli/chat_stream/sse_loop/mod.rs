@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use astra_core::RuntimeLimits;
+use astra_pipeline::step_recorder::StepRecorder;
 use astra_runtime::{
-    pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     tool_registry::ToolRegistry,
     turn::agentic_loop::finalization::run_agentic_loop_with_host,
@@ -1025,7 +1025,6 @@ pub(crate) async fn stream_chat_sse(
         permission_handler: None,
         tactical_adapter: None,
         step_signal_collector: None,
-        tool_budget_override: None,
         recent_tactical_actions: Vec::new(),
         runtime_tool_executor: None,
         interruption: None,

@@ -699,14 +699,14 @@ async fn refresh_runtime_promotion_signals_from_db(state: &mut AgenticLoopState)
     };
     let verdict_warning =
         crate::server::run::lifecycle::has_turn_verdict_warning(&state.stall.verdict_events);
-    let evaluation = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
+    let evaluation = astra_turn_core::evaluation::evaluate_tool_call_records_with_thresholds(
         &state.message,
         &state.recent_tools,
         &state.stall.tool_call_records,
         state.stall.events.len(),
         verdict_warning,
         state.telemetry.first_budget_pressure,
-        crate::pipeline::evaluation::current_evaluation_thresholds(),
+        crate::turn::runtime_policy::configured_evaluation_thresholds(),
     );
     let assessment = build_runtime_session_quality_assessment(
         &session_id,
@@ -1700,19 +1700,19 @@ async fn finalize_server_rollback_boundary_with_authority(
             if session_state_entries_added > 0 {
                 let output = tool_session_state_rollback::execute_rollback_session_state(
                     tool_session_state_rollback::RollbackSessionStateContext {
-                        journal: executor.session_state_journal.as_ref(),
+                        journal: executor.session_state_journal.clone(),
                         current_turn_index: executor.journal_turn_index.load(Ordering::Relaxed),
                         restore_context: tool_session_state_rollback::SessionStateRestoreContext {
-                            user_id: executor.journal_user_id(),
-                            session_id: &executor.session_id,
-                            observability_session: executor.observability_session.as_ref(),
+                            user_id: executor.journal_user_id().to_string(),
+                            session_id: executor.session_id.clone(),
+                            observability_session: executor.observability_session.clone(),
                         },
                     },
-                    &serde_json::json!({
+                    serde_json::json!({
                         "scope": "current_turn",
                         "session_state_after_sequence": session_state_checkpoint,
                     }),
-                    || executor.publish_current_workspace("tool_phase:rollback_session_state"),
+                    executor.owned_current_workspace_publisher("tool_phase:rollback_session_state"),
                 )
                 .await;
                 Some(parse_server_rollback_output(
@@ -3150,7 +3150,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         policy_subject,
         &state.stall.tool_call_records,
         state.llm_rounds_completed,
-        crate::pipeline::evaluation::current_evaluation_thresholds(),
+        crate::turn::runtime_policy::configured_evaluation_thresholds(),
     );
     state.stall.runtime_policy_evaluation = policy_state;
     if let Some(policy_feedback) = policy_update {
