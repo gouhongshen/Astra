@@ -14,60 +14,20 @@ on:
         description: Immutable source commit selected by the caller
         required: true
         type: string
-      source_ref:
-        description: Selected branch name or immutable commit used in OCI ref metadata
-        required: true
-        type: string
-      controller_sha:
-        description: Trusted workflow revision that owns scripts and smoke verification
-        required: true
-        type: string
       matrix_json:
         description: JSON platform build matrix
         required: true
         type: string
-      registry:
-        description: Registry that owns the verified candidate manifests
-        required: true
-        type: string
-      image_name:
-        description: Target image repository that owns the verified candidate manifests
-        required: true
-        type: string
-      http_proxy:
-        type: string
-        default: ""
-      https_proxy:
-        type: string
-        default: ""
-      no_proxy:
-        type: string
-        default: ""
-      require_self_hosted:
-        type: boolean
-        default: false
-      retain_candidate_tag:
-        description: Retain a run-scoped tag for release recovery
-        type: boolean
-        default: true
-      use_registry_cache:
-        description: Read and publish registry-backed BuildKit cache manifests
-        type: boolean
-        default: true
     secrets:
-      REGISTRY_USERNAME:
+      DOCKERHUB_USERNAME:
         required: true
-      REGISTRY_PASSWORD:
+      DOCKERHUB_TOKEN:
         required: true
 
 env:
-  IMAGE_NAME: ${{ inputs.image_name }}
+  IMAGE_NAME: matrixorigin/astra
   RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}
-  RELEASE_SOURCE_REF: ${{ inputs.source_ref }}
   RELEASE_IMAGE_VERSION: ${{ inputs.image_version }}
-  http_proxy: ${{ inputs.http_proxy }}
-  https_proxy: ${{ inputs.https_proxy }}
-  no_proxy: ${{ inputs.no_proxy }}
 
 jobs:
   build:
@@ -79,62 +39,36 @@ jobs:
       matrix: ${{ fromJSON(inputs.matrix_json) }}
 
     steps:
-      - name: Require an admitted runner
-        if: ${{ inputs.require_self_hosted }}
-        shell: bash
-        env:
-          RUNNER_ENVIRONMENT: ${{ runner.environment }}
-        run: |
-          if [ "${RUNNER_ENVIRONMENT}" != "self-hosted" ]; then
-            echo "::error::This candidate requires a self-hosted runner."
-            exit 1
-          fi
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          ref: ${{ inputs.controller_sha }}
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           ref: ${{ env.RELEASE_SOURCE_SHA }}
-          path: source
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        with:
-          driver-opts: |
-            env.http_proxy=${{ inputs.http_proxy }}
-            env.https_proxy=${{ inputs.https_proxy }}
-            env.no_proxy=${{ inputs.no_proxy }}
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ${{ inputs.registry }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         id: build
         with:
-          context: source
-          file: source/Dockerfile
+          context: .
+          file: Dockerfile
           platforms: ${{ matrix.platform }}
           tags: ${{ env.IMAGE_NAME }}
           labels: |
             org.opencontainers.image.version=${{ env.RELEASE_IMAGE_VERSION }}
             org.opencontainers.image.revision=${{ env.RELEASE_SOURCE_SHA }}
-            org.opencontainers.image.source=https://github.com/matrixorigin/astra
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
           build-args: |
             IMAGE_VERSION=${{ env.RELEASE_IMAGE_VERSION }}
             IMAGE_REVISION=${{ env.RELEASE_SOURCE_SHA }}
             IMAGE_SOURCE_DIRTY=false
-            IMAGE_BRANCH=${{ inputs.source_ref }}
-            HTTP_PROXY=${{ inputs.http_proxy }}
-            HTTPS_PROXY=${{ inputs.https_proxy }}
-            NO_PROXY=${{ inputs.no_proxy }}
-          cache-from: ${{ inputs.use_registry_cache && format('type=registry,ref={0}:buildcache-{1}', env.IMAGE_NAME, matrix.slug) || '' }}
-          cache-to: ${{ inputs.use_registry_cache && format('type=registry,ref={0}:buildcache-{1},mode=max', env.IMAGE_NAME, matrix.slug) || '' }}
+            IMAGE_BRANCH=${{ github.ref_name }}
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.slug }}
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.slug }},mode=max
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true
@@ -143,16 +77,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/digests"
+          mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "Build returned an invalid image digest: ${digest:-<empty>}" >&2
             exit 1
           fi
-          touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
+          touch "/tmp/digests/${digest#sha256:}"
 
       - name: Retain candidate with a run-scoped immutable tag
-        if: ${{ inputs.retain_candidate_tag }}
         shell: bash
         run: |
           set -euo pipefail
@@ -167,7 +100,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-digest-${{ matrix.slug }}
-          path: ${{ runner.temp }}/digests/*
+          path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 30
 
@@ -181,41 +114,29 @@ jobs:
       matrix: ${{ fromJSON(inputs.matrix_json) }}
 
     steps:
-      - name: Require an admitted runner
-        if: ${{ inputs.require_self_hosted }}
-        shell: bash
-        env:
-          RUNNER_ENVIRONMENT: ${{ runner.environment }}
-        run: |
-          if [ "${RUNNER_ENVIRONMENT}" != "self-hosted" ]; then
-            echo "::error::This candidate requires a self-hosted runner."
-            exit 1
-          fi
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          ref: ${{ inputs.controller_sha }}
+          ref: ${{ env.RELEASE_SOURCE_SHA }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-digest-${{ matrix.slug }}
-          path: ${{ runner.temp }}/digest
+          path: /tmp/digest
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ${{ inputs.registry }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Start candidate through the released all-in-one path
         shell: bash
         env:
-          CONTAINER_IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DOCKERHUB_IMAGE_NAME: ${{ env.IMAGE_NAME }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          digest_files=("${RUNNER_TEMP}/digest/"*)
+          digest_files=(/tmp/digest/*)
           if [ "${#digest_files[@]}" -ne 1 ]; then
             echo "Expected one candidate digest for ${{ matrix.platform }}, found ${#digest_files[@]}" >&2
             exit 1
@@ -225,7 +146,7 @@ jobs:
             echo "Candidate artifact contains an invalid image digest: ${digest}" >&2
             exit 1
           fi
-          release_image="${CONTAINER_IMAGE_NAME}@sha256:${digest}"
+          release_image="${DOCKERHUB_IMAGE_NAME}@sha256:${digest}"
 
           make stack-env
           sed -i "s|^ASTRA_IMAGE=.*|ASTRA_IMAGE=${release_image}|" deployment/all-in-one/.env
@@ -242,16 +163,6 @@ jobs:
             echo "Candidate image version ${image_version:-<missing>} does not match ${RELEASE_IMAGE_VERSION}" >&2
             exit 1
           fi
-          image_source="$(docker image inspect "${release_image}" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')"
-          if [ "${image_source}" != "https://github.com/matrixorigin/astra" ]; then
-            echo "Candidate image source ${image_source:-<missing>} is not the canonical Astra repository" >&2
-            exit 1
-          fi
-          source_ref="$(docker image inspect "${release_image}" --format '{{ index .Config.Labels "org.opencontainers.image.ref.name" }}')"
-          if [ "${source_ref}" != "${RELEASE_SOURCE_REF}" ]; then
-            echo "Candidate image source ref ${source_ref:-<missing>} does not match ${RELEASE_SOURCE_REF}" >&2
-            exit 1
-          fi
 
       - name: Verify health and exact memory round trip
         run: make stack-verify
@@ -261,7 +172,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          digest_files=("${RUNNER_TEMP}/digest/"*)
+          digest_files=(/tmp/digest/*)
           if [ "${#digest_files[@]}" -ne 1 ]; then
             echo "Expected one verified candidate digest, found ${#digest_files[@]}" >&2
             exit 1

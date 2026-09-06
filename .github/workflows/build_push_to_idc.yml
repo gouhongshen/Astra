@@ -21,7 +21,6 @@ jobs:
     name: Validate IDC build configuration
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.resolve.outputs.matrix }}
       image_version: ${{ steps.resolve.outputs.image_version }}
       source_sha: ${{ steps.resolve.outputs.source_sha }}
       source_ref: ${{ steps.resolve.outputs.source_ref }}
@@ -95,20 +94,27 @@ jobs:
             echo "::error::IDC image must be an untagged repository under the configured IDC registry."
             exit 1
           fi
-          matrix="$(jq -cn --arg runner "${IDC_RUNNER}" '{include:[{platform:"linux/amd64",runner:$runner,slug:"linux-amd64"}]}')"
           {
-            echo "matrix=${matrix}"
             echo "controller_sha=${controller_sha}"
             echo "source_sha=${source_sha}"
             echo "source_ref=${source_ref}"
             echo "image_version=idc-$(date -u +%Y%m%dT%H%M%SZ)-${source_sha}-${GITHUB_RUN_ID}-amd64"
           } >> "${GITHUB_OUTPUT}"
 
-  credentials:
-    name: Validate IDC registry credentials
+  publish:
+    name: Build, verify, and publish IDC image
     needs: settings
     runs-on: ${{ vars.CONTAINER_MIRROR_RUNNER }}
-    timeout-minutes: 5
+    environment: idc-publication
+    timeout-minutes: 210
+    env:
+      LOCAL_IMAGE: astra-idc-candidate:${{ needs.settings.outputs.source_sha }}
+      IMAGE_VERSION: ${{ needs.settings.outputs.image_version }}
+      RELEASE_SOURCE_SHA: ${{ needs.settings.outputs.source_sha }}
+      RELEASE_SOURCE_REF: ${{ needs.settings.outputs.source_ref }}
+      http_proxy: ${{ vars.CONTAINER_MIRROR_HTTP_PROXY }}
+      https_proxy: ${{ vars.CONTAINER_MIRROR_HTTPS_PROXY }}
+      no_proxy: ${{ vars.CONTAINER_MIRROR_NO_PROXY }}
     steps:
       - name: Require a self-hosted IDC runner
         shell: bash
@@ -116,9 +122,10 @@ jobs:
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           if [ "${RUNNER_ENVIRONMENT}" != "self-hosted" ]; then
-            echo "::error::IDC credential validation requires a self-hosted runner."
+            echo "::error::IDC publication requires a self-hosted runner."
             exit 1
           fi
+
       - name: Require IDC registry credentials
         shell: bash
         env:
@@ -133,75 +140,124 @@ jobs:
             fi
           done
 
-  candidates:
-    name: Build and verify IDC image
-    needs: [settings, credentials]
-    uses: ./.github/workflows/release-container-candidates.yml
-    with:
-      image_version: ${{ needs.settings.outputs.image_version }}
-      controller_sha: ${{ needs.settings.outputs.controller_sha }}
-      source_sha: ${{ needs.settings.outputs.source_sha }}
-      source_ref: ${{ needs.settings.outputs.source_ref }}
-      matrix_json: ${{ needs.settings.outputs.matrix }}
-      registry: ${{ vars.CONTAINER_MIRROR_REGISTRY }}
-      image_name: ${{ vars.CONTAINER_MIRROR_IMAGE }}
-      http_proxy: ${{ vars.CONTAINER_MIRROR_HTTP_PROXY }}
-      https_proxy: ${{ vars.CONTAINER_MIRROR_HTTPS_PROXY }}
-      no_proxy: ${{ vars.CONTAINER_MIRROR_NO_PROXY }}
-      require_self_hosted: true
-      retain_candidate_tag: false
-      use_registry_cache: false
-    secrets:
-      REGISTRY_USERNAME: ${{ secrets.IDC_REGISTRY_USERNAME }}
-      REGISTRY_PASSWORD: ${{ secrets.IDC_REGISTRY_PASSWORD }}
-
-  publish:
-    name: Publish verified IDC image
-    needs: [settings, candidates]
-    runs-on: ${{ vars.CONTAINER_MIRROR_RUNNER }}
-    timeout-minutes: 20
-    env:
-      http_proxy: ${{ vars.CONTAINER_MIRROR_HTTP_PROXY }}
-      https_proxy: ${{ vars.CONTAINER_MIRROR_HTTPS_PROXY }}
-      no_proxy: ${{ vars.CONTAINER_MIRROR_NO_PROXY }}
-    steps:
-      - name: Require a self-hosted IDC runner
-        shell: bash
-        env:
-          RUNNER_ENVIRONMENT: ${{ runner.environment }}
-        run: |
-          if [ "${RUNNER_ENVIRONMENT}" != "self-hosted" ]; then
-            echo "::error::IDC publication requires a self-hosted runner."
-            exit 1
-          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
           ref: ${{ needs.settings.outputs.controller_sha }}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          pattern: release-digest-*
-          path: ${{ runner.temp }}/idc-digests
-          merge-multiple: true
+          persist-credentials: false
+          ref: ${{ needs.settings.outputs.source_sha }}
+          path: source
+
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build the IDC candidate locally
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: source
+          file: source/Dockerfile
+          platforms: linux/amd64
+          tags: ${{ env.LOCAL_IMAGE }}
+          labels: |
+            org.opencontainers.image.version=${{ env.IMAGE_VERSION }}
+            org.opencontainers.image.revision=${{ env.RELEASE_SOURCE_SHA }}
+            org.opencontainers.image.source=https://github.com/matrixorigin/astra
+          build-args: |
+            IMAGE_VERSION=${{ env.IMAGE_VERSION }}
+            IMAGE_REVISION=${{ env.RELEASE_SOURCE_SHA }}
+            IMAGE_SOURCE_DIRTY=false
+            IMAGE_BRANCH=${{ env.RELEASE_SOURCE_REF }}
+            HTTP_PROXY=${{ vars.CONTAINER_MIRROR_HTTP_PROXY }}
+            HTTPS_PROXY=${{ vars.CONTAINER_MIRROR_HTTPS_PROXY }}
+            NO_PROXY=${{ vars.CONTAINER_MIRROR_NO_PROXY }}
+          load: true
+          push: false
+
+      - name: Verify local candidate identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          assert_label() {
+            local label="$1"
+            local expected="$2"
+            local actual
+            actual="$(docker image inspect "${LOCAL_IMAGE}" --format "{{ index .Config.Labels \"${label}\" }}")"
+            if [ "${actual}" != "${expected}" ]; then
+              echo "::error::Candidate ${label} is ${actual:-<missing>}, expected ${expected}."
+              exit 1
+            fi
+          }
+          platform="$(docker image inspect "${LOCAL_IMAGE}" --format '{{.Os}}/{{.Architecture}}')"
+          if [ "${platform}" != "linux/amd64" ]; then
+            echo "::error::Candidate platform is ${platform}, expected linux/amd64."
+            exit 1
+          fi
+          assert_label org.opencontainers.image.version "${IMAGE_VERSION}"
+          assert_label org.opencontainers.image.revision "${RELEASE_SOURCE_SHA}"
+          assert_label org.opencontainers.image.ref.name "${RELEASE_SOURCE_REF}"
+          assert_label org.opencontainers.image.source https://github.com/matrixorigin/astra
+
+      - name: Start local candidate through the all-in-one path
+        shell: bash
+        run: |
+          set -euo pipefail
+          make stack-env
+          sed -i "s|^ASTRA_IMAGE=.*|ASTRA_IMAGE=${LOCAL_IMAGE}|" deployment/all-in-one/.env
+          sed -i 's|^MEMORIA_EMBEDDING_PROVIDER=.*|MEMORIA_EMBEDDING_PROVIDER=mock|' deployment/all-in-one/.env
+          make stack-up
+
+      - name: Verify health and exact memory round trip
+        run: make stack-verify
+
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ vars.CONTAINER_MIRROR_REGISTRY }}
           username: ${{ secrets.IDC_REGISTRY_USERNAME }}
           password: ${{ secrets.IDC_REGISTRY_PASSWORD }}
-      - name: Publish or verify immutable IDC manifest
+
+      - name: Publish or verify immutable IDC image
         shell: bash
         env:
           IMAGE_NAME: ${{ vars.CONTAINER_MIRROR_IMAGE }}
-          IMAGE_VERSION: ${{ needs.settings.outputs.image_version }}
-          BUILD_MATRIX_JSON: ${{ needs.settings.outputs.matrix }}
         run: |
           set -euo pipefail
-          scripts/reconcile-docker-manifest.sh \
-            "${IMAGE_NAME}" "${IMAGE_VERSION}" "${BUILD_MATRIX_JSON}" \
-            "${RUNNER_TEMP}/idc-digests" verify
+          target="${IMAGE_NAME}:${IMAGE_VERSION}"
+          local_id="$(docker image inspect "${LOCAL_IMAGE}" --format '{{.Id}}')"
+          target_exists=false
+          if inspect_output="$(docker buildx imagetools inspect "${target}" 2>&1)"; then
+            target_exists=true
+          elif ! grep -Eqi '(: not found|manifest unknown|name unknown|HTTP 404|status[^0-9]*404)' \
+            <<< "${inspect_output}"; then
+            echo "::error::Could not safely determine whether ${target} exists."
+            printf '%s\n' "${inspect_output}" >&2
+            exit 1
+          fi
+
+          if [ "${target_exists}" = false ]; then
+            docker tag "${LOCAL_IMAGE}" "${target}"
+            docker push "${target}"
+          fi
+          docker pull "${target}"
+          target_id="$(docker image inspect "${target}" --format '{{.Id}}')"
+          if [ "${target_id}" != "${local_id}" ]; then
+            echo "::error::${target} does not match the verified local image."
+            exit 1
+          fi
           {
             echo "## IDC image published"
-            echo "- Image: \`${IMAGE_NAME}:${IMAGE_VERSION}\`"
-            echo "- Source: \`${{ needs.settings.outputs.source_sha }}\`"
+            echo "- Image: \`${target}\`"
+            echo "- Source: \`${RELEASE_SOURCE_SHA}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Show service logs after failure
+        if: ${{ failure() }}
+        working-directory: deployment/all-in-one
+        run: docker compose --env-file .env logs --no-color --tail=200 api memoria matrixone || true
+
+      - name: Remove local smoke stack and image
+        if: ${{ always() }}
+        run: |
+          make stack-clean || true
+          docker image rm "${LOCAL_IMAGE}" "${{ vars.CONTAINER_MIRROR_IMAGE }}:${IMAGE_VERSION}" >/dev/null 2>&1 || true

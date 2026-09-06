@@ -193,14 +193,6 @@ def main() -> None:
 
     for required in (
         "workflow_call:",
-        "controller_sha:",
-        "source_ref:",
-        "require_self_hosted:",
-        "retain_candidate_tag:",
-        "use_registry_cache:",
-        'RUNNER_ENVIRONMENT}" != "self-hosted"',
-        "context: source",
-        "file: source/Dockerfile",
         "push-by-digest=true",
         "name-canonical=true",
         "@sha256:",
@@ -212,10 +204,6 @@ def main() -> None:
         "retention-days: 30",
         "Write container candidate summary",
         "Candidate image version",
-        "org.opencontainers.image.source=https://github.com/matrixorigin/astra",
-        "IMAGE_BRANCH=${{ inputs.source_ref }}",
-        "Candidate image source ref",
-        "Candidate image source",
     ):
         if required not in container_candidates:
             errors.append(
@@ -242,20 +230,44 @@ def main() -> None:
         "source_ref:",
         'GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}',
         "source_ref commit must belong to main or moi-dev",
-        'runner:$runner',
-        "require_self_hosted: true",
-        "retain_candidate_tag: false",
-        "use_registry_cache: false",
-        "controller_sha: ${{ needs.settings.outputs.controller_sha }}",
-        "source_ref: ${{ needs.settings.outputs.source_ref }}",
-        "Validate IDC registry credentials",
+        "environment: idc-publication",
+        "runs-on: ${{ vars.CONTAINER_MIRROR_RUNNER }}",
         "Require IDC registry credentials",
         "IDC publication requires a self-hosted runner",
+        "Build the IDC candidate locally",
+        "load: true",
+        "push: false",
+        "Verify health and exact memory round trip",
+        "docker/login-action",
+        'docker push "${target}"',
+        "org.opencontainers.image.source=https://github.com/matrixorigin/astra",
+        "IMAGE_BRANCH=${{ env.RELEASE_SOURCE_REF }}",
     ):
         if required not in idc_workflow:
             errors.append(
                 ".github/workflows/build_push_to_idc.yml: missing trusted-controller "
                 f"or self-hosted admission contract ({required})"
+            )
+
+    idc_build = idc_workflow.find("Build the IDC candidate locally")
+    idc_smoke = idc_workflow.find("Verify health and exact memory round trip")
+    idc_login = idc_workflow.find("docker/login-action")
+    idc_push = idc_workflow.find('docker push "${target}"')
+    if not 0 <= idc_build < idc_smoke < idc_login < idc_push:
+        errors.append(
+            ".github/workflows/build_push_to_idc.yml: the verified local image must "
+            "pass smoke before Harbor authentication and publication"
+        )
+    for forbidden in (
+        "release-container-candidates.yml",
+        "push-by-digest=true",
+        "buildcache-",
+        "astra-candidate-${GITHUB_RUN_ID}",
+    ):
+        if forbidden in idc_workflow:
+            errors.append(
+                ".github/workflows/build_push_to_idc.yml: IDC runtime repository must "
+                f"not receive candidate/cache objects ({forbidden})"
             )
 
     manifest_reconciler = Path("scripts/reconcile-docker-manifest.sh").read_text(

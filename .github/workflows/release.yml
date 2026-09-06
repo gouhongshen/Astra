@@ -279,15 +279,9 @@ jobs:
     uses: ./.github/workflows/release-container-candidates.yml
     with:
       image_version: ${{ needs.preflight.outputs.version }}
-      controller_sha: ${{ github.sha }}
       source_sha: ${{ needs.preflight.outputs.source_sha }}
-      source_ref: ${{ needs.preflight.outputs.source_tag }}
       matrix_json: ${{ needs.preflight.outputs.matrix }}
-      registry: docker.io
-      image_name: matrixorigin/astra
-    secrets:
-      REGISTRY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-      REGISTRY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
+    secrets: inherit
 
   publish:
     name: Publish Verified Release

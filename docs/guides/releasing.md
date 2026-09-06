@@ -123,30 +123,27 @@ not push to Docker Hub.
 Configure repository variables `CONTAINER_MIRROR_REGISTRY` (host and optional
 port), `CONTAINER_MIRROR_IMAGE` (full untagged repository), and
 `CONTAINER_MIRROR_RUNNER` (a Linux AMD64 Docker-capable self-hosted runner
-label), plus
-secrets `IDC_REGISTRY_USERNAME` and `IDC_REGISTRY_PASSWORD`. Missing required
-configuration fails before scheduling a build; there is no public-runner
-substitution. ARC jobs target the configured scale-set label directly and
-verify `runner.environment` before checkout or registry login. A credential-only
-preflight on that admitted runner validates both secrets before any build or
-smoke job is scheduled, without exposing IDC credentials to a GitHub-hosted
-runner. Optional proxy variables are `CONTAINER_MIRROR_HTTP_PROXY`,
+label). Store `IDC_REGISTRY_USERNAME` and `IDC_REGISTRY_PASSWORD` exclusively
+as secrets in the `idc-publication` Environment; its deployment branch policy
+must admit only `main`. Do not keep copies as repository or organization
+secrets. This external policy is the trust boundary that prevents a workflow
+definition selected from another branch from receiving IDC credentials. Missing
+configuration fails before build work, and the admitted ARC runner verifies
+`runner.environment` before checkout or registry login. Optional proxy variables are `CONTAINER_MIRROR_HTTP_PROXY`,
 `CONTAINER_MIRROR_HTTPS_PROXY`, and `CONTAINER_MIRROR_NO_PROXY`.
 
-The workflow reuses the container-candidate build and all-in-one smoke test,
-then publishes `idc-<UTC YYYYMMDDTHHMMSSZ>-<full commit SHA>-<run ID>-amd64`
-to IDC. The timestamp is captured during settings; rerunning all jobs generates
-a new timestamp, while rerunning only failed jobs reuses the settings output. All candidate,
-cache and final image writes stay in the configured IDC repository. Reruns
-verify the existing immutable manifest; different content is rejected. The
-runner must support the existing all-in-one stack, Python 3, and Docker
-Buildx. IDC candidates remain untagged until smoke verification succeeds and
-the workflow does not publish BuildKit cache tags into the runtime repository,
-so consumers that resolve its newest tagged artifact select only a verified
-final image. That image records the full selected source commit, its selected
-branch or SHA, and the canonical `https://github.com/matrixorigin/astra` OCI
-source label used by MOI's Astra revision resolver. Formal release tags and
-`latest` are not changed.
+The workflow builds a Linux AMD64 candidate only in the admitted runner's local
+Docker store, runs the existing all-in-one smoke test, and authenticates to
+Harbor only after verification succeeds. It then publishes
+`idc-<UTC YYYYMMDDTHHMMSSZ>-<full commit SHA>-<run ID>-amd64` directly to IDC.
+No candidate manifest or BuildKit cache is pushed to the runtime repository, so
+MOI's newest-artifact resolver cannot observe an untagged pre-publication
+object. Reruns verify an existing immutable tag against the locally verified
+image instead of overwriting it. The final image records the full selected
+source commit, its selected branch or SHA, and the canonical
+`https://github.com/matrixorigin/astra` OCI source label used by MOI's Astra
+revision resolver. The runner must support the existing all-in-one stack,
+Python 3, and Docker Buildx. Formal release tags and `latest` are not changed.
 
 ## Prepare a release
 

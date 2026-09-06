@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Execute release shell entrypoints with build/network commands stubbed out."""
 
-import json
 import os
 from pathlib import Path
 import re
@@ -87,7 +86,7 @@ class ReleaseShellTests(unittest.TestCase):
                                     capture_output=True, text=True)
             return result, {"main": main_sha, "moi-dev": moi_dev_sha, "base": base_sha}
 
-    def test_idc_build_identity_and_runner(self):
+    def test_idc_build_identity(self):
         result, revisions = self.run_idc_settings()
         self.assertEqual(result.returncode, 0, result.stderr)
         outputs = dict(line.split("=", 1) for line in result.stdout.splitlines())
@@ -95,9 +94,20 @@ class ReleaseShellTests(unittest.TestCase):
         self.assertEqual(outputs["source_sha"], revisions["main"])
         self.assertEqual(outputs["source_ref"], "main")
         self.assertRegex(outputs["image_version"], r"^idc-\d{8}T\d{6}Z-" + revisions["main"] + r"-123-amd64$")
-        self.assertEqual(json.loads(outputs["matrix"]), {"include": [
-            {"platform": "linux/amd64", "runner": "idc-amd64",
-             "slug": "linux-amd64"}]})
+
+    def test_idc_build_stays_local_until_smoke_succeeds(self):
+        workflow = (ROOT / ".github/workflows/build_push_to_idc.yml").read_text()
+        build = workflow.index("Build the IDC candidate locally")
+        smoke = workflow.index("Verify health and exact memory round trip")
+        login = workflow.index("docker/login-action")
+        publish = workflow.index('docker push "${target}"')
+        self.assertLess(build, smoke)
+        self.assertLess(smoke, login)
+        self.assertLess(login, publish)
+        self.assertIn("environment: idc-publication", workflow)
+        self.assertIn("load: true", workflow)
+        self.assertIn("push: false", workflow)
+        self.assertNotIn("release-container-candidates.yml", workflow)
 
     def test_idc_resolves_moi_dev_and_allowed_historical_commit(self):
         result, revisions = self.run_idc_settings(SOURCE_REF="moi-dev")
@@ -143,7 +153,7 @@ class ReleaseShellTests(unittest.TestCase):
                 result, _ = self.run_idc_settings(**{key: ""})
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("Missing required IDC configuration: " + key, result.stdout)
-                self.assertNotIn("matrix=", result.stdout)
+                self.assertNotIn("image_version=", result.stdout)
 
     def test_idc_rejects_wrong_or_tagged_repository(self):
         for image in ("docker.io/team/astra", "registry.example:5000/",
