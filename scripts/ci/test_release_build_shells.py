@@ -37,7 +37,7 @@ class ReleaseShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         outputs = dict(line.split("=", 1) for line in result.stdout.splitlines())
         self.assertEqual(outputs["source_sha"], "a" * 40)
-        self.assertEqual(outputs["image_version"], "idc-" + "a" * 40 + "-123-amd64")
+        self.assertRegex(outputs["image_version"], r"^idc-\d{8}T\d{6}Z-" + "a" * 40 + r"-123-amd64$")
         self.assertEqual(json.loads(outputs["matrix"]), {"include": [
             {"platform": "linux/amd64", "runner": "idc-amd64", "slug": "linux-amd64"}]})
         self.assertNotIn("test-password", result.stdout + result.stderr)

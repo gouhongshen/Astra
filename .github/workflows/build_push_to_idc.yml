@@ -48,7 +48,7 @@ jobs:
           {
             echo "matrix=${matrix}"
             echo "source_sha=${GITHUB_SHA}"
-            echo "image_version=idc-${GITHUB_SHA}-${GITHUB_RUN_ID}-amd64"
+            echo "image_version=idc-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_SHA}-${GITHUB_RUN_ID}-amd64"
           } >> "${GITHUB_OUTPUT}"
 
   candidates:

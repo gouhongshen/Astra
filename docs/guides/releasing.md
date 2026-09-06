@@ -125,7 +125,9 @@ substitution. Optional proxy variables are `CONTAINER_MIRROR_HTTP_PROXY`,
 `CONTAINER_MIRROR_HTTPS_PROXY`, and `CONTAINER_MIRROR_NO_PROXY`.
 
 The workflow reuses the container-candidate build and all-in-one smoke test,
-then publishes `idc-<full commit SHA>-<run ID>-amd64` to IDC. All candidate,
+then publishes `idc-<UTC YYYYMMDDTHHMMSSZ>-<full commit SHA>-<run ID>-amd64`
+to IDC. The timestamp is captured during settings; rerunning all jobs generates
+a new timestamp, while rerunning only failed jobs reuses the settings output. All candidate,
 cache and final image writes stay in the configured IDC repository. Reruns
 verify the existing immutable manifest; different content is rejected. The
 runner must support the existing all-in-one stack, Python 3, and Docker
