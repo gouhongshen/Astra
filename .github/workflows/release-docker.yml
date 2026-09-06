@@ -161,6 +161,7 @@ jobs:
     uses: ./.github/workflows/release-container-candidates.yml
     with:
       image_version: ${{ needs.settings.outputs.image_version }}
+      controller_sha: ${{ github.sha }}
       source_sha: ${{ needs.settings.outputs.source_sha }}
       matrix_json: ${{ needs.settings.outputs.matrix }}
       registry: docker.io

@@ -121,6 +121,9 @@ def main() -> None:
     snapshot_workflow = Path(".github/workflows/release-docker.yml").read_text(
         encoding="utf-8"
     )
+    idc_workflow = Path(".github/workflows/build_push_to_idc.yml").read_text(
+        encoding="utf-8"
+    )
 
     for forbidden in ("push:\n    tags:", "on:\n  push:"):
         if forbidden in release_controller:
@@ -190,6 +193,11 @@ def main() -> None:
 
     for required in (
         "workflow_call:",
+        "controller_sha:",
+        "require_self_hosted:",
+        'RUNNER_ENVIRONMENT}" != "self-hosted"',
+        "context: source",
+        "file: source/Dockerfile",
         "push-by-digest=true",
         "name-canonical=true",
         "@sha256:",
@@ -221,6 +229,21 @@ def main() -> None:
         if required not in snapshot_workflow:
             errors.append(
                 f".github/workflows/release-docker.yml: missing immutable snapshot guard ({required})"
+            )
+
+    for required in (
+        "source_ref:",
+        'GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}',
+        "source_ref commit must belong to main or moi-dev",
+        'runner:["self-hosted",$runner]',
+        "require_self_hosted: true",
+        "controller_sha: ${{ needs.settings.outputs.controller_sha }}",
+        "IDC publication requires a self-hosted runner",
+    ):
+        if required not in idc_workflow:
+            errors.append(
+                ".github/workflows/build_push_to_idc.yml: missing trusted-controller "
+                f"or self-hosted admission contract ({required})"
             )
 
     manifest_reconciler = Path("scripts/reconcile-docker-manifest.sh").read_text(

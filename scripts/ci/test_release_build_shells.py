@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Execute release shell entrypoints with build/network commands stubbed out."""
 
-import os
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import unittest
 
 
@@ -17,35 +18,92 @@ class ReleaseShellTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/build_push_to_idc.yml").read_text()
         script = workflow.split("        run: |\n", 1)[1].split("\n  candidates:", 1)[0]
         script = "\n".join(line[10:] for line in script.splitlines())
-        env = {
-            **os.environ,
-            "IDC_REGISTRY": "registry.example:5000",
-            "IDC_IMAGE": "registry.example:5000/team/astra",
-            "IDC_RUNNER": "idc-amd64",
-            "IDC_USERNAME": "test-user",
-            "IDC_PASSWORD": "test-password",
-            "GITHUB_SHA": "a" * 40,
-            "GITHUB_RUN_ID": "123",
-            "GITHUB_OUTPUT": "/dev/stdout",
-            **overrides,
-        }
-        return subprocess.run(["bash", "-c", script], env=env,
-                              capture_output=True, text=True)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            origin = temporary / "origin.git"
+            checkout = temporary / "checkout"
+            subprocess.run(["git", "init", "--bare", str(origin)], check=True,
+                           capture_output=True)
+            subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True,
+                           capture_output=True)
+            for key, value in (("user.name", "Release Test"),
+                               ("user.email", "release-test@example.invalid")):
+                subprocess.run(["git", "-C", str(checkout), "config", key, value], check=True)
+            marker = checkout / "marker"
+            marker.write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(checkout), "add", "marker"], check=True)
+            subprocess.run(["git", "-C", str(checkout), "commit", "-m", "base"],
+                           check=True, capture_output=True)
+            base_sha = subprocess.check_output(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+            subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin", str(origin)],
+                           check=True)
+            subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(checkout), "switch", "-c", "moi-dev"],
+                           check=True, capture_output=True)
+            marker.write_text("moi-dev\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(checkout), "commit", "-am", "moi-dev"],
+                           check=True, capture_output=True)
+            moi_dev_sha = subprocess.check_output(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+            subprocess.run(["git", "-C", str(checkout), "push", "origin", "moi-dev"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(checkout), "switch", "main"],
+                           check=True, capture_output=True)
+            main_sha = subprocess.check_output(
+                ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+            source_ref = overrides.pop("SOURCE_REF", "main")
+            if source_ref == "__base_sha__":
+                source_ref = base_sha
+            env = {
+                **os.environ,
+                "DEFAULT_BRANCH": "main",
+                "SOURCE_REF": source_ref,
+                "IDC_REGISTRY": "registry.example:5000",
+                "IDC_IMAGE": "registry.example:5000/team/astra",
+                "IDC_RUNNER": "idc-amd64",
+                "GITHUB_REF": "refs/heads/main",
+                "GITHUB_SHA": main_sha,
+                "GITHUB_RUN_ID": "123",
+                "GITHUB_OUTPUT": "/dev/stdout",
+                **overrides,
+            }
+            result = subprocess.run(["bash", "-c", script], env=env, cwd=checkout,
+                                    capture_output=True, text=True)
+            return result, {"main": main_sha, "moi-dev": moi_dev_sha, "base": base_sha}
 
     def test_idc_build_identity_and_runner(self):
-        result = self.run_idc_settings()
+        result, revisions = self.run_idc_settings()
         self.assertEqual(result.returncode, 0, result.stderr)
         outputs = dict(line.split("=", 1) for line in result.stdout.splitlines())
-        self.assertEqual(outputs["source_sha"], "a" * 40)
-        self.assertRegex(outputs["image_version"], r"^idc-\d{8}T\d{6}Z-" + "a" * 40 + r"-123-amd64$")
+        self.assertEqual(outputs["controller_sha"], revisions["main"])
+        self.assertEqual(outputs["source_sha"], revisions["main"])
+        self.assertRegex(outputs["image_version"], r"^idc-\d{8}T\d{6}Z-" + revisions["main"] + r"-123-amd64$")
         self.assertEqual(json.loads(outputs["matrix"]), {"include": [
-            {"platform": "linux/amd64", "runner": "idc-amd64", "slug": "linux-amd64"}]})
-        self.assertNotIn("test-password", result.stdout + result.stderr)
+            {"platform": "linux/amd64", "runner": ["self-hosted", "idc-amd64"],
+             "slug": "linux-amd64"}]})
+
+    def test_idc_resolves_moi_dev_and_allowed_historical_commit(self):
+        result, revisions = self.run_idc_settings(SOURCE_REF="moi-dev")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("source_sha=" + revisions["moi-dev"], result.stdout)
+        result, revisions = self.run_idc_settings(SOURCE_REF="__base_sha__")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("source_sha=" + revisions["base"], result.stdout)
+
+    def test_idc_rejects_non_main_controller_and_arbitrary_ref(self):
+        result, _ = self.run_idc_settings(GITHUB_REF="refs/heads/moi-dev")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Run this workflow from main", result.stdout)
+        result, _ = self.run_idc_settings(SOURCE_REF="feature/test")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("source_ref must be main, moi-dev, or a full commit SHA", result.stdout)
 
     def test_idc_missing_configuration_stops_before_build(self):
-        for key in ("IDC_REGISTRY", "IDC_IMAGE", "IDC_RUNNER", "IDC_USERNAME", "IDC_PASSWORD"):
+        for key in ("IDC_REGISTRY", "IDC_IMAGE", "IDC_RUNNER"):
             with self.subTest(key=key):
-                result = self.run_idc_settings(**{key: ""})
+                result, _ = self.run_idc_settings(**{key: ""})
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("Missing required IDC configuration: " + key, result.stdout)
                 self.assertNotIn("matrix=", result.stdout)
@@ -56,8 +114,10 @@ class ReleaseShellTests(unittest.TestCase):
                       "registry.example:5000/team/astra@sha256:abc",
                       "registry.example:5000/team/astra bad"):
             with self.subTest(image=image):
-                self.assertNotEqual(self.run_idc_settings(IDC_IMAGE=image).returncode, 0)
-        self.assertNotEqual(self.run_idc_settings(IDC_REGISTRY="https://registry.example").returncode, 0)
+                result, _ = self.run_idc_settings(IDC_IMAGE=image)
+                self.assertNotEqual(result.returncode, 0)
+        result, _ = self.run_idc_settings(IDC_REGISTRY="https://registry.example")
+        self.assertNotEqual(result.returncode, 0)
 
     def test_client_arguments_with_and_without_features(self):
         workflow = (ROOT / ".github/workflows/release-binaries.yml").read_text()

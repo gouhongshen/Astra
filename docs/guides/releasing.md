@@ -111,17 +111,24 @@ instead of silently installing a legacy package.
 
 ## Build an IDC image independently
 
-Run **build_push_to_idc** (`build_push_to_idc.yml`) manually and select the
-source branch or tag in the Run workflow dialog. Only maintainers should run
-trusted source on the self-hosted runner. This workflow does not create Git
-tags or GitHub Releases and does not push to Docker Hub.
+Run **build_push_to_idc** (`build_push_to_idc.yml`) manually from `main`. Its
+`source_ref` defaults to the latest `main`; set it to `moi-dev` for that
+branch's latest commit, or to a full commit SHA that is contained in the
+current `main` or `moi-dev` history. Other branches, tags, abbreviated SHAs,
+and commits outside those histories are rejected. The workflow controller and
+host-side verification scripts always come from the current protected `main`
+revision. This workflow does not create Git tags or GitHub Releases and does
+not push to Docker Hub.
 
 Configure repository variables `CONTAINER_MIRROR_REGISTRY` (host and optional
 port), `CONTAINER_MIRROR_IMAGE` (full untagged repository), and
-`CONTAINER_MIRROR_RUNNER` (a Linux AMD64 Docker-capable runner label), plus
+`CONTAINER_MIRROR_RUNNER` (a Linux AMD64 Docker-capable self-hosted runner
+label), plus
 secrets `IDC_REGISTRY_USERNAME` and `IDC_REGISTRY_PASSWORD`. Missing required
 configuration fails before scheduling a build; there is no public-runner
-substitution. Optional proxy variables are `CONTAINER_MIRROR_HTTP_PROXY`,
+substitution. Jobs require both `self-hosted` and the configured runner label,
+then verify `runner.environment` before checkout or registry login. Optional
+proxy variables are `CONTAINER_MIRROR_HTTP_PROXY`,
 `CONTAINER_MIRROR_HTTPS_PROXY`, and `CONTAINER_MIRROR_NO_PROXY`.
 
 The workflow reuses the container-candidate build and all-in-one smoke test,
