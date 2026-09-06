@@ -163,7 +163,11 @@ jobs:
       image_version: ${{ needs.settings.outputs.image_version }}
       source_sha: ${{ needs.settings.outputs.source_sha }}
       matrix_json: ${{ needs.settings.outputs.matrix }}
-    secrets: inherit
+      registry: docker.io
+      image_name: matrixorigin/astra
+    secrets:
+      REGISTRY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
 
   publish:
     name: Publish Immutable Snapshot Manifest

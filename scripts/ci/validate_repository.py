@@ -131,16 +131,18 @@ def main() -> None:
     for required in (
         "workflow_dispatch:",
         "recover_existing_tag:",
+        "push_to_dockerhub:",
         "push_to_idc:",
+        "At least one container registry target must be selected.",
         'GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}',
         'validate-release-version.sh "${version}" --syntax-only',
         "release-binaries.yml",
         "release-container-candidates.yml",
         "environment: release",
         "ASTRA_RELEASE_ENVIRONMENT_GUARD",
-        "Require Docker publication credentials",
-        "Reject an existing Docker version before candidate builds",
-        "Reject conflicting Docker version before creating the tag",
+        "Require a selected container publication target",
+        "Reject an existing container version before candidate builds",
+        "Reject conflicting container version before creating the tag",
         "Resolve publication continuation state",
         "Release-Run:",
         "Recovery cannot adopt manual or legacy tags",
@@ -153,10 +155,10 @@ def main() -> None:
         "Prepare canonical GitHub Release body",
         "Stage GitHub Release and verified assets",
         "Verify canonical staged GitHub Release body",
-        "Create or verify the immutable Docker version manifest",
+        "Create or verify the immutable container version manifest",
         "scripts/reconcile-docker-manifest.sh",
         "Publish GitHub Release",
-        "Promote stable rolling Docker tags",
+        "Promote stable rolling container tags",
     ):
         if required not in release_controller:
             errors.append(
@@ -178,12 +180,12 @@ def main() -> None:
                 f"release lookup contract ({required})"
             )
 
-    docker_manifest = release_controller.find(
-        "Create or verify the immutable Docker version manifest"
+    container_manifest = release_controller.find(
+        "Create or verify the immutable container version manifest"
     )
     github_publish = release_controller.find("Publish GitHub Release")
-    rolling_promotion = release_controller.find("Promote stable rolling Docker tags")
-    if not 0 <= docker_manifest < github_publish < rolling_promotion:
+    rolling_promotion = release_controller.find("Promote stable rolling container tags")
+    if not 0 <= container_manifest < github_publish < rolling_promotion:
         errors.append(
             ".github/workflows/release.yml: version artifacts must be reconciled before "
             "the GitHub Release and rolling Docker tags become public"
@@ -191,6 +193,10 @@ def main() -> None:
 
     for required in (
         "workflow_call:",
+        "registry:",
+        "image_name:",
+        "REGISTRY_USERNAME:",
+        "REGISTRY_PASSWORD:",
         "push-by-digest=true",
         "name-canonical=true",
         "@sha256:",
@@ -215,6 +221,9 @@ def main() -> None:
         "Snapshot tags must start with snapshot-",
         "Semantic versions are owned by the unified Release workflow",
         "Require Docker publication credentials",
+        "registry: docker.io",
+        "image_name: matrixorigin/astra",
+        "REGISTRY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}",
         "ASTRA_SNAPSHOT_ENVIRONMENT_GUARD",
         "release-container-candidates.yml",
         "scripts/reconcile-docker-manifest.sh",
@@ -320,6 +329,7 @@ def main() -> None:
             )
     mirror_job = release_controller.split("\n  registry-mirror:\n", 1)[1]
     for required in (
+        "inputs.push_to_dockerhub == true",
         "inputs.push_to_idc == true",
         "vars.CONTAINER_MIRROR_REGISTRY != ''",
         "vars.CONTAINER_MIRROR_IMAGE != ''",
