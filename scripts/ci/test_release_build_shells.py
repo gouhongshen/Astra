@@ -71,11 +71,11 @@ class ReleaseShellTests(unittest.TestCase):
                 source_ref = base_sha
             env = {
                 **os.environ,
+                "ARCHITECTURE": "amd64",
                 "DEFAULT_BRANCH": "main",
                 "SOURCE_REF": source_ref,
                 "IDC_REGISTRY": "registry.example:5000",
                 "IDC_IMAGE": "registry.example:5000/team/astra",
-                "IDC_RUNNER": "idc-amd64",
                 "GITHUB_REF": "refs/heads/main",
                 "GITHUB_SHA": main_sha,
                 "GITHUB_RUN_ID": "123",
@@ -93,21 +93,25 @@ class ReleaseShellTests(unittest.TestCase):
         self.assertEqual(outputs["controller_sha"], revisions["main"])
         self.assertEqual(outputs["source_sha"], revisions["main"])
         self.assertEqual(outputs["source_ref"], "main")
+        self.assertEqual(outputs["candidate_image"], "registry.example:5000/team/astra-candidates")
+        self.assertEqual(outputs["target_image"], "registry.example:5000/team/astra")
         self.assertRegex(outputs["image_version"], r"^idc-\d{8}T\d{6}Z-" + revisions["main"] + r"-123-amd64$")
 
-    def test_idc_build_stays_local_until_smoke_succeeds(self):
+    def test_idc_reuses_release_candidate_topology_and_publishes_only_to_idc(self):
         workflow = (ROOT / ".github/workflows/build_push_to_idc.yml").read_text()
-        build = workflow.index("Build the IDC candidate locally")
-        smoke = workflow.index("Verify health and exact memory round trip")
-        login = workflow.index("docker/login-action")
-        publish = workflow.index('docker push "${target}"')
-        self.assertLess(build, smoke)
-        self.assertLess(smoke, login)
-        self.assertLess(login, publish)
+        candidates = (ROOT / ".github/workflows/idc-container-candidates.yml").read_text()
+        self.assertIn("uses: ./.github/workflows/idc-container-candidates.yml", workflow)
+        self.assertIn("Assemble verified IDC manifest", workflow)
+        self.assertIn("crane copy --platform=all", workflow)
         self.assertIn("environment: idc-publication", workflow)
-        self.assertIn("load: true", workflow)
-        self.assertIn("push: false", workflow)
-        self.assertNotIn("release-container-candidates.yml", workflow)
+        self.assertIn("push-by-digest=true", candidates)
+        self.assertIn("make stack-verify", candidates)
+        self.assertIn("ref: ${{ inputs.controller_sha }}", candidates)
+        self.assertIn("context: source", candidates)
+        self.assertIn("file: source/Dockerfile", candidates)
+        self.assertIn("ubuntu-24.04-arm", workflow)
+        self.assertNotIn("matrixorigin/astra", candidates.split("org.opencontainers.image.source", 1)[0])
+        self.assertNotIn("DOCKERHUB_", workflow + candidates)
 
     def test_idc_resolves_moi_dev_and_allowed_historical_commit(self):
         result, revisions = self.run_idc_settings(SOURCE_REF="moi-dev")
@@ -139,16 +143,18 @@ class ReleaseShellTests(unittest.TestCase):
                 self.assertIn("Missing required IDC credential: " + missing, result.stdout)
                 self.assertNotIn("release-password", result.stdout + result.stderr)
 
-    def test_idc_rejects_non_main_controller_and_arbitrary_ref(self):
+    def test_idc_rejects_non_main_controller(self):
         result, _ = self.run_idc_settings(GITHUB_REF="refs/heads/moi-dev")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Run this workflow from main", result.stdout)
+
+    def test_idc_rejects_arbitrary_source_ref(self):
         result, _ = self.run_idc_settings(SOURCE_REF="feature/test")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("source_ref must be main, moi-dev, or a full commit SHA", result.stdout)
 
     def test_idc_missing_configuration_stops_before_build(self):
-        for key in ("IDC_REGISTRY", "IDC_IMAGE", "IDC_RUNNER"):
+        for key in ("IDC_REGISTRY", "IDC_IMAGE"):
             with self.subTest(key=key):
                 result, _ = self.run_idc_settings(**{key: ""})
                 self.assertNotEqual(result.returncode, 0)
@@ -165,6 +171,17 @@ class ReleaseShellTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
         result, _ = self.run_idc_settings(IDC_REGISTRY="https://registry.example")
         self.assertNotEqual(result.returncode, 0)
+
+    def test_idc_architecture_matrix(self):
+        result, _ = self.run_idc_settings(ARCHITECTURE="all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outputs = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertIn('"platform":"linux/amd64"', outputs["matrix"])
+        self.assertIn('"platform":"linux/arm64"', outputs["matrix"])
+        self.assertNotRegex(outputs["image_version"], r"-amd64$")
+        result, _ = self.run_idc_settings(ARCHITECTURE="s390x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unsupported architecture: s390x", result.stdout)
 
     def test_client_arguments_with_and_without_features(self):
         script = workflow_run_script(
