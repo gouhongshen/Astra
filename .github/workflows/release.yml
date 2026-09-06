@@ -15,16 +15,6 @@ on:
         required: true
         default: false
         type: boolean
-      push_to_dockerhub:
-        description: Publish the verified container manifest to Docker Hub
-        required: true
-        default: true
-        type: boolean
-      push_to_idc:
-        description: Push the verified container manifest to the IDC registry mirror
-        required: true
-        default: false
-        type: boolean
 
 concurrency:
   group: release-astra
@@ -48,8 +38,6 @@ jobs:
       publish_latest: ${{ steps.resolve.outputs.publish_latest }}
       matrix: ${{ steps.resolve.outputs.matrix }}
       owner_run_id: ${{ steps.resolve.outputs.owner_run_id }}
-      container_registry: ${{ steps.resolve.outputs.container_registry }}
-      container_image: ${{ steps.resolve.outputs.container_image }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -57,37 +45,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Require a selected container publication target
+      - name: Require Docker publication credentials
         shell: bash
         env:
-          PUSH_TO_DOCKERHUB: ${{ inputs.push_to_dockerhub }}
-          PUSH_TO_IDC: ${{ inputs.push_to_idc }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          MIRROR_REGISTRY: ${{ vars.CONTAINER_MIRROR_REGISTRY }}
-          TARGET_IMAGE: ${{ vars.CONTAINER_MIRROR_IMAGE }}
-          MIRROR_USERNAME: ${{ secrets.IDC_REGISTRY_USERNAME }}
-          MIRROR_PASSWORD: ${{ secrets.IDC_REGISTRY_PASSWORD }}
         run: |
           set -euo pipefail
-          if [ "${PUSH_TO_DOCKERHUB}" != "true" ] && [ "${PUSH_TO_IDC}" != "true" ]; then
-            echo "At least one container registry target must be selected." >&2
-            exit 1
-          fi
-
           missing=()
-          if [ "${PUSH_TO_DOCKERHUB}" = "true" ]; then
-            [ -n "${DOCKERHUB_USERNAME}" ] || missing+=(DOCKERHUB_USERNAME)
-            [ -n "${DOCKERHUB_TOKEN}" ] || missing+=(DOCKERHUB_TOKEN)
-          else
-            [ -n "${MIRROR_REGISTRY}" ] || missing+=(CONTAINER_MIRROR_REGISTRY)
-            [ -n "${TARGET_IMAGE}" ] || missing+=(CONTAINER_MIRROR_IMAGE)
-            [ -n "${MIRROR_USERNAME}" ] || missing+=(IDC_REGISTRY_USERNAME)
-            [ -n "${MIRROR_PASSWORD}" ] || missing+=(IDC_REGISTRY_PASSWORD)
-          fi
+          [ -n "${DOCKERHUB_USERNAME}" ] || missing+=(DOCKERHUB_USERNAME)
+          [ -n "${DOCKERHUB_TOKEN}" ] || missing+=(DOCKERHUB_TOKEN)
           if [ "${#missing[@]}" -ne 0 ]; then
             echo "Missing repository or organization Actions secrets: ${missing[*]}" >&2
-            echo "Configure the selected registry before building release candidates." >&2
+            echo "Configure the Docker Hub publisher credentials before building release candidates." >&2
             exit 1
           fi
 
@@ -99,9 +69,6 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           INPUT_VERSION: ${{ inputs.version }}
           RECOVER_EXISTING_TAG: ${{ inputs.recover_existing_tag }}
-          PUSH_TO_DOCKERHUB: ${{ inputs.push_to_dockerhub }}
-          MIRROR_REGISTRY: ${{ vars.CONTAINER_MIRROR_REGISTRY }}
-          TARGET_IMAGE: ${{ vars.CONTAINER_MIRROR_IMAGE }}
         run: |
           set -euo pipefail
           if [ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]; then
@@ -203,14 +170,6 @@ jobs:
             publish_latest=false
             rolling_version=""
           fi
-
-          if [ "${PUSH_TO_DOCKERHUB}" = "true" ]; then
-            container_registry=docker.io
-            container_image=matrixorigin/astra
-          else
-            container_registry="${MIRROR_REGISTRY}"
-            container_image="${TARGET_IMAGE}"
-          fi
           matrix='{"include":[{"platform":"linux/amd64","runner":"ubuntu-latest","slug":"linux-amd64"},{"platform":"linux/arm64","runner":"ubuntu-24.04-arm","slug":"linux-arm64"}]}'
 
           {
@@ -223,8 +182,6 @@ jobs:
             echo "publish_latest=${publish_latest}"
             echo "matrix=${matrix}"
             echo "owner_run_id=${marker_run_id}"
-            echo "container_registry=${container_registry}"
-            echo "container_image=${container_image}"
           } >> "${GITHUB_OUTPUT}"
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -233,9 +190,8 @@ jobs:
         if: ${{ inputs.recover_existing_tag == true }}
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ${{ steps.resolve.outputs.container_registry }}
-          username: ${{ inputs.push_to_dockerhub && secrets.DOCKERHUB_USERNAME || secrets.IDC_REGISTRY_USERNAME }}
-          password: ${{ inputs.push_to_dockerhub && secrets.DOCKERHUB_TOKEN || secrets.IDC_REGISTRY_PASSWORD }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Download retained server candidate coordinates for recovery preflight
         if: ${{ inputs.recover_existing_tag == true }}
@@ -253,7 +209,6 @@ jobs:
         env:
           BUILD_MATRIX_JSON: ${{ steps.resolve.outputs.matrix }}
           OWNER_RUN_ID: ${{ steps.resolve.outputs.owner_run_id }}
-          IMAGE_NAME: ${{ steps.resolve.outputs.container_image }}
         run: |
           set -euo pipefail
           while IFS= read -r slug; do
@@ -267,7 +222,7 @@ jobs:
             fi
             digest="$(basename "${digest_files[0]}")"
             scripts/reconcile-docker-candidate-tag.sh \
-              "${IMAGE_NAME}" \
+              matrixorigin/astra \
               "astra-candidate-${OWNER_RUN_ID}-${slug}-${digest}" \
               "sha256:${digest}" \
               verify
@@ -276,15 +231,15 @@ jobs:
               <<< "${BUILD_MATRIX_JSON}"
           )
 
-      - name: Reject an existing container version before candidate builds
+      - name: Reject an existing Docker version before candidate builds
         if: ${{ inputs.recover_existing_tag != true }}
         shell: bash
         env:
-          IMAGE: ${{ steps.resolve.outputs.container_image }}:${{ steps.resolve.outputs.version }}
+          IMAGE: matrixorigin/astra:${{ steps.resolve.outputs.version }}
         run: |
           set -euo pipefail
           if inspect_output="$(docker buildx imagetools inspect "${IMAGE}" 2>&1)"; then
-            echo "Container version ${IMAGE} already exists." >&2
+            echo "Docker version ${IMAGE} already exists." >&2
             echo "Choose a new version; normal publication never adopts or overwrites an existing tag." >&2
             exit 1
           elif ! grep -Eqi '(: not found|manifest unknown|name unknown|HTTP 404|status[^0-9]*404)' \
@@ -304,9 +259,6 @@ jobs:
             echo "- Version: \`${{ steps.resolve.outputs.source_tag }}\`"
             echo "- Source: \`${{ steps.resolve.outputs.source_sha }}\`"
             echo "- Recovery: \`${{ inputs.recover_existing_tag }}\`"
-            echo "- Push to Docker Hub: \`${{ inputs.push_to_dockerhub }}\`"
-            echo "- Push to IDC: \`${{ inputs.push_to_idc }}\`"
-            echo "- Container target: \`${{ steps.resolve.outputs.container_image }}\`"
             echo "- Client targets: Linux and macOS, AMD64 and ARM64"
             echo "- Server targets: Linux AMD64 and ARM64"
           } >> "${GITHUB_STEP_SUMMARY}"
@@ -329,11 +281,11 @@ jobs:
       image_version: ${{ needs.preflight.outputs.version }}
       source_sha: ${{ needs.preflight.outputs.source_sha }}
       matrix_json: ${{ needs.preflight.outputs.matrix }}
-      registry: ${{ needs.preflight.outputs.container_registry }}
-      image_name: ${{ needs.preflight.outputs.container_image }}
+      registry: docker.io
+      image_name: matrixorigin/astra
     secrets:
-      REGISTRY_USERNAME: ${{ inputs.push_to_dockerhub && secrets.DOCKERHUB_USERNAME || secrets.IDC_REGISTRY_USERNAME }}
-      REGISTRY_PASSWORD: ${{ inputs.push_to_dockerhub && secrets.DOCKERHUB_TOKEN || secrets.IDC_REGISTRY_PASSWORD }}
+      REGISTRY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
 
   publish:
     name: Publish Verified Release
@@ -429,9 +381,8 @@ jobs:
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
-          registry: ${{ needs.preflight.outputs.container_registry }}
-          username: ${{ inputs.push_to_dockerhub && secrets.DOCKERHUB_USERNAME || secrets.IDC_REGISTRY_USERNAME }}
-          password: ${{ inputs.push_to_dockerhub && secrets.DOCKERHUB_TOKEN || secrets.IDC_REGISTRY_PASSWORD }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Resolve publication continuation state
         id: publication_state
@@ -490,17 +441,17 @@ jobs:
           echo "state=${state}" >> "${GITHUB_OUTPUT}"
           echo "release_id=${release_id}" >> "${GITHUB_OUTPUT}"
 
-      - name: Reject conflicting container version before creating the tag
+      - name: Reject conflicting Docker version before creating the tag
         if: >-
           inputs.recover_existing_tag != true &&
           steps.publication_state.outputs.same_run != 'true'
         shell: bash
         env:
-          IMAGE: ${{ needs.preflight.outputs.container_image }}:${{ needs.preflight.outputs.version }}
+          IMAGE: matrixorigin/astra:${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
           if inspect_output="$(docker buildx imagetools inspect "${IMAGE}" 2>&1)"; then
-            echo "Container version ${IMAGE} already exists." >&2
+            echo "Docker version ${IMAGE} already exists." >&2
             echo "Choose a new version; normal publication never adopts or overwrites an existing tag." >&2
             exit 1
           elif ! grep -Eqi '(: not found|manifest unknown|name unknown|HTTP 404|status[^0-9]*404)' \
@@ -570,10 +521,10 @@ jobs:
             exit 1
           fi
 
-      - name: Create or verify the immutable container version manifest
+      - name: Create or verify the immutable Docker version manifest
         shell: bash
         env:
-          IMAGE_NAME: ${{ needs.preflight.outputs.container_image }}
+          IMAGE_NAME: matrixorigin/astra
           IMAGE_VERSION: ${{ needs.preflight.outputs.version }}
           BUILD_MATRIX_JSON: ${{ needs.preflight.outputs.matrix }}
           RECOVER_EXISTING_TAG: ${{ inputs.recover_existing_tag }}
@@ -741,11 +692,11 @@ jobs:
             -F prerelease="${PRERELEASE}" \
             -f make_latest="${PUBLISH_LATEST}" >/dev/null
 
-      - name: Promote stable rolling container tags
+      - name: Promote stable rolling Docker tags
         if: ${{ needs.preflight.outputs.publish_latest == 'true' }}
         shell: bash
         env:
-          IMAGE_NAME: ${{ needs.preflight.outputs.container_image }}
+          IMAGE_NAME: matrixorigin/astra
           IMAGE_VERSION: ${{ needs.preflight.outputs.version }}
           ROLLING_VERSION: ${{ needs.preflight.outputs.rolling_version }}
         run: |
@@ -773,81 +724,10 @@ jobs:
             echo "- Release: \`${{ needs.preflight.outputs.source_tag }}\`"
             echo "- Source: \`${{ needs.preflight.outputs.source_sha }}\`"
             echo "- Clients: Linux/macOS, AMD64/ARM64"
-            echo "- Server: \`${{ needs.preflight.outputs.container_image }}:${{ needs.preflight.outputs.version }}\`"
+            echo "- Server: \`matrixorigin/astra:${{ needs.preflight.outputs.version }}\`"
             if [ "${{ needs.preflight.outputs.publish_latest }}" = "true" ]; then
               echo "- Promoted: \`${{ needs.preflight.outputs.rolling_version }}\`, \`latest\`"
             else
               echo "- Prerelease: rolling Docker tags were not changed"
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
-
-  registry-mirror:
-    name: Publish IDC Registry Mirror
-    if: >-
-      inputs.push_to_dockerhub == true &&
-      inputs.push_to_idc == true &&
-      vars.CONTAINER_MIRROR_REGISTRY != '' &&
-      vars.CONTAINER_MIRROR_IMAGE != ''
-    needs:
-      - preflight
-      - publish
-    runs-on: ${{ vars.CONTAINER_MIRROR_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 45
-    continue-on-error: true
-    env:
-      http_proxy: ${{ vars.CONTAINER_MIRROR_HTTP_PROXY || '' }}
-      https_proxy: ${{ vars.CONTAINER_MIRROR_HTTPS_PROXY || '' }}
-      no_proxy: ${{ vars.CONTAINER_MIRROR_NO_PROXY || '' }}
-
-    steps:
-      - name: Install pinned crane
-        shell: bash
-        env:
-          CRANE_VERSION: v0.20.6
-          CRANE_LINUX_X86_64_SHA256: c1d593d01551f2c9a3df5ca0a0be4385a839bd9b86d4a76e18d7b17d16559127
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/bin"
-          curl -fsSL \
-            -o "${RUNNER_TEMP}/go-containerregistry.tar.gz" \
-            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
-          echo "${CRANE_LINUX_X86_64_SHA256}  ${RUNNER_TEMP}/go-containerregistry.tar.gz" \
-            | sha256sum --check --strict
-          tar -xzf "${RUNNER_TEMP}/go-containerregistry.tar.gz" -C "${RUNNER_TEMP}/bin" crane
-          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
-          "${RUNNER_TEMP}/bin/crane" version
-
-      - name: Copy the verified public manifest
-        shell: bash
-        env:
-          IMAGE_VERSION: ${{ needs.preflight.outputs.version }}
-          ROLLING_VERSION: ${{ needs.preflight.outputs.rolling_version }}
-          PUBLISH_LATEST: ${{ needs.preflight.outputs.publish_latest }}
-          SOURCE_IMAGE: matrixorigin/astra
-          MIRROR_REGISTRY: ${{ vars.CONTAINER_MIRROR_REGISTRY }}
-          TARGET_IMAGE: ${{ vars.CONTAINER_MIRROR_IMAGE }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          MIRROR_USERNAME: ${{ secrets.IDC_REGISTRY_USERNAME }}
-          MIRROR_PASSWORD: ${{ secrets.IDC_REGISTRY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          printf '%s' "${DOCKERHUB_TOKEN}" | crane auth login index.docker.io -u "${DOCKERHUB_USERNAME}" --password-stdin
-          printf '%s' "${MIRROR_PASSWORD}" | crane auth login "${MIRROR_REGISTRY}" -u "${MIRROR_USERNAME}" --password-stdin
-
-          source_ref="docker.io/${SOURCE_IMAGE}:${IMAGE_VERSION}"
-          source_digest="$(crane digest "${source_ref}")"
-          tags=("${IMAGE_VERSION}")
-          if [ "${PUBLISH_LATEST}" = "true" ]; then
-            tags+=("${ROLLING_VERSION}" latest)
-          fi
-          for tag in "${tags[@]}"; do
-            crane copy --platform=all --jobs 2 \
-              "${source_ref}" \
-              "${TARGET_IMAGE}:${tag}"
-            target_digest="$(crane digest "${TARGET_IMAGE}:${tag}")"
-            if [ "${target_digest}" != "${source_digest}" ]; then
-              echo "Mirror tag ${TARGET_IMAGE}:${tag} does not match ${source_ref}." >&2
-              exit 1
-            fi
-          done

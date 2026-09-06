@@ -2,8 +2,7 @@
 
 This guide defines the maintainer workflow for publishing Astra from the
 `matrixorigin/Astra` repository. One protected workflow owns the source tag,
-GitHub Release, client archives, public server image, rolling Docker tags, and
-optional registry mirror. A release is selected once, verified as one candidate
+GitHub Release, client archives, public server image, and rolling Docker tags. A release is selected once, verified as one candidate
 set, and only then made visible to users.
 
 ## What one release contains
@@ -48,8 +47,7 @@ Publication is deliberately ordered:
 4. create or validate the immutable annotated tag;
 5. create or verify the exact Docker version manifest;
 6. stage and publish the GitHub Release with verified client assets;
-7. update stable rolling Docker tags;
-8. copy the already-public manifest to an optional private mirror.
+7. update stable rolling Docker tags.
 
 The GitHub Release is not published until the exact Docker version exists. If
 a late step fails, rerun the failed jobs from the same Actions run so its
@@ -78,8 +76,7 @@ Provide `DOCKERHUB_USERNAME` and a least-privilege `DOCKERHUB_TOKEN`, capable
 of writing only `matrixorigin/astra`, as repository or organization Actions
 secrets. Candidate jobs use them to push untagged digests for runtime smoke;
 only the environment-gated publication job gives those digests a user-visible
-tag. Keep `IDC_REGISTRY_USERNAME` and `IDC_REGISTRY_PASSWORD` as repository or
-organization secrets when the optional mirror is enabled.
+tag.
 
 After migration, remove the unused `ASTRA_SUITE_PAT` secret and
 `RELEASE_MIRROR_REPOSITORY` variable once a repository search confirms that no
@@ -100,23 +97,6 @@ Repository Actions should default to read-only permissions. The release
 controller grants `contents: write` only to the publication job that creates
 the tag and GitHub Release.
 
-The **Release Astra** workflow has two independent container targets:
-
-- **Push to Docker Hub** defaults to on and publishes `matrixorigin/astra`.
-- **Push to IDC** defaults to off. When it is the only selected target, verified
-  candidates and the final manifest are published directly to the IDC image
-  configured by `CONTAINER_MIRROR_REGISTRY` and `CONTAINER_MIRROR_IMAGE`; no
-  container image is published to Docker Hub.
-- When both targets are selected, Docker Hub remains the verified publication
-  target and the existing IDC mirror copies that manifest after release
-  publication.
-
-At least one target must be selected. Proxy and runner variables are documented
-in `release.yml`. Mirror failure is reported without invalidating a public
-release that has already completed. A recovery run must select the same primary
-container target as its original release because retained candidates live in
-that registry.
-
 The source tree versions `@astra/sdk` and the Helm chart, but the workflow does
 not yet publish either to npm or a chart registry. Treat them as explicit
 maintainer actions until dedicated verification and provenance gates exist.
@@ -128,6 +108,28 @@ annotated tags created by this unified workflow. For the first repository-owned
 release, choose a new version whose tag and Docker version do not exist; until
 that release is complete, latest-release installation will fail explicitly
 instead of silently installing a legacy package.
+
+## Build an IDC image independently
+
+Run **build_push_to_idc** (`build_push_to_idc.yml`) manually and select the
+source branch or tag in the Run workflow dialog. Only maintainers should run
+trusted source on the self-hosted runner. This workflow does not create Git
+tags or GitHub Releases and does not push to Docker Hub.
+
+Configure repository variables `CONTAINER_MIRROR_REGISTRY` (host and optional
+port), `CONTAINER_MIRROR_IMAGE` (full untagged repository), and
+`CONTAINER_MIRROR_RUNNER` (a Linux AMD64 Docker-capable runner label), plus
+secrets `IDC_REGISTRY_USERNAME` and `IDC_REGISTRY_PASSWORD`. Missing required
+configuration fails before scheduling a build; there is no public-runner
+substitution. Optional proxy variables are `CONTAINER_MIRROR_HTTP_PROXY`,
+`CONTAINER_MIRROR_HTTPS_PROXY`, and `CONTAINER_MIRROR_NO_PROXY`.
+
+The workflow reuses the container-candidate build and all-in-one smoke test,
+then publishes `idc-<full commit SHA>-<run ID>-amd64` to IDC. All candidate,
+cache and final image writes stay in the configured IDC repository. Reruns
+verify the existing immutable manifest; different content is rejected. The
+runner must support the existing all-in-one stack, Python 3, and Docker
+Buildx. Formal release tags and `latest` are not changed.
 
 ## Prepare a release
 

@@ -1,0 +1,111 @@
+name: build_push_to_idc
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-push-to-idc
+  cancel-in-progress: false
+
+jobs:
+  settings:
+    name: Validate IDC build configuration
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      image_version: ${{ steps.resolve.outputs.image_version }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+    steps:
+      - name: Resolve IDC target and immutable build identity
+        id: resolve
+        shell: bash
+        env:
+          IDC_REGISTRY: ${{ vars.CONTAINER_MIRROR_REGISTRY }}
+          IDC_IMAGE: ${{ vars.CONTAINER_MIRROR_IMAGE }}
+          IDC_RUNNER: ${{ vars.CONTAINER_MIRROR_RUNNER }}
+          IDC_USERNAME: ${{ secrets.IDC_REGISTRY_USERNAME }}
+          IDC_PASSWORD: ${{ secrets.IDC_REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for key in IDC_REGISTRY IDC_IMAGE IDC_RUNNER IDC_USERNAME IDC_PASSWORD; do
+            if [ -z "${!key}" ]; then
+              echo "::error::Missing required IDC configuration: ${key}"
+              exit 1
+            fi
+          done
+          if [[ "${IDC_REGISTRY}" == */* || "${IDC_REGISTRY}" == *[[:space:]]* ]]; then
+            echo "::error::IDC registry must be a hostname with an optional port, without a URL scheme."
+            exit 1
+          fi
+          if [[ "${IDC_IMAGE}" != "${IDC_REGISTRY}/"* || "${IDC_IMAGE}" == *[[:space:]]* || "${IDC_IMAGE}" == *@* || "${IDC_IMAGE#*/}" == *:* || -z "${IDC_IMAGE#*/}" ]]; then
+            echo "::error::IDC image must be an untagged repository under the configured IDC registry."
+            exit 1
+          fi
+          matrix="$(jq -cn --arg runner "${IDC_RUNNER}" '{include:[{platform:"linux/amd64",runner:$runner,slug:"linux-amd64"}]}')"
+          {
+            echo "matrix=${matrix}"
+            echo "source_sha=${GITHUB_SHA}"
+            echo "image_version=idc-${GITHUB_SHA}-${GITHUB_RUN_ID}-amd64"
+          } >> "${GITHUB_OUTPUT}"
+
+  candidates:
+    name: Build and verify IDC image
+    needs: settings
+    uses: ./.github/workflows/release-container-candidates.yml
+    with:
+      image_version: ${{ needs.settings.outputs.image_version }}
+      source_sha: ${{ needs.settings.outputs.source_sha }}
+      matrix_json: ${{ needs.settings.outputs.matrix }}
+      registry: ${{ vars.CONTAINER_MIRROR_REGISTRY }}
+      image_name: ${{ vars.CONTAINER_MIRROR_IMAGE }}
+      http_proxy: ${{ vars.CONTAINER_MIRROR_HTTP_PROXY }}
+      https_proxy: ${{ vars.CONTAINER_MIRROR_HTTPS_PROXY }}
+      no_proxy: ${{ vars.CONTAINER_MIRROR_NO_PROXY }}
+    secrets:
+      REGISTRY_USERNAME: ${{ secrets.IDC_REGISTRY_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.IDC_REGISTRY_PASSWORD }}
+
+  publish:
+    name: Publish verified IDC image
+    needs: [settings, candidates]
+    runs-on: ${{ vars.CONTAINER_MIRROR_RUNNER }}
+    timeout-minutes: 20
+    env:
+      http_proxy: ${{ vars.CONTAINER_MIRROR_HTTP_PROXY }}
+      https_proxy: ${{ vars.CONTAINER_MIRROR_HTTPS_PROXY }}
+      no_proxy: ${{ vars.CONTAINER_MIRROR_NO_PROXY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ needs.settings.outputs.source_sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-digest-*
+          path: ${{ runner.temp }}/idc-digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ vars.CONTAINER_MIRROR_REGISTRY }}
+          username: ${{ secrets.IDC_REGISTRY_USERNAME }}
+          password: ${{ secrets.IDC_REGISTRY_PASSWORD }}
+      - name: Publish or verify immutable IDC manifest
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ vars.CONTAINER_MIRROR_IMAGE }}
+          IMAGE_VERSION: ${{ needs.settings.outputs.image_version }}
+          BUILD_MATRIX_JSON: ${{ needs.settings.outputs.matrix }}
+        run: |
+          set -euo pipefail
+          scripts/reconcile-docker-manifest.sh \
+            "${IMAGE_NAME}" "${IMAGE_VERSION}" "${BUILD_MATRIX_JSON}" \
+            "${RUNNER_TEMP}/idc-digests" verify
+          {
+            echo "## IDC image published"
+            echo "- Image: \`${IMAGE_NAME}:${IMAGE_VERSION}\`"
+            echo "- Source: \`${GITHUB_SHA}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
