@@ -100,11 +100,11 @@ Repository Actions should default to read-only permissions. The release
 controller grants `contents: write` only to the publication job that creates
 the tag and GitHub Release.
 
-The optional registry mirror is enabled only when both
-`CONTAINER_MIRROR_REGISTRY` and `CONTAINER_MIRROR_IMAGE` repository variables
-are set. Proxy and runner variables are documented in `release.yml`. Mirror
-failure is reported without invalidating a public release that has already
-completed.
+The IDC registry mirror runs only when the **Push to IDC** workflow-dispatch
+option is selected and both `CONTAINER_MIRROR_REGISTRY` and
+`CONTAINER_MIRROR_IMAGE` repository variables are set. It defaults to off.
+Proxy and runner variables are documented in `release.yml`. Mirror failure is
+reported without invalidating a public release that has already completed.
 
 The source tree versions `@astra/sdk` and the Helm chart, but the workflow does
 not yet publish either to npm or a chart registry. Treat them as explicit

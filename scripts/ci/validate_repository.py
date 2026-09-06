@@ -131,6 +131,7 @@ def main() -> None:
     for required in (
         "workflow_dispatch:",
         "recover_existing_tag:",
+        "push_to_idc:",
         'GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}',
         'validate-release-version.sh "${version}" --syntax-only',
         "release-binaries.yml",
@@ -316,6 +317,17 @@ def main() -> None:
             errors.append(
                 ".github/workflows/release.yml: publication must not resist cancellation "
                 f"or execute historical controller scripts ({forbidden})"
+            )
+    mirror_job = release_controller.split("\n  registry-mirror:\n", 1)[1]
+    for required in (
+        "inputs.push_to_idc == true",
+        "vars.CONTAINER_MIRROR_REGISTRY != ''",
+        "vars.CONTAINER_MIRROR_IMAGE != ''",
+    ):
+        if required not in mirror_job:
+            errors.append(
+                ".github/workflows/release.yml: IDC mirror publication must require "
+                f"an explicit dispatch request ({required})"
             )
     if 'git checkout --detach "${source_sha}"' in release_controller:
         errors.append(

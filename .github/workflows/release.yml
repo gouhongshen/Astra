@@ -15,6 +15,11 @@ on:
         required: true
         default: false
         type: boolean
+      push_to_idc:
+        description: Push the verified container manifest to the IDC registry mirror
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
   group: release-astra
@@ -259,6 +264,7 @@ jobs:
             echo "- Version: \`${{ steps.resolve.outputs.source_tag }}\`"
             echo "- Source: \`${{ steps.resolve.outputs.source_sha }}\`"
             echo "- Recovery: \`${{ inputs.recover_existing_tag }}\`"
+            echo "- Push to IDC: \`${{ inputs.push_to_idc }}\`"
             echo "- Client targets: Linux and macOS, AMD64 and ARM64"
             echo "- Server targets: Linux AMD64 and ARM64"
           } >> "${GITHUB_STEP_SUMMARY}"
@@ -729,8 +735,9 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
 
   registry-mirror:
-    name: Publish Optional Registry Mirror
+    name: Publish IDC Registry Mirror
     if: >-
+      inputs.push_to_idc == true &&
       vars.CONTAINER_MIRROR_REGISTRY != '' &&
       vars.CONTAINER_MIRROR_IMAGE != ''
     needs:
