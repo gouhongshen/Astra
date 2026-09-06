@@ -163,6 +163,7 @@ jobs:
       image_version: ${{ needs.settings.outputs.image_version }}
       controller_sha: ${{ github.sha }}
       source_sha: ${{ needs.settings.outputs.source_sha }}
+      source_ref: ${{ github.ref_name }}
       matrix_json: ${{ needs.settings.outputs.matrix }}
       registry: docker.io
       image_name: matrixorigin/astra

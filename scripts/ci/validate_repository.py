@@ -194,7 +194,10 @@ def main() -> None:
     for required in (
         "workflow_call:",
         "controller_sha:",
+        "source_ref:",
         "require_self_hosted:",
+        "retain_candidate_tag:",
+        "use_registry_cache:",
         'RUNNER_ENVIRONMENT}" != "self-hosted"',
         "context: source",
         "file: source/Dockerfile",
@@ -209,6 +212,10 @@ def main() -> None:
         "retention-days: 30",
         "Write container candidate summary",
         "Candidate image version",
+        "org.opencontainers.image.source=https://github.com/matrixorigin/astra",
+        "IMAGE_BRANCH=${{ inputs.source_ref }}",
+        "Candidate image source ref",
+        "Candidate image source",
     ):
         if required not in container_candidates:
             errors.append(
@@ -235,9 +242,14 @@ def main() -> None:
         "source_ref:",
         'GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}',
         "source_ref commit must belong to main or moi-dev",
-        'runner:["self-hosted",$runner]',
+        'runner:$runner',
         "require_self_hosted: true",
+        "retain_candidate_tag: false",
+        "use_registry_cache: false",
         "controller_sha: ${{ needs.settings.outputs.controller_sha }}",
+        "source_ref: ${{ needs.settings.outputs.source_ref }}",
+        "Validate IDC registry credentials",
+        "Require IDC registry credentials",
         "IDC publication requires a self-hosted runner",
     ):
         if required not in idc_workflow:

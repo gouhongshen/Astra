@@ -14,6 +14,10 @@ on:
         description: Immutable source commit selected by the caller
         required: true
         type: string
+      source_ref:
+        description: Selected branch name or immutable commit used in OCI ref metadata
+        required: true
+        type: string
       controller_sha:
         description: Trusted workflow revision that owns scripts and smoke verification
         required: true
@@ -42,6 +46,14 @@ on:
       require_self_hosted:
         type: boolean
         default: false
+      retain_candidate_tag:
+        description: Retain a run-scoped tag for release recovery
+        type: boolean
+        default: true
+      use_registry_cache:
+        description: Read and publish registry-backed BuildKit cache manifests
+        type: boolean
+        default: true
     secrets:
       REGISTRY_USERNAME:
         required: true
@@ -51,6 +63,7 @@ on:
 env:
   IMAGE_NAME: ${{ inputs.image_name }}
   RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}
+  RELEASE_SOURCE_REF: ${{ inputs.source_ref }}
   RELEASE_IMAGE_VERSION: ${{ inputs.image_version }}
   http_proxy: ${{ inputs.http_proxy }}
   https_proxy: ${{ inputs.https_proxy }}
@@ -111,17 +124,17 @@ jobs:
           labels: |
             org.opencontainers.image.version=${{ env.RELEASE_IMAGE_VERSION }}
             org.opencontainers.image.revision=${{ env.RELEASE_SOURCE_SHA }}
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/matrixorigin/astra
           build-args: |
             IMAGE_VERSION=${{ env.RELEASE_IMAGE_VERSION }}
             IMAGE_REVISION=${{ env.RELEASE_SOURCE_SHA }}
             IMAGE_SOURCE_DIRTY=false
-            IMAGE_BRANCH=${{ github.ref_name }}
+            IMAGE_BRANCH=${{ inputs.source_ref }}
             HTTP_PROXY=${{ inputs.http_proxy }}
             HTTPS_PROXY=${{ inputs.https_proxy }}
             NO_PROXY=${{ inputs.no_proxy }}
-          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.slug }}
-          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.slug }},mode=max
+          cache-from: ${{ inputs.use_registry_cache && format('type=registry,ref={0}:buildcache-{1}', env.IMAGE_NAME, matrix.slug) || '' }}
+          cache-to: ${{ inputs.use_registry_cache && format('type=registry,ref={0}:buildcache-{1},mode=max', env.IMAGE_NAME, matrix.slug) || '' }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true
@@ -139,6 +152,7 @@ jobs:
           touch "${RUNNER_TEMP}/digests/${digest#sha256:}"
 
       - name: Retain candidate with a run-scoped immutable tag
+        if: ${{ inputs.retain_candidate_tag }}
         shell: bash
         run: |
           set -euo pipefail
@@ -226,6 +240,16 @@ jobs:
           image_version="$(docker image inspect "${release_image}" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
           if [ "${image_version}" != "${RELEASE_IMAGE_VERSION}" ]; then
             echo "Candidate image version ${image_version:-<missing>} does not match ${RELEASE_IMAGE_VERSION}" >&2
+            exit 1
+          fi
+          image_source="$(docker image inspect "${release_image}" --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')"
+          if [ "${image_source}" != "https://github.com/matrixorigin/astra" ]; then
+            echo "Candidate image source ${image_source:-<missing>} is not the canonical Astra repository" >&2
+            exit 1
+          fi
+          source_ref="$(docker image inspect "${release_image}" --format '{{ index .Config.Labels "org.opencontainers.image.ref.name" }}')"
+          if [ "${source_ref}" != "${RELEASE_SOURCE_REF}" ]; then
+            echo "Candidate image source ref ${source_ref:-<missing>} does not match ${RELEASE_SOURCE_REF}" >&2
             exit 1
           fi
 

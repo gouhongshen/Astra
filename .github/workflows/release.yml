@@ -281,6 +281,7 @@ jobs:
       image_version: ${{ needs.preflight.outputs.version }}
       controller_sha: ${{ github.sha }}
       source_sha: ${{ needs.preflight.outputs.source_sha }}
+      source_ref: ${{ needs.preflight.outputs.source_tag }}
       matrix_json: ${{ needs.preflight.outputs.matrix }}
       registry: docker.io
       image_name: matrixorigin/astra

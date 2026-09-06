@@ -126,9 +126,11 @@ port), `CONTAINER_MIRROR_IMAGE` (full untagged repository), and
 label), plus
 secrets `IDC_REGISTRY_USERNAME` and `IDC_REGISTRY_PASSWORD`. Missing required
 configuration fails before scheduling a build; there is no public-runner
-substitution. Jobs require both `self-hosted` and the configured runner label,
-then verify `runner.environment` before checkout or registry login. Optional
-proxy variables are `CONTAINER_MIRROR_HTTP_PROXY`,
+substitution. ARC jobs target the configured scale-set label directly and
+verify `runner.environment` before checkout or registry login. A credential-only
+preflight on that admitted runner validates both secrets before any build or
+smoke job is scheduled, without exposing IDC credentials to a GitHub-hosted
+runner. Optional proxy variables are `CONTAINER_MIRROR_HTTP_PROXY`,
 `CONTAINER_MIRROR_HTTPS_PROXY`, and `CONTAINER_MIRROR_NO_PROXY`.
 
 The workflow reuses the container-candidate build and all-in-one smoke test,
@@ -138,7 +140,13 @@ a new timestamp, while rerunning only failed jobs reuses the settings output. Al
 cache and final image writes stay in the configured IDC repository. Reruns
 verify the existing immutable manifest; different content is rejected. The
 runner must support the existing all-in-one stack, Python 3, and Docker
-Buildx. Formal release tags and `latest` are not changed.
+Buildx. IDC candidates remain untagged until smoke verification succeeds and
+the workflow does not publish BuildKit cache tags into the runtime repository,
+so consumers that resolve its newest tagged artifact select only a verified
+final image. That image records the full selected source commit, its selected
+branch or SHA, and the canonical `https://github.com/matrixorigin/astra` OCI
+source label used by MOI's Astra revision resolver. Formal release tags and
+`latest` are not changed.
 
 ## Prepare a release
 

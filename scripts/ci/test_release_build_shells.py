@@ -13,11 +13,25 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def workflow_run_script(path, step_name):
+    """Extract one literal Bash run block from a workflow."""
+    workflow = (ROOT / path).read_text()
+    block = workflow.split(f"      - name: {step_name}\n", 1)[1]
+    block = block.split("        run: |\n", 1)[1]
+    lines = []
+    for line in block.splitlines():
+        if line and len(line) - len(line.lstrip()) < 10:
+            break
+        lines.append(line[10:] if line else "")
+    return "\n".join(lines)
+
+
 class ReleaseShellTests(unittest.TestCase):
     def run_idc_settings(self, **overrides):
-        workflow = (ROOT / ".github/workflows/build_push_to_idc.yml").read_text()
-        script = workflow.split("        run: |\n", 1)[1].split("\n  candidates:", 1)[0]
-        script = "\n".join(line[10:] for line in script.splitlines())
+        script = workflow_run_script(
+            ".github/workflows/build_push_to_idc.yml",
+            "Resolve IDC target and immutable build identity",
+        )
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary = Path(temporary_directory)
             origin = temporary / "origin.git"
@@ -79,18 +93,41 @@ class ReleaseShellTests(unittest.TestCase):
         outputs = dict(line.split("=", 1) for line in result.stdout.splitlines())
         self.assertEqual(outputs["controller_sha"], revisions["main"])
         self.assertEqual(outputs["source_sha"], revisions["main"])
+        self.assertEqual(outputs["source_ref"], "main")
         self.assertRegex(outputs["image_version"], r"^idc-\d{8}T\d{6}Z-" + revisions["main"] + r"-123-amd64$")
         self.assertEqual(json.loads(outputs["matrix"]), {"include": [
-            {"platform": "linux/amd64", "runner": ["self-hosted", "idc-amd64"],
+            {"platform": "linux/amd64", "runner": "idc-amd64",
              "slug": "linux-amd64"}]})
 
     def test_idc_resolves_moi_dev_and_allowed_historical_commit(self):
         result, revisions = self.run_idc_settings(SOURCE_REF="moi-dev")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("source_sha=" + revisions["moi-dev"], result.stdout)
+        self.assertIn("source_ref=moi-dev", result.stdout)
         result, revisions = self.run_idc_settings(SOURCE_REF="__base_sha__")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("source_sha=" + revisions["base"], result.stdout)
+        self.assertIn("source_ref=" + revisions["base"], result.stdout)
+
+    def test_idc_registry_credentials_are_required_before_build(self):
+        script = workflow_run_script(
+            ".github/workflows/build_push_to_idc.yml",
+            "Require IDC registry credentials",
+        )
+        for missing in ("IDC_REGISTRY_USERNAME", "IDC_REGISTRY_PASSWORD"):
+            with self.subTest(missing=missing):
+                env = {
+                    **os.environ,
+                    "IDC_REGISTRY_USERNAME": "release-user",
+                    "IDC_REGISTRY_PASSWORD": "release-password",
+                    missing: "",
+                }
+                result = subprocess.run(
+                    ["bash", "-c", script], env=env, capture_output=True, text=True
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Missing required IDC credential: " + missing, result.stdout)
+                self.assertNotIn("release-password", result.stdout + result.stderr)
 
     def test_idc_rejects_non_main_controller_and_arbitrary_ref(self):
         result, _ = self.run_idc_settings(GITHUB_REF="refs/heads/moi-dev")
@@ -120,10 +157,9 @@ class ReleaseShellTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
     def test_client_arguments_with_and_without_features(self):
-        workflow = (ROOT / ".github/workflows/release-binaries.yml").read_text()
-        step = workflow.split("      - name: Build client candidates\n", 1)[1]
-        script = step.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
-        script = "\n".join(line[10:] for line in script.splitlines())
+        script = workflow_run_script(
+            ".github/workflows/release-binaries.yml", "Build client candidates"
+        )
         script = script.replace("${{ matrix.target }}", "test-target")
         # POSIX positional parameters also work on macOS's Bash 3.2.
         # Run that portion under sh as well as bash to guard portability.
