@@ -42,9 +42,10 @@ def main() -> int:
         return 2
 
     credentials = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+    encoded_repository_name = quote(quote(repository_name, safe=""), safe="")
     url = (
         f"{base_url.rstrip('/')}/api/v2.0/projects/{quote(project, safe='')}"
-        f"/repositories/{quote(repository_name, safe='')}/artifacts/{quote(reference, safe='')}"
+        f"/repositories/{encoded_repository_name}/artifacts/{quote(reference, safe='')}"
     )
     request = Request(
         url,

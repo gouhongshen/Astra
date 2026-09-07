@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -206,14 +207,18 @@ else:
         class HarborHandler(BaseHTTPRequestHandler):
             state = "missing"
             paths = []
+            expected_path = "/api/v2.0/projects/team/repositories/astra/artifacts/release"
 
             def log_message(self, _format, *_args):
                 pass
 
             def do_GET(self):
                 type(self).paths.append(self.path)
-                if self.path != "/api/v2.0/projects/team/repositories/astra/artifacts/release":
-                    self.send_error(404)
+                if self.path != type(self).expected_path:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"errors": [{"code": "NOT_FOUND"}]}).encode())
                     return
                 status = {
                     "missing": 404,
@@ -282,13 +287,19 @@ esac
                 "RUNNER_TEMP": str(fixture),
             }
 
-            def run(state):
+            def run(state, repository="team/astra"):
                 calls.write_text("", encoding="utf-8")
                 HarborHandler.state = state
                 HarborHandler.paths = []
+                repository_name = repository.partition("/")[2]
+                encoded_repository_name = quote(quote(repository_name, safe=""), safe="")
+                HarborHandler.expected_path = (
+                    "/api/v2.0/projects/team/repositories/"
+                    f"{encoded_repository_name}/artifacts/release"
+                )
                 result = subprocess.run(
                     [str(script), "source.example/astra:staged",
-                     f"127.0.0.1:{server.server_port}/team/astra:release",
+                     f"127.0.0.1:{server.server_port}/{repository}:release",
                      f"http://127.0.0.1:{server.server_port}"],
                     env={**common_env, "ASTRA_TEST_TARGET_STATE": state},
                     capture_output=True,
@@ -321,6 +332,20 @@ esac
             self.assertNotEqual(conflict.returncode, 0)
             self.assertIn("already exists with digest", conflict.stderr)
             self.assertNotIn("copy ", conflict_calls)
+
+            nested_conflict, nested_conflict_calls, nested_paths = run(
+                "conflict", "team/nested/astra"
+            )
+            self.assertNotEqual(nested_conflict.returncode, 0)
+            self.assertIn("already exists with digest", nested_conflict.stderr)
+            self.assertNotIn("copy ", nested_conflict_calls)
+            self.assertEqual(
+                nested_paths,
+                [
+                    "/api/v2.0/projects/team/repositories/"
+                    "nested%252Fastra/artifacts/release"
+                ],
+            )
 
             for state in ("unauthorized", "forbidden", "server_error"):
                 with self.subTest(state=state):
