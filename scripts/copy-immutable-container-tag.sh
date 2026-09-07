@@ -12,27 +12,36 @@ fi
 source_ref="$1"
 target_ref="$2"
 
+target_repository="${target_ref%:*}"
+target_tag="${target_ref##*:}"
+if [[ "${target_repository}" == "${target_ref}" || "${target_tag}" == */* || -z "${target_tag}" ]]; then
+    echo "target reference must contain an explicit tag: ${target_ref}" >&2
+    exit 2
+fi
+
 command -v crane >/dev/null 2>&1 || {
     echo "crane is required" >&2
     exit 1
 }
 
 source_digest="$(crane digest "${source_ref}")"
-lookup_error="$(mktemp "${RUNNER_TEMP:-/tmp}/astra-target-lookup.XXXXXX")"
-trap 'rm -f "${lookup_error}"' EXIT HUP INT TERM
+target_tags="$(mktemp "${RUNNER_TEMP:-/tmp}/astra-target-tags.XXXXXX")"
+trap 'rm -f "${target_tags}"' EXIT HUP INT TERM
 
 target_exists=false
-if target_digest="$(crane digest "${target_ref}" 2>"${lookup_error}")"; then
-    target_exists=true
-elif ! grep -Eqi \
-    '(manifest unknown|name unknown|(^|[^[:alnum:]_])not found([^[:alnum:]_]|$)|HTTP[^0-9]*404([^0-9]|$)|status([^0-9]|[[:space:]]+code[[:space:]]*)[^0-9]*404([^0-9]|$))' \
-    "${lookup_error}"; then
-    echo "could not safely determine whether ${target_ref} exists:" >&2
-    cat "${lookup_error}" >&2
+if ! crane ls "${target_repository}" > "${target_tags}"; then
+    echo "could not safely enumerate tags in ${target_repository}" >&2
     exit 1
 fi
+while IFS= read -r existing_tag; do
+    if [[ "${existing_tag}" == "${target_tag}" ]]; then
+        target_exists=true
+        break
+    fi
+done < "${target_tags}"
 
 if [[ "${target_exists}" == true ]]; then
+    target_digest="$(crane digest "${target_ref}")"
     if [[ "${target_digest}" != "${source_digest}" ]]; then
         echo "${target_ref} already exists with digest ${target_digest}, expected ${source_digest}" >&2
         exit 1

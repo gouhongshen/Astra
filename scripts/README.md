@@ -264,9 +264,10 @@ reconciliation at the actual publication boundary.
 run-scoped staging tag per server platform so registry cleanup cannot discard
 an otherwise retained recovery candidate.
 `scripts/copy-immutable-container-tag.sh` copies a verified manifest between
-repositories only after the target lookup confirms absence. Authentication,
-network, and registry failures fail closed; an existing tag is accepted only
-when its digest already matches the verified source.
+repositories only after successful repository tag enumeration confirms that
+the exact target tag is absent. Authentication, network, and registry failures
+fail closed without interpreting their diagnostics; an existing tag is
+accepted only when its digest already matches the verified source.
 
 ### `scripts/verify_github_release_assets.py`
 

@@ -216,22 +216,29 @@ case "$1 $2" in
     printf '%s\\n' "${ASTRA_TEST_SOURCE_DIGEST}"
     ;;
   "digest runtime.example/astra:release")
-    case "${ASTRA_TEST_TARGET_STATE}" in
-      missing)
-        if [ -e "${ASTRA_TEST_STATE_DIR}/copied" ]; then
-          printf '%s\\n' "${ASTRA_TEST_SOURCE_DIGEST}"
-        else
-          echo 'MANIFEST_UNKNOWN: manifest unknown' >&2
-          exit 1
-        fi
-        ;;
+    if [ -e "${ASTRA_TEST_STATE_DIR}/copied" ]; then
+      printf '%s\\n' "${ASTRA_TEST_SOURCE_DIGEST}"
+    else
+      case "${ASTRA_TEST_TARGET_STATE}" in
       same) printf '%s\\n' "${ASTRA_TEST_SOURCE_DIGEST}" ;;
       conflict) printf '%s\\n' "${ASTRA_TEST_CONFLICTING_DIGEST}" ;;
+      *) exit 92 ;;
+      esac
+    fi
+    ;;
+  "ls runtime.example/astra")
+    case "${ASTRA_TEST_TARGET_STATE}" in
+      missing) printf '%s\\n' other-tag ;;
+      same|conflict) printf '%s\\n' other-tag release ;;
       timeout) echo 'Get registry: TLS handshake timeout' >&2; exit 1 ;;
       unauthorized) echo 'UNAUTHORIZED: authentication required (HTTP 401)' >&2; exit 1 ;;
       forbidden) echo 'DENIED: requested access is denied (status code 403)' >&2; exit 1 ;;
       server_error) echo 'registry returned HTTP 503 Service Unavailable' >&2; exit 1 ;;
-      *) exit 92 ;;
+      token_not_found)
+        echo 'GET http://registry.example/token?scope=repository:team/astra:pull: unexpected status code 404 Not Found' >&2
+        exit 1
+        ;;
+      *) exit 94 ;;
     esac
     ;;
   "copy --platform=all")
@@ -279,11 +286,12 @@ esac
             self.assertIn("already exists with digest", conflict.stderr)
             self.assertNotIn("copy ", conflict_calls)
 
-            for state in ("timeout", "unauthorized", "forbidden", "server_error"):
+            for state in ("timeout", "unauthorized", "forbidden", "server_error",
+                          "token_not_found"):
                 with self.subTest(state=state):
                     failed, failed_calls = run(state)
                     self.assertNotEqual(failed.returncode, 0)
-                    self.assertIn("could not safely determine", failed.stderr)
+                    self.assertIn("could not safely enumerate", failed.stderr)
                     self.assertNotIn("copy ", failed_calls)
 
     def test_idc_resolves_moi_dev_and_allowed_historical_commit(self):

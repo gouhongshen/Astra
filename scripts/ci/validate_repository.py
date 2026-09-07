@@ -307,8 +307,8 @@ def main() -> None:
         encoding="utf-8"
     )
     for required in (
-        "could not safely determine whether",
-        "manifest unknown",
+        "could not safely enumerate tags",
+        'crane ls "${target_repository}"',
         "crane copy --platform=all --jobs 2",
         "already exists with digest",
         "resolves to ${target_digest}, expected ${source_digest}",
