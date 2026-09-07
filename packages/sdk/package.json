@@ -1,6 +1,6 @@
 {
   "name": "@astra/sdk",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "license": "Apache-2.0",
   "description": "TypeScript SDK for Astra — streaming chat, tool execution, and WebSocket support",
   "homepage": "https://github.com/matrixorigin/Astra#readme",
@@ -71,7 +71,7 @@
     "@testing-library/react": "^16.3.3",
     "@types/node": "^22.14.1",
     "@types/react": "^19.2.18",
-    "@types/react-dom": "^19.2.5",
+    "@types/react-dom": "^19.2.7",
     "@vitest/coverage-v8": "^4.1.11",
     "jsdom": "^30.0.1",
     "react": "^19.2.8",

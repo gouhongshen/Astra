@@ -84,11 +84,21 @@ Sets up a demo environment and performs prerequisite checks.
 
 ### `scripts/setup/stack-setup.sh`
 Runs the human-facing first-run flow behind `make stack-setup`. It validates the
-embedding endpoint before startup, inventories current Compose state, repairs
-disconnected containers without deleting volumes, checks host-port conflicts,
-and gives explicit retry/stop/inspect choices. It keeps keys out of output,
-verifies the complete stack, and delegates admin/model configuration to
-`astra admin setup`. Use `make stack-up` and explicit variables for automation.
+intended installation before asking for provider configuration, validates the
+embedding endpoint before startup, inventories current Compose state, and gives
+explicit update/separate/leave and retry/stop/inspect choices. It keeps keys out
+of output, verifies the complete stack, persists the CLI API URL, shows
+administrator/model status, and optionally delegates admin/model configuration
+to `astra admin setup`. Use `make stack-up` and
+explicit variables for automation. Installation naming, independent volume/log
+paths, automatic port selection, and final host-port uniqueness checks are owned by
+`scripts/setup/stack_identity.sh` and its contract tests.
+
+`scripts/setup/stack_env_write.sh` owns credential-safe environment updates and
+the EXIT cleanup contract for setup staging and per-write temporary files.
+
+`scripts/setup/stack_status.sh` owns the read-only model-catalog projection
+used by the wizard's status summary, including active and inactive model names.
 
 ### `scripts/setup/check_embedding.py`
 Performs the credential-safe OpenAI-compatible embedding probe used by the
@@ -238,7 +248,9 @@ Memoria do not silently drift across releases.
 ### `scripts/validate-release-version.sh` and `scripts/verify-release-artifacts.sh`
 The release workflows use these scripts as shared, locally testable gates.
 The first requires every versioned workspace surface, including the default
-all-in-one Astra image, to match the selected release version. The
+all-in-one Astra image, to match the selected release version. Its optional
+`--root <path>` argument lets the trusted release controller inspect a
+historical source worktree without executing scripts from that worktree. The
 second requires the complete four-platform client archive set, verifies every
 checksum and archive layout, and creates the aggregate checksum manifest.
 `scripts/ci/test_release_contract.sh` exercises the success, rollback, and
@@ -248,6 +260,21 @@ Docker-tag creation, exact recovery, and rejection of duplicate platform
 candidates with an offline registry fixture. The shared
 `scripts/reconcile-docker-manifest.sh` performs the same platform-to-digest
 reconciliation at the actual publication boundary.
+`scripts/reconcile-docker-candidate-tag.sh` creates or verifies one immutable,
+run-scoped staging tag per server platform so registry cleanup cannot discard
+an otherwise retained recovery candidate.
+
+### `scripts/verify_github_release_assets.py`
+
+Before a draft GitHub Release becomes public, this gate requires the remote
+asset set to match the locally verified files exactly by name, byte size,
+upload state, and GitHub SHA-256 digest. Missing, additional, incomplete, and
+changed assets all fail closed.
+
+`scripts/prepare_github_release_body.py` binds a draft body to its immutable
+release owner and source. A repeated staging attempt reuses and verifies the
+same body without appending generated notes, while unrelated manual drafts are
+rejected.
 
 ### `scripts/prepare-release-version.py`
 

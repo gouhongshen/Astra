@@ -70,6 +70,10 @@ def main() -> None:
         Path("scripts/ops/test_production_env_contract.sh"),
         Path("scripts/ci/test_release_contract.sh"),
         Path("scripts/ci/test_github_release_lookup.sh"),
+        Path("scripts/ci/test_github_release_assets.py"),
+        Path("scripts/ci/test_github_release_body.py"),
+        Path("scripts/ci/test_release_owner_artifacts.sh"),
+        Path("scripts/ci/test_release_candidate_tags.sh"),
         Path("scripts/ci/test_release_manifest_contract.sh"),
         Path("scripts/ci/test_release_build_shells.py"),
         Path("scripts/ci/test_sccache_fallback.sh"),
@@ -109,12 +113,25 @@ def main() -> None:
             ".github/workflows/static-checks.yml: CI must validate workflow semantics "
             "with the repository-pinned actionlint version"
         )
+    if 'name: "Astra SDK (typecheck, test+coverage, build)"' not in static_checks:
+        errors.append(
+            ".github/workflows/static-checks.yml: the SDK required check must use "
+            "the Mergify-safe name Astra SDK (typecheck, test+coverage, build)"
+        )
+    if 'name: "@astra/sdk (typecheck, test+coverage, build)"' in static_checks:
+        errors.append(
+            ".github/workflows/static-checks.yml: required check names must not "
+            "start with @, which Mergify reserves for App-qualified checks"
+        )
 
     release_controller = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
     container_candidates = Path(
         ".github/workflows/release-container-candidates.yml"
     ).read_text(encoding="utf-8")
     snapshot_workflow = Path(".github/workflows/release-docker.yml").read_text(
+        encoding="utf-8"
+    )
+    idc_workflow = Path(".github/workflows/build_push_to_idc.yml").read_text(
         encoding="utf-8"
     )
 
@@ -145,7 +162,10 @@ def main() -> None:
         "release_id=${release_id}",
         "steps.stage_release.outputs.id",
         "Create or validate the immutable release tag",
+        "scripts/reconcile-release-tag.sh",
+        "Prepare canonical GitHub Release body",
         "Stage GitHub Release and verified assets",
+        "Verify canonical staged GitHub Release body",
         "Create or verify the immutable Docker version manifest",
         "scripts/reconcile-docker-manifest.sh",
         "Publish GitHub Release",
@@ -171,15 +191,34 @@ def main() -> None:
                 f"release lookup contract ({required})"
             )
 
+    release_tag_reconciler = Path("scripts/reconcile-release-tag.sh").read_text(
+        encoding="utf-8"
+    )
+    for required in (
+        "is no longer the current ${default_branch} head",
+        "No tag was created",
+        "Release-Run:",
+        'gh api --method POST "repos/${repository}/git/tags"',
+        'gh api --method POST "repos/${repository}/git/refs"',
+        "is not an annotated release tag owned by this run",
+    ):
+        if required not in release_tag_reconciler:
+            errors.append(
+                "scripts/reconcile-release-tag.sh: missing current-head or immutable "
+                f"ownership contract ({required})"
+            )
+
     docker_manifest = release_controller.find(
         "Create or verify the immutable Docker version manifest"
     )
+    release_tag = release_controller.find("Create or validate the immutable release tag")
+    publication_job = release_controller.find("\n  publish:\n")
     github_publish = release_controller.find("Publish GitHub Release")
     rolling_promotion = release_controller.find("Promote stable rolling Docker tags")
-    if not 0 <= docker_manifest < github_publish < rolling_promotion:
+    if not 0 <= publication_job < release_tag < docker_manifest < github_publish < rolling_promotion:
         errors.append(
-            ".github/workflows/release.yml: version artifacts must be reconciled before "
-            "the GitHub Release and rolling Docker tags become public"
+            ".github/workflows/release.yml: the protected release tag and version "
+            "artifacts must be reconciled before the GitHub Release and rolling tags"
         )
 
     for required in (
@@ -190,6 +229,9 @@ def main() -> None:
         "make stack-up",
         "make stack-verify",
         "release-digest-",
+        "Retain candidate with a run-scoped immutable tag",
+        "scripts/reconcile-docker-candidate-tag.sh",
+        "retention-days: 30",
         "Write container candidate summary",
         "Candidate image version",
     ):
@@ -212,6 +254,50 @@ def main() -> None:
         if required not in snapshot_workflow:
             errors.append(
                 f".github/workflows/release-docker.yml: missing immutable snapshot guard ({required})"
+            )
+
+    for required in (
+        "source_ref:",
+        'GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}',
+        "source_ref commit must belong to main or moi-dev",
+        "environment: idc-publication",
+        "runs-on: ${{ vars.CONTAINER_MIRROR_RUNNER }}",
+        "Require IDC registry credentials",
+        "IDC publication requires a self-hosted runner",
+        "Build the IDC candidate locally",
+        "load: true",
+        "push: false",
+        "Verify health and exact memory round trip",
+        "docker/login-action",
+        'docker push "${target}"',
+        "org.opencontainers.image.source=https://github.com/matrixorigin/astra",
+        "IMAGE_BRANCH=${{ env.RELEASE_SOURCE_REF }}",
+    ):
+        if required not in idc_workflow:
+            errors.append(
+                ".github/workflows/build_push_to_idc.yml: missing trusted-controller "
+                f"or self-hosted admission contract ({required})"
+            )
+
+    idc_build = idc_workflow.find("Build the IDC candidate locally")
+    idc_smoke = idc_workflow.find("Verify health and exact memory round trip")
+    idc_login = idc_workflow.find("docker/login-action")
+    idc_push = idc_workflow.find('docker push "${target}"')
+    if not 0 <= idc_build < idc_smoke < idc_login < idc_push:
+        errors.append(
+            ".github/workflows/build_push_to_idc.yml: the verified local image must "
+            "pass smoke before Harbor authentication and publication"
+        )
+    for forbidden in (
+        "release-container-candidates.yml",
+        "push-by-digest=true",
+        "buildcache-",
+        "astra-candidate-${GITHUB_RUN_ID}",
+    ):
+        if forbidden in idc_workflow:
+            errors.append(
+                ".github/workflows/build_push_to_idc.yml: IDC runtime repository must "
+                f"not receive candidate/cache objects ({forbidden})"
             )
 
     manifest_reconciler = Path("scripts/reconcile-docker-manifest.sh").read_text(
@@ -247,17 +333,74 @@ def main() -> None:
     for required in (
         "workflow_call:",
         "Execute client candidates",
+        "Verify Darwin session execution lease contract",
+        "macos_session_execution_lease",
         "--locked",
         "source_sha",
         "astra-edge",
+        "create_reproducible_release_archive.py",
         "scripts/verify-release-artifacts.sh",
         "release-client-assets",
+        "retention-days: 30",
     ):
         if required not in binary_release_workflow:
             errors.append(
                 ".github/workflows/release-binaries.yml: missing verified client candidate contract "
                 f"({required})"
             )
+
+    for required in (
+        "owner_run_id:",
+        "inputs.recover_existing_tag != true",
+        "Download original verified client candidates for recovery",
+        "Download original verified server candidates for recovery",
+        "Verify retained server candidates before publication approval",
+        "astra-candidate-${OWNER_RUN_ID}-${slug}-${digest}",
+        "run-id: ${{ needs.preflight.outputs.owner_run_id }}",
+        "scripts/verify-release-owner-artifacts.sh",
+        "scripts/prepare_github_release_body.py",
+        "Verify exact staged GitHub Release assets",
+        "scripts/verify_github_release_assets.py",
+        'git worktree add --detach "${source_dir}" "${source_sha}"',
+        'validate-release-version.sh "${version}" --root "${source_dir}"',
+    ):
+        if required not in release_controller:
+            errors.append(
+                ".github/workflows/release.yml: recovery must reuse the original "
+                f"verified candidate set ({required})"
+            )
+
+    publish_job = release_controller.split("\n  publish:\n", 1)[1]
+    for required in (
+        "!cancelled()",
+        "needs.clients.result == 'skipped'",
+        "needs.containers.result == 'skipped'",
+        "inputs.recover_existing_tag != true",
+        "ref: ${{ github.sha }}",
+        "contents: write",
+        "scripts/reconcile-release-tag.sh",
+    ):
+        if required not in publish_job:
+            errors.append(
+                ".github/workflows/release.yml: publication must remain cancellable "
+                f"and execute the trusted controller revision ({required})"
+            )
+    for forbidden in (
+        "always()",
+        "ref: ${{ needs.preflight.outputs.source_sha }}",
+        'gh api --method POST "repos/${GITHUB_REPOSITORY}/git/tags"',
+        'gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs"',
+    ):
+        if forbidden in publish_job:
+            errors.append(
+                ".github/workflows/release.yml: publication must not resist cancellation "
+                f"or execute historical controller scripts ({forbidden})"
+            )
+    if 'git checkout --detach "${source_sha}"' in release_controller:
+        errors.append(
+            ".github/workflows/release.yml: the release controller must inspect the "
+            "historical source in a separate worktree instead of executing from it"
+        )
 
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
     if "cargo chef cook --release --locked" not in dockerfile \

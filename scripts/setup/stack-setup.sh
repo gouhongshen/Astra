@@ -17,6 +17,8 @@ if [[ "$stack_env" != /* ]]; then
     stack_env="$repo_root/$stack_env"
 fi
 stack_dir="$repo_root/deployment/all-in-one"
+. "$repo_root/scripts/setup/stack_status.sh"
+. "$repo_root/scripts/setup/stack_env_write.sh"
 
 die() {
     echo "❌ $*" >&2
@@ -36,13 +38,19 @@ cancel_setup() {
 on_interrupt() {
     printf '\n\nSetup interrupted. No persistent data was deleted.\n' >&2
     printf 'Services may be partially started if Compose was already running.\n' >&2
-    printf 'Inspect: make stack-status    Stop safely: make stack-down\n' >&2
+    print_stack_inspect_commands >&2
+    printf 'Stop safely: ' >&2
+    print_stack_command stack-down >&2
+    printf '\n' >&2
     exit 130
 }
 trap on_interrupt INT TERM
+trap cleanup_setup_temporary_files EXIT
 
 command -v docker >/dev/null 2>&1 || die "docker is required"
 docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
+docker compose up --help 2>/dev/null | grep -q -- '--dry-run' ||
+    die "Docker Compose is too old for safe change planning; upgrade to a version whose 'docker compose up --help' includes --dry-run"
 docker info >/dev/null 2>&1 || die "Docker is not running or is not accessible"
 
 python_cmd=""
@@ -62,8 +70,9 @@ setup_overrides=""
 for key in \
     MEMORIA_EMBEDDING_PROVIDER MEMORIA_EMBEDDING_BASE_URL \
     MEMORIA_EMBEDDING_MODEL MEMORIA_EMBEDDING_DIM MEMORIA_EMBEDDING_API_KEY \
-    MEMORIA_EMBEDDING_ENDPOINTS ASTRA_BIND_ADDRESS ASTRA_API_PORT MEMORIA_PORT \
-    MATRIXONE_PORT MATRIXONE_DEBUG_HTTP_PORT; do
+    MEMORIA_EMBEDDING_ENDPOINTS ASTRA_STACK_NAME MATRIXONE_DATA_VOLUME \
+    MATRIXONE_LOG_DIR MEMORIA_LOG_DIR ASTRA_BIND_ADDRESS ASTRA_API_URL \
+    ASTRA_API_PORT MEMORIA_PORT MATRIXONE_PORT MATRIXONE_DEBUG_HTTP_PORT; do
     if printenv "$key" >/dev/null 2>&1; then
         setup_overrides="${setup_overrides}${setup_overrides:+, }$key"
     fi
@@ -74,43 +83,16 @@ if [[ -n "$setup_overrides" ]]; then
 fi
 
 compose() {
+    local project_name
+    project_name="$(env_file_read "$stack_env" ASTRA_STACK_NAME 2>/dev/null || true)"
+    project_name="${project_name:-all-in-one}"
     (
         cd "$stack_dir"
-        env UID="$(id -u)" GID="$(id -g)" \
-            docker compose --env-file "$stack_env" "$@"
+        env -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE \
+            UID="$(id -u)" GID="$(id -g)" ASTRA_STACK_ENV_FILE="$stack_env" \
+            docker compose --project-name "$project_name" \
+            --file "$stack_dir/docker-compose.yml" --env-file "$stack_env" "$@"
     )
-}
-
-set_env_value() {
-    local key="$1" value="$2" temporary value_file
-    temporary="$(mktemp "${TMPDIR:-/tmp}/astra-stack-env.XXXXXX")"
-    value_file="$(mktemp "${TMPDIR:-/tmp}/astra-stack-value.XXXXXX")"
-    chmod 600 "$value_file"
-    printf '%s' "$value" > "$value_file"
-    trap 'rm -f "$temporary" "$value_file"' RETURN
-    ASTRA_SETUP_VALUE_FILE="$value_file" awk -v key="$key" '
-        BEGIN {
-            value_file = ENVIRON["ASTRA_SETUP_VALUE_FILE"]
-            if ((getline file_value < value_file) > 0) value = file_value
-            close(value_file)
-            updated = 0
-        }
-        {
-            line = $0
-            sub(/^[[:space:]]*/, "", line)
-            if (line ~ "^" key "[[:space:]]*=") {
-                print key "=" value
-                updated = 1
-                next
-            }
-            print
-        }
-        END { if (!updated) print key "=" value }
-    ' "$stack_env" > "$temporary"
-    chmod 600 "$temporary"
-    mv "$temporary" "$stack_env"
-    rm -f "$value_file"
-    trap - RETURN
 }
 
 read_default() {
@@ -367,12 +349,14 @@ stack_exists() {
 }
 
 service_matches_configuration() {
-    local service="$1" container_id desired actual
-    container_id="$(compose ps -a -q "$service" 2>/dev/null | head -n 1)"
-    [[ -n "$container_id" ]] || return 1
-    desired="$(compose config --hash "$service" 2>/dev/null | awk -v service="$service" '$1 == service { print $2; exit }')"
-    actual="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$container_id" 2>/dev/null || true)"
-    [[ -n "$desired" && "$desired" == "$actual" ]]
+    local service="$1" plan
+    # Compose's `config --hash` does not match the runtime label for every
+    # env_file configuration. Ask Compose for its own read-only execution plan
+    # so the wizard makes the same recreate decision as `compose up`.
+    if ! plan="$(COMPOSE_ANSI=never compose --dry-run up -d --no-deps --no-build --pull never "$service" 2>&1)"; then
+        return 1
+    fi
+    compose_plan_keeps_service "$plan"
 }
 
 stack_matches_configuration() {
@@ -415,6 +399,8 @@ finally:
 PY
 }
 
+. "$repo_root/scripts/setup/stack_identity.sh"
+
 listener_pid() {
     local port="$1" pid=""
     if command -v lsof >/dev/null 2>&1; then
@@ -456,86 +442,6 @@ stop_detected_api() {
     ok "stopped the detected source-mode Astra API (PID $pid)"
 }
 
-ensure_host_port() {
-    local env_key="$1" label="$2" service="$3" default_port="$4" container_port="$5"
-    local bind_address port pid owner suggested answer
-    bind_address="$(env_file_read "$stack_env" ASTRA_BIND_ADDRESS 2>/dev/null || true)"
-    bind_address="${bind_address:-127.0.0.1}"
-    port="$(env_file_read "$stack_env" "$env_key" 2>/dev/null || true)"
-    port="${port:-$default_port}"
-    case "$port" in
-        ''|*[!0-9]*|0) die "$env_key must be a valid TCP port" ;;
-    esac
-    port=$((10#$port))
-    ((port <= 65535)) || die "$env_key must be a TCP port from 1 to 65535"
-
-    # A running container from this compose project already owns its declared
-    # port. Compose can safely preserve or recreate that container itself.
-    if service_owns_host_port "$service" "$port" "$container_port"; then
-        return 0
-    fi
-
-    while ! port_is_available "$bind_address" "$port"; do
-        pid="$(listener_pid "$port")"
-        owner=""
-        if [[ -n "$pid" ]]; then
-            owner="$(process_name "$pid")"
-        fi
-        warn "$label port $bind_address:$port is already in use${owner:+ by $owner (PID $pid)}"
-
-        if [[ "$env_key" == ASTRA_API_PORT && "$owner" == astra-server ]]; then
-            choose "Resolve the API port conflict:" \
-                "Stop the detected source-mode Astra API (PID $pid) and continue" \
-                "Use a different all-in-one API port" \
-                "Exit without further changes"
-            case "$menu_choice" in
-                    1)
-                        stop_detected_api "$pid" "$port" || true
-                        continue
-                        ;;
-                    2)
-                        suggested="$((port + 1))"
-                        read_tcp_port 'New all-in-one API port' "$suggested"
-                        answer="$prompt_value"
-                        set_env_value "$env_key" "$answer"
-                        port="$answer"
-                        continue
-                        ;;
-                    3)
-                        echo "Existing services and data were left unchanged."
-                        exit 0
-                        ;;
-            esac
-        else
-            choose "Resolve the $label port conflict:" \
-                "Use a different $label port" \
-                "Exit and stop the conflicting service yourself"
-            case "$menu_choice" in
-                    1)
-                        suggested="$((port + 1))"
-                        read_tcp_port "New $label port" "$suggested"
-                        answer="$prompt_value"
-                        set_env_value "$env_key" "$answer"
-                        port="$answer"
-                        continue
-                        ;;
-                    2)
-                        echo "Existing services and data were left unchanged."
-                        exit 0
-                        ;;
-            esac
-        fi
-    done
-}
-
-check_host_ports() {
-    ensure_host_port ASTRA_API_PORT "API" api 17001 17001
-    ensure_host_port MEMORIA_PORT "Memoria" memoria 8100 8100
-    ensure_host_port MATRIXONE_PORT "MatrixOne SQL" matrixone 26001 6001
-    ensure_host_port MATRIXONE_DEBUG_HTTP_PORT "MatrixOne debug" matrixone 26060 6060
-    ok "required host ports are available or owned by this stack"
-}
-
 stop_and_exit() {
     make --no-print-directory stack-down STACK_ENV="$stack_env"
     echo "Stack stopped. Persistent data was kept."
@@ -549,24 +455,26 @@ choose_existing_stack_action() {
         return
     fi
 
-    echo "Existing all-in-one stack detected:"
+    echo "Existing local Astra installation detected:"
     compose ps -a
     echo
     echo "  matrixone: $(service_state matrixone)"
     echo "  memoria:   $(service_state memoria)"
     echo "  api:       $(service_state api)"
 
-    if [[ "$embedding_changed" == true ]]; then
-        warn "embedding settings changed, so running containers must be recreated"
-        startup_mode=repair
-        return
+    if ! stack_matches_configuration; then
+        warn "the existing installation differs from this release or the current .env"
+        choose "Choose the intended outcome:" \
+            "Update the existing installation (recreate containers, preserve its data)" \
+            "Create a separate installation (new data and ports; existing installation untouched)" \
+            "Leave the existing installation unchanged and exit"
+        case "$menu_choice" in
+            1) startup_mode=repair; return ;;
+            2) configure_isolated_stack; startup_mode=normal; return ;;
+            3) echo "Existing installation left unchanged."; exit 0 ;;
+        esac
     fi
     if stack_is_healthy; then
-        if ! stack_matches_configuration; then
-            warn "the running stack differs from the current .env or Compose configuration"
-            startup_mode=repair
-            return
-        fi
         if confirm "Reuse this healthy stack without restarting it?" yes; then
             reuse_stack=true
             return
@@ -616,7 +524,7 @@ start_stack() {
         case "$menu_choice" in
                 1) recreate=true; continue ;;
                 2) stop_and_exit ;;
-                3) echo "Inspect with: make stack-status  or  make stack-logs"; exit 0 ;;
+                3) print_stack_inspect_commands; exit 0 ;;
         esac
     done
 }
@@ -636,19 +544,192 @@ verify_stack() {
                 1) continue ;;
                 2) start_stack true; continue ;;
                 3) stop_and_exit ;;
-                4) echo "Inspect with: make stack-status  or  make stack-logs"; exit 0 ;;
+                4) print_stack_inspect_commands; exit 0 ;;
         esac
     done
 }
 
+# Inspect server-side setup without printing credentials. This is deliberately
+# a read-only status probe: setup can be rerun for a healthy stack and will
+# explain exactly which user-layer pieces are still missing.
+admin_model_state() {
+    local whoami_json model_json
+    admin_state="not configured"
+    admin_identity=""
+    active_model_count=0
+    inactive_model_count=0
+    active_model_names=""
+    inactive_model_names=""
+
+    if ASTRA_API_URL="$ASTRA_API_URL" "$cli" admin config list >/dev/null 2>&1; then
+        admin_state="ready"
+        whoami_json="$(ASTRA_API_URL="$ASTRA_API_URL" "$cli" admin whoami 2>/dev/null || true)"
+        admin_identity="$("$python_cmd" -c '
+import json
+import sys
+
+try:
+    value = json.loads(sys.argv[1])
+except (IndexError, json.JSONDecodeError):
+    raise SystemExit(0)
+if isinstance(value, dict):
+    identity = value.get("username") or value.get("email") or value.get("user_id")
+    if isinstance(identity, str) and identity.strip():
+        print(identity.strip())
+' "$whoami_json" 2>/dev/null || true)"
+    else
+        # A non-admin account may still be useful for a later login, but it
+        # cannot complete this wizard's server-wide model configuration.
+        whoami_json="$(ASTRA_API_URL="$ASTRA_API_URL" "$cli" admin whoami 2>/dev/null || true)"
+        admin_identity="$("$python_cmd" -c '
+import json
+import sys
+
+try:
+    value = json.loads(sys.argv[1])
+except (IndexError, json.JSONDecodeError):
+    raise SystemExit(0)
+if isinstance(value, dict):
+    identity = value.get("username") or value.get("email") or value.get("user_id")
+    if isinstance(identity, str) and identity.strip():
+        print(identity.strip())
+' "$whoami_json" 2>/dev/null || true)"
+        if [[ -n "$admin_identity" ]]; then
+            admin_state="signed in (admin role not verified)"
+        fi
+        return 0
+    fi
+
+    model_json="$(ASTRA_API_URL="$ASTRA_API_URL" "$cli" admin model list 2>/dev/null || true)"
+    [[ -n "$model_json" ]] || return 0
+    parse_model_catalog_state "$model_json"
+}
+
+show_setup_state() {
+    local chat_state
+    admin_model_state
+    echo
+    echo "Current installation status"
+    echo "  Infrastructure: ready (API $ASTRA_API_URL; dependencies and memory verified)"
+    if [[ "$admin_state" == ready ]]; then
+        if [[ -n "$admin_identity" ]]; then
+            echo "  Administrator:  ready ($admin_identity)"
+        else
+            echo "  Administrator:  ready (authenticated admin profile)"
+        fi
+    else
+        echo "  Administrator:  $admin_state"
+    fi
+    if ((active_model_count > 0)); then
+        echo "  Models:          $active_model_count active${active_model_names:+ ($active_model_names)}"
+    else
+        echo "  Models:          no active model"
+    fi
+    if ((inactive_model_count > 0)); then
+        echo "                   $inactive_model_count inactive${inactive_model_names:+ ($inactive_model_names)}"
+    fi
+    if [[ "$admin_state" == ready && "$active_model_count" -gt 0 ]]; then
+        chat_state="configured (provider connectivity will be checked before completion)"
+    else
+        chat_state="incomplete"
+    fi
+    echo "  Chat:             $chat_state"
+}
+
+save_cli_api_url() {
+    cli_api_prefix=""
+    if "$cli" config set api_url "$ASTRA_API_URL" >/dev/null 2>&1; then
+        ok "saved this installation as the CLI default"
+    else
+        warn "could not save the API URL in CLI settings"
+        warn "prefix CLI commands with ASTRA_API_URL=$ASTRA_API_URL"
+        printf -v cli_api_prefix 'ASTRA_API_URL=%q ' "$ASTRA_API_URL"
+    fi
+}
+
+finish_infrastructure_only() {
+    echo
+    printf '\033[1;32mAstra stack is ready.\033[0m\n'
+    echo "  API:   $ASTRA_API_URL"
+    if [[ "${admin_state:-not configured}" == ready ]]; then
+        echo "  Admin: administrator is ready; existing chat settings were kept"
+    else
+        echo "  Admin: not configured or not verified in this run"
+    fi
+    if (( ${active_model_count:-0} > 0 )); then
+        echo "  Model: ${active_model_count} active model(s) present; connectivity was not rechecked"
+    else
+        echo "  Model: no active model configured"
+    fi
+    echo "  Resume: ${cli_api_prefix}${cli} admin setup"
+    echo "  TUI:   ${cli_api_prefix}${cli}"
+    echo "  Health: ${cli_api_prefix}${cli} health"
+    if [[ -n "${stack_original_env:-}" ]]; then
+        echo "  Existing installation descriptor kept at: $stack_original_env"
+        printf '  Manage this installation with: '
+        print_stack_command stack-status
+        printf '\n'
+    fi
+    echo
+    if [[ "${admin_state:-not configured}" == ready && "${active_model_count:-0}" -gt 0 ]]; then
+        echo "Chat configuration is present; provider connectivity was not rechecked in this run."
+    elif [[ "${admin_state:-not configured}" == ready ]]; then
+        echo "Chat is not ready: add and activate an LLM model with astra admin setup."
+    else
+        echo "Chat is not ready: configure an administrator and an active model with astra admin setup."
+    fi
+    exit 0
+}
+
+run_admin_model_setup() {
+    while true; do
+        if "$cli" admin setup; then
+            return 0
+        fi
+        warn "services are healthy, but administrator/model setup did not complete"
+        printf '  Resume without restarting services: %s%q admin setup\n' \
+            "$cli_api_prefix" "$cli" >&2
+        choose "Choose how to continue:" \
+            "Retry administrator and model setup" \
+            "Finish the stack now and configure chat later" \
+            "Exit with an error for inspection"
+        case "$menu_choice" in
+            1) continue ;;
+            2) finish_infrastructure_only ;;
+            3) return 1 ;;
+        esac
+    done
+}
+
+choose_admin_model_action() {
+    if [[ "$admin_state" == ready && "$active_model_count" -gt 0 ]]; then
+        choose "Administrator and model state is already present. What should setup do?" \
+            "Verify the existing administrator and model (recommended)" \
+            "Open setup to choose a different administrator or model" \
+            "Finish the stack and leave chat settings unchanged"
+        case "$menu_choice" in
+            1|2) return 0 ;;
+            3) finish_infrastructure_only ;;
+        esac
+    else
+        choose "Chat setup is incomplete. What should setup do?" \
+            "Configure administrator and model now (recommended)" \
+            "Finish the stack and configure chat later"
+        case "$menu_choice" in
+            1) return 0 ;;
+            2) finish_infrastructure_only ;;
+        esac
+    fi
+}
+
 echo
 printf '\033[1;36mAstra local setup\033[0m\n'
-echo "A state-aware setup for memory, services, administrator, and model."
+echo "A guided setup for one local installation, memory, and optional chat configuration."
 echo "No persistent data is removed by this wizard. Secrets are never displayed."
 
 cli="$(resolve_cli)"
 
-step "1/5" "Checking prerequisites and local configuration"
+step "1/5" "Choosing the local installation and checking prerequisites"
 make --no-print-directory stack-env STACK_ENV="$stack_env"
 chmod 600 "$stack_env"
 . scripts/lib/env_file.sh
@@ -657,7 +738,9 @@ if [[ -n "$embedding_endpoints" ]]; then
     die "make stack-setup supports one embedding endpoint, but MEMORIA_EMBEDDING_ENDPOINTS is configured.
    Keep the advanced endpoint set and use make stack-start, or clear it before running the wizard."
 fi
+ensure_data_volume_is_not_shared
 ok "Docker, Compose, Python, CLI, and local secrets are ready"
+choose_existing_stack_action
 
 step "2/5" "Configuring and testing semantic memory"
 refresh_embedding_state
@@ -679,9 +762,13 @@ fi
 refresh_embedding_state
 probe_embedding
 unset embedding_key
+if [[ "$embedding_changed" == true && "$reuse_stack" == true ]]; then
+    warn "embedding settings changed, so the existing containers must be recreated"
+    reuse_stack=false
+    startup_mode=repair
+fi
 
 step "3/5" "Reconciling and starting Astra services"
-choose_existing_stack_action
 if [[ "$reuse_stack" == true ]]; then
     ok "healthy existing stack reused"
 else
@@ -697,15 +784,30 @@ step "4/5" "Verifying the complete runtime"
 verify_stack
 ok "readiness, dependencies, and embedding memory round trip passed"
 
-step "5/5" "Configuring administrator and model"
+step "5/5" "Reviewing optional administrator and model setup"
 api_port="$(env_resolve_value "$stack_env" ASTRA_API_PORT 2>/dev/null || true)"
 bind_address="$(env_resolve_value "$stack_env" ASTRA_BIND_ADDRESS 2>/dev/null || true)"
 api_host="$(env_http_host_from_bind "$bind_address")"
-export ASTRA_API_URL="${ASTRA_API_URL:-http://${api_host}:${api_port:-17001}}"
-"$cli" admin setup
+export ASTRA_API_URL="http://${api_host}:${api_port:-17001}"
+echo "  Model requests originate inside Docker. For a model server on this host,"
+echo "  use http://host.docker.internal:<port> instead of localhost."
+save_cli_api_url
+show_setup_state
+choose_admin_model_action
+echo
+echo "Continuing with administrator and model verification..."
+run_admin_model_setup
 
 echo
 printf '\033[1;32mAstra is ready.\033[0m\n'
 echo "  API:  $ASTRA_API_URL"
-echo "  Chat: $cli chat -m \"Hello Astra\""
+echo "  TUI:  ${cli_api_prefix}${cli}"
+echo "  One-shot: ${cli_api_prefix}${cli} chat -m \"Hello Astra\""
 echo "  Edge: astra-edge --help (connect a local runner when private tools are needed)"
+if [[ -n "${stack_original_env:-}" ]]; then
+    echo "  Env:  $stack_env"
+    echo "  Existing installation descriptor kept at: $stack_original_env"
+    printf '  Manage this installation: '
+    print_stack_command stack-status
+    printf '\n'
+fi

@@ -109,6 +109,18 @@ jobs:
             "${candidate}" --help >/dev/null
           done
 
+      - name: Verify Darwin session execution lease contract
+        if: ${{ contains(matrix.target, 'apple-darwin') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --locked --no-default-features \
+            --manifest-path Cargo.toml --target "${{ matrix.target }}" \
+            -p astra-services --lib macos_session_execution_lease
+          cargo test --release --locked --no-default-features \
+            --manifest-path Cargo.toml --target "${{ matrix.target }}" \
+            -p astra-cli --lib session_execution_lease::tests
+
       - name: Package client archive
         shell: bash
         run: |
@@ -132,11 +144,13 @@ jobs:
           done
           install -m 0644 LICENSE "${package_dir}/LICENSE"
           archive="astra-v${RELEASE_VERSION}-${{ matrix.suffix }}.tar.gz"
-          tar -czf "dist/${archive}" -C "${package_dir}" astra astra-edge LICENSE
+          source_date_epoch="$(git show -s --format=%ct "${RELEASE_SOURCE_SHA}")"
+          python3 scripts/create_reproducible_release_archive.py \
+            "${package_dir}" "dist/${archive}" "${source_date_epoch}"
           (cd dist && checksum_file "${archive}" > "${archive}.sha256")
 
       - name: Upload client candidate
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: client-${{ matrix.suffix }}
           path: dist/
@@ -179,9 +193,9 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload verified client release set
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-client-assets
           path: dist/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
