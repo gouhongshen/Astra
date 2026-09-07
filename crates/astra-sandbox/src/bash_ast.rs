@@ -215,7 +215,10 @@ fn parse_plain_command(node: Node<'_>, source: &str) -> Option<Vec<String>> {
 #[derive(Debug)]
 enum CommandWord {
     Literal(String),
-    Dynamic { may_split: bool },
+    Dynamic {
+        may_split: bool,
+        proven_find_path: bool,
+    },
 }
 
 impl CommandWord {
@@ -227,7 +230,23 @@ impl CommandWord {
     }
 
     fn may_split(&self) -> bool {
-        matches!(self, Self::Dynamic { may_split: true })
+        matches!(
+            self,
+            Self::Dynamic {
+                may_split: true,
+                ..
+            }
+        )
+    }
+
+    fn is_proven_find_path(&self) -> bool {
+        matches!(
+            self,
+            Self::Dynamic {
+                proven_find_path: true,
+                ..
+            }
+        )
     }
 }
 
@@ -248,6 +267,7 @@ fn command_words(node: Node<'_>, source: &str) -> Option<Vec<CommandWord>> {
             _ => {
                 words.push(CommandWord::Dynamic {
                     may_split: dynamic_word_may_split(child, source),
+                    proven_find_path: dynamic_word_has_proven_find_path_prefix(child, source),
                 });
                 continue;
             }
@@ -257,6 +277,7 @@ fn command_words(node: Node<'_>, source: &str) -> Option<Vec<CommandWord>> {
                 .map(CommandWord::Literal)
                 .unwrap_or_else(|| CommandWord::Dynamic {
                     may_split: dynamic_word_may_split(word_node, source),
+                    proven_find_path: dynamic_word_has_proven_find_path_prefix(word_node, source),
                 }),
         );
     }
@@ -282,6 +303,31 @@ fn dynamic_word_may_split(node: Node<'_>, source: &str) -> bool {
             }
             _ => true,
         })
+}
+
+/// A runtime-dependent `find` operand is provably a path only when a literal
+/// prefix forces path syntax regardless of the expansion value. Quoting alone
+/// is insufficient because a scalar value may itself be `-exec`.
+fn dynamic_word_has_proven_find_path_prefix(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "string" {
+        return false;
+    }
+
+    let mut cursor = node.walk();
+    let Some(prefix_node) = node.named_children(&mut cursor).next() else {
+        return false;
+    };
+    if prefix_node.kind() != "string_content" {
+        return false;
+    }
+    let Some(prefix) = prefix_node
+        .utf8_text(source.as_bytes())
+        .ok()
+        .and_then(decode_double_quoted_content)
+    else {
+        return false;
+    };
+    prefix.starts_with('/') || prefix.starts_with("./") || prefix.starts_with("../")
 }
 
 fn is_quoted_scalar_expansion(raw: &str) -> bool {
@@ -1224,7 +1270,6 @@ fn resolve_xargs_command(
         "-E",
         "-I",
         "-L",
-        "--max-lines",
         "-n",
         "--max-args",
         "-P",
@@ -1237,7 +1282,7 @@ fn resolve_xargs_command(
         "-d",
         "--delimiter",
     ];
-    const LONG_OPTIONS_WITH_OPTIONAL_INLINE_VALUE: &[&str] = &["--eof", "--replace"];
+    const LONG_OPTIONS_WITH_OPTIONAL_INLINE_VALUE: &[&str] = &["--eof", "--replace", "--max-lines"];
     const OPTIONS_WITH_ATTACHED_VALUE: &[&str] = &["-E", "-I", "-L", "-n", "-P", "-s", "-a", "-d"];
     const FLAGS: &[&str] = &[
         "-0",
@@ -1250,8 +1295,9 @@ fn resolve_xargs_command(
         "--verbose",
         "-x",
         "--exit",
+        "--show-limits",
     ];
-    const TERMINAL_FLAGS: &[&str] = &["--show-limits", "--help", "--version"];
+    const TERMINAL_FLAGS: &[&str] = &["--help", "--version"];
 
     let mut index = 0;
     while let Some(word) = words.get(index) {
@@ -1312,10 +1358,11 @@ fn resolve_find_commands(
     let mut expression_started = false;
     while index < words.len() {
         let Some(argument) = words[index].literal() else {
-            // A quoted scalar path remains one argv entry and cannot mint a
-            // complete predicate. Unquoted splitting, or any dynamic word
-            // after the expression begins, can change find's grammar.
-            if words[index].may_split() || expression_started {
+            // Quoting proves one argv entry, but not that its value is a path:
+            // a quoted scalar may still expand to `-exec`. Only a literal path
+            // prefix is sufficient before the expression begins.
+            if words[index].may_split() || expression_started || !words[index].is_proven_find_path()
+            {
                 return DestructiveCommandResolution::Ambiguous;
             }
             index += 1;
@@ -1897,6 +1944,11 @@ mod tests {
             "printf '%s\\n' data | xargs -n 1 dd if=/dev/zero of=/dev/sda",
             "printf '' | xargs --eof dd if=/dev/zero of=important.db count=1",
             "printf '' | xargs --replace wipefs -a /dev/sdb",
+            "printf '' | xargs --show-limits dd of=important.db count=0",
+            "printf '' | xargs --show-limits timeout 5 wipefs -a /dev/sdb",
+            "printf 'count=0\\n' | xargs --max-lines dd of=important.db",
+            "printf 'count=0\\n' | xargs --max-lines=1 dd of=important.db",
+            "printf 'count=0\\n' | xargs -L 1 dd of=important.db",
             "find . -exec dd if=/dev/zero of=/dev/sda {} \\;",
             "find . -execdir sh -c 'wipefs -a /dev/sdb' {} \\;",
             "printf data | xargs sh -c 'dd if=/dev/zero of=/dev/sda'",
@@ -1936,10 +1988,14 @@ mod tests {
             "printf '%s\\n' dd | xargs",
             "printf '' | xargs --eof=STOP printf '%s\\n' dd",
             "printf '' | xargs --replace=ITEM printf '%s\\n' dd",
+            "printf '' | xargs --show-limits printf '%s\\n' dd",
+            "printf safe | xargs --max-lines printf '%s\\n'",
+            "printf safe | xargs --max-lines=1 printf '%s\\n'",
+            "printf safe | xargs -L 1 printf '%s\\n'",
             "xargs --help dd",
             "xargs --version dd",
             "find . -name dd -print",
-            "root=src; find \"$root\" -name dd -print",
+            "root=src; find \"./$root\" -name dd -print",
             "opts=/tmp/bashrc; bash --rcfile \"$opts\" -c 'printf safe'",
             "spec=HOME; env -u \"$spec\" printf safe",
             "command -v dd",
@@ -1980,6 +2036,7 @@ mod tests {
             "printf data | xargs \"$tool\" if=/dev/zero of=/dev/sda",
             "find . -exec \"$tool\" if=/dev/zero of=/dev/sda {} \\;",
             "find_args='-exec truncate -s 0 important.db {} ;'; find . $find_args",
+            "pred=-exec; find owned.db \"$pred\" truncate -s 0 owned.db \\;",
             "opts='/tmp/rc -c reboot'; bash --rcfile $opts printf",
             "spec='HOME dd'; env -u $spec if=/dev/zero of=important.db count=1",
             "spec='STOP dd'; printf '' | xargs -E $spec if=/dev/zero of=important.db count=1",
