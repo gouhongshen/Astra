@@ -3,10 +3,12 @@
 
 import os
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import re
 import subprocess
 import tempfile
+import threading
 import unittest
 
 
@@ -201,6 +203,39 @@ else:
         source_digest = "sha256:" + "a" * 64
         conflicting_digest = "sha256:" + "b" * 64
 
+        class HarborHandler(BaseHTTPRequestHandler):
+            state = "missing"
+            paths = []
+
+            def log_message(self, _format, *_args):
+                pass
+
+            def do_GET(self):
+                type(self).paths.append(self.path)
+                if self.path != "/api/v2.0/projects/team/repositories/astra/artifacts/release":
+                    self.send_error(404)
+                    return
+                status = {
+                    "missing": 404,
+                    "new_repository": 404,
+                    "unauthorized": 401,
+                    "forbidden": 403,
+                    "server_error": 503,
+                }.get(type(self).state, 200)
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                if type(self).state == "malformed_not_found":
+                    self.wfile.write(b"not a Harbor error envelope")
+                    return
+                if status == 200:
+                    digest = (source_digest if type(self).state == "same"
+                              else conflicting_digest)
+                    self.wfile.write(json.dumps({"digest": digest}).encode())
+                else:
+                    code = "NOT_FOUND" if status == 404 else "TEST"
+                    self.wfile.write(json.dumps({"errors": [{"code": code}]}).encode())
+
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
             fake_bin = fixture / "bin"
@@ -215,34 +250,18 @@ case "$1 $2" in
   "digest source.example/astra:staged")
     printf '%s\\n' "${ASTRA_TEST_SOURCE_DIGEST}"
     ;;
-  "digest runtime.example/astra:release")
+  digest\ *)
     if [ -e "${ASTRA_TEST_STATE_DIR}/copied" ]; then
       printf '%s\\n' "${ASTRA_TEST_SOURCE_DIGEST}"
     else
-      case "${ASTRA_TEST_TARGET_STATE}" in
-      same) printf '%s\\n' "${ASTRA_TEST_SOURCE_DIGEST}" ;;
-      conflict) printf '%s\\n' "${ASTRA_TEST_CONFLICTING_DIGEST}" ;;
-      *) exit 92 ;;
-      esac
+      exit 92
     fi
     ;;
-  "ls runtime.example/astra")
-    case "${ASTRA_TEST_TARGET_STATE}" in
-      missing) printf '%s\\n' other-tag ;;
-      same|conflict) printf '%s\\n' other-tag release ;;
-      timeout) echo 'Get registry: TLS handshake timeout' >&2; exit 1 ;;
-      unauthorized) echo 'UNAUTHORIZED: authentication required (HTTP 401)' >&2; exit 1 ;;
-      forbidden) echo 'DENIED: requested access is denied (status code 403)' >&2; exit 1 ;;
-      server_error) echo 'registry returned HTTP 503 Service Unavailable' >&2; exit 1 ;;
-      token_not_found)
-        echo 'GET http://registry.example/token?scope=repository:team/astra:pull: unexpected status code 404 Not Found' >&2
-        exit 1
-        ;;
-      *) exit 94 ;;
-    esac
-    ;;
   "copy --platform=all")
-    [ "${ASTRA_TEST_TARGET_STATE}" = missing ] || exit 93
+    case "${ASTRA_TEST_TARGET_STATE}" in
+      missing|new_repository) ;;
+      *) exit 93 ;;
+    esac
     touch "${ASTRA_TEST_STATE_DIR}/copied"
     ;;
   *) exit 91 ;;
@@ -258,41 +277,77 @@ esac
                 "ASTRA_TEST_STATE_DIR": str(fixture),
                 "ASTRA_TEST_SOURCE_DIGEST": source_digest,
                 "ASTRA_TEST_CONFLICTING_DIGEST": conflicting_digest,
+                "IDC_REGISTRY_USERNAME": "release-user",
+                "IDC_REGISTRY_PASSWORD": "release-password",
                 "RUNNER_TEMP": str(fixture),
             }
 
             def run(state):
                 calls.write_text("", encoding="utf-8")
+                HarborHandler.state = state
+                HarborHandler.paths = []
                 result = subprocess.run(
                     [str(script), "source.example/astra:staged",
-                     "runtime.example/astra:release"],
+                     f"127.0.0.1:{server.server_port}/team/astra:release",
+                     f"http://127.0.0.1:{server.server_port}"],
                     env={**common_env, "ASTRA_TEST_TARGET_STATE": state},
                     capture_output=True,
                     text=True,
                 )
-                return result, calls.read_text(encoding="utf-8")
+                return result, calls.read_text(encoding="utf-8"), HarborHandler.paths
 
-            missing, missing_calls = run("missing")
-            self.assertEqual(missing.returncode, 0, missing.stderr)
-            self.assertIn("copy --platform=all --jobs 2", missing_calls)
-            (fixture / "copied").unlink()
+            server = ThreadingHTTPServer(("127.0.0.1", 0), HarborHandler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
 
-            same, same_calls = run("same")
+            for state in ("missing", "new_repository"):
+                with self.subTest(state=state):
+                    published, published_calls, paths = run(state)
+                    self.assertEqual(published.returncode, 0, published.stderr)
+                    self.assertIn("copy --platform=all --jobs 2", published_calls)
+                    self.assertEqual(
+                        paths,
+                        ["/api/v2.0/projects/team/repositories/astra/artifacts/release"],
+                    )
+                    (fixture / "copied").unlink()
+
+            same, same_calls, _ = run("same")
             self.assertEqual(same.returncode, 0, same.stderr)
             self.assertNotIn("copy ", same_calls)
 
-            conflict, conflict_calls = run("conflict")
+            conflict, conflict_calls, _ = run("conflict")
             self.assertNotEqual(conflict.returncode, 0)
             self.assertIn("already exists with digest", conflict.stderr)
             self.assertNotIn("copy ", conflict_calls)
 
-            for state in ("timeout", "unauthorized", "forbidden", "server_error",
-                          "token_not_found"):
+            for state in ("unauthorized", "forbidden", "server_error"):
                 with self.subTest(state=state):
-                    failed, failed_calls = run(state)
+                    failed, failed_calls, _ = run(state)
                     self.assertNotEqual(failed.returncode, 0)
-                    self.assertIn("could not safely enumerate", failed.stderr)
+                    self.assertIn("could not safely inspect", failed.stderr)
                     self.assertNotIn("copy ", failed_calls)
+
+            HarborHandler.state = "malformed_not_found"
+            malformed, malformed_calls, _ = run("malformed_not_found")
+            self.assertNotEqual(malformed.returncode, 0)
+            self.assertNotIn("copy ", malformed_calls)
+
+            unreachable = ThreadingHTTPServer(("127.0.0.1", 0), HarborHandler)
+            unreachable_port = unreachable.server_port
+            unreachable.server_close()
+            calls.write_text("", encoding="utf-8")
+            network_failure = subprocess.run(
+                [str(script), "source.example/astra:staged",
+                 f"127.0.0.1:{unreachable_port}/team/astra:release",
+                 f"http://127.0.0.1:{unreachable_port}"],
+                env={**common_env, "ASTRA_TEST_TARGET_STATE": "network_failure"},
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(network_failure.returncode, 0)
+            self.assertNotIn("copy ", calls.read_text(encoding="utf-8"))
 
     def test_idc_resolves_moi_dev_and_allowed_historical_commit(self):
         result, revisions = self.run_idc_settings(SOURCE_REF="moi-dev")

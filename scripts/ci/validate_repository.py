@@ -307,8 +307,8 @@ def main() -> None:
         encoding="utf-8"
     )
     for required in (
-        "could not safely enumerate tags",
-        'crane ls "${target_repository}"',
+        "could not safely inspect",
+        "inspect-harbor-artifact.py",
         "crane copy --platform=all --jobs 2",
         "already exists with digest",
         "resolves to ${target_digest}, expected ${source_digest}",
@@ -317,6 +317,22 @@ def main() -> None:
             errors.append(
                 "scripts/copy-immutable-container-tag.sh: missing fail-closed "
                 f"immutable publication contract ({required})"
+            )
+
+    harbor_inspector = Path("scripts/inspect-harbor-artifact.py").read_text(
+        encoding="utf-8"
+    )
+    for required in (
+        'if error.code == 404:',
+        'item.get("code") == "NOT_FOUND"',
+        "return NOT_FOUND",
+        "Harbor artifact lookup failed with HTTP",
+        'document.get("digest")',
+    ):
+        if required not in harbor_inspector:
+            errors.append(
+                "scripts/inspect-harbor-artifact.py: missing structured artifact "
+                f"lookup contract ({required})"
             )
 
     manifest_reconciler = Path("scripts/reconcile-docker-manifest.sh").read_text(

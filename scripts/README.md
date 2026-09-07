@@ -264,10 +264,11 @@ reconciliation at the actual publication boundary.
 run-scoped staging tag per server platform so registry cleanup cannot discard
 an otherwise retained recovery candidate.
 `scripts/copy-immutable-container-tag.sh` copies a verified manifest between
-repositories only after successful repository tag enumeration confirms that
-the exact target tag is absent. Authentication, network, and registry failures
-fail closed without interpreting their diagnostics; an existing tag is
-accepted only when its digest already matches the verified source.
+repositories only after `scripts/inspect-harbor-artifact.py` resolves the exact
+target through Harbor's structured API. A 404 from that artifact endpoint
+permits first publication for either a new repository or a new tag;
+authentication, network, malformed-response, and registry failures fail closed.
+An existing tag is accepted only when its digest already matches the source.
 
 ### `scripts/verify_github_release_assets.py`
 

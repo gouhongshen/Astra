@@ -246,7 +246,8 @@ jobs:
           source="${CANDIDATE_IMAGE}:${IMAGE_VERSION}"
           target="${IMAGE_NAME}:${IMAGE_VERSION}"
           source_digest="$(crane digest "${source}")"
-          scripts/copy-immutable-container-tag.sh "${source}" "${target}"
+          scripts/copy-immutable-container-tag.sh \
+            "${source}" "${target}" "https://${IDC_REGISTRY}"
           {
             echo "## IDC image published"
             echo "- Image: \`${target}\`"
