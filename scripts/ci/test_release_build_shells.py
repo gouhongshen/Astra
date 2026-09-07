@@ -3,11 +3,14 @@
 
 import os
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import re
 import subprocess
 import tempfile
+import threading
 import unittest
+from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -154,11 +157,11 @@ else:
                 source_ref = base_sha
             env = {
                 **os.environ,
+                "ARCHITECTURE": "amd64",
                 "DEFAULT_BRANCH": "main",
                 "SOURCE_REF": source_ref,
                 "IDC_REGISTRY": "registry.example:5000",
                 "IDC_IMAGE": "registry.example:5000/team/astra",
-                "IDC_RUNNER": "idc-amd64",
                 "GITHUB_REF": "refs/heads/main",
                 "GITHUB_SHA": main_sha,
                 "GITHUB_RUN_ID": "123",
@@ -176,21 +179,200 @@ else:
         self.assertEqual(outputs["controller_sha"], revisions["main"])
         self.assertEqual(outputs["source_sha"], revisions["main"])
         self.assertEqual(outputs["source_ref"], "main")
+        self.assertEqual(outputs["candidate_image"], "registry.example:5000/team/astra-candidates")
+        self.assertEqual(outputs["target_image"], "registry.example:5000/team/astra")
         self.assertRegex(outputs["image_version"], r"^idc-\d{8}T\d{6}Z-" + revisions["main"] + r"-123-amd64$")
 
-    def test_idc_build_stays_local_until_smoke_succeeds(self):
+    def test_idc_reuses_release_candidate_topology_and_publishes_only_to_idc(self):
         workflow = (ROOT / ".github/workflows/build_push_to_idc.yml").read_text()
-        build = workflow.index("Build the IDC candidate locally")
-        smoke = workflow.index("Verify health and exact memory round trip")
-        login = workflow.index("docker/login-action")
-        publish = workflow.index('docker push "${target}"')
-        self.assertLess(build, smoke)
-        self.assertLess(smoke, login)
-        self.assertLess(login, publish)
+        candidates = (ROOT / ".github/workflows/idc-container-candidates.yml").read_text()
+        self.assertIn("uses: ./.github/workflows/idc-container-candidates.yml", workflow)
+        self.assertIn("Assemble verified IDC manifest", workflow)
+        self.assertIn("scripts/copy-immutable-container-tag.sh", workflow)
         self.assertIn("environment: idc-publication", workflow)
-        self.assertIn("load: true", workflow)
-        self.assertIn("push: false", workflow)
-        self.assertNotIn("release-container-candidates.yml", workflow)
+        self.assertIn("push-by-digest=true", candidates)
+        self.assertIn("make stack-verify", candidates)
+        self.assertIn("ref: ${{ inputs.controller_sha }}", candidates)
+        self.assertIn("context: source", candidates)
+        self.assertIn("file: source/Dockerfile", candidates)
+        self.assertIn("ubuntu-24.04-arm", workflow)
+        self.assertNotIn("matrixorigin/astra", candidates.split("org.opencontainers.image.source", 1)[0])
+        self.assertNotIn("DOCKERHUB_", workflow + candidates)
+
+    def test_idc_immutable_copy_distinguishes_absence_from_lookup_failures(self):
+        script = ROOT / "scripts/copy-immutable-container-tag.sh"
+        source_digest = "sha256:" + "a" * 64
+        conflicting_digest = "sha256:" + "b" * 64
+
+        class HarborHandler(BaseHTTPRequestHandler):
+            state = "missing"
+            paths = []
+            expected_path = "/api/v2.0/projects/team/repositories/astra/artifacts/release"
+
+            def log_message(self, _format, *_args):
+                pass
+
+            def do_GET(self):
+                type(self).paths.append(self.path)
+                if self.path != type(self).expected_path:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"errors": [{"code": "NOT_FOUND"}]}).encode())
+                    return
+                status = {
+                    "missing": 404,
+                    "new_repository": 404,
+                    "unauthorized": 401,
+                    "forbidden": 403,
+                    "server_error": 503,
+                }.get(type(self).state, 200)
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                if type(self).state == "malformed_not_found":
+                    self.wfile.write(b"not a Harbor error envelope")
+                    return
+                if status == 200:
+                    digest = (source_digest if type(self).state == "same"
+                              else conflicting_digest)
+                    self.wfile.write(json.dumps({"digest": digest}).encode())
+                else:
+                    code = "NOT_FOUND" if status == 404 else "TEST"
+                    self.wfile.write(json.dumps({"errors": [{"code": code}]}).encode())
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            calls = fixture / "calls"
+            crane = fake_bin / "crane"
+            crane.write_text(
+                '''#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${ASTRA_TEST_CALLS}"
+case "$1 $2" in
+  "digest source.example/astra:staged")
+    printf '%s\\n' "${ASTRA_TEST_SOURCE_DIGEST}"
+    ;;
+  digest\ *)
+    if [ -e "${ASTRA_TEST_STATE_DIR}/copied" ]; then
+      printf '%s\\n' "${ASTRA_TEST_SOURCE_DIGEST}"
+    else
+      exit 92
+    fi
+    ;;
+  "copy --platform=all")
+    case "${ASTRA_TEST_TARGET_STATE}" in
+      missing|new_repository) ;;
+      *) exit 93 ;;
+    esac
+    touch "${ASTRA_TEST_STATE_DIR}/copied"
+    ;;
+  *) exit 91 ;;
+esac
+''',
+                encoding="utf-8",
+            )
+            crane.chmod(0o755)
+            common_env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "ASTRA_TEST_CALLS": str(calls),
+                "ASTRA_TEST_STATE_DIR": str(fixture),
+                "ASTRA_TEST_SOURCE_DIGEST": source_digest,
+                "ASTRA_TEST_CONFLICTING_DIGEST": conflicting_digest,
+                "IDC_REGISTRY_USERNAME": "release-user",
+                "IDC_REGISTRY_PASSWORD": "release-password",
+                "RUNNER_TEMP": str(fixture),
+            }
+
+            def run(state, repository="team/astra"):
+                calls.write_text("", encoding="utf-8")
+                HarborHandler.state = state
+                HarborHandler.paths = []
+                repository_name = repository.partition("/")[2]
+                encoded_repository_name = quote(quote(repository_name, safe=""), safe="")
+                HarborHandler.expected_path = (
+                    "/api/v2.0/projects/team/repositories/"
+                    f"{encoded_repository_name}/artifacts/release"
+                )
+                result = subprocess.run(
+                    [str(script), "source.example/astra:staged",
+                     f"127.0.0.1:{server.server_port}/{repository}:release",
+                     f"http://127.0.0.1:{server.server_port}"],
+                    env={**common_env, "ASTRA_TEST_TARGET_STATE": state},
+                    capture_output=True,
+                    text=True,
+                )
+                return result, calls.read_text(encoding="utf-8"), HarborHandler.paths
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), HarborHandler)
+            server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            server_thread.start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+
+            for state in ("missing", "new_repository"):
+                with self.subTest(state=state):
+                    published, published_calls, paths = run(state)
+                    self.assertEqual(published.returncode, 0, published.stderr)
+                    self.assertIn("copy --platform=all --jobs 2", published_calls)
+                    self.assertEqual(
+                        paths,
+                        ["/api/v2.0/projects/team/repositories/astra/artifacts/release"],
+                    )
+                    (fixture / "copied").unlink()
+
+            same, same_calls, _ = run("same")
+            self.assertEqual(same.returncode, 0, same.stderr)
+            self.assertNotIn("copy ", same_calls)
+
+            conflict, conflict_calls, _ = run("conflict")
+            self.assertNotEqual(conflict.returncode, 0)
+            self.assertIn("already exists with digest", conflict.stderr)
+            self.assertNotIn("copy ", conflict_calls)
+
+            nested_conflict, nested_conflict_calls, nested_paths = run(
+                "conflict", "team/nested/astra"
+            )
+            self.assertNotEqual(nested_conflict.returncode, 0)
+            self.assertIn("already exists with digest", nested_conflict.stderr)
+            self.assertNotIn("copy ", nested_conflict_calls)
+            self.assertEqual(
+                nested_paths,
+                [
+                    "/api/v2.0/projects/team/repositories/"
+                    "nested%252Fastra/artifacts/release"
+                ],
+            )
+
+            for state in ("unauthorized", "forbidden", "server_error"):
+                with self.subTest(state=state):
+                    failed, failed_calls, _ = run(state)
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertIn("could not safely inspect", failed.stderr)
+                    self.assertNotIn("copy ", failed_calls)
+
+            HarborHandler.state = "malformed_not_found"
+            malformed, malformed_calls, _ = run("malformed_not_found")
+            self.assertNotEqual(malformed.returncode, 0)
+            self.assertNotIn("copy ", malformed_calls)
+
+            unreachable = ThreadingHTTPServer(("127.0.0.1", 0), HarborHandler)
+            unreachable_port = unreachable.server_port
+            unreachable.server_close()
+            calls.write_text("", encoding="utf-8")
+            network_failure = subprocess.run(
+                [str(script), "source.example/astra:staged",
+                 f"127.0.0.1:{unreachable_port}/team/astra:release",
+                 f"http://127.0.0.1:{unreachable_port}"],
+                env={**common_env, "ASTRA_TEST_TARGET_STATE": "network_failure"},
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(network_failure.returncode, 0)
+            self.assertNotIn("copy ", calls.read_text(encoding="utf-8"))
 
     def test_idc_resolves_moi_dev_and_allowed_historical_commit(self):
         result, revisions = self.run_idc_settings(SOURCE_REF="moi-dev")
@@ -222,16 +404,18 @@ else:
                 self.assertIn("Missing required IDC credential: " + missing, result.stdout)
                 self.assertNotIn("release-password", result.stdout + result.stderr)
 
-    def test_idc_rejects_non_main_controller_and_arbitrary_ref(self):
+    def test_idc_rejects_non_main_controller(self):
         result, _ = self.run_idc_settings(GITHUB_REF="refs/heads/moi-dev")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Run this workflow from main", result.stdout)
+
+    def test_idc_rejects_arbitrary_source_ref(self):
         result, _ = self.run_idc_settings(SOURCE_REF="feature/test")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("source_ref must be main, moi-dev, or a full commit SHA", result.stdout)
 
     def test_idc_missing_configuration_stops_before_build(self):
-        for key in ("IDC_REGISTRY", "IDC_IMAGE", "IDC_RUNNER"):
+        for key in ("IDC_REGISTRY", "IDC_IMAGE"):
             with self.subTest(key=key):
                 result, _ = self.run_idc_settings(**{key: ""})
                 self.assertNotEqual(result.returncode, 0)
@@ -248,6 +432,17 @@ else:
                 self.assertNotEqual(result.returncode, 0)
         result, _ = self.run_idc_settings(IDC_REGISTRY="https://registry.example")
         self.assertNotEqual(result.returncode, 0)
+
+    def test_idc_architecture_matrix(self):
+        result, _ = self.run_idc_settings(ARCHITECTURE="all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outputs = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertIn('"platform":"linux/amd64"', outputs["matrix"])
+        self.assertIn('"platform":"linux/arm64"', outputs["matrix"])
+        self.assertNotRegex(outputs["image_version"], r"-amd64$")
+        result, _ = self.run_idc_settings(ARCHITECTURE="s390x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unsupported architecture: s390x", result.stdout)
 
     def test_client_arguments_with_and_without_features(self):
         script = workflow_run_script(
