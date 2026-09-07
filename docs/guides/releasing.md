@@ -35,9 +35,9 @@ therefore lets obsolete automation become the release control plane.
 The **Release Astra** workflow is manually dispatched from the protected
 default branch instead. It selects the current `main` commit, validates the
 complete version and release contract, builds every candidate, and creates the
-annotated tag only after all candidates pass. GitHub does not start a second
-workflow for a tag created with `GITHUB_TOKEN`, so one run remains the sole
-release owner.
+annotated tag only after all candidates pass. The release workflow has no
+tag-push trigger; its annotated tag records the sole release owner. Tags created with
+`GITHUB_TOKEN` do not trigger additional tag-push workflows.
 
 Publication is deliberately ordered:
 
@@ -48,6 +48,18 @@ Publication is deliberately ordered:
 5. create or verify the exact Docker version manifest;
 6. stage and publish the GitHub Release with verified client assets;
 7. update stable rolling Docker tags.
+
+The protected publication job uses the built-in `GITHUB_TOKEN`. Immediately
+before creating a new tag, it requires the selected source to still be the
+current `main` head. If `main` advanced during builds or approval, publication
+stops before creating a tag or versioned Docker manifest. Start a new normal
+release run from current `main`; rerunning the old candidates cannot fix this.
+
+This check is not an atomic lock on `main`: a concurrent update can still cause
+GitHub to reject tag creation. Existing-tag recovery remains available, but
+does not promise to overcome GitHub workflow-permission restrictions on a
+historical source. If recovery encounters that restriction, stop and inspect
+the partial publication; never move the immutable tag or overwrite its assets.
 
 The GitHub Release is not published until the exact Docker version exists. If
 a late step fails, rerun the failed jobs from the same Actions run so its
@@ -94,8 +106,10 @@ A manually created tag cannot publish anything and cannot be adopted by
 recovery, but it will reserve that version until an administrator removes it.
 
 Repository Actions should default to read-only permissions. The release
-controller grants `contents: write` only to the publication job that creates
-the tag and GitHub Release.
+controller grants `contents: write` only to the approved publication job.
+That same token performs draft lookup, body preparation, staged verification,
+and publication; draft visibility requires push access. No GitHub App, App
+private key, or personal access token is required.
 
 The source tree versions `@astra/sdk` and the Helm chart, but the workflow does
 not yet publish either to npm or a chart registry. Treat them as explicit

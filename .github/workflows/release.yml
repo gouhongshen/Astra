@@ -325,7 +325,6 @@ jobs:
             echo "Publication fails closed when the protected Environment has not been configured." >&2
             exit 1
           fi
-
       - name: Check out the trusted release controller
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -388,6 +387,8 @@ jobs:
           RECOVER_EXISTING_TAG: ${{ inputs.recover_existing_tag }}
           SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
           SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
+          RECOVERY_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          ORIGINAL_OWNER_RUN_ID: ${{ needs.preflight.outputs.owner_run_id }}
         run: |
           set -euo pipefail
           same_run=false
@@ -395,23 +396,19 @@ jobs:
             git ls-remote origin "refs/tags/${SOURCE_TAG}" |
               awk 'NR == 1 { print $1 }'
           )"
-          if [ -n "${tag_object}" ] && [ "${RECOVER_EXISTING_TAG}" != "true" ]; then
-            tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}")" \
-              || {
-                echo "Existing ${SOURCE_TAG} is not a release tag owned by this run." >&2
-                exit 1
-              }
-            tag_source="$(printf '%s' "${tag_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["object"]["sha"])')"
-            tag_message="$(printf '%s' "${tag_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["message"])')"
-            run_marker="Release-Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            mapfile -t run_markers < <(grep -F 'Release-Run: ' <<< "${tag_message}" || true)
-            if [ "${tag_source}" != "${SOURCE_SHA}" ] \
-              || [ "${#run_markers[@]}" -ne 1 ] \
-              || [ "${run_markers[0]}" != "${run_marker}" ]; then
-              echo "Release tag ${SOURCE_TAG} appeared during candidate verification and is not owned by this run." >&2
-              exit 1
-            fi
+          if [ "${RECOVER_EXISTING_TAG}" = "true" ]; then
+            tag_object="$(
+              scripts/reconcile-release-tag.sh verify \
+                "${GITHUB_REPOSITORY}" "${SOURCE_TAG}" "${SOURCE_SHA}" \
+                "${ORIGINAL_OWNER_RUN_ID}" "" "${RECOVERY_TAG_OBJECT}"
+            )"
+          elif [ -n "${tag_object}" ]; then
             same_run=true
+            tag_object="$(
+              scripts/reconcile-release-tag.sh verify \
+                "${GITHUB_REPOSITORY}" "${SOURCE_TAG}" "${SOURCE_SHA}" \
+                "${GITHUB_RUN_ID}" "" "${tag_object}"
+            )"
           fi
           echo "same_run=${same_run}" >> "${GITHUB_OUTPUT}"
           echo "tag_object=${tag_object}" >> "${GITHUB_OUTPUT}"
@@ -461,61 +458,33 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           RECOVER_EXISTING_TAG: ${{ inputs.recover_existing_tag }}
           SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
           SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
-          EXPECTED_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          RECOVERY_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          ORIGINAL_OWNER_RUN_ID: ${{ needs.preflight.outputs.owner_run_id }}
           SAME_RUN: ${{ steps.publication_state.outputs.same_run }}
           CURRENT_TAG_OBJECT: ${{ steps.publication_state.outputs.tag_object }}
         run: |
           set -euo pipefail
-          remote_tag_object="$(
-            git ls-remote origin "refs/tags/${SOURCE_TAG}" |
-              awk 'NR == 1 { print $1 }'
-          )"
-          if [ -z "${remote_tag_object}" ]; then
-            if [ "${RECOVER_EXISTING_TAG}" = "true" ]; then
-              echo "Release tag ${SOURCE_TAG} disappeared after preflight." >&2
-              exit 1
-            fi
-            tag_message="$(printf 'Astra %s\n\nRelease-Run: %s/%s/actions/runs/%s' \
-              "${SOURCE_TAG}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")"
-            tag_object="$(
-              gh api --method POST "repos/${GITHUB_REPOSITORY}/git/tags" \
-                -f tag="${SOURCE_TAG}" \
-                -f message="${tag_message}" \
-                -f object="${SOURCE_SHA}" \
-                -f type=commit \
-                --jq .sha
-            )"
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref="refs/tags/${SOURCE_TAG}" \
-              -f sha="${tag_object}" >/dev/null
-            remote_tag_object="${tag_object}"
-          else
-            if [ "${RECOVER_EXISTING_TAG}" = "true" ]; then
-              if [ "${remote_tag_object}" != "${EXPECTED_TAG_OBJECT}" ]; then
-                echo "Release tag ${SOURCE_TAG} changed after preflight." >&2
-                exit 1
-              fi
-            elif [ "${SAME_RUN}" != "true" ] \
-              || [ "${remote_tag_object}" != "${CURRENT_TAG_OBJECT}" ]; then
-              echo "Release tag ${SOURCE_TAG} appeared or changed during publication." >&2
-              exit 1
-            fi
+          mode=create
+          owner_run_id="${GITHUB_RUN_ID}"
+          default_branch="${DEFAULT_BRANCH}"
+          expected_tag_object=""
+          if [ "${RECOVER_EXISTING_TAG}" = "true" ]; then
+            mode=verify
+            owner_run_id="${ORIGINAL_OWNER_RUN_ID}"
+            default_branch=""
+            expected_tag_object="${RECOVERY_TAG_OBJECT}"
+          elif [ "${SAME_RUN}" = "true" ]; then
+            mode=verify
+            default_branch=""
+            expected_tag_object="${CURRENT_TAG_OBJECT}"
           fi
-
-          git fetch --force origin \
-            "refs/tags/${SOURCE_TAG}:refs/tags/${SOURCE_TAG}"
-          if [ "$(git cat-file -t "refs/tags/${SOURCE_TAG}")" != "tag" ]; then
-            echo "Release tag ${SOURCE_TAG} is not annotated." >&2
-            exit 1
-          fi
-          peeled_sha="$(git rev-list -n 1 "refs/tags/${SOURCE_TAG}")"
-          if [ "${peeled_sha}" != "${SOURCE_SHA}" ]; then
-            echo "Release tag ${SOURCE_TAG} points to ${peeled_sha}, expected ${SOURCE_SHA}." >&2
-            exit 1
-          fi
+          scripts/reconcile-release-tag.sh "${mode}" \
+            "${GITHUB_REPOSITORY}" "${SOURCE_TAG}" "${SOURCE_SHA}" \
+            "${owner_run_id}" "${default_branch}" "${expected_tag_object}" >/dev/null
 
       - name: Create or verify the immutable Docker version manifest
         shell: bash

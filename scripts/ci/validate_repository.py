@@ -155,6 +155,7 @@ def main() -> None:
         "release_id=${release_id}",
         "steps.stage_release.outputs.id",
         "Create or validate the immutable release tag",
+        "scripts/reconcile-release-tag.sh",
         "Prepare canonical GitHub Release body",
         "Stage GitHub Release and verified assets",
         "Verify canonical staged GitHub Release body",
@@ -183,15 +184,34 @@ def main() -> None:
                 f"release lookup contract ({required})"
             )
 
+    release_tag_reconciler = Path("scripts/reconcile-release-tag.sh").read_text(
+        encoding="utf-8"
+    )
+    for required in (
+        "is no longer the current ${default_branch} head",
+        "No tag was created",
+        "Release-Run:",
+        'gh api --method POST "repos/${repository}/git/tags"',
+        'gh api --method POST "repos/${repository}/git/refs"',
+        "is not an annotated release tag owned by this run",
+    ):
+        if required not in release_tag_reconciler:
+            errors.append(
+                "scripts/reconcile-release-tag.sh: missing current-head or immutable "
+                f"ownership contract ({required})"
+            )
+
     docker_manifest = release_controller.find(
         "Create or verify the immutable Docker version manifest"
     )
+    release_tag = release_controller.find("Create or validate the immutable release tag")
+    publication_job = release_controller.find("\n  publish:\n")
     github_publish = release_controller.find("Publish GitHub Release")
     rolling_promotion = release_controller.find("Promote stable rolling Docker tags")
-    if not 0 <= docker_manifest < github_publish < rolling_promotion:
+    if not 0 <= publication_job < release_tag < docker_manifest < github_publish < rolling_promotion:
         errors.append(
-            ".github/workflows/release.yml: version artifacts must be reconciled before "
-            "the GitHub Release and rolling Docker tags become public"
+            ".github/workflows/release.yml: the protected release tag and version "
+            "artifacts must be reconciled before the GitHub Release and rolling tags"
         )
 
     for required in (
@@ -350,6 +370,8 @@ def main() -> None:
         "needs.containers.result == 'skipped'",
         "inputs.recover_existing_tag != true",
         "ref: ${{ github.sha }}",
+        "contents: write",
+        "scripts/reconcile-release-tag.sh",
     ):
         if required not in publish_job:
             errors.append(
@@ -359,6 +381,8 @@ def main() -> None:
     for forbidden in (
         "always()",
         "ref: ${{ needs.preflight.outputs.source_sha }}",
+        'gh api --method POST "repos/${GITHUB_REPOSITORY}/git/tags"',
+        'gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs"',
     ):
         if forbidden in publish_job:
             errors.append(

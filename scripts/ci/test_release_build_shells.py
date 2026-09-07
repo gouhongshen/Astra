@@ -2,6 +2,7 @@
 """Execute release shell entrypoints with build/network commands stubbed out."""
 
 import os
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -26,6 +27,88 @@ def workflow_run_script(path, step_name):
 
 
 class ReleaseShellTests(unittest.TestCase):
+    def test_draft_reads_use_publication_credentials(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn("contents: write", workflow.split("\n  publish:\n", 1)[1])
+        for name in (
+            "Detect existing GitHub Release",
+            "Prepare canonical GitHub Release body",
+            "Resolve staged GitHub Release ID",
+            "Verify canonical staged GitHub Release body",
+            "Verify exact staged GitHub Release assets",
+        ):
+            with self.subTest(step=name):
+                block = workflow.split(f"      - name: {name}\n", 1)[1]
+                block = block.split("      - ", 1)[0]
+                self.assertIn("GH_TOKEN: ${{ github.token }}", block)
+
+    def test_draft_detection_and_body_reuse_with_restricted_visibility(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            draft = fixture / "draft.json"
+            gh = fake_bin / "gh"
+            gh.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+draft = Path(os.environ["ASTRA_TEST_DRAFT"])
+visible = os.environ["GH_TOKEN"] == "publication-write" and draft.exists()
+if "releases?" in sys.argv[2]:
+    if visible:
+        print("v0.2.2\\ttrue\\t42")
+elif visible:
+    print(draft.read_text())
+else:
+    sys.exit(1)
+''', encoding="utf-8")
+            gh.chmod(0o755)
+            env = {
+                **os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "ASTRA_TEST_DRAFT": str(draft), "GITHUB_REPOSITORY": "matrixorigin/Astra",
+                "SOURCE_TAG": "v0.2.2", "SOURCE_SHA": "a" * 40,
+                "GITHUB_RUN_ID": "123", "ORIGINAL_OWNER_RUN_ID": "123",
+                "RECOVER_EXISTING_TAG": "false", "SAME_RUN": "false",
+                "RUNNER_TEMP": str(fixture), "GITHUB_OUTPUT": "/dev/stdout",
+            }
+
+            def run_step(name, **overrides):
+                block = workflow.split(f"      - name: {name}\n", 1)[1].split("      - ", 1)[0]
+                token = "publication-write" if "GH_TOKEN: ${{ github.token }}" in block and "contents: write" in workflow.split("\n  publish:\n", 1)[1] else "builtin-read"
+                result = subprocess.run(
+                    ["bash", "-c", workflow_run_script(".github/workflows/release.yml", name)],
+                    cwd=ROOT, env={**env, "GH_TOKEN": token, **overrides},
+                    capture_output=True, text=True,
+                )
+                return result
+
+            first = run_step("Detect existing GitHub Release")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertIn("state=none", first.stdout)
+            prepared = run_step("Prepare canonical GitHub Release body", EXISTING_RELEASE_ID="")
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            self.assertIn("generate_notes=true", prepared.stdout)
+            body_path = fixture / "release-body.md"
+            body = body_path.read_text() + "Canonical generated notes\n"
+            draft.write_text(json.dumps({"draft": True, "tag_name": "v0.2.2", "body": body}))
+            for _ in range(2):
+                detected = run_step("Detect existing GitHub Release", SAME_RUN="true")
+                self.assertEqual(detected.returncode, 0, detected.stderr)
+                self.assertIn("state=draft", detected.stdout)
+                self.assertIn("release_id=42", detected.stdout)
+                reused = run_step("Prepare canonical GitHub Release body", EXISTING_RELEASE_ID="42")
+                self.assertEqual(reused.returncode, 0, reused.stderr)
+                self.assertIn("generate_notes=false", reused.stdout)
+                self.assertEqual(body_path.read_text(), body)
+                verified = run_step("Verify canonical staged GitHub Release body",
+                                    RELEASE_ID="42", OWNER_RUN_ID="123",
+                                    BODY_PATH=str(body_path), GENERATED_NOTES="false")
+                self.assertEqual(verified.returncode, 0, verified.stderr)
+            conflict = run_step("Detect existing GitHub Release")
+            self.assertNotEqual(conflict.returncode, 0)
+            self.assertIn("already exists", conflict.stderr)
+
     def run_idc_settings(self, **overrides):
         script = workflow_run_script(
             ".github/workflows/build_push_to_idc.yml",
@@ -207,6 +290,149 @@ class ReleaseShellTests(unittest.TestCase):
                                  "-p", "astra-cli", "--bin", "astra",
                                  "-p", "astra-edge", "--bin", "astra-edge"]
                     self.assertEqual(result.stdout.splitlines(), expected)
+
+    def test_release_tag_creation_requires_current_head(self):
+        script = ROOT / "scripts/reconcile-release-tag.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            calls = fixture / "calls"
+            (fake_bin / "git").write_text(
+                """#!/bin/sh
+set -eu
+printf '%s\\n' "git $*" >> "${ASTRA_TEST_CALLS}"
+case "$*" in
+  "ls-remote origin refs/tags/"*) exit 0 ;;
+  "ls-remote origin refs/heads/main")
+    printf '%s\\trefs/heads/main\\n' "${ASTRA_TEST_DEFAULT_SHA}"
+    ;;
+  "fetch --no-tags origin refs/heads/main:refs/remotes/origin/main") exit 0 ;;
+  "merge-base --is-ancestor verified-source-sha new-main-sha") exit 0 ;;
+  *) exit 2 ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            (fake_bin / "gh").write_text(
+                """#!/bin/sh
+set -eu
+printf '%s\\n' "gh $*" >> "${ASTRA_TEST_CALLS}"
+case "$*" in
+  "api --method POST repos/matrixorigin/Astra/git/tags "*)
+    printf '%s\\n' 'owned-tag-object'
+    ;;
+  "api --method POST repos/matrixorigin/Astra/git/refs "*) exit 0 ;;
+  "api repos/matrixorigin/Astra/git/tags/owned-tag-object")
+    printf '{"object":{"sha":"%s"},"message":"Astra v0.2.2\\\\n\\\\nRelease-Run: https://github.com/matrixorigin/Astra/actions/runs/123"}\\n' \
+      'verified-source-sha'
+    ;;
+  *) exit 2 ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            (fake_bin / "git").chmod(0o755)
+            (fake_bin / "gh").chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "ASTRA_TEST_CALLS": str(calls),
+                "ASTRA_TEST_DEFAULT_SHA": "verified-source-sha",
+                "SOURCE_SHA": "verified-source-sha",
+                "GITHUB_SERVER_URL": "https://github.com",
+            }
+            result = subprocess.run(
+                [
+                    str(script),
+                    "create",
+                    "matrixorigin/Astra",
+                    "v0.2.2",
+                    "verified-source-sha",
+                    "123",
+                    "main",
+                    "",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "owned-tag-object\n")
+            recorded_calls = calls.read_text(encoding="utf-8")
+            self.assertIn("gh api --method POST repos/matrixorigin/Astra/git/tags", recorded_calls)
+            self.assertIn("gh api --method POST repos/matrixorigin/Astra/git/refs", recorded_calls)
+
+            calls.write_text("")
+            stale = subprocess.run(
+                [str(script), "create", "matrixorigin/Astra", "v0.2.2",
+                 "verified-source-sha", "123", "main", ""],
+                env={**env, "ASTRA_TEST_DEFAULT_SHA": "new-main-sha"},
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(stale.returncode, 0)
+            self.assertIn("Start a new normal release run", stale.stderr)
+            self.assertNotIn("gh ", calls.read_text())
+
+    def test_release_tag_creation_is_idempotent_for_the_same_run(self):
+        script = ROOT / "scripts/reconcile-release-tag.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            calls = fixture / "calls"
+            (fake_bin / "git").write_text(
+                """#!/bin/sh
+set -eu
+printf '%s\\n' "git $*" >> "${ASTRA_TEST_CALLS}"
+case "$*" in
+  "ls-remote origin refs/tags/v0.2.2")
+    printf '%s\\trefs/tags/v0.2.2\\n' 'owned-tag-object'
+    ;;
+  *) exit 2 ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            (fake_bin / "gh").write_text(
+                """#!/bin/sh
+set -eu
+printf '%s\\n' "gh $*" >> "${ASTRA_TEST_CALLS}"
+case "$*" in
+  *"--method POST"*) exit 99 ;;
+esac
+printf '{"object":{"sha":"%s"},"message":"Astra v0.2.2\\\\n\\\\nRelease-Run: https://github.com/matrixorigin/Astra/actions/runs/123"}\\n' \
+  "${SOURCE_SHA}"
+""",
+                encoding="utf-8",
+            )
+            (fake_bin / "git").chmod(0o755)
+            (fake_bin / "gh").chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "ASTRA_TEST_CALLS": str(calls),
+                "SOURCE_SHA": "verified-source-sha",
+                "GITHUB_SERVER_URL": "https://github.com",
+            }
+            result = subprocess.run(
+                [
+                    str(script),
+                    "create",
+                    "matrixorigin/Astra",
+                    "v0.2.2",
+                    "verified-source-sha",
+                    "123",
+                    "main",
+                    "",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "owned-tag-object\n")
+            self.assertNotIn("--method POST", calls.read_text(encoding="utf-8"))
 
     def test_docker_optional_mirrors_unset_and_empty(self):
         dockerfile = (ROOT / "Dockerfile").read_text().replace("\\\n", "")
