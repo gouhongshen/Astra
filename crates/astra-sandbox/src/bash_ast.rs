@@ -160,11 +160,7 @@ fn dynamic_word_has_proven_find_path_prefix(node: Node<'_>, source: &str) -> boo
     if prefix_node.kind() != "string_content" {
         return false;
     }
-    let Some(prefix) = prefix_node
-        .utf8_text(source.as_bytes())
-        .ok()
-        .and_then(decode_double_quoted_content)
-    else {
+    let Ok(prefix) = prefix_node.utf8_text(source.as_bytes()) else {
         return false;
     };
     prefix.starts_with('/') || prefix.starts_with("./") || prefix.starts_with("../")
