@@ -185,7 +185,7 @@ else:
         candidates = (ROOT / ".github/workflows/idc-container-candidates.yml").read_text()
         self.assertIn("uses: ./.github/workflows/idc-container-candidates.yml", workflow)
         self.assertIn("Assemble verified IDC manifest", workflow)
-        self.assertIn("crane copy --platform=all", workflow)
+        self.assertIn("scripts/copy-immutable-container-tag.sh", workflow)
         self.assertIn("environment: idc-publication", workflow)
         self.assertIn("push-by-digest=true", candidates)
         self.assertIn("make stack-verify", candidates)
@@ -195,6 +195,96 @@ else:
         self.assertIn("ubuntu-24.04-arm", workflow)
         self.assertNotIn("matrixorigin/astra", candidates.split("org.opencontainers.image.source", 1)[0])
         self.assertNotIn("DOCKERHUB_", workflow + candidates)
+
+    def test_idc_immutable_copy_distinguishes_absence_from_lookup_failures(self):
+        script = ROOT / "scripts/copy-immutable-container-tag.sh"
+        source_digest = "sha256:" + "a" * 64
+        conflicting_digest = "sha256:" + "b" * 64
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            calls = fixture / "calls"
+            crane = fake_bin / "crane"
+            crane.write_text(
+                '''#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${ASTRA_TEST_CALLS}"
+case "$1 $2" in
+  "digest source.example/astra:staged")
+    printf '%s\\n' "${ASTRA_TEST_SOURCE_DIGEST}"
+    ;;
+  "digest runtime.example/astra:release")
+    case "${ASTRA_TEST_TARGET_STATE}" in
+      missing)
+        if [ -e "${ASTRA_TEST_STATE_DIR}/copied" ]; then
+          printf '%s\\n' "${ASTRA_TEST_SOURCE_DIGEST}"
+        else
+          echo 'MANIFEST_UNKNOWN: manifest unknown' >&2
+          exit 1
+        fi
+        ;;
+      same) printf '%s\\n' "${ASTRA_TEST_SOURCE_DIGEST}" ;;
+      conflict) printf '%s\\n' "${ASTRA_TEST_CONFLICTING_DIGEST}" ;;
+      timeout) echo 'Get registry: TLS handshake timeout' >&2; exit 1 ;;
+      unauthorized) echo 'UNAUTHORIZED: authentication required (HTTP 401)' >&2; exit 1 ;;
+      forbidden) echo 'DENIED: requested access is denied (status code 403)' >&2; exit 1 ;;
+      server_error) echo 'registry returned HTTP 503 Service Unavailable' >&2; exit 1 ;;
+      *) exit 92 ;;
+    esac
+    ;;
+  "copy --platform=all")
+    [ "${ASTRA_TEST_TARGET_STATE}" = missing ] || exit 93
+    touch "${ASTRA_TEST_STATE_DIR}/copied"
+    ;;
+  *) exit 91 ;;
+esac
+''',
+                encoding="utf-8",
+            )
+            crane.chmod(0o755)
+            common_env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "ASTRA_TEST_CALLS": str(calls),
+                "ASTRA_TEST_STATE_DIR": str(fixture),
+                "ASTRA_TEST_SOURCE_DIGEST": source_digest,
+                "ASTRA_TEST_CONFLICTING_DIGEST": conflicting_digest,
+                "RUNNER_TEMP": str(fixture),
+            }
+
+            def run(state):
+                calls.write_text("", encoding="utf-8")
+                result = subprocess.run(
+                    [str(script), "source.example/astra:staged",
+                     "runtime.example/astra:release"],
+                    env={**common_env, "ASTRA_TEST_TARGET_STATE": state},
+                    capture_output=True,
+                    text=True,
+                )
+                return result, calls.read_text(encoding="utf-8")
+
+            missing, missing_calls = run("missing")
+            self.assertEqual(missing.returncode, 0, missing.stderr)
+            self.assertIn("copy --platform=all --jobs 2", missing_calls)
+            (fixture / "copied").unlink()
+
+            same, same_calls = run("same")
+            self.assertEqual(same.returncode, 0, same.stderr)
+            self.assertNotIn("copy ", same_calls)
+
+            conflict, conflict_calls = run("conflict")
+            self.assertNotEqual(conflict.returncode, 0)
+            self.assertIn("already exists with digest", conflict.stderr)
+            self.assertNotIn("copy ", conflict_calls)
+
+            for state in ("timeout", "unauthorized", "forbidden", "server_error"):
+                with self.subTest(state=state):
+                    failed, failed_calls = run(state)
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertIn("could not safely determine", failed.stderr)
+                    self.assertNotIn("copy ", failed_calls)
 
     def test_idc_resolves_moi_dev_and_allowed_historical_commit(self):
         result, revisions = self.run_idc_settings(SOURCE_REF="moi-dev")

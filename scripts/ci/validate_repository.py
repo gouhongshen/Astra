@@ -257,7 +257,7 @@ def main() -> None:
         "idc-container-candidates.yml",
         "Assemble verified IDC manifest",
         "Require IDC registry credentials",
-        "crane copy --platform=all",
+        "scripts/copy-immutable-container-tag.sh",
         "${IDC_IMAGE}-candidates",
         '"runner":"ubuntu-24.04-arm"',
     ):
@@ -291,6 +291,22 @@ def main() -> None:
             errors.append(
                 ".github/workflows/build_push_to_idc.yml: IDC builds must not publish "
                 f"to Docker Hub ({forbidden})"
+            )
+
+    immutable_copy = Path("scripts/copy-immutable-container-tag.sh").read_text(
+        encoding="utf-8"
+    )
+    for required in (
+        "could not safely determine whether",
+        "manifest unknown",
+        "crane copy --platform=all --jobs 2",
+        "already exists with digest",
+        "resolves to ${target_digest}, expected ${source_digest}",
+    ):
+        if required not in immutable_copy:
+            errors.append(
+                "scripts/copy-immutable-container-tag.sh: missing fail-closed "
+                f"immutable publication contract ({required})"
             )
 
     manifest_reconciler = Path("scripts/reconcile-docker-manifest.sh").read_text(

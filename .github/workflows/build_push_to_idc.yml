@@ -193,6 +193,11 @@ jobs:
     environment: idc-publication
     timeout-minutes: 20
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ needs.settings.outputs.controller_sha }}
+
       - name: Require IDC registry credentials
         shell: bash
         env:
@@ -241,20 +246,7 @@ jobs:
           source="${CANDIDATE_IMAGE}:${IMAGE_VERSION}"
           target="${IMAGE_NAME}:${IMAGE_VERSION}"
           source_digest="$(crane digest "${source}")"
-
-          if target_digest="$(crane digest "${target}" 2>/dev/null)"; then
-            if [ "${target_digest}" != "${source_digest}" ]; then
-              echo "::error::${target} already exists with a different manifest."
-              exit 1
-            fi
-          else
-            crane copy --platform=all --jobs 2 "${source}" "${target}"
-            target_digest="$(crane digest "${target}")"
-            if [ "${target_digest}" != "${source_digest}" ]; then
-              echo "::error::${target} does not match the verified staged manifest."
-              exit 1
-            fi
-          fi
+          scripts/copy-immutable-container-tag.sh "${source}" "${target}"
           {
             echo "## IDC image published"
             echo "- Image: \`${target}\`"
