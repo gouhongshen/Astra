@@ -5132,8 +5132,14 @@ printf 'probe.txt:1:needle\n'
             "printf data | xargs dd if=/dev/zero of=/dev/sda",
             "printf '' | xargs --eof dd if=/dev/zero of=important.db count=1",
             "printf '' | xargs --replace wipefs -a /dev/sdb",
+            "printf '' | xargs --show-limits dd of=important.db count=0",
+            "printf '' | xargs --show-limits timeout 5 wipefs -a /dev/sdb",
+            "printf 'count=0\\n' | xargs --max-lines dd of=important.db",
+            "printf 'count=0\\n' | xargs --max-lines=1 dd of=important.db",
+            "printf 'count=0\\n' | xargs -L 1 dd of=important.db",
             "find . -exec wipefs -a /dev/sdb {} \\;",
             "find_args='-exec truncate -s 0 important.db {} ;'; find . $find_args",
+            "pred=-exec; find owned.db \"$pred\" truncate -s 0 owned.db \\;",
             "opts='/tmp/rc -c reboot'; bash --rcfile $opts printf",
             "spec='HOME dd'; env -u $spec if=/dev/zero of=important.db count=1",
             "spec='STOP dd'; printf '' | xargs -E $spec if=/dev/zero of=important.db count=1",
@@ -5172,7 +5178,9 @@ printf 'probe.txt:1:needle\n'
         assert!(validate_execute_bash_command("taskset -c 0 printf '%s\\n' dd").is_ok());
         assert!(validate_execute_bash_command("chroot /mnt printf '%s\\n' dd").is_ok());
         assert!(validate_execute_bash_command("unshare --fork printf '%s\\n' dd").is_ok());
-        assert!(validate_execute_bash_command("root=src; find \"$root\" -name dd -print").is_ok());
+        assert!(
+            validate_execute_bash_command("root=src; find \"./$root\" -name dd -print").is_ok()
+        );
         assert!(
             validate_execute_bash_command(
                 "opts=/tmp/bashrc; bash --rcfile \"$opts\" -c 'printf safe'"
@@ -5187,6 +5195,18 @@ printf 'probe.txt:1:needle\n'
             validate_execute_bash_command("printf '' | xargs --replace=ITEM printf '%s\\n' dd")
                 .is_ok()
         );
+        assert!(
+            validate_execute_bash_command("printf '' | xargs --show-limits printf '%s\\n' dd")
+                .is_ok()
+        );
+        assert!(
+            validate_execute_bash_command("printf safe | xargs --max-lines printf '%s\\n'").is_ok()
+        );
+        assert!(
+            validate_execute_bash_command("printf safe | xargs --max-lines=1 printf '%s\\n'")
+                .is_ok()
+        );
+        assert!(validate_execute_bash_command("printf safe | xargs -L 1 printf '%s\\n'").is_ok());
     }
 
     #[test]
