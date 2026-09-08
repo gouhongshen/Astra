@@ -330,7 +330,9 @@ pub(crate) struct RegisterArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(after_help = "Examples:\n  astra login --username alice --password secret")]
+#[command(
+    after_help = "Examples:\n  astra login\n  astra login --manual\n  astra login --username alice --password secret"
+)]
 pub(crate) struct LoginArgs {
     /// Username to log in with
     #[arg(long)]
@@ -338,6 +340,9 @@ pub(crate) struct LoginArgs {
     /// Password to log in with
     #[arg(long)]
     pub password: Option<String>,
+    /// Enter a Memoria connection key instead of opening the browser
+    #[arg(long)]
+    pub manual: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1009,12 +1014,45 @@ pub(crate) struct SessionShowArgs {
 }
 
 #[derive(Subcommand, Debug)]
-#[command(after_help = "Examples:\n  astra model list\n  astra model show gpt-4o")]
+#[command(
+    after_help = "Examples:\n  astra model add\n  astra model list\n  astra model add deepseek --provider deepseek --model deepseek-v4-flash --context-window 1000000 --api-key-stdin --default\n  astra model add gateway --provider openai-compatible --base-url https://gateway.example/v1 --model MODEL_ID --api-key-stdin\n  astra model show deepseek\n  astra model probe deepseek"
+)]
 pub(crate) enum ModelCmd {
     /// List available models
     List,
+    /// Add a personal Cloud BYOK model
+    Add(ModelAddArgs),
     /// Show model details
     Show(ModelShowArgs),
+    /// Check a personal model credential and endpoint
+    Probe(ModelShowArgs),
+    /// Delete a personal Cloud BYOK model
+    Delete(ModelShowArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelAddArgs {
+    /// Configuration alias used with chat --model (wizard default: provider model ID)
+    #[arg(value_name = "ALIAS")]
+    pub name: Option<String>,
+    /// Model provider (omit to choose interactively)
+    #[arg(long, value_parser = ["openai", "anthropic", "deepseek", "openai-compatible"])]
+    pub provider: Option<String>,
+    /// Exact model ID from your provider's API documentation (not the Astra alias)
+    #[arg(long)]
+    pub model: Option<String>,
+    /// HTTPS API base URL, required for openai-compatible
+    #[arg(long)]
+    pub base_url: Option<String>,
+    /// Read the API key from standard input
+    #[arg(long)]
+    pub api_key_stdin: bool,
+    /// Make this the default model for the current user
+    #[arg(long)]
+    pub default: bool,
+    /// Model context-window size in tokens
+    #[arg(long, default_value_t = 128_000)]
+    pub context_window: i32,
 }
 
 #[derive(Args, Debug)]
@@ -1370,7 +1408,7 @@ pub(crate) struct ConfigShowPolicyArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, SessionCmd, WorkSubcommand};
+    use super::{Cli, Command, ModelCmd, SessionCmd, WorkSubcommand};
     use clap::Parser;
 
     #[test]
@@ -1432,5 +1470,56 @@ mod tests {
 
         let message = Cli::try_parse_from(["astra", "explain", "history", "please"]).unwrap();
         assert!(message.validate_external_message_shorthand().is_ok());
+    }
+
+    #[test]
+    fn personal_byok_model_add_is_a_typed_user_command() {
+        let cli = Cli::try_parse_from([
+            "astra",
+            "model",
+            "add",
+            "deepseek",
+            "--provider",
+            "deepseek",
+            "--model",
+            "deepseek-chat",
+            "--api-key-stdin",
+            "--default",
+        ])
+        .expect("personal model add command");
+        let Some(Command::Model(ModelCmd::Add(args))) = cli.command else {
+            panic!("expected ModelCmd::Add")
+        };
+        assert_eq!(args.name.as_deref(), Some("deepseek"));
+        assert_eq!(args.provider.as_deref(), Some("deepseek"));
+        assert_eq!(args.model.as_deref(), Some("deepseek-chat"));
+        assert!(args.api_key_stdin);
+        assert!(args.default);
+        assert_eq!(args.context_window, 128_000);
+    }
+
+    #[test]
+    fn personal_byok_supports_wizard_and_compatible_flags() {
+        assert!(Cli::try_parse_from(["astra", "model", "add"]).is_ok());
+        let cli = Cli::try_parse_from([
+            "astra",
+            "model",
+            "add",
+            "gateway",
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            "https://gateway.example/v1",
+            "--model",
+            "custom-model",
+            "--api-key-stdin",
+        ])
+        .unwrap();
+        let Some(Command::Model(ModelCmd::Add(args))) = cli.command else {
+            panic!("model add")
+        };
+        assert_eq!(args.base_url.as_deref(), Some("https://gateway.example/v1"));
+        assert_eq!(args.provider.as_deref(), Some("openai-compatible"));
+        assert!(Cli::try_parse_from(["astra", "model", "add", "--provider", "unknown"]).is_err());
     }
 }

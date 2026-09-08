@@ -7,7 +7,7 @@ Interactive docs: `http://localhost:17001/docs` (Swagger UI) | `http://localhost
 ## Authentication
 
 All protected endpoints require a JWT. The public authentication exceptions
-are `/live`, `/ready`, `/health`, `/auth/register`, `/auth/login`, `/auth/refresh`, and
+are `/live`, `/ready`, `/health`, `/auth/register`, `/auth/login`, `GET /auth/methods`, `POST /auth/memoria`, `/auth/refresh`, and
 `/auth/logout` (refresh/logout authenticate the supplied refresh token):
 
 ```
@@ -47,6 +47,28 @@ Authorization: Bearer <access_token>
 ### GET /auth/me
 
 Returns current user info.
+
+### GET /auth/methods
+
+Returns Server-owned login discovery. With no configured browser integration:
+
+```json
+{"password":true,"memoria":null}
+```
+
+When enabled, `memoria` contains `issuer` and `authorization_url` (the website base URL). CLI login uses this discovery; it does not assume a hosted website for a self-hosted Server.
+
+### POST /auth/memoria
+
+Accepts `{"connection_key":"<scoped key>"}`. The auth service verifies the key online, then commits the provider-scoped identity, encrypted credential and refresh session in one transaction. Response: `user_id`, `access_token`, `refresh_token`, `token_type`, `expires_in` (at most 900 seconds), `memory_access`, and `granted_scopes`. No Memoria secret is returned.
+
+Invalid keys fail with 401; unavailable verification fails with 503; legacy identity mappings without explicitly configured provenance fail with 409. An identity-only key can log in but cannot access memory.
+
+### DELETE /auth/memoria
+
+Requires an Astra access token. Removes the account's stored Memoria credential and revokes all its Astra refresh sessions in one transaction; returns 204. Existing access tokens then fail session validation. The service operation is idempotent; retrying with an already revoked access token returns 401.
+
+Account identity, Work/history and Memoria memories are retained. This disconnects Astra; it does not delete the Memoria account or revoke keys at their issuer. Upstream key revocation remains owned by Memoria/its integration settings. Ordinary `/auth/logout` signs out only the submitted session and does not disconnect other devices.
 
 ---
 

@@ -3119,7 +3119,6 @@ impl ServerAgenticLoopHostBuilder {
         user_id: String,
         session_id: String,
     ) -> Self {
-        let memoria_owner_user_id = user_id.clone();
         Self {
             matrixone,
             encryptor,
@@ -3146,12 +3145,7 @@ impl ServerAgenticLoopHostBuilder {
             static_tool_catalog_admissible: true,
             plan_resume_hint: None,
             plan_authoring_active: false,
-            memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env().map(
-                |client| {
-                    let client = client.with_owner_user_id(memoria_owner_user_id.clone());
-                    Arc::new(client) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>
-                },
-            ),
+            memoria_client: None,
             server_service_tool_catalog_enabled: true,
             control_plane_tool_catalog_enabled: true,
             #[cfg(feature = "e2e-hooks")]
@@ -6215,15 +6209,15 @@ impl ServerAgenticLoopHost {
             // no Server-owned route or secret to refresh at this boundary.
             return Ok(());
         }
-        let offering = astra_services::revalidate_active_llm_offering(
+        let execution = astra_services::revalidate_admitted_model_execution(
             &self.matrixone,
             self.encryptor.as_ref(),
+            &self.user_id,
             &admitted.offering_id,
             self.shared_pool.as_ref().map(SharedPool::get),
         )
         .await
         .map_err(|error| error.to_string())?;
-        let execution = astra_services::AdmittedModelExecution::from_offering(offering)?;
         self.admitted_model_execution = Some(execution);
         self.clear_resolved_llm_config();
         Ok(())

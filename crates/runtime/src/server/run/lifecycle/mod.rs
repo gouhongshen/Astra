@@ -8888,19 +8888,51 @@ impl AgenticRunLifecycleService {
                 .model_service
                 .list_models(user_id.to_string(), false)
                 .await?;
-            let projection = astra_services::project_model_access(
-                vec![astra_services::DeclaredModelAccess {
+            let allows_deployment = self
+                .model_service
+                .allows_deployment_models(user_id.to_string())
+                .await?;
+            let has_cloud_byok = !allows_deployment
+                || offerings.iter().any(|offering| {
+                    offering.access_kind == astra_services::ModelAccessKind::CloudByok
+                });
+            let mut declared = Vec::new();
+            if allows_deployment {
+                declared.push(astra_services::DeclaredModelAccess {
                     id: "self-hosted".to_string(),
                     kind: astra_services::ModelAccessKind::SelfHosted,
                     label: "Self-hosted".to_string(),
                     execution_placement: astra_services::ModelExecutionPlacement::Server,
                     availability: astra_services::ModelAccessAvailability::Ready,
-                }],
-                offerings
-                    .into_iter()
-                    .filter(|offering| offering.is_active)
-                    .map(astra_services::ModelListItemResponse::from)
-                    .collect(),
+                });
+            }
+            if has_cloud_byok {
+                declared.push(astra_services::DeclaredModelAccess {
+                    id: "cloud-byok".to_string(),
+                    kind: astra_services::ModelAccessKind::CloudByok,
+                    label: "Cloud BYOK".to_string(),
+                    execution_placement: astra_services::ModelExecutionPlacement::Server,
+                    availability: astra_services::ModelAccessAvailability::Ready,
+                });
+            }
+            let user_default = self
+                .model_service
+                .default_user_model_offering_id(user_id.to_string())
+                .await?
+                .map(|offering_id| astra_services::ModelDefaultCandidate {
+                    offering_id,
+                    source: astra_services::ModelDefaultSource::Astra,
+                    scope: astra_services::ModelDefaultScope::EffectiveCatalog,
+                });
+            let offering_views = offerings
+                .into_iter()
+                .filter(|offering| offering.is_active)
+                .map(astra_services::ModelListItemResponse::from)
+                .collect::<Vec<_>>();
+            let projection = astra_services::project_model_access_with_default(
+                declared,
+                offering_views,
+                user_default,
                 chrono::Utc::now().to_rfc3339(),
             )
             .map_err(|error| {
@@ -8921,6 +8953,7 @@ impl AgenticRunLifecycleService {
             let selection = ModelSelection { offering_id };
             let admitted = crate::server::model_execution_admission::admit_model_execution(
                 &self.model_service,
+                user_id,
                 &selection,
                 None,
                 None,
@@ -8975,6 +9008,7 @@ impl AgenticRunLifecycleService {
             request.admitted_model_execution = Some(
                 crate::server::model_execution_admission::admit_model_execution(
                     &self.model_service,
+                    user_id,
                     selection,
                     Some(resolved),
                     Some(gateway),
@@ -8994,6 +9028,7 @@ impl AgenticRunLifecycleService {
         }
         let admitted = crate::server::model_execution_admission::admit_model_execution(
             &self.model_service,
+            user_id,
             selection,
             None,
             None,
@@ -10507,6 +10542,12 @@ impl AgenticRunLifecycleService {
         if let Some(binding) = work_runtime_binding {
             builder = builder.with_canonical_work_context_binding(binding.context_binding());
         }
+
+        builder = builder.with_memoria_client(
+            self.memory_extraction_service
+                .as_ref()
+                .and_then(|svc| svc.memoria_client_for_owner(user_id).ok()),
+        );
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
@@ -13119,7 +13160,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // explicit workspace/executor binding and cannot silently fall back.
         let mut root_runtime_context_guard = None;
         if let Some(workspace) = server_tool_executor_workspace {
-            let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
+            // Memory access is provided by the composition-owned, scoped port.
+            let memoria_base = None;
             let mut executor = runtime_tool_executor::RuntimeToolExecutor::new(
                 workspace.clone(),
                 user_id.clone(),
@@ -15458,7 +15500,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // tools to edge or blocks when edge is unavailable.
         let mut root_runtime_context_guard = None;
         if let Some(workspace) = server_tool_executor_workspace {
-            let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
+            let memoria_base = None;
             let mut executor = runtime_tool_executor::RuntimeToolExecutor::new(
                 workspace.clone(),
                 user_id.clone(),
@@ -20033,21 +20075,22 @@ impl ServerSubRunExecutor {
             }
             return Ok(Some(execution.clone()));
         }
-        let offering = astra_services::resolve_active_llm_offering(
+        let execution = astra_services::revalidate_admitted_model_execution(
             &self.matrixone,
             self.encryptor.as_ref(),
+            &config.user_id,
             offering_id,
             self.shared_pool.as_ref().map(SharedPool::get),
         )
         .await
         .map_err(|error| error.to_string())?;
-        if offering.model.model_name != expected_model_name {
+        if execution.model_name != expected_model_name {
             return Err(
                 "durable sub-run Offering changed after admission; refusing route drift"
                     .to_string(),
             );
         }
-        astra_services::AdmittedModelExecution::from_offering(offering).map(Some)
+        Ok(Some(execution))
     }
 
     async fn select_subrun_execution(
@@ -20061,15 +20104,16 @@ impl ServerSubRunExecutor {
                 .or(self.admitted_model_execution.as_ref())
                 .cloned());
         };
-        let offering = astra_services::revalidate_active_llm_offering(
+        let execution = astra_services::revalidate_admitted_model_execution(
             &self.matrixone,
             self.encryptor.as_ref(),
+            &config.user_id,
             &selection.offering_id,
             self.shared_pool.as_ref().map(SharedPool::get),
         )
         .await
         .map_err(|error| error.to_string())?;
-        astra_services::AdmittedModelExecution::from_offering(offering).map(Some)
+        Ok(Some(execution))
     }
 
     async fn exact_durable_subrun_control_authority(
@@ -21005,6 +21049,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
         .with_interaction_mode(Some(config.interaction_mode));
 
+        builder = builder.with_memoria_client(self.memory_extraction_service.as_ref()
+            .and_then(|svc| svc.memoria_client_for_owner(&config.user_id).ok()));
+
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
         }
@@ -21322,7 +21369,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         // Without this, the headless pipeline fallback cannot execute tools
         // server-side and sub-agents would get edge-protocol errors.
         {
-            let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
+            let memoria_base = None;
             let agent_working_dir = subrun_workspace.clone();
             let mut executor = runtime_tool_executor::RuntimeToolExecutor::new(
                 subrun_workspace,

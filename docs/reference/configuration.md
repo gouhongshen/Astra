@@ -124,7 +124,12 @@ If `reasoning_offering_id` is not set, the server applies its governed default a
 ### Memoria
 
 - `MEMORIA_BASE_URL`, `MEMORIA_MASTER_KEY`
+- `MEMORIA_ISSUER` — stable identity issuer URL; defaults to normalized `MEMORIA_BASE_URL`. Changing the issuer creates a different identity namespace. Keep it stable when changing only the service transport address.
+- `MEMORIA_WEB_URL` — Server-owned browser sign-in website, advertised through `GET /auth/methods`. Unset preserves password login. Requires HTTPS except for explicit loopback development URLs. The CLI does not read this environment variable.
+- `MEMORIA_LEGACY_ISSUER` — explicit administrator assertion of the issuer that owned pre-issuer Memoria identities. Migration is allowed only when it equals the configured issuer, after fresh key verification. Leave unset unless the provenance of the old database is known.
 - `MEMORIA_EMBEDDING_PROVIDER`, `MEMORIA_EMBEDDING_MODEL`, `MEMORIA_EMBEDDING_DIM`, `MEMORIA_EMBEDDING_API_KEY`, `MEMORIA_EMBEDDING_BASE_URL`
+
+Scoped login, refresh, memory proxy, recall, extraction and session-end governance share the authentication service's provider configuration and credential resolver. Runtime builders do not independently select a transport from environment variables or fall back to a master key. See [authentication](../design/authentication.md).
 
 ### Runtime tuning (optional)
 

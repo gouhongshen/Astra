@@ -46,9 +46,26 @@ fi
 # Clean up old process record
 rm -f "$PID_FILE"
 
-# Load .env early so DB host/port are available for the readiness check
-if [ -f .env ]; then
-    set -a; source .env; set +a
+# Load the selected env file early so DB host/port are available for the
+# readiness check. ASTRA_ENV_FILE lets cross-repository local harnesses use an
+# isolated configuration without rewriting a developer's normal .env.
+ENV_FILE="${ASTRA_ENV_FILE:-.env}"
+if [ -f "$ENV_FILE" ]; then
+    set -a; source "$ENV_FILE"; set +a
+fi
+
+# A caller-selected env file is an explicit configuration boundary. Prevent
+# the server's own config loader from filling missing values from the repo
+# .env or user/system config after this script has deliberately omitted them.
+if [ -n "${ASTRA_ENV_FILE:-}" ]; then
+    export ASTRA_CONFIG_SOURCE="${ASTRA_CONFIG_SOURCE:-explicit-env}"
+fi
+
+# Cloud BYOK must resolve a per-user Memoria credential. This explicit switch
+# guarantees an inherited shell variable cannot silently re-enable master-key
+# fallback in the local cross-repository test topology.
+if [ "${ASTRA_DISABLE_MEMORIA_MASTER_KEY:-}" = "1" ]; then
+    unset MEMORIA_MASTER_KEY
 fi
 
 API_PORT="${ASTRA_API_PORT:-17001}"

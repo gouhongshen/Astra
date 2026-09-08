@@ -2723,6 +2723,15 @@ fn inference_canonical_transition_wal_definition_mismatches(create_sql: &str) ->
     }
 }
 
+fn database_reports_check_constraints_in_show_create(version: &str) -> bool {
+    // MatrixOne currently accepts CHECK syntax but omits CHECK clauses from
+    // SHOW CREATE TABLE. Treating the omitted text as proof of an obsolete
+    // table makes every freshly bootstrapped MatrixOne database fail startup.
+    // MySQL-compatible engines that do report the definition retain the
+    // strict recovery-mode contract check below.
+    !version.to_ascii_lowercase().contains("matrixone")
+}
+
 fn inference_invocation_schema_mismatches(
     columns: &BTreeMap<String, ObservedColumnShape>,
 ) -> Vec<String> {
@@ -3055,9 +3064,12 @@ async fn verify_inference_canonical_transition_wal_schema_contract(
     let show_create = format!("SHOW CREATE TABLE `{database}`.`{table}`");
     let create_row = query(&show_create).fetch_one(pool).await?;
     let create_sql: String = create_row.try_get(1_usize)?;
-    reasons.extend(inference_canonical_transition_wal_definition_mismatches(
-        &create_sql,
-    ));
+    let database_version: String = query_scalar("SELECT VERSION()").fetch_one(pool).await?;
+    if database_reports_check_constraints_in_show_create(&database_version) {
+        reasons.extend(inference_canonical_transition_wal_definition_mismatches(
+            &create_sql,
+        ));
+    }
     if reasons.is_empty() {
         return Ok(());
     }
@@ -3652,6 +3664,39 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_auth_tokens_active (is_active),
             INDEX idx_auth_tokens_scope_user (scope_user_id),
             INDEX idx_auth_tokens_scope_repo (scope_repo)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "auth_external_identities",
+        "CREATE TABLE IF NOT EXISTS auth_external_identities (
+            provider_id VARCHAR(128) NOT NULL,
+            external_subject VARCHAR(255) NOT NULL,
+            astra_user_id VARCHAR(128) NOT NULL,
+            username VARCHAR(255) NULL,
+            email VARCHAR(255) NULL,
+            display_name VARCHAR(255) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (provider_id, external_subject),
+            INDEX idx_external_identity_user (astra_user_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Read-only migration source. Never create new unnamespaced identities.
+    core_schema_create!(
+        pool,
+        "auth_memoria_identities",
+        "CREATE TABLE IF NOT EXISTS auth_memoria_identities (
+            memoria_user_id VARCHAR(128) PRIMARY KEY,
+            astra_user_id VARCHAR(128) NOT NULL UNIQUE,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_auth_memoria_astra_user (astra_user_id)
         )",
     )
     .execute(&pool)
@@ -6741,6 +6786,32 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
+    core_schema_create!(
+        pool,
+        "user_llm_models",
+        "CREATE TABLE IF NOT EXISTS user_llm_models (
+            model_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            model_alias VARCHAR(100) NOT NULL,
+            model_name VARCHAR(255) NOT NULL,
+            provider VARCHAR(50) NOT NULL,
+            api_key_encrypted TEXT NOT NULL,
+            base_url VARCHAR(500) NOT NULL,
+            context_window INT NOT NULL,
+            is_default SMALLINT NOT NULL DEFAULT 0,
+            is_active SMALLINT NOT NULL DEFAULT 1,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, model_id),
+            UNIQUE KEY uq_user_llm_models_alias (user_id, model_alias),
+            CONSTRAINT chk_user_llm_models_context_window CHECK (context_window > 0),
+            INDEX idx_user_llm_models_catalog (user_id, is_active, provider, model_alias, model_id),
+            INDEX idx_user_llm_models_default (user_id, is_default, is_active)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Canonical inference execution ledger. Admission writes the immutable route
     // and logical invocation together; each physical attempt is then committed
     // before its provider I/O. Route rows contain no credential or endpoint
@@ -8995,6 +9066,13 @@ impl Default for RetentionPolicy {
     }
 }
 
+/// Remove one bounded batch of credentials owned by inactive or deleted accounts.
+pub async fn cleanup_inactive_memoria_credentials(pool: &sqlx::MySqlPool) -> Result<u64, String> {
+    sqlx::query("DELETE FROM auth_tokens WHERE type = 'memoria_connection' AND provider = 'memoria' AND NOT EXISTS (SELECT 1 FROM auth_users WHERE user_id = auth_tokens.scope_user_id AND is_active = 1) ORDER BY created_at ASC, token_id ASC LIMIT 100")
+        .execute(pool).await.map(|result| result.rows_affected())
+        .map_err(|error| format!("cleanup inactive Memoria credentials: {error}"))
+}
+
 /// Purge expired authentication and operational records with TTL/expiry semantics.
 ///
 /// Returns a list of per-table cleanup results showing how many rows were deleted.
@@ -9063,7 +9141,9 @@ pub async fn cleanup_expired_data(
         rows_deleted: deleted,
     });
 
-    // 2. Inactive auth tokens
+    // 2. Inactive auth tokens, plus credentials whose account was removed or
+    // deactivated. Scoped resolvers already deny these before cleanup runs.
+    let orphaned_memoria = cleanup_inactive_memoria_credentials(pool).await?;
     let deleted = sqlx::query(
         "DELETE FROM auth_tokens \
          WHERE is_active = 0 \
@@ -9075,7 +9155,7 @@ pub async fn cleanup_expired_data(
     .bind(AUTH_TOKEN_BATCH_LIMIT)
     .execute(pool)
     .await
-    .map(|r| r.rows_affected())
+    .map(|r| r.rows_affected() + orphaned_memoria)
     .map_err(|e| format!("cleanup auth_tokens: {e}"))?;
     results.push(CleanupResult {
         table: "auth_tokens",
@@ -9783,6 +9863,12 @@ mod tests {
 
     #[test]
     fn canonical_transition_wal_schema_contract_is_exact_and_fail_closed() {
+        assert!(!database_reports_check_constraints_in_show_create(
+            "8.0.30-MatrixOne-v2.1.0"
+        ));
+        assert!(database_reports_check_constraints_in_show_create(
+            "8.0.36 MySQL Community Server"
+        ));
         let exact_columns = canonical_transition_wal_columns();
         let exact_indexes = canonical_transition_wal_indexes();
         assert!(

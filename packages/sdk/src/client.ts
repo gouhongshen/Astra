@@ -550,14 +550,36 @@ export class AstraClient {
     return this.fetch<UserInfo>(PATH_AUTH_ME);
   }
 
+  async getReauthenticationOptions(): Promise<{ method: "password" } | { method: "memoria"; verification_url: string }> {
+    const value = await this.fetch<{ method: string; verification_url?: unknown }>(PATH_AUTH_REAUTHENTICATE);
+    if (value?.method === "password") return { method: "password" };
+    if (value?.method === "memoria" && typeof value.verification_url === "string") {
+      const url = new URL(value.verification_url);
+      if (!url.username && !url.password && !url.hash && !url.search &&
+          (url.protocol === "https:" || (url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)))) {
+        return { method: "memoria", verification_url: url.toString() };
+      }
+    }
+    throw new TypeError("reauthentication options are invalid");
+  }
+
   async reauthenticate(
-    password: string,
+    credential: string | { memoriaProof: string },
     purpose: ReauthenticationPurpose,
   ): Promise<ReauthenticationProof> {
-    if (password.length === 0 || password.length > 4096) {
-      throw new TypeError("password must be non-empty and bounded");
+    let evidence: { password: string } | { memoria_proof: string };
+    if (typeof credential === "string") {
+      if (credential.length === 0 || credential.length > 4096) {
+        throw new TypeError("password must be non-empty and bounded");
+      }
+      evidence = { password: credential };
+    } else {
+      if (!credential || Object.keys(credential).join() !== "memoriaProof" || !/^msu_[a-f0-9]{64}$/.test(credential.memoriaProof)) {
+        throw new TypeError("a fresh Memoria verification proof is required");
+      }
+      evidence = { memoria_proof: credential.memoriaProof };
     }
-    const raw = await this.post<unknown>(PATH_AUTH_REAUTHENTICATE, { password, purpose });
+    const raw = await this.post<unknown>(PATH_AUTH_REAUTHENTICATE, { ...evidence, purpose });
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       throw new TypeError("reauthentication response must be an object");
     }

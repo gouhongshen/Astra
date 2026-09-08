@@ -678,6 +678,28 @@ test("reauthenticate returns one bounded purpose-bound proof", async () => {
   });
 });
 
+test("Memoria reauthentication sends fresh evidence without a password", async () => {
+  const proof = { proof: "rp_opaque", purpose: "device_trust", expires_in: 300 };
+  const fetchMock = vi.fn().mockResolvedValue(response(200, proof));
+  globalThis.fetch = fetchMock;
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+  const fresh = `msu_${"a".repeat(64)}`;
+  await expect(client.reauthenticate({ memoriaProof: fresh }, "device_trust")).resolves.toEqual(proof);
+  expect(JSON.parse(String(fetchMock.mock.calls[0][1].body))).toEqual({ memoria_proof: fresh, purpose: "device_trust" });
+  await expect(client.reauthenticate({ memoriaProof: "stored-connection-key" }, "device_trust")).rejects.toThrow("fresh Memoria");
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+});
+
+test("reauthentication discovery rejects unsafe verification URLs", async () => {
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+  for (const verification_url of ["javascript:alert(1)", "http://remote.example/verify", "https://user:password@example.com/verify"]) {
+    globalThis.fetch = vi.fn().mockResolvedValue(response(200, { method: "memoria", verification_url }));
+    await expect(client.getReauthenticationOptions()).rejects.toThrow();
+  }
+  globalThis.fetch = vi.fn().mockResolvedValue(response(200, { method: "memoria", verification_url: "https://thememoria.ai/astra/reauthenticate" }));
+  await expect(client.getReauthenticationOptions()).resolves.toMatchObject({ method: "memoria" });
+});
+
 test("reauthenticate rejects a proof not bound to the requested purpose", async () => {
   globalThis.fetch = vi.fn().mockResolvedValue(
     response(200, {

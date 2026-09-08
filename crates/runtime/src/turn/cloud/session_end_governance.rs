@@ -193,6 +193,9 @@ pub async fn run_session_end_governance(
     session_id: &str,
     client: &dyn super::memoria_compact::MemoriaPort,
 ) -> Result<SessionEndReport, String> {
+    if !client.admits_operation(true).await? {
+        return Ok(SessionEndReport::default());
+    }
     let mut report = SessionEndReport::default();
 
     // Read before purge: the canonical narrative is the most valuable

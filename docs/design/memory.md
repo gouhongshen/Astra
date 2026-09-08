@@ -38,6 +38,16 @@ Memory loading is intent-driven:
 
 The design does not require one physical backend. Vector, fulltext, graph, tabular, or MCP-backed memory can coexist as long as they satisfy the same provenance, confidence, deletion, and trace contract.
 
+## Scoped credential admission
+
+The Server uses the application-scoped credential resolver owned by authentication. Each operation resolves the current owner binding and generation; no master-key fallback is inferred by a generic pool builder.
+
+- Missing binding or `none`: normal disabled state. Prompt recall reports `NotAttempted` and does not contact Memoria.
+- `read_only`: recall is allowed; write-oriented extraction, reflection and session-end cleanup are not admitted.
+- `read_write`: read and write operations are allowed. Transport checks remain in place to catch revocation or changes after admission.
+
+The background coordinator may launch a lightweight admission task, but it checks consent before loading snapshots, resolving an LLM, generating memory, or scheduling persistence. See [authentication](authentication.md) for issuer, credential replacement and retention.
+
 ## Learning boundary
 
 Memory is not training data by default. Learning artifacts require consent, redaction, quality gate, lineage, and deletion propagation.

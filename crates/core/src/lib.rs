@@ -32,6 +32,7 @@ pub mod history_work;
 pub mod history_work_baseline;
 pub mod identity;
 pub mod local_state;
+pub mod model_wire;
 pub mod process_runtime;
 pub mod work_unit;
 

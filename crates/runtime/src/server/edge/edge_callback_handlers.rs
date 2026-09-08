@@ -1342,7 +1342,8 @@ pub(crate) async fn post_provider_interaction_respond_handler(
                 provider_scope_id: context.provider_scope_id.clone(),
             }
         }
-        astra_services::AuthPrincipalOrigin::Internal => {
+        astra_services::AuthPrincipalOrigin::Internal
+        | astra_services::AuthPrincipalOrigin::VerifiedProvider { .. } => {
             return Err(error_response(
                 StatusCode::FORBIDDEN,
                 "Provider interaction responses require provider authorization",

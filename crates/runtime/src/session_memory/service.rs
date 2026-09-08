@@ -210,6 +210,10 @@ impl std::fmt::Debug for MemoryExtractionService {
 }
 
 impl MemoryExtractionService {
+    /// Share the composition-owned memory provider with the run and its children.
+    pub fn memoria_client_for_owner(&self, user: &str) -> Result<Arc<dyn MemoriaPort>, String> {
+        self.memoria_client.bind_owner(user)
+    }
     /// Build a service. `memoria_client` is required — callers that
     /// can't produce one (offline CLI, no Memoria configured) should
     /// simply skip constructing the service and leave
@@ -798,6 +802,16 @@ impl MemoryExtractionService {
     // ── internals ─────────────────────────────────────────────────────
 
     async fn run_one(self: Arc<Self>, req: ExtractionRequest, content_fingerprint: u64) {
+        // This lightweight admission task must not load snapshots, resolve a
+        // model, spend tokens or schedule writes when consent forbids them.
+        match self.memoria_client.admits_operation(true).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                tracing::warn!(%error, "memory extraction admission unavailable");
+                return;
+            }
+        }
         let Some((session_id, turn)) = req.session_coordinates() else {
             tracing::error!(
                 scope_kind = req.inference_scope.kind(),
@@ -2698,6 +2712,97 @@ mod tests {
             } else {
                 Ok(0)
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn consent_admission_prevents_read_only_and_disabled_extraction_cost() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ConsentPort {
+            read: bool,
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl MemoriaPort for ConsentPort {
+            async fn purge_working(&self, _: &str) -> Result<u64, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(0)
+            }
+            async fn admits_operation(&self, write: bool) -> Result<bool, String> {
+                Ok(self.read && !write)
+            }
+            async fn retrieve_ext(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: usize,
+                _: bool,
+            ) -> Result<Vec<astra_memoria::MemoriaMemory>, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![])
+            }
+            async fn store(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<String, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok("unexpected".into())
+            }
+        }
+        #[derive(Debug)]
+        struct Resolver(Arc<AtomicUsize>);
+        #[async_trait]
+        impl MemoryInferenceResolver for Resolver {
+            async fn resolve_candidates(&self, _: &str) -> Vec<MemoryInferenceClient> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                vec![]
+            }
+        }
+        for read in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let port: Arc<dyn MemoriaPort> = Arc::new(ConsentPort {
+                read,
+                calls: calls.clone(),
+            });
+            let (ingestion, _rx) = IngestionSender::for_tests(32);
+            let service = Arc::new(MemoryExtractionService::new(
+                Arc::new(Resolver(calls.clone())),
+                port.clone(),
+                ingestion,
+                "consent-user",
+                Arc::new(BackgroundActivityBroker::new()),
+            ));
+            service.maybe_spawn(sample_req("consent-session", 50_000, false));
+            service.wait_for_pending(Duration::from_secs(2)).await;
+            crate::turn::cloud::session_end_governance::run_session_end_governance(
+                &Default::default(),
+                "consent-session",
+                port.as_ref(),
+            )
+            .await
+            .unwrap();
+            if !read {
+                let recalled = crate::turn::memory_prefetch::prefetch_memories_with_client(
+                    port.as_ref(),
+                    "recall",
+                    "consent-user",
+                    "consent-session",
+                    5,
+                )
+                .await;
+                assert_eq!(
+                    recalled.outcome,
+                    astra_turn_types::MemoryRetrievalOutcome::NotAttempted
+                );
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "no retrieval, model resolution or write before consent"
+            );
         }
     }
 

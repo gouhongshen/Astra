@@ -89,6 +89,7 @@ pub(super) async fn completions_handler(
         };
         super::model_execution_admission::admit_model_execution(
             &state.model_service,
+            &user.user_id,
             &selection,
             None,
             None,
@@ -96,39 +97,52 @@ pub(super) async fn completions_handler(
         )
         .await?
     } else {
-        let matrixone =
-            crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|error| {
+        let offering_id = if let Some(offering_id) = state
+            .model_service
+            .default_user_model_offering_id(user.user_id.clone())
+            .await?
+        {
+            offering_id
+        } else {
+            if !state
+                .model_service
+                .allows_deployment_models(user.user_id.clone())
+                .await?
+            {
+                return Err(crate::error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "Configure and select your own BYOK model; deployment model fallback is disabled",
+                    "missing_model_selection",
+                ));
+            }
+            let matrixone =
+                crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|error| {
+                    crate::error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("MatrixOne configuration unavailable: {error}"),
+                        "model_catalog_unavailable",
+                    )
+                })?;
+            astra_services::resolve_reasoning_offering(
+                &matrixone,
+                &state.fernet_encryptor,
+                state.admin.config_service.as_ref(),
+                state.shared_pool.as_ref().map(|pool| pool.get()),
+            )
+            .await
+            .map_err(|error| {
                 crate::error_response_coded(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    format!("MatrixOne configuration unavailable: {error}"),
-                    "model_catalog_unavailable",
+                    format!("Default Offering resolution failed: {error}"),
+                    "model_default_unavailable",
                 )
-            })?;
-        let selected = astra_services::resolve_reasoning_offering(
-            &matrixone,
-            &state.fernet_encryptor,
-            state.admin.config_service.as_ref(),
-            state.shared_pool.as_ref().map(|pool| pool.get()),
-        )
-        .await
-        .map_err(|error| {
-            crate::error_response_coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Default Offering resolution failed: {error}"),
-                "model_default_unavailable",
-            )
-        })?;
-        let offering = state
+            })?
+            .offering_id
+        };
+        state
             .model_service
-            .revalidate_model_offering(selected.offering_id)
-            .await?;
-        astra_services::AdmittedModelExecution::from_offering(offering).map_err(|error| {
-            crate::error_response_coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Default Offering execution configuration is invalid: {error}"),
-                "model_execution_configuration_invalid",
-            )
-        })?
+            .admit_model_offering(user.user_id.clone(), offering_id)
+            .await?
     };
 
     // 3. Durably admit the logical invocation before provider I/O. Auxiliary

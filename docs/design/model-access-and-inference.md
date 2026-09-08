@@ -1,7 +1,7 @@
 # Model access and inference
 
 > Status: target design contract.
-> Last updated: 2026-07-20.
+> Last updated: 2026-09-06.
 
 Model access and inference defines how Astra presents model capability as a product, binds cloud accounts, resolves an eligible model to a trusted execution path, and records inference usage consistently across Web, CLI, Server, and Edge.
 
@@ -30,7 +30,7 @@ It does not own:
 
 - A new Astra Cloud user can use an administrator-approved model without understanding provider wiring.
 - Astra can link a user or organization to TaaS without making TaaS a special agent runtime.
-- A user can use a non-TaaS provider or local model without uploading its secret to Astra Server.
+- A user can explicitly choose Cloud BYOK, where Astra Server encrypts the provider credential and executes inference, or This device, where the secret is never uploaded.
 - Web, CLI, Server Only, and Edge + Server expose the same model and run semantics.
 - Every inference has an immutable execution placement, credential owner, billing owner, policy decision, and durable identity.
 - Account, entitlement, credential, endpoint, and billing failures are visible and recoverable without corrupting run state.
@@ -39,7 +39,8 @@ It does not own:
 ## Non-goals
 
 - A generic provider plugin marketplace or routing DSL.
-- Arbitrary user-supplied inference URLs on Astra Cloud Server.
+- Ungoverned or request-scoped inference URLs on Astra Cloud Server. Personal
+  BYOK configuration may register public HTTPS endpoints under the policy below.
 - Separate agent loops for TaaS, direct providers, or Edge models.
 - Silent fallback across billing or data boundaries.
 - Treating cached balance, health, or entitlement data as authoritative without freshness.
@@ -78,6 +79,7 @@ must preserve the first-page server decision.
 | Product source | Credential owner | Billing owner | Execution | Availability |
 | --- | --- | --- | --- | --- |
 | Astra Cloud | User-linked TaaS account | User TaaS account | Server | All clients |
+| Cloud BYOK | User | User external account | Server | All clients |
 | Workspace | Organization | Organization account | Server | Authorized workspace clients |
 | This device | User/device | User external account or local compute | Edge | While the bound Edge is available |
 | Self-hosted | Deployment administrator | Deployment administrator | Server | Self-hosted deployment |
@@ -103,6 +105,7 @@ struct ModelAccessView {
 
 enum ModelAccessKind {
     AstraCloud,
+    CloudByok,
     Workspace,
     ThisDevice,
     SelfHosted,
@@ -123,6 +126,84 @@ Astra Cloud is the default personal model-access product. It is backed by a TaaS
 
 The model picker must not show both `Astra Cloud` and `My TaaS` for the same personal account. TaaS appears where the account or billing relationship matters, not as a duplicate model source.
 
+### Cloud BYOK
+
+Cloud BYOK is an explicit personal access source for users who want Astra
+Server to remain available without a connected Edge while billing inference to
+their own provider account.
+
+- `POST /me/models` accepts a provider credential once over an authenticated
+  TLS connection. Owner identity is derived from the Astra access token; the
+  request cannot select another owner.
+- Astra Server encrypts the credential with the configured secret backend and
+  stores only ciphertext in `user_llm_models`.
+- `GET /me/models`, `GET /me/models/{model_id}`, catalog, trace, error, and
+  audit projections never return credential material or a reversible prefix.
+- `PUT /me/models/{model_id}` rotates the credential or changes activation and
+  default state. `DELETE /me/models/{model_id}` removes only the authenticated
+  user's row. Cross-owner access returns `404` so resource existence is not
+  disclosed.
+- User configuration presents OpenAI, Anthropic, DeepSeek, and
+  OpenAI-compatible. The first three use fixed official endpoints. The
+  `openai-compatible` provider requires an HTTPS `base_url` and a model ID;
+  public HTTPS endpoints do not require administrator registration by default.
+  `ASTRA_BYOK_ENDPOINT_POLICY=trusted-domains` opts a deployment into the
+  existing administrator registry; a host-only entry admits port 443 only.
+  The default is `public-https`; invalid configuration fails closed.
+- Custom endpoint policy is rechecked at create, credential rotation, probe,
+  activation, and inference admission. Each outbound attempt pins a freshly
+  validated public DNS address set and forbids redirects. DNS queries go directly
+  to system-configured nameservers instead of OS synthetic-address caches;
+  `ASTRA_BYOK_DNS_SERVERS` optionally selects comma-separated DNS IPs (ports
+  optional); prefix an entry with `tcp://` for TCP-only DNS without a UDP
+  attempt or UDP fallback. This is an explicit operator route, not automatic
+  retry of rejected private/Fake-IP answers. Nameserver priority is preserved
+  instead of racing answers from different DNS servers. There is no hardcoded
+  public DNS or OS resolver fallback.
+  Direct egress is the default. Operators may set `ASTRA_BYOK_PROXY_URL` to an
+  HTTP/HTTPS CONNECT or SOCKS5/SOCKS5h proxy. A request-owned authenticated
+  loopback adapter sends only validated public IP targets to that proxy,
+  retaining the origin hostname for end-to-end TLS, SNI and Host. SOCKS5h does
+  not delegate target DNS. Dropping the client cancels its tunnel tasks.
+  Ambient proxy variables cannot override this route; proxy failure never
+  falls back to direct access. Private/Fake-IP DNS answers remain rejected.
+- Authenticated `POST /me/models/validate-endpoint` accepts only `base_url` and
+  returns `204` after URL, policy, and DNS checks, without provider HTTP traffic,
+  credentials, or stored model state. CLI runs it immediately after custom URL
+  input, before asking for the key. This preflight is advisory: every later
+  operation still enforces policy and every outbound attempt revalidates DNS.
+  Server DNS/egress configuration failures return `502` with code
+  `model_endpoint_network`; malformed or forbidden URLs remain `400`.
+- `astra model add` prompts for provider, model ID, alias, context window,
+  default selection and a hidden key. Explicit flags and `--api-key-stdin`
+  support non-interactive configuration. Custom endpoints reuse the existing
+  OpenAI transport; adding user ownership does not create another agent loop.
+- Inference admission revalidates `(user_id, offering_id, is_active)` and
+  decrypts the current credential immediately before provider execution.
+- Create, credential rotation and explicit probe validate connectivity with a
+  small output budget using the same provider-specific wire-field rule as
+  inference: OpenAI (including o-series) and the generic OpenAI-compatible
+  adapter use `max_completion_tokens`; native DeepSeek Chat Completions and
+  Anthropic Messages use `max_tokens`. Sharing the Chat Completions message
+  format does not imply identical optional parameters. Provider credential/model
+  errors remain failures; failed checks do not persist a new or rotated credential.
+- Memoria-authenticated identities can only use their own BYOK Offerings;
+  deployment Offerings are excluded from both their catalog and execution.
+  `ASTRA_DEPLOYMENT_MODE=cloud-byok` applies the same restriction to all
+  Server-authenticated users. `self-hosted` (the default) retains deployment
+  models for non-Memoria users. Admin registry management is separate from
+  end-user inference eligibility. Unknown mode values do not grant access.
+- Background memory selectors obey the same owner eligibility and fresh
+  admission checks. A memory read/write grant never authorizes spending a
+  deployment model credential. Without an explicitly eligible background model
+  route, personal Cloud BYOK uses the existing deterministic/degraded path;
+  it does not silently select the deployment registry or a personal default.
+- Missing a personal default in Cloud BYOK requires model configuration or
+  selection; it never falls back to a deployment reasoning model. The same
+  owner gate applies when resuming runs and executing child runs.
+- Cloud BYOK never silently imports an existing This device credential. Moving
+  a credential between those access sources requires an explicit user action.
+
 ### Workspace
 
 Workspace access is owned and paid for by an organization. Personal Cloud and Workspace remain distinguishable even when they expose the same upstream model.
@@ -133,6 +214,9 @@ Routing between them is allowed only when policy explicitly permits crossing the
 
 Non-TaaS provider credentials, private endpoints, Ollama, LM Studio, and other user-local models belong to This device.
 
+This device remains distinct from Cloud BYOK. Selecting it is the explicit
+choice that keeps a personal provider credential outside Astra Server.
+
 - Secrets remain in the device vault.
 - Edge advertises a typed, leased capability and non-secret model metadata.
 - Server remains authoritative for the canonical run, transcript, task, route summary, and usage projection.
@@ -140,7 +224,7 @@ Non-TaaS provider credentials, private endpoints, Ollama, LM Studio, and other u
 
 ### Self-hosted
 
-A deployment administrator may register Server-local or organization-trusted inference endpoints. This does not authorize ordinary Astra Cloud users to upload arbitrary Server-side provider URLs or keys.
+A deployment administrator may register Server-local or organization-trusted inference endpoints. Ordinary users remain subject to the public-network Cloud BYOK policy; administrator access does not implicitly authorize their private-network endpoints.
 
 ## Product surfaces
 
@@ -838,6 +922,9 @@ Retry is coordinated at one layer. Server, gateway, and provider adapters cannot
 - TaaS instance registration validates origin, redirects, DNS results, and network policy.
 - Normal users cannot turn a binding request into arbitrary Server egress.
 - Secret material never appears in profile responses, route records, transcript, journal, SSE, traces, errors, or snapshots.
+- Cloud BYOK ciphertext is owner-scoped at every query and mutation boundary;
+  plaintext exists only in bounded process memory while checking or executing
+  the selected provider request.
 - Effective Offering IDs are principal-bound and revalidated.
 - Tenant/organization/user/device ownership is enforced at query and mutation boundaries.
 - Cache namespaces include trust, connection, credential generation, and tenant scope where content may be sensitive.
@@ -954,7 +1041,9 @@ Cover Web, CLI + Server, Server Only, and Edge + Server:
 - A normal user can understand available models without provider configuration knowledge.
 - The UI always states execution placement and billing owner when it affects a decision.
 - TaaS account handling never becomes a special branch in the agent loop.
-- Non-TaaS personal credentials remain on Edge.
+- Non-TaaS personal credentials remain on Edge when the user selects This
+  device; Cloud BYOK credentials are explicitly uploaded and encrypted on
+  Astra Server.
 - All inference purposes use one resolver and invocation contract.
 - Every upstream request is attributable to a durable provider attempt.
 - No client can select an endpoint, credential, or placement directly.
