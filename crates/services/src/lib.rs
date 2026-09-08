@@ -6,6 +6,7 @@ pub mod agents;
 pub mod artifact_policy;
 pub mod auth;
 pub mod branches;
+pub mod byok_endpoint;
 pub mod config_version_cloud;
 pub mod context;
 pub mod context_manifest;
@@ -261,11 +262,13 @@ pub use models::{
     ModelUpdateRequestData, PricingData, PromptCacheCapabilityData, PromptCacheProtocolData,
     PromptCacheReuseScopeData, PromptCacheVolatileDeliveryData, PromptCacheVolatilePlacementData,
     QuirksData, ResolvedActiveLlmModel, ResolvedModelOffering, UnconfiguredModelService,
+    UserModelCreateRequestData, UserModelRecord, UserModelUpdateRequestData,
     model_catalog_revision, project_model_access, project_model_access_page,
     project_model_access_page_with_default_catalog, project_model_access_with_default,
     prompt_cache_capability_from_models_yaml, resolve_active_llm_model,
     resolve_active_llm_offering, resolve_memory_offerings, resolve_reasoning_offering,
-    revalidate_active_llm_offering, validate_model_offering_id,
+    revalidate_active_llm_offering, revalidate_admitted_model_execution,
+    validate_model_offering_id,
 };
 pub use multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeAgentRecord,

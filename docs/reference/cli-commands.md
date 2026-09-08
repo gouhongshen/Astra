@@ -2,6 +2,55 @@
 
 Current Rust CLI reference for the single `astra` CLI, including `astra admin`.
 
+## Personal BYOK model setup
+
+Run `astra model add` after logging in to configure a personal model interactively.
+
+- **Model ID from your provider** is the exact identifier documented by the
+  provider. Astra sends it unchanged to the provider API.
+- **Configuration alias in Astra** is the account-local name used to select that
+  configuration. Press Enter to use the model ID, or enter a unique alias to
+  distinguish different credentials/endpoints for the same model.
+
+For example, an alias `work-model` for provider model ID `deepseek-v4-flash`
+is selected with `astra chat --model work-model`. Commands such as
+`astra model show work-model` and `astra model probe work-model` use the alias.
+The alias is not an account username or a provider model ID.
+
+Scripts can still supply both explicitly:
+
+```bash
+astra model add work-model --provider deepseek --model deepseek-v4-flash --api-key-stdin
+```
+
+With `--api-key-stdin`, the alias and required provider/model arguments remain
+mandatory; only the interactive wizard offers a default alias. Keys should be
+entered at the hidden prompt or supplied via stdin, never as command arguments.
+
+For OpenAI-compatible services, enter the provider's public HTTPS base URL
+(including `/v1` if required). The CLI checks URL policy and DNS with the Server
+before requesting the API key. This does not send a request to the provider or
+prove that the key/model is valid; adding the model performs that check next.
+The key prompt hides typed input; press Enter to submit it.
+
+Public HTTPS endpoints do not require individual administrator registration by
+default. Operators can opt into strict host/port approval by setting
+`ASTRA_BYOK_ENDPOINT_POLICY=trusted-domains` on every Server replica and using
+`PUT /admin/llm/trusted-domains`. Both modes block private/metadata addresses,
+validate and pin DNS results, and disable redirects. Custom BYOK uses direct
+queries to the Server's configured DNS servers, not OS Fake-IP caches. Operators
+may override DNS IPs with `ASTRA_BYOK_DNS_SERVERS` and select an HTTP(S) CONNECT
+or SOCKS5 proxy with `ASTRA_BYOK_PROXY_URL`. Proxies connect to validated public
+IPs, retaining origin TLS verification; ambient proxy variables are not used.
+Direct UDP DNS can still be intercepted by a VPN/proxy. Use an explicit
+TCP-only entry such as `ASTRA_BYOK_DNS_SERVERS=tcp://10.0.0.53:53` when a
+reachable DNS server supports TCP. TCP-only entries never fall back to UDP;
+private/Fake-IP answers remain rejected. DNS failures retain resolver diagnostics
+in Server logs without exposing them in public API errors.
+These are Server settings, not options ordinary CLI users need to fill in.
+The default policy is `public-https`; invalid values fail closed. Upgrade the
+Server together with the CLI to provide `/me/models/validate-endpoint`.
+
 ## Installation
 
 For day-to-day development builds:
@@ -42,6 +91,7 @@ Commands:
 
 ```bash
 # Auth
+astra login # Server discovery: configured browser sign-in, otherwise password prompts
 astra register --username alice --email alice@example.com --password '***'
 astra login --username alice --password '***'
 astra interactive
@@ -73,6 +123,8 @@ astra skill list [--limit 50] [--offset 0]
 astra skill show <skill_id> [--version 1.0.0]
 astra skill status [--per-group 50]
 ```
+
+`astra login --username alice` explicitly selects password login. `astra login --manual` accepts a scoped connection key when browser handoff is unavailable. Older Servers returning 404 for `/auth/methods` retain the password journey; network errors do not silently select another provider. Browser addresses come from the target Server's `MEMORIA_WEB_URL`, not the CLI environment.
 
 ## astra admin
 

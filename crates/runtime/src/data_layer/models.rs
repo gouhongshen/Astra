@@ -57,6 +57,120 @@ fn default_model_catalog_limit() -> u32 {
     DEFAULT_MODEL_CATALOG_LIMIT
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModelEndpointRequest {
+    base_url: String,
+}
+
+pub async fn validate_user_model_endpoint_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UserModelEndpointRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .model_service
+        .validate_user_model_endpoint(user.user_id, request.base_url)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn create_user_model_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UserModelCreateRequest>,
+) -> Result<(StatusCode, Json<UserModelRecord>), (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let model = state
+        .model_service
+        .create_user_model(
+            user.user_id,
+            UserModelCreateRequestData {
+                name: request.name,
+                provider: request.provider,
+                model: request.model,
+                base_url: request.base_url,
+                api_key: request.api_key,
+                context_window: request.context_window,
+                is_default: request.is_default,
+            },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(model)))
+}
+
+pub async fn list_user_models_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<UserModelListResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let items = state.model_service.list_user_models(user.user_id).await?;
+    Ok(Json(UserModelListResponse { items }))
+}
+
+pub async fn get_user_model_handler(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<UserModelRecord>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let model = state
+        .model_service
+        .get_user_model(user.user_id, model_id)
+        .await?;
+    Ok(Json(model))
+}
+
+pub async fn update_user_model_handler(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<UserModelUpdateRequest>,
+) -> Result<Json<UserModelRecord>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let model = state
+        .model_service
+        .update_user_model(
+            user.user_id,
+            model_id,
+            UserModelUpdateRequestData {
+                api_key: request.api_key,
+                context_window: request.context_window,
+                is_default: request.is_default,
+                is_active: request.is_active,
+            },
+        )
+        .await?;
+    Ok(Json(model))
+}
+
+pub async fn delete_user_model_handler(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .model_service
+        .delete_user_model(user.user_id, model_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn check_user_model_handler(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<UserModelRecord>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let model = state
+        .model_service
+        .check_user_model(user.user_id, model_id)
+        .await?;
+    Ok(Json(model))
+}
+
 pub async fn create_model_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -183,25 +297,78 @@ async fn effective_model_catalog(
     }
     let user = principal.user;
     let is_admin = !active_only && state.admin.authorizer.require_admin(headers).await.is_ok();
+    let user_id = user.user_id.clone();
     let page = state
         .model_service
-        .list_models_page(user.user_id.clone(), is_admin, query.limit, cursor)
+        .list_models_page(user_id.clone(), is_admin, query.limit, cursor)
         .await?;
     let catalog_revision = state
         .model_service
-        .model_catalog_revision(user.user_id, is_admin)
+        .model_catalog_revision(user_id.clone(), is_admin)
         .await?;
-    Ok(EffectiveModelCatalog {
-        declared: vec![DeclaredModelAccess {
+    let mut declared = Vec::new();
+    let allows_deployment = is_admin
+        || state
+            .model_service
+            .allows_deployment_models(user_id.clone())
+            .await?;
+    if allows_deployment {
+        declared.push(DeclaredModelAccess {
             id: "self-hosted".to_string(),
             kind: ModelAccessKind::SelfHosted,
             label: "Self-hosted".to_string(),
             execution_placement: ModelExecutionPlacement::Server,
             availability: ModelAccessAvailability::Ready,
-        }],
+        });
+    }
+    let provider_default = state
+        .model_service
+        .default_user_model_offering_id(user_id)
+        .await?
+        .map(|offering_id| ModelDefaultCandidate {
+            offering_id,
+            source: ModelDefaultSource::Astra,
+            scope: ModelDefaultScope::EffectiveCatalog,
+        });
+    // Model Access needs the complete catalog both to resolve a default and
+    // to publish per-access counts that stay stable across pagination.
+    let default_catalog: Option<Vec<ModelListItemResponse>> =
+        if !is_admin || active_only || provider_default.is_some() {
+            Some(
+                state
+                    .model_service
+                    .list_models(user.user_id, false)
+                    .await?
+                    .into_iter()
+                    .map(ModelListItemResponse::from)
+                    .collect(),
+            )
+        } else {
+            None
+        };
+    // Match run admission, and inspect the complete catalog rather than the
+    // current page so access sources cannot disappear across pagination.
+    if !is_admin
+        && (!allows_deployment
+            || default_catalog.as_ref().is_some_and(|catalog| {
+                catalog
+                    .iter()
+                    .any(|offering| offering.access_kind == ModelAccessKind::CloudByok)
+            }))
+    {
+        declared.push(DeclaredModelAccess {
+            id: "cloud-byok".to_string(),
+            kind: ModelAccessKind::CloudByok,
+            label: "Cloud BYOK".to_string(),
+            execution_placement: ModelExecutionPlacement::Server,
+            availability: ModelAccessAvailability::Ready,
+        });
+    }
+    Ok(EffectiveModelCatalog {
+        declared,
         offerings: page.items,
-        provider_default: None,
-        default_catalog: None,
+        provider_default,
+        default_catalog,
         next_cursor: page.next_cursor,
         limit: page.limit,
         total: page.total,
@@ -327,7 +494,7 @@ pub async fn get_memory_model_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MemoryInferenceOfferingsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
+    let user = state.auth_service.current_user(&headers).await?;
     let matrixone = crate::matrix_cloud_runtime::matrix_settings_from_env().map_err(|e| {
         error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -335,14 +502,15 @@ pub async fn get_memory_model_handler(
         )
     })?;
     let pool_ref = state.shared_pool.as_ref().map(|sp| sp.get());
-    let resolved = resolve_memory_offerings(&matrixone, &state.fernet_encryptor, pool_ref)
-        .await
-        .map_err(|e| {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Memory model resolution failed: {e}"),
-            )
-        })?;
+    let resolved =
+        resolve_memory_offerings(&matrixone, &state.fernet_encryptor, &user.user_id, pool_ref)
+            .await
+            .map_err(|e| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Memory model resolution failed: {e}"),
+                )
+            })?;
     let offerings = resolved
         .into_iter()
         .map(|offering| MemoryInferenceOfferingResponse {

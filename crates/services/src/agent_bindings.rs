@@ -39,6 +39,13 @@ impl AgentBindingOwnerScope {
             crate::AuthPrincipalOrigin::Internal => {
                 Self::for_internal_user(&principal.user.user_id)
             }
+            crate::AuthPrincipalOrigin::VerifiedProvider {
+                provider_id,
+                external_subject,
+            } => Self {
+                owner_user_id: principal.user.user_id.clone(),
+                principal_scope_id: format!("verified:{provider_id}:{external_subject}"),
+            },
             crate::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) => {
                 let mut hasher = Sha256::new();
                 hasher.update(b"astra.agent-binding-principal.v1\0");

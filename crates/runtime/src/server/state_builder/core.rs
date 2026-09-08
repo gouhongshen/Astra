@@ -24,6 +24,7 @@ pub(super) fn build_auth_service(
 ) -> Result<Arc<dyn AuthService>, Box<dyn std::error::Error>> {
     let mut service = DatabaseAuthService::new(settings.matrixone.clone(), settings.jwt.clone())
         .with_pool(shared_pool.clone())
+        .with_memoria_settings(&settings.memoria)?
         .with_encryptor(shared_encryptor.as_ref().clone());
     if let Some(control_pool) = control_pool {
         service = service.with_control_pool(control_pool.clone());

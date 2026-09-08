@@ -222,6 +222,13 @@ pub fn validate_strict_memories(
 /// Provider-neutral Memoria operations used by runtime orchestration.
 #[async_trait::async_trait]
 pub trait MemoriaPort: Send + Sync {
+    /// Admission precedes retrieval, inference, reflection and cleanup work.
+    /// Explicit transports default to admitted; user-bound transports resolve
+    /// current consent without contacting the external memory service.
+    async fn admits_operation(&self, _write: bool) -> Result<bool, String> {
+        Ok(true)
+    }
+
     /// Return a transport bound to an authenticated owner.
     ///
     /// Server runtimes are multi-tenant and must scope the port before placing

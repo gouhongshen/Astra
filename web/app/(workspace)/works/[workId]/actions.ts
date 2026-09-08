@@ -737,7 +737,8 @@ type AcquireWorkBranchControlInput = {
 };
 
 type ForceTakeoverWorkBranchInput = AcquireWorkBranchControlInput & {
-  password: string;
+  password?: string;
+  memoriaProof?: string;
 };
 
 type WorkBranchControlOperationInput = {
@@ -975,6 +976,11 @@ export async function acquireWorkBranchControlAction(
   }
 }
 
+export async function getWorkReauthenticationOptionsAction() {
+  const runtime = await requireRuntimeClient({ auth: "required", operation: "verify identity before moving Work" });
+  return runtime.sdk.getReauthenticationOptions();
+}
+
 export async function forceTakeoverWorkBranchAction(
   input: ForceTakeoverWorkBranchInput,
 ): Promise<ForceTakeoverWorkBranchResult> {
@@ -984,13 +990,13 @@ export async function forceTakeoverWorkBranchAction(
       "branchId",
       "expectedBranchRevision",
       "expectedControlBasis",
-      "password",
+      input && typeof input === "object" && "memoriaProof" in input ? "memoriaProof" : "password",
       "requestId",
       "workId",
     ]) ||
-    typeof input.password !== "string" ||
-    input.password.length < 1 ||
-    input.password.length > 4096
+    ("memoriaProof" in input
+      ? typeof input.memoriaProof !== "string" || !/^msu_[a-f0-9]{64}$/.test(input.memoriaProof)
+      : typeof input.password !== "string" || input.password.length < 1 || input.password.length > 4096)
   ) {
     return {
       ok: false,
@@ -1005,7 +1011,7 @@ export async function forceTakeoverWorkBranchAction(
       operation: "continue Work on this device",
     });
     const authorization = await runtime.sdk.reauthenticate(
-      input.password,
+      "memoriaProof" in input ? { memoriaProof: input.memoriaProof! } : input.password!,
       "session_forced_takeover",
     );
     return {

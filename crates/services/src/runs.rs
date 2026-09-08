@@ -10366,9 +10366,9 @@ impl DatabaseRunStateStore {
                    OR CAST(? AS SIGNED) > total_completion_tokens
                    OR CAST(? AS SIGNED) > total_tool_calls,
                    NOW(6), updated_at),
-                 total_prompt_tokens = GREATEST(total_prompt_tokens, CAST(? AS SIGNED)),
-                 total_completion_tokens = GREATEST(total_completion_tokens, CAST(? AS SIGNED)),
-                 total_tool_calls = GREATEST(total_tool_calls, CAST(? AS SIGNED))
+                 total_prompt_tokens = IF(CAST(? AS SIGNED) > total_prompt_tokens, CAST(? AS SIGNED), total_prompt_tokens),
+                 total_completion_tokens = IF(CAST(? AS SIGNED) > total_completion_tokens, CAST(? AS SIGNED), total_completion_tokens),
+                 total_tool_calls = IF(CAST(? AS SIGNED) > total_tool_calls, CAST(? AS SIGNED), total_tool_calls)
              WHERE user_id = ? AND session_id = ? AND run_id = ?",
         )
         .bind(prompt_tokens as i64)
@@ -10379,7 +10379,10 @@ impl DatabaseRunStateStore {
         .bind(completion_tokens as i64)
         .bind(tool_calls as i64)
         .bind(prompt_tokens as i64)
+        .bind(prompt_tokens as i64)
         .bind(completion_tokens as i64)
+        .bind(completion_tokens as i64)
+        .bind(tool_calls as i64)
         .bind(tool_calls as i64)
         .bind(user_id)
         .bind(expected_session_id)
@@ -10510,12 +10513,12 @@ impl DatabaseRunStateStore {
                waiting_for = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(waiting_for), waiting_for),
                error_message = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(error_message), error_message),
                latest_event_type = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(latest_event_type), latest_event_type),
-               total_prompt_tokens = GREATEST(total_prompt_tokens, VALUES(total_prompt_tokens)),
-               total_completion_tokens = GREATEST(total_completion_tokens, VALUES(total_completion_tokens)),
-               total_tool_calls = GREATEST(total_tool_calls, VALUES(total_tool_calls)),
+               total_prompt_tokens = IF(VALUES(total_prompt_tokens) > total_prompt_tokens, VALUES(total_prompt_tokens), total_prompt_tokens),
+               total_completion_tokens = IF(VALUES(total_completion_tokens) > total_completion_tokens, VALUES(total_completion_tokens), total_completion_tokens),
+               total_tool_calls = IF(VALUES(total_tool_calls) > total_tool_calls, VALUES(total_tool_calls), total_tool_calls),
                projection_hash = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(projection_hash), projection_hash),
                updated_at = IF(VALUES(projection_event_idx) > projection_event_idx, NOW(6), updated_at),
-               projection_event_idx = GREATEST(projection_event_idx, VALUES(projection_event_idx))",
+               projection_event_idx = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(projection_event_idx), projection_event_idx)",
             [run.waiting_for.is_some(), run.error_message.is_some()],
         );
         sqlx::query(&upsert_sql)
@@ -10787,12 +10790,12 @@ impl DatabaseRunStateStore {
                latest_checkpoint_id = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_id), latest_checkpoint_id),
                latest_checkpoint_kind = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_kind), latest_checkpoint_kind),
                latest_checkpoint_version = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_version), latest_checkpoint_version),
-               total_prompt_tokens = GREATEST(total_prompt_tokens, VALUES(total_prompt_tokens)),
-               total_completion_tokens = GREATEST(total_completion_tokens, VALUES(total_completion_tokens)),
-               total_tool_calls = GREATEST(total_tool_calls, VALUES(total_tool_calls)),
+               total_prompt_tokens = IF(VALUES(total_prompt_tokens) > total_prompt_tokens, VALUES(total_prompt_tokens), total_prompt_tokens),
+               total_completion_tokens = IF(VALUES(total_completion_tokens) > total_completion_tokens, VALUES(total_completion_tokens), total_completion_tokens),
+               total_tool_calls = IF(VALUES(total_tool_calls) > total_tool_calls, VALUES(total_tool_calls), total_tool_calls),
                projection_hash = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(projection_hash), projection_hash),
                updated_at = IF(VALUES(projection_event_idx) >= projection_event_idx, NOW(6), updated_at),
-               projection_event_idx = GREATEST(projection_event_idx, VALUES(projection_event_idx))",
+               projection_event_idx = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(projection_event_idx), projection_event_idx)",
             [
                 projection.waiting_for.is_some(),
                 projection.error_message.is_some(),
@@ -15940,16 +15943,19 @@ impl RunStateStore for DatabaseRunStateStore {
                    OR CAST(? AS SIGNED) > total_completion_tokens
                    OR CAST(? AS SIGNED) > total_tool_calls,
                    NOW(6), updated_at),
-                 total_prompt_tokens = GREATEST(total_prompt_tokens, CAST(? AS SIGNED)),
-                 total_completion_tokens = GREATEST(total_completion_tokens, CAST(? AS SIGNED)),
-                 total_tool_calls = GREATEST(total_tool_calls, CAST(? AS SIGNED))
+                 total_prompt_tokens = IF(CAST(? AS SIGNED) > total_prompt_tokens, CAST(? AS SIGNED), total_prompt_tokens),
+                 total_completion_tokens = IF(CAST(? AS SIGNED) > total_completion_tokens, CAST(? AS SIGNED), total_completion_tokens),
+                 total_tool_calls = IF(CAST(? AS SIGNED) > total_tool_calls, CAST(? AS SIGNED), total_tool_calls)
              WHERE user_id = ? AND session_id = ? AND run_id = ?",
         )
         .bind(prompt_tokens as i64)
         .bind(completion_tokens as i64)
         .bind(tool_calls as i64)
         .bind(prompt_tokens as i64)
+        .bind(prompt_tokens as i64)
         .bind(completion_tokens as i64)
+        .bind(completion_tokens as i64)
+        .bind(tool_calls as i64)
         .bind(tool_calls as i64)
         .bind(user_id)
         .bind(expected_session_id)
@@ -16341,16 +16347,19 @@ impl RunStateStore for DatabaseRunStateStore {
                    OR CAST(? AS SIGNED) > total_completion_tokens
                    OR CAST(? AS SIGNED) > total_tool_calls,
                    NOW(6), updated_at),
-                 total_prompt_tokens = GREATEST(total_prompt_tokens, CAST(? AS SIGNED)),
-                 total_completion_tokens = GREATEST(total_completion_tokens, CAST(? AS SIGNED)),
-                 total_tool_calls = GREATEST(total_tool_calls, CAST(? AS SIGNED))
+                 total_prompt_tokens = IF(CAST(? AS SIGNED) > total_prompt_tokens, CAST(? AS SIGNED), total_prompt_tokens),
+                 total_completion_tokens = IF(CAST(? AS SIGNED) > total_completion_tokens, CAST(? AS SIGNED), total_completion_tokens),
+                 total_tool_calls = IF(CAST(? AS SIGNED) > total_tool_calls, CAST(? AS SIGNED), total_tool_calls)
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND run_generation = ?",
         )
         .bind(prompt_tokens as i64)
         .bind(completion_tokens as i64)
         .bind(tool_calls as i64)
         .bind(prompt_tokens as i64)
+        .bind(prompt_tokens as i64)
         .bind(completion_tokens as i64)
+        .bind(completion_tokens as i64)
+        .bind(tool_calls as i64)
         .bind(tool_calls as i64)
         .bind(user_id)
         .bind(expected_session_id)

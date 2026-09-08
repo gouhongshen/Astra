@@ -500,7 +500,7 @@ impl ServerSkillSubRunExecutor {
         invocation_ledger: crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger,
     ) -> Result<super::runtime_tool_executor::RuntimeToolExecutor, String> {
         let workspace = self.provision_skill_workspace(skill_name, presentation_session_id)?;
-        let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
+        let memoria_base = None;
         let mut builder = ToolExecutionService::builder();
         if let Some(pool) = &self.edge_connection_pool {
             builder = builder.edge_connection_pool(pool.clone());
@@ -955,6 +955,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             builder = builder.with_dedup_state(dedup.clone());
         }
 
+        builder = builder.with_memoria_client(self.memory_extraction_service.as_ref()
+            .and_then(|svc| svc.memoria_client_for_owner(&self.user_id).ok()));
         let mut host = builder.build();
         if let Some(sink) = &self.interaction_sink {
             host.set_interaction_sink(Arc::clone(sink));

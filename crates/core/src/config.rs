@@ -1133,6 +1133,9 @@ impl AppSettings {
             memoria: MemoriaSettings {
                 base_url: value_or_default(&lookup, "MEMORIA_BASE_URL", DEFAULT_MEMORIA_URL),
                 master_key: lookup("MEMORIA_MASTER_KEY"),
+                issuer: lookup("MEMORIA_ISSUER"),
+                web_url: lookup("MEMORIA_WEB_URL"),
+                legacy_issuer: lookup("MEMORIA_LEGACY_ISSUER"),
             },
             runtime_root_secret: required_value(
                 &lookup,
@@ -1498,6 +1501,9 @@ impl fmt::Debug for ApiSettings {
 pub struct MemoriaSettings {
     pub base_url: String,
     pub master_key: Option<String>,
+    pub issuer: Option<String>,
+    pub web_url: Option<String>,
+    pub legacy_issuer: Option<String>,
 }
 
 impl MemoriaSettings {
@@ -1507,6 +1513,9 @@ impl MemoriaSettings {
             base_url: env::var("MEMORIA_BASE_URL")
                 .unwrap_or_else(|_| DEFAULT_MEMORIA_URL.to_string()),
             master_key: env::var("MEMORIA_MASTER_KEY").ok(),
+            issuer: env::var("MEMORIA_ISSUER").ok(),
+            web_url: env::var("MEMORIA_WEB_URL").ok(),
+            legacy_issuer: env::var("MEMORIA_LEGACY_ISSUER").ok(),
         }
     }
 

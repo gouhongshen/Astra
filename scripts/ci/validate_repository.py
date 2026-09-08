@@ -134,6 +134,9 @@ def main() -> None:
     idc_workflow = Path(".github/workflows/build_push_to_idc.yml").read_text(
         encoding="utf-8"
     )
+    idc_candidates = Path(
+        ".github/workflows/idc-container-candidates.yml"
+    ).read_text(encoding="utf-8")
 
     for forbidden in ("push:\n    tags:", "on:\n  push:"):
         if forbidden in release_controller:
@@ -258,46 +261,78 @@ def main() -> None:
 
     for required in (
         "source_ref:",
-        'GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}',
+        "architecture:",
         "source_ref commit must belong to main or moi-dev",
         "environment: idc-publication",
-        "runs-on: ${{ vars.CONTAINER_MIRROR_RUNNER }}",
+        "idc-container-candidates.yml",
+        "Assemble verified IDC manifest",
         "Require IDC registry credentials",
-        "IDC publication requires a self-hosted runner",
-        "Build the IDC candidate locally",
-        "load: true",
-        "push: false",
-        "Verify health and exact memory round trip",
-        "docker/login-action",
-        'docker push "${target}"',
-        "org.opencontainers.image.source=https://github.com/matrixorigin/astra",
-        "IMAGE_BRANCH=${{ env.RELEASE_SOURCE_REF }}",
+        "scripts/copy-immutable-container-tag.sh",
+        "${IDC_IMAGE}-candidates",
+        '"runner":"ubuntu-24.04-arm"',
     ):
         if required not in idc_workflow:
             errors.append(
-                ".github/workflows/build_push_to_idc.yml: missing trusted-controller "
-                f"or self-hosted admission contract ({required})"
+                ".github/workflows/build_push_to_idc.yml: missing IDC controller "
+                f"or publication contract ({required})"
             )
 
-    idc_build = idc_workflow.find("Build the IDC candidate locally")
-    idc_smoke = idc_workflow.find("Verify health and exact memory round trip")
-    idc_login = idc_workflow.find("docker/login-action")
-    idc_push = idc_workflow.find('docker push "${target}"')
-    if not 0 <= idc_build < idc_smoke < idc_login < idc_push:
-        errors.append(
-            ".github/workflows/build_push_to_idc.yml: the verified local image must "
-            "pass smoke before Harbor authentication and publication"
-        )
-    for forbidden in (
-        "release-container-candidates.yml",
+    for required in (
+        "workflow_call:",
+        "controller_sha:",
         "push-by-digest=true",
+        "context: source",
+        "file: source/Dockerfile",
         "buildcache-",
-        "astra-candidate-${GITHUB_RUN_ID}",
+        "make stack-up",
+        "make stack-verify",
+        "idc-digest-",
+        "Retain IDC candidate with a run-scoped immutable tag",
+        "org.opencontainers.image.source=https://github.com/matrixorigin/astra",
+        "IMAGE_BRANCH=${{ env.RELEASE_SOURCE_REF }}",
     ):
-        if forbidden in idc_workflow:
+        if required not in idc_candidates:
             errors.append(
-                ".github/workflows/build_push_to_idc.yml: IDC runtime repository must "
-                f"not receive candidate/cache objects ({forbidden})"
+                ".github/workflows/idc-container-candidates.yml: missing copied "
+                f"release candidate contract ({required})"
+            )
+    for forbidden in ("DOCKERHUB_", "matrixorigin/astra:"):
+        if forbidden in idc_workflow + idc_candidates:
+            errors.append(
+                ".github/workflows/build_push_to_idc.yml: IDC builds must not publish "
+                f"to Docker Hub ({forbidden})"
+            )
+
+    immutable_copy = Path("scripts/copy-immutable-container-tag.sh").read_text(
+        encoding="utf-8"
+    )
+    for required in (
+        "could not safely inspect",
+        "inspect-harbor-artifact.py",
+        "crane copy --platform=all --jobs 2",
+        "already exists with digest",
+        "resolves to ${target_digest}, expected ${source_digest}",
+    ):
+        if required not in immutable_copy:
+            errors.append(
+                "scripts/copy-immutable-container-tag.sh: missing fail-closed "
+                f"immutable publication contract ({required})"
+            )
+
+    harbor_inspector = Path("scripts/inspect-harbor-artifact.py").read_text(
+        encoding="utf-8"
+    )
+    for required in (
+        'if error.code == 404:',
+        'item.get("code") == "NOT_FOUND"',
+        "return NOT_FOUND",
+        "Harbor artifact lookup failed with HTTP",
+        'document.get("digest")',
+    ):
+        if required not in harbor_inspector:
+            errors.append(
+                "scripts/inspect-harbor-artifact.py: missing structured artifact "
+                f"lookup contract ({required})"
             )
 
     manifest_reconciler = Path("scripts/reconcile-docker-manifest.sh").read_text(

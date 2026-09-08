@@ -3,7 +3,7 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStruct};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, query};
+use sqlx::{Row, query, query_scalar};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
@@ -636,6 +636,7 @@ pub struct ResolvedModelOffering {
 #[serde(rename_all = "snake_case")]
 pub enum ModelAccessKind {
     AstraCloud,
+    CloudByok,
     Workspace,
     ThisDevice,
     SelfHosted,
@@ -646,6 +647,7 @@ impl ModelAccessKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AstraCloud => "astra_cloud",
+            Self::CloudByok => "cloud_byok",
             Self::Workspace => "workspace",
             Self::ThisDevice => "this_device",
             Self::SelfHosted => "self_hosted",
@@ -1569,6 +1571,153 @@ pub async fn revalidate_active_llm_offering(
     }
 }
 
+/// Revalidate execution material for an authenticated user's effective
+/// catalog. Personal Cloud BYOK Offerings are owner-scoped; deployment
+/// Offerings retain the existing global catalog behavior.
+pub async fn revalidate_admitted_model_execution(
+    matrixone: &MatrixOneSettings,
+    encryptor: &FernetTokenEncryptor,
+    user_id: &str,
+    offering_id: &str,
+    pool: Option<&sqlx::Pool<sqlx::MySql>>,
+) -> Result<AdmittedModelExecution, ModelOfferingResolutionError> {
+    let offering_id = validate_model_offering_id(offering_id)?;
+    let pool = require_pool(pool, matrixone)
+        .await
+        .map_err(ModelOfferingResolutionError::Backend)?;
+    let row = query(
+        "SELECT model_alias, model_name, provider, api_key_encrypted, base_url, \
+         context_window, is_active FROM user_llm_models \
+         WHERE user_id = ? AND model_id = ? LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(offering_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|error| ModelOfferingResolutionError::Backend(format!("DB query: {error}")))?;
+
+    if let Some(row) = row {
+        let alias: String = row.try_get("model_alias").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid user_llm_models.model_alias: {error}"
+            ))
+        })?;
+        let is_active: i16 = row.try_get("is_active").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid user_llm_models.is_active: {error}"
+            ))
+        })?;
+        if is_active == 0 {
+            return Err(ModelOfferingResolutionError::Inactive {
+                offering_id: offering_id.to_string(),
+                model_name: alias,
+            });
+        }
+        let encrypted: String = row.try_get("api_key_encrypted").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid user_llm_models.api_key_encrypted: {error}"
+            ))
+        })?;
+        let api_key = encryptor
+            .decrypt(&encrypted)
+            .map_err(ModelOfferingResolutionError::Backend)?;
+        let context_window: i32 = row.try_get("context_window").map_err(|error| {
+            ModelOfferingResolutionError::Backend(format!(
+                "invalid user_llm_models.context_window: {error}"
+            ))
+        })?;
+        let context_window = u32::try_from(context_window).map_err(|_| {
+            ModelOfferingResolutionError::Backend(
+                "invalid user_llm_models.context_window: must be positive".to_string(),
+            )
+        })?;
+        let provider: String = row
+            .try_get("provider")
+            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+        let base_url: String = row
+            .try_get("base_url")
+            .map_err(|error| ModelOfferingResolutionError::Backend(error.to_string()))?;
+        if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+            crate::byok_endpoint::require_endpoint_policy(&pool, &base_url)
+                .await
+                .map_err(ModelOfferingResolutionError::Backend)?;
+        }
+        return Ok(AdmittedModelExecution {
+            offering_id: offering_id.to_string(),
+            access_kind: ModelAccessKind::CloudByok,
+            execution_placement: ModelExecutionPlacement::Server,
+            model_name: alias,
+            wire_model_name: Some(row.try_get("model_name").map_err(|error| {
+                ModelOfferingResolutionError::Backend(format!(
+                    "invalid user_llm_models.model_name: {error}"
+                ))
+            })?),
+            api_key,
+            base_url: row.try_get("base_url").map_err(|error| {
+                ModelOfferingResolutionError::Backend(format!(
+                    "invalid user_llm_models.base_url: {error}"
+                ))
+            })?,
+            provider: row.try_get("provider").map_err(|error| {
+                ModelOfferingResolutionError::Backend(format!(
+                    "invalid user_llm_models.provider: {error}"
+                ))
+            })?,
+            cache_capability: None,
+            thinking_capability: None,
+            request_body_overrides: None,
+            context_window: Some(context_window),
+            max_completion_tokens: None,
+            header_overrides: HashMap::new(),
+            completions_url_override: None,
+            request_timeout_ms: None,
+        });
+    }
+
+    if !deployment_models_allowed(&pool, user_id)
+        .await
+        .map_err(ModelOfferingResolutionError::Backend)?
+    {
+        return Err(ModelOfferingResolutionError::NotFound {
+            offering_id: offering_id.to_string(),
+        });
+    }
+    let offering =
+        revalidate_active_llm_offering(matrixone, encryptor, offering_id, Some(&pool)).await?;
+    AdmittedModelExecution::from_offering(offering).map_err(ModelOfferingResolutionError::Backend)
+}
+
+/// Shared eligibility gate for catalog and execution, including resumed runs.
+/// Memoria identities are personal BYOK even on a self-hosted deployment.
+async fn deployment_models_allowed(pool: &sqlx::MySqlPool, user_id: &str) -> Result<bool, String> {
+    let mode = std::env::var("ASTRA_DEPLOYMENT_MODE")
+        .map(Some)
+        .or_else(|error| match error {
+            std::env::VarError::NotPresent => Ok(None),
+            _ => Err("Invalid ASTRA_DEPLOYMENT_MODE".to_string()),
+        })?;
+    if !deployment_mode_allows_shared_models(mode.as_deref())? {
+        return Ok(false);
+    }
+    let mapped: Option<String> = sqlx::query_scalar(
+        "SELECT external_subject FROM auth_external_identities WHERE astra_user_id = ? AND provider_id LIKE 'memoria:%' UNION ALL SELECT memoria_user_id FROM auth_memoria_identities WHERE astra_user_id = ? LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| format!("Model ownership lookup failed: {error}"))?;
+    Ok(mapped.is_none())
+}
+
+fn deployment_mode_allows_shared_models(mode: Option<&str>) -> Result<bool, String> {
+    match mode {
+        None | Some("self-hosted") => Ok(true),
+        Some("cloud-byok") => Ok(false),
+        _ => Err("Invalid ASTRA_DEPLOYMENT_MODE; expected cloud-byok or self-hosted".into()),
+    }
+}
+
 async fn resolve_active_llm_offering_uncached(
     encryptor: &FernetTokenEncryptor,
     offering_id: &str,
@@ -1843,9 +1992,17 @@ fn rank_memory_model_candidate_indices(
 pub async fn resolve_memory_offerings(
     matrixone: &MatrixOneSettings,
     encryptor: &FernetTokenEncryptor,
+    user_id: &str,
     pool: Option<&sqlx::Pool<sqlx::MySql>>,
 ) -> Result<Vec<ResolvedModelOffering>, String> {
     let pool = require_pool(pool, matrixone).await?;
+
+    // A memory-write grant is not authorization to spend deployment credentials.
+    // Personal BYOK has no implicit background selector binding: use the
+    // existing deterministic extraction path until one is explicitly admitted.
+    if !deployment_models_allowed(&pool, user_id).await? {
+        return Ok(Vec::new());
+    }
 
     let rows = sqlx::query(&format!(
         "SELECT model_id, {RESOLVE_COLS} FROM infra_llm_models WHERE is_active = 1"
@@ -2054,10 +2211,157 @@ fn model_list_page_from_items(
     })
 }
 
+/// User-owned Server-side BYOK model configuration.
+///
+/// The credential is deliberately absent. It is accepted only on create or
+/// rotation and is never projected back through the API.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModelRecord {
+    pub model_id: String,
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub context_window: i32,
+    pub is_default: bool,
+    pub is_active: bool,
+    pub credential_configured: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct UserModelCreateRequestData {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub api_key: String,
+    pub context_window: i32,
+    pub is_default: bool,
+}
+
+impl std::fmt::Debug for UserModelCreateRequestData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserModelCreateRequestData")
+            .field("name", &self.name)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("api_key", &"<redacted>")
+            .field("context_window", &self.context_window)
+            .field("is_default", &self.is_default)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, PartialEq)]
+pub struct UserModelUpdateRequestData {
+    pub api_key: Option<String>,
+    pub context_window: Option<i32>,
+    pub is_default: Option<bool>,
+    pub is_active: Option<bool>,
+}
+
+impl std::fmt::Debug for UserModelUpdateRequestData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserModelUpdateRequestData")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("context_window", &self.context_window)
+            .field("is_default", &self.is_default)
+            .field("is_active", &self.is_active)
+            .finish()
+    }
+}
+
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]
 pub trait ModelService: Send + Sync {
+    /// Credential-free preflight. This is not authorization for later requests.
+    async fn validate_user_model_endpoint(
+        &self,
+        _user_id: String,
+        _base_url: String,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        Err(internal_error("user model service not configured"))
+    }
+
+    async fn create_user_model(
+        &self,
+        _user_id: String,
+        _request: UserModelCreateRequestData,
+    ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(internal_error("user model service not configured"))
+    }
+
+    async fn list_user_models(
+        &self,
+        _user_id: String,
+    ) -> Result<Vec<UserModelRecord>, (StatusCode, Json<ErrorResponse>)> {
+        Ok(Vec::new())
+    }
+
+    async fn get_user_model(
+        &self,
+        _user_id: String,
+        _model_id: String,
+    ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(internal_error("user model service not configured"))
+    }
+
+    async fn update_user_model(
+        &self,
+        _user_id: String,
+        _model_id: String,
+        _request: UserModelUpdateRequestData,
+    ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(internal_error("user model service not configured"))
+    }
+
+    async fn delete_user_model(
+        &self,
+        _user_id: String,
+        _model_id: String,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        Err(internal_error("user model service not configured"))
+    }
+
+    async fn check_user_model(
+        &self,
+        _user_id: String,
+        _model_id: String,
+    ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(internal_error("user model service not configured"))
+    }
+
+    async fn default_user_model_offering_id(
+        &self,
+        _user_id: String,
+    ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+        Ok(None)
+    }
+
+    /// Revalidate and materialize an Offering for one authenticated user.
+    async fn allows_deployment_models(
+        &self,
+        _user_id: String,
+    ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+        Ok(true)
+    }
+
+    /// Revalidate and materialize an Offering for one authenticated user.
+    /// The default implementation preserves the deployment catalog behavior;
+    /// database-backed services additionally resolve user-owned BYOK rows.
+    async fn admit_model_offering(
+        &self,
+        _user_id: String,
+        offering_id: String,
+    ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
+        let offering = self.revalidate_model_offering(offering_id).await?;
+        AdmittedModelExecution::from_offering(offering).map_err(internal_error)
+    }
+
     async fn create_model(
         &self,
         user_id: String,
@@ -2299,6 +2603,45 @@ impl DatabaseModelService {
             thinking_capability,
         })
     }
+
+    fn user_model_record_from_row(
+        row: &sqlx::mysql::MySqlRow,
+    ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        let context_window: i32 = row.try_get("context_window").map_err(internal_error)?;
+        validate_context_window_value(context_window, "user model context_window")
+            .map_err(internal_error)?;
+        let is_default: i16 = row.try_get("is_default").map_err(internal_error)?;
+        let is_active: i16 = row.try_get("is_active").map_err(internal_error)?;
+        Ok(UserModelRecord {
+            model_id: row.try_get("model_id").map_err(internal_error)?,
+            name: row.try_get("model_alias").map_err(internal_error)?,
+            provider: row.try_get("provider").map_err(internal_error)?,
+            model: row.try_get("model_name").map_err(internal_error)?,
+            base_url: row.try_get("base_url").map_err(internal_error)?,
+            context_window,
+            is_default: is_default != 0,
+            is_active: is_active != 0,
+            credential_configured: true,
+            created_at: row.try_get("created_at_text").map_err(internal_error)?,
+            updated_at: row.try_get("updated_at_text").map_err(internal_error)?,
+        })
+    }
+
+    async fn user_model_row(
+        &self,
+        user_id: &str,
+        model_id: &str,
+    ) -> Result<Option<sqlx::mysql::MySqlRow>, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        query(&format!(
+            "SELECT {USER_MODEL_SELECT_COLS} FROM user_llm_models WHERE user_id = ? AND model_id = ?"
+        ))
+        .bind(user_id)
+        .bind(model_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)
+    }
 }
 
 pub const MODEL_SELECT_COLS: &str = "\
@@ -2319,9 +2662,357 @@ const MODEL_LIST_CURSOR_SQL: &str = " AND (provider > ? \
      OR (provider = ? AND model_name > ?) \
      OR (provider = ? AND model_name = ? AND model_id > ?))";
 const MODEL_LIST_ORDER_SQL: &str = " ORDER BY provider ASC, model_name ASC, model_id ASC LIMIT ?";
+const USER_MODEL_SELECT_COLS: &str = "model_id, model_alias, model_name, provider, base_url, \
+    context_window, is_default, is_active, \
+    CAST(created_at AS CHAR) AS created_at_text, CAST(updated_at AS CHAR) AS updated_at_text";
 
 #[async_trait]
 impl ModelService for DatabaseModelService {
+    async fn allows_deployment_models(
+        &self,
+        user_id: String,
+    ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        deployment_models_allowed(&pool, &user_id)
+            .await
+            .map_err(internal_error)
+    }
+    async fn validate_user_model_endpoint(
+        &self,
+        _user_id: String,
+        base_url: String,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        crate::byok_endpoint::require_endpoint_policy(&pool, &base_url)
+            .await
+            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        // Validate DNS without sending an HTTP request or accepting any secret.
+        crate::byok_endpoint::endpoint_client(&base_url)
+            .await
+            .map_err(|error| {
+                astra_core::error_response_coded(
+                    StatusCode::BAD_GATEWAY,
+                    error,
+                    "model_endpoint_network",
+                )
+            })?;
+        Ok(())
+    }
+
+    async fn create_user_model(
+        &self,
+        user_id: String,
+        request: UserModelCreateRequestData,
+    ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        let name = validate_user_model_identifier("name", &request.name)?;
+        let model = validate_user_model_identifier("model", &request.model)?;
+        let provider = request.provider.trim().to_ascii_lowercase();
+        let base_url = user_byok_base_url(&provider, request.base_url.as_deref())?;
+        validate_context_window_value(request.context_window, "context_window")
+            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        validate_user_model_api_key(&request.api_key)?;
+
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let duplicate =
+            query("SELECT 1 FROM user_llm_models WHERE user_id = ? AND model_alias = ? LIMIT 1")
+                .bind(&user_id)
+                .bind(&name)
+                .fetch_optional(&pool)
+                .await
+                .map_err(internal_error)?;
+        if duplicate.is_some() {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                format!("User model '{name}' already exists"),
+            ));
+        }
+
+        if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+            crate::byok_endpoint::require_endpoint_policy(&pool, &base_url)
+                .await
+                .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        }
+
+        let encrypted_key = self
+            .encryptor
+            .encrypt(&request.api_key)
+            .map_err(internal_error)?;
+        let connectivity = validate_connectivity(
+            &provider,
+            &model,
+            &request.api_key,
+            Some(&base_url),
+            None,
+            None,
+        )
+        .await;
+        if let Some(reason) = connectivity {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!("Model credential or endpoint check failed: {reason}"),
+            ));
+        }
+
+        let model_id = Uuid::new_v4().to_string();
+        let mut tx = pool.begin().await.map_err(internal_error)?;
+        if request.is_default {
+            query(
+                "UPDATE user_llm_models SET is_default = 0, updated_at = NOW(6) WHERE user_id = ?",
+            )
+            .bind(&user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+        }
+        query(
+            "INSERT INTO user_llm_models \
+             (model_id, user_id, model_alias, model_name, provider, api_key_encrypted, base_url, \
+              context_window, is_default, is_active, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NOW(6), NOW(6))",
+        )
+        .bind(&model_id)
+        .bind(&user_id)
+        .bind(&name)
+        .bind(&model)
+        .bind(&provider)
+        .bind(&encrypted_key)
+        .bind(&base_url)
+        .bind(request.context_window)
+        .bind(if request.is_default { 1_i16 } else { 0_i16 })
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+        tx.commit().await.map_err(internal_error)?;
+
+        self.get_user_model(user_id, model_id).await
+    }
+
+    async fn list_user_models(
+        &self,
+        user_id: String,
+    ) -> Result<Vec<UserModelRecord>, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let rows = query(&format!(
+            "SELECT {USER_MODEL_SELECT_COLS} FROM user_llm_models \
+             WHERE user_id = ? ORDER BY is_default DESC, model_alias ASC, model_id ASC"
+        ))
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .map_err(internal_error)?;
+        rows.iter().map(Self::user_model_record_from_row).collect()
+    }
+
+    async fn get_user_model(
+        &self,
+        user_id: String,
+        model_id: String,
+    ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        let row = self
+            .user_model_row(&user_id, &model_id)
+            .await?
+            .ok_or_else(user_model_not_found)?;
+        Self::user_model_record_from_row(&row)
+    }
+
+    async fn update_user_model(
+        &self,
+        user_id: String,
+        model_id: String,
+        request: UserModelUpdateRequestData,
+    ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        if request.api_key.is_none()
+            && request.context_window.is_none()
+            && request.is_default.is_none()
+            && request.is_active.is_none()
+        {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "At least one user model field must be supplied",
+            ));
+        }
+        if let Some(context_window) = request.context_window {
+            validate_context_window_value(context_window, "context_window")
+                .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        }
+        if request.is_default == Some(true) && request.is_active == Some(false) {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "A disabled user model cannot be the default",
+            ));
+        }
+
+        let existing = self
+            .user_model_row(&user_id, &model_id)
+            .await?
+            .ok_or_else(user_model_not_found)?;
+        let provider: String = existing.try_get("provider").map_err(internal_error)?;
+        let model: String = existing.try_get("model_name").map_err(internal_error)?;
+        let base_url: String = existing.try_get("base_url").map_err(internal_error)?;
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER
+            && (request.api_key.is_some()
+                || request.is_active == Some(true)
+                || request.is_default == Some(true))
+        {
+            crate::byok_endpoint::require_endpoint_policy(&pool, &base_url)
+                .await
+                .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        }
+        let encrypted_key = if let Some(api_key) = request.api_key.as_deref() {
+            validate_user_model_api_key(api_key)?;
+            if let Some(reason) =
+                validate_connectivity(&provider, &model, api_key, Some(&base_url), None, None).await
+            {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Model credential or endpoint check failed: {reason}"),
+                ));
+            }
+            Some(self.encryptor.encrypt(api_key).map_err(internal_error)?)
+        } else {
+            None
+        };
+
+        let mut tx = pool.begin().await.map_err(internal_error)?;
+        if request.is_default == Some(true) {
+            query(
+                "UPDATE user_llm_models SET is_default = 0, updated_at = NOW(6) WHERE user_id = ?",
+            )
+            .bind(&user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+        }
+        if let Some(encrypted_key) = encrypted_key {
+            query("UPDATE user_llm_models SET api_key_encrypted = ?, updated_at = NOW(6) WHERE user_id = ? AND model_id = ?")
+                .bind(encrypted_key)
+                .bind(&user_id)
+                .bind(&model_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+        }
+        if let Some(context_window) = request.context_window {
+            query("UPDATE user_llm_models SET context_window = ?, updated_at = NOW(6) WHERE user_id = ? AND model_id = ?")
+                .bind(context_window)
+                .bind(&user_id)
+                .bind(&model_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+        }
+        if let Some(is_active) = request.is_active {
+            query("UPDATE user_llm_models SET is_active = ?, is_default = CASE WHEN ? = 0 THEN 0 ELSE is_default END, updated_at = NOW(6) WHERE user_id = ? AND model_id = ?")
+                .bind(if is_active { 1_i16 } else { 0_i16 })
+                .bind(if is_active { 1_i16 } else { 0_i16 })
+                .bind(&user_id)
+                .bind(&model_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+        }
+        if let Some(is_default) = request.is_default {
+            query("UPDATE user_llm_models SET is_default = ?, is_active = CASE WHEN ? = 1 THEN 1 ELSE is_active END, updated_at = NOW(6) WHERE user_id = ? AND model_id = ?")
+                .bind(if is_default { 1_i16 } else { 0_i16 })
+                .bind(if is_default { 1_i16 } else { 0_i16 })
+                .bind(&user_id)
+                .bind(&model_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal_error)?;
+        }
+        tx.commit().await.map_err(internal_error)?;
+        self.get_user_model(user_id, model_id).await
+    }
+
+    async fn delete_user_model(
+        &self,
+        user_id: String,
+        model_id: String,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let result = query("DELETE FROM user_llm_models WHERE user_id = ? AND model_id = ?")
+            .bind(user_id)
+            .bind(model_id)
+            .execute(&pool)
+            .await
+            .map_err(internal_error)?;
+        if result.rows_affected() == 0 {
+            return Err(user_model_not_found());
+        }
+        Ok(())
+    }
+
+    async fn check_user_model(
+        &self,
+        user_id: String,
+        model_id: String,
+    ) -> Result<UserModelRecord, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let row = query(
+            "SELECT model_name, provider, api_key_encrypted, base_url \
+             FROM user_llm_models WHERE user_id = ? AND model_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&model_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(user_model_not_found)?;
+        let model: String = row.try_get("model_name").map_err(internal_error)?;
+        let provider: String = row.try_get("provider").map_err(internal_error)?;
+        let encrypted: String = row.try_get("api_key_encrypted").map_err(internal_error)?;
+        let base_url: String = row.try_get("base_url").map_err(internal_error)?;
+        if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+            crate::byok_endpoint::require_endpoint_policy(&pool, &base_url)
+                .await
+                .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        }
+        let api_key = self.encryptor.decrypt(&encrypted).map_err(internal_error)?;
+        if let Some(reason) =
+            validate_connectivity(&provider, &model, &api_key, Some(&base_url), None, None).await
+        {
+            return Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("Model credential or endpoint check failed: {reason}"),
+            ));
+        }
+        self.get_user_model(user_id, model_id).await
+    }
+
+    async fn default_user_model_offering_id(
+        &self,
+        user_id: String,
+    ) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        query_scalar(
+            "SELECT model_id FROM user_llm_models \
+             WHERE user_id = ? AND is_default = 1 AND is_active = 1 \
+             ORDER BY updated_at DESC, model_id ASC LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)
+    }
+
+    async fn admit_model_offering(
+        &self,
+        user_id: String,
+        offering_id: String,
+    ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
+        revalidate_admitted_model_execution(
+            &self.matrixone,
+            self.encryptor.as_ref(),
+            &user_id,
+            &offering_id,
+            self.pool.as_ref().map(SharedPool::get),
+        )
+        .await
+        .map_err(model_offering_resolution_error_response)
+    }
+
     async fn create_model(
         &self,
         user_id: String,
@@ -2450,7 +3141,7 @@ impl ModelService for DatabaseModelService {
 
     async fn list_models(
         &self,
-        _user_id: String,
+        user_id: String,
         is_admin: bool,
     ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
@@ -2466,7 +3157,11 @@ impl ModelService for DatabaseModelService {
                 MODEL_LIST_SELECT_COLS
             )
         };
-        let rows = query(&sql).fetch_all(&pool).await.map_err(internal_error)?;
+        let rows = if is_admin || self.allows_deployment_models(user_id.clone()).await? {
+            query(&sql).fetch_all(&pool).await.map_err(internal_error)?
+        } else {
+            Vec::new()
+        };
 
         let mut models = Vec::with_capacity(rows.len());
         for row in rows {
@@ -2498,16 +3193,50 @@ impl ModelService for DatabaseModelService {
                 },
             });
         }
+        if !is_admin && !user_id.is_empty() {
+            let user_rows = query(
+                "SELECT model_id, model_alias, provider, context_window, is_active \
+                 FROM user_llm_models WHERE user_id = ? AND is_active = 1 \
+                 ORDER BY provider, model_alias, model_id",
+            )
+            .bind(&user_id)
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
+            for row in user_rows {
+                let is_active: i16 = row.try_get("is_active").map_err(internal_error)?;
+                models.push(ModelListItem {
+                    offering_id: row.try_get("model_id").map_err(internal_error)?,
+                    access_id: "cloud-byok".to_string(),
+                    access_kind: ModelAccessKind::CloudByok,
+                    access_label: "Cloud BYOK".to_string(),
+                    execution_placement: ModelExecutionPlacement::Server,
+                    name: row.try_get("model_alias").map_err(internal_error)?,
+                    provider: row.try_get("provider").map_err(internal_error)?,
+                    description: Some("Personal BYOK model".to_string()),
+                    is_active: is_active != 0,
+                    context_window: row.try_get("context_window").map_err(internal_error)?,
+                    max_completion_tokens: None,
+                    architecture: None,
+                    thinking_capability: None,
+                });
+            }
+        }
+        sort_model_list_items(&mut models);
         Ok(models)
     }
 
     async fn list_models_page(
         &self,
-        _user_id: String,
+        user_id: String,
         is_admin: bool,
         limit: u32,
         cursor: Option<ModelListCursor>,
     ) -> Result<ModelListPage, (StatusCode, Json<ErrorResponse>)> {
+        if !is_admin && !user_id.is_empty() {
+            let items = self.list_models(user_id, false).await?;
+            return model_list_page_from_items(items, limit, cursor);
+        }
         let limit = validate_model_list_limit(limit);
         let cursor = cursor
             .as_ref()
@@ -2571,9 +3300,14 @@ impl ModelService for DatabaseModelService {
 
     async fn model_catalog_revision(
         &self,
-        _user_id: String,
+        user_id: String,
         is_admin: bool,
     ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+        if !is_admin && !user_id.is_empty() {
+            return Ok(model_catalog_revision(
+                &self.list_models(user_id, false).await?,
+            ));
+        }
         let pool = self.get_pool().await.map_err(internal_error)?;
         let visibility = if is_admin { "1 = 1" } else { "is_active = 1" };
         let fingerprint_sql = format!(
@@ -2969,6 +3703,111 @@ pub fn resolve_provider_base_url(provider: &str) -> Option<String> {
     }
 }
 
+fn user_byok_base_url(
+    provider: &str,
+    requested: Option<&str>,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    match (provider, requested) {
+        (crate::byok_endpoint::COMPATIBLE_PROVIDER, Some(raw)) => {
+            Ok(crate::byok_endpoint::parse_endpoint(raw)
+                .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?
+                .as_str()
+                .trim_end_matches('/')
+                .to_string())
+        }
+        (crate::byok_endpoint::COMPATIBLE_PROVIDER, None) => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "base_url is required for OpenAI-compatible",
+        )),
+        (_, Some(_)) => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "Use provider openai-compatible to configure a custom base_url",
+        )),
+        (_, None) => user_byok_provider_base_url(provider),
+    }
+}
+
+fn user_byok_provider_base_url(
+    provider: &str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    if std::env::var("ASTRA_ALLOW_INSECURE_DEFAULTS").as_deref() == Ok("1")
+        && provider == "deepseek"
+        && let Ok(base_url) = std::env::var("ASTRA_BYOK_DEEPSEEK_BASE_URL")
+    {
+        let parsed = reqwest::Url::parse(&base_url).map_err(|_| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ASTRA_BYOK_DEEPSEEK_BASE_URL is invalid",
+            )
+        })?;
+        let loopback = parsed.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
+        if parsed.scheme() != "http"
+            || !loopback
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ASTRA_BYOK_DEEPSEEK_BASE_URL must be an unauthenticated loopback HTTP origin",
+            ));
+        }
+        return Ok(base_url.trim_end_matches('/').to_string());
+    }
+    let base_url = match provider {
+        "openai" => "https://api.openai.com/v1",
+        "anthropic" => "https://api.anthropic.com",
+        "deepseek" => "https://api.deepseek.com",
+        _ => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Unsupported BYOK provider '{provider}'. Supported providers: openai, anthropic, deepseek, openai-compatible"
+                ),
+            ));
+        }
+    };
+    Ok(base_url.to_string())
+}
+
+fn validate_user_model_identifier(
+    field: &str,
+    value: &str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 100 || value.chars().any(char::is_control) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{field} must contain 1 to 100 non-control characters"),
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn validate_user_model_api_key(api_key: &str) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if api_key.is_empty()
+        || api_key.len() > 8_192
+        || api_key.trim() != api_key
+        || api_key.chars().any(char::is_control)
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "api_key must be a non-empty credential without surrounding whitespace or control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn user_model_not_found() -> (StatusCode, Json<ErrorResponse>) {
+    error_response(StatusCode::NOT_FOUND, "User model not found")
+}
+
 /// Full URL for a minimal Anthropic Messages API probe (`POST`, JSON body).
 ///
 /// - Official Anthropic: `https://api.anthropic.com` → `.../v1/messages`.
@@ -3015,13 +3854,21 @@ pub async fn validate_connectivity(
 
     // Connectivity probes reach external provider endpoints (Anthropic, Bedrock,
     // OpenAI-compatible base_urls) — same class of traffic as the LLM client.
-    // They are NOT "internal connections" in the sense of 3e3d6fa8, so they
-    // share the LLM client's proxy policy via the single authoritative
-    // implementation in `astra_core::net::apply_env_proxy`.
+    // Native providers share the LLM client's ambient proxy policy. User-owned
+    // OpenAI-compatible endpoints instead use the pinned BYOK egress transport
+    // below, matching their runtime path without delegating destination DNS.
     let probe_builder = astra_core::net::apply_env_proxy(
         reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
     );
-    let client = match probe_builder.build() {
+    let client_result = if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+        crate::byok_endpoint::endpoint_client(base_url.unwrap_or_default()).await
+    } else {
+        probe_builder
+            .build()
+            .map(crate::byok_endpoint::EndpointClient::from)
+            .map_err(|e| e.to_string())
+    };
+    let client = match client_result {
         Ok(c) => c,
         Err(e) => return Some(format!("Client error: {}", e)),
     };
@@ -3040,14 +3887,12 @@ pub async fn validate_connectivity(
                 }
             }
         }
-        let send_result = req
-            .json(&serde_json::json!({
-               "model": model_name,
-               "max_tokens": 1,
-               "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .send()
-            .await;
+        let mut body = serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        astra_core::model_wire::apply_chat_output_token_limit(&mut body, provider, 32);
+        let send_result = req.json(&body).send().await;
         (send_result, probe)
     } else if provider == "bedrock" {
         let Some(base_url_value) = base_url.map(str::trim).filter(|url| !url.is_empty()) else {
@@ -3115,21 +3960,26 @@ pub async fn validate_connectivity(
                 }
             }
         }
-        let send_result = req
-            .json(&serde_json::json!({
-                "model": model_name,
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .send()
-            .await;
+        let mut body = serde_json::json!({
+            "model": model_name,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        astra_core::model_wire::apply_chat_output_token_limit(&mut body, provider, 32);
+        let send_result = req.json(&body).send().await;
         (send_result, probe)
     };
 
     match result {
-        (Ok(resp), _) if resp.status().as_u16() < 400 => None,
+        (Ok(resp), _) if resp.status().is_success() => None,
         (Ok(resp), _) => {
             let status = resp.status().as_u16();
+            if provider == crate::byok_endpoint::COMPATIBLE_PROVIDER {
+                // Arbitrary compatible endpoints may reflect credentials in
+                // their error body. Return status without forwarding that body.
+                return Some(format!(
+                    "HTTP {status}: check the model ID, API key and endpoint"
+                ));
+            }
             let text = resp.text().await.unwrap_or_default();
             let detail = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
@@ -3632,6 +4482,50 @@ impl ModelService for UnconfiguredModelService {
 
 // ── HTTP types ───────────────────────────────────────────────────────────────
 
+fn default_user_model_context_window() -> i32 {
+    128_000
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModelCreateRequest {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub api_key: String,
+    #[serde(default = "default_user_model_context_window")]
+    pub context_window: i32,
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+impl std::fmt::Debug for UserModelCreateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserModelCreateRequest")
+            .field("name", &self.name)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("api_key", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModelUpdateRequest {
+    pub api_key: Option<String>,
+    pub context_window: Option<i32>,
+    pub is_default: Option<bool>,
+    pub is_active: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserModelListResponse {
+    pub items: Vec<UserModelRecord>,
+}
+
 #[derive(Deserialize)]
 pub struct ModelCreateRequest {
     pub name: String,
@@ -3834,6 +4728,7 @@ pub enum ModelAccessAction {
     ContactAdministrator,
     ReconnectDevice,
     ConfigureDeviceModels,
+    ConfigureCloudByokModels,
     Reauthenticate,
     ManageBilling,
     Retry,
@@ -3976,6 +4871,9 @@ fn recovery_actions(
         }
         (_, Some(ModelAccessReason::NoEligibleOfferings), ModelAccessKind::ThisDevice) => {
             vec![ModelAccessAction::ConfigureDeviceModels]
+        }
+        (_, Some(ModelAccessReason::NoEligibleOfferings), ModelAccessKind::CloudByok) => {
+            vec![ModelAccessAction::ConfigureCloudByokModels]
         }
         (
             _,
@@ -4177,7 +5075,6 @@ pub fn project_model_access_page_with_default_catalog(
     sort_model_list_item_responses(&mut offerings);
 
     let mut offering_ids = BTreeSet::new();
-    let mut counts = BTreeMap::<String, u32>::new();
     for offering in &offerings {
         validate_model_offering_id(&offering.offering_id).map_err(|_| {
             crate::service_error::ServiceError::invalid(format!(
@@ -4212,15 +5109,45 @@ pub fn project_model_access_page_with_default_catalog(
                 offering.offering_id, offering.access_id
             )));
         }
+    }
+
+    // Access counts describe the complete effective catalog, not the current
+    // seek-paginated page.  Counting the page (or assigning the aggregate
+    // total to every access) makes a mixed self-hosted/Cloud-BYOK catalog
+    // internally inconsistent and causes strict clients to reject it.
+    let mut counts = BTreeMap::<String, u32>::new();
+    for offering in default_catalog {
+        let Some(access) = accesses.get(&offering.access_id) else {
+            return Err(crate::service_error::ServiceError::invalid(format!(
+                "Offering '{}' references undeclared Model Access '{}'",
+                offering.offering_id, offering.access_id
+            )));
+        };
+        if access.kind != offering.access_kind
+            || access.label != offering.access_label
+            || access.execution_placement != offering.execution_placement
+        {
+            return Err(crate::service_error::ServiceError::conflict(format!(
+                "Offering '{}' conflicts with Model Access '{}'",
+                offering.offering_id, offering.access_id
+            )));
+        }
         let count = counts.entry(offering.access_id.clone()).or_default();
         *count = count.saturating_add(1);
+    }
+    if let Some(total) = total_offerings
+        && usize::try_from(total).ok() != Some(default_catalog.len())
+    {
+        return Err(crate::service_error::ServiceError::conflict(format!(
+            "effective catalog advertised {total} Offerings but supplied {} for projection",
+            default_catalog.len()
+        )));
     }
 
     let accesses: Vec<ModelAccessViewResponse> = accesses
         .into_values()
         .map(|access| {
-            let available_model_count = total_offerings
-                .unwrap_or_else(|| counts.get(&access.id).copied().unwrap_or_default());
+            let available_model_count = counts.get(&access.id).copied().unwrap_or_default();
             let availability = project_access_availability(&access, available_model_count)?;
             Ok(ModelAccessViewResponse {
                 id: access.id,
@@ -4338,6 +5265,22 @@ fn resolve_model_default(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deployment_mode_gate_is_explicit_and_fails_closed() {
+        assert_eq!(deployment_mode_allows_shared_models(None), Ok(true));
+        assert_eq!(
+            deployment_mode_allows_shared_models(Some("self-hosted")),
+            Ok(true)
+        );
+        assert_eq!(
+            deployment_mode_allows_shared_models(Some("cloud-byok")),
+            Ok(false)
+        );
+        for invalid in ["", "cloud", "CLOUD-BYOK", " cloud-byok "] {
+            assert!(deployment_mode_allows_shared_models(Some(invalid)).is_err());
+        }
+    }
 
     fn test_model_list_item(provider: &str, name: &str, offering_id: &str) -> ModelListItem {
         ModelListItem {
@@ -5830,6 +6773,57 @@ mod tests {
     }
 
     #[test]
+    fn paged_model_access_reports_counts_per_access_from_complete_catalog() {
+        let self_hosted = DeclaredModelAccess {
+            id: "self-hosted".into(),
+            kind: ModelAccessKind::SelfHosted,
+            label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            availability: ModelAccessAvailability::Ready,
+        };
+        let cloud_byok = DeclaredModelAccess {
+            id: "cloud-byok".into(),
+            kind: ModelAccessKind::CloudByok,
+            label: "Cloud BYOK".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            availability: ModelAccessAvailability::Ready,
+        };
+        let byok_offering = ModelListItemResponse {
+            offering_id: "byok-1".into(),
+            access_id: cloud_byok.id.clone(),
+            access_kind: cloud_byok.kind,
+            access_label: cloud_byok.label.clone(),
+            execution_placement: cloud_byok.execution_placement,
+            name: "deepseek-real".into(),
+            provider: "deepseek".into(),
+            description: None,
+            is_active: true,
+            context_window: 128_000,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+
+        let projection = project_model_access_page_with_default_catalog(
+            vec![self_hosted, cloud_byok],
+            vec![byok_offering.clone()],
+            Some(1),
+            &[byok_offering],
+            None,
+            "2026-09-07T00:00:00Z".into(),
+        )
+        .expect("mixed access projection");
+
+        let counts = projection
+            .accesses
+            .iter()
+            .map(|access| (access.id.as_str(), access.available_model_count))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(counts.get("self-hosted"), Some(&0));
+        assert_eq!(counts.get("cloud-byok"), Some(&1));
+    }
+
+    #[test]
     fn model_access_projection_honors_provider_default_offering() {
         let declared = DeclaredModelAccess {
             id: "this-device".into(),
@@ -6490,6 +7484,98 @@ mod tests {
     }
 
     // ── Provider-aware probe regression tests ─────────────────────────
+
+    #[tokio::test]
+    async fn connectivity_probe_uses_native_token_budget_and_preserves_provider_errors() {
+        use axum::{Json, Router, http::HeaderMap, routing::post};
+        for (provider, model, path, token_field, wrong_field) in [
+            (
+                "openai",
+                "o3",
+                "/chat/completions",
+                "max_completion_tokens",
+                "max_tokens",
+            ),
+            (
+                "openai",
+                "gpt-4o",
+                "/chat/completions",
+                "max_completion_tokens",
+                "max_tokens",
+            ),
+            (
+                "deepseek",
+                "deepseek-chat",
+                "/chat/completions",
+                "max_tokens",
+                "max_completion_tokens",
+            ),
+            (
+                "deepseek",
+                "deepseek-v4-flash",
+                "/chat/completions",
+                "max_tokens",
+                "max_completion_tokens",
+            ),
+            (
+                "anthropic",
+                "claude-sonnet-4-5",
+                "/v1/messages",
+                "max_tokens",
+                "max_completion_tokens",
+            ),
+        ] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let captured = calls.clone();
+            let app = Router::new().route(
+                path,
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                    captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        let auth = if provider == "anthropic" {
+                            assert_eq!(headers["anthropic-version"], "2023-06-01");
+                            headers.get("x-api-key").and_then(|v| v.to_str().ok())
+                                == Some("valid-key")
+                        } else {
+                            headers.get("authorization").and_then(|v| v.to_str().ok())
+                                == Some("Bearer valid-key")
+                        };
+                        let status = if !auth {
+                            StatusCode::UNAUTHORIZED
+                        } else if body["model"] != model {
+                            StatusCode::NOT_FOUND
+                        } else if body[token_field] != 32 || body.get(wrong_field).is_some() {
+                            StatusCode::BAD_REQUEST
+                        } else {
+                            StatusCode::OK
+                        };
+                        (
+                            status,
+                            Json(serde_json::json!({"error":{"message":"fixture rejection"}})),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let result =
+                validate_connectivity(provider, model, "valid-key", Some(&base), None, None).await;
+            assert!(result.is_none(), "{provider}/{model}: {result:?}");
+            for (key, model_id, expected) in [
+                ("invalid-key", model, "HTTP 401"),
+                ("valid-key", "missing-model", "HTTP 404"),
+            ] {
+                let result =
+                    validate_connectivity(provider, model_id, key, Some(&base), None, None)
+                        .await
+                        .unwrap();
+                assert!(result.contains(expected), "{provider}: {result}");
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+            task.abort();
+        }
+    }
     //
     // Based on real API recordings from 2026-05-04.
     // Each mock simulates the provider's actual response pattern.
@@ -6687,6 +7773,86 @@ mod tests {
         assert!(
             result.error.is_none(),
             "mock provider should skip cleanly, not error"
+        );
+    }
+
+    #[test]
+    fn user_model_requests_redact_credentials_in_debug_output() {
+        let create = UserModelCreateRequestData {
+            name: "deepseek".into(),
+            provider: "deepseek".into(),
+            model: "deepseek-chat".into(),
+            base_url: None,
+            api_key: "sk-user-secret".into(),
+            context_window: 128_000,
+            is_default: true,
+        };
+        let update = UserModelUpdateRequestData {
+            api_key: Some("sk-rotated-secret".into()),
+            ..Default::default()
+        };
+        assert!(!format!("{create:?}").contains("sk-user-secret"));
+        assert!(!format!("{update:?}").contains("sk-rotated-secret"));
+    }
+
+    #[test]
+    fn cloud_byok_accepts_only_fixed_provider_endpoints() {
+        assert_eq!(
+            user_byok_provider_base_url("deepseek").unwrap(),
+            "https://api.deepseek.com"
+        );
+        let error = user_byok_provider_base_url("custom").unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.detail.contains("Unsupported BYOK provider"));
+    }
+
+    #[test]
+    fn empty_cloud_byok_access_projects_a_user_configuration_action() {
+        let projection = project_model_access(
+            vec![DeclaredModelAccess {
+                id: "cloud-byok".into(),
+                kind: ModelAccessKind::CloudByok,
+                label: "Cloud BYOK".into(),
+                execution_placement: ModelExecutionPlacement::Server,
+                availability: ModelAccessAvailability::Ready,
+            }],
+            Vec::new(),
+            "2026-09-06T00:00:00Z".into(),
+        )
+        .expect("Cloud BYOK setup projection");
+        assert_eq!(projection.accesses.len(), 1);
+        assert_eq!(
+            projection.accesses[0].actions,
+            vec![ModelAccessAction::ConfigureCloudByokModels]
+        );
+    }
+
+    #[test]
+    fn user_model_api_keys_reject_ambiguous_whitespace_and_controls() {
+        assert!(validate_user_model_api_key("sk-valid").is_ok());
+        for invalid in ["", " sk-key", "sk-key ", "sk\nkey"] {
+            assert!(validate_user_model_api_key(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn user_byok_endpoint_selection_requires_explicit_compatible_mode() {
+        assert_eq!(
+            user_byok_base_url("openai", None).unwrap(),
+            "https://api.openai.com/v1"
+        );
+        assert_eq!(
+            user_byok_base_url("anthropic", None).unwrap(),
+            "https://api.anthropic.com"
+        );
+        for provider in ["openai", "anthropic", "deepseek", "unknown"] {
+            assert!(user_byok_base_url(provider, Some("https://gateway.example/v1")).is_err());
+        }
+        assert!(user_byok_base_url("openai-compatible", None).is_err());
+        assert!(user_byok_base_url("openai-compatible", Some("http://127.0.0.1:1234/v1")).is_err());
+        assert_eq!(
+            user_byok_base_url("openai-compatible", Some("https://gateway.example/v1/")).unwrap(),
+            "https://gateway.example/v1"
         );
     }
 }

@@ -8,7 +8,7 @@ use astra_services::{
 use astra_turn_types::ModelSelection;
 use axum::{Json, http::StatusCode};
 
-use crate::{error_response_coded, internal_error};
+use crate::error_response_coded;
 
 /// Admit one Offering into the single execution-material contract consumed by
 /// every agent and inference adapter.
@@ -19,6 +19,7 @@ use crate::{error_response_coded, internal_error};
 /// non-serializable value.
 pub(crate) async fn admit_model_execution(
     model_service: &Arc<dyn ModelService>,
+    user_id: &str,
     selection: &ModelSelection,
     resolved: Option<&ResolvedModelSelection>,
     gateway: Option<&RuntimeCapabilityDescriptorRequest>,
@@ -83,10 +84,9 @@ pub(crate) async fn admit_model_execution(
             "model_selection_invalid",
         ));
     }
-    let offering = model_service
-        .revalidate_model_offering(selection.offering_id.clone())
-        .await?;
-    AdmittedModelExecution::from_offering(offering).map_err(internal_error)
+    model_service
+        .admit_model_offering(user_id.to_string(), selection.offering_id.clone())
+        .await
 }
 
 fn is_exact_runtime_identity(value: &str) -> bool {
@@ -198,6 +198,7 @@ mod tests {
         let service: Arc<dyn ModelService> = Arc::new(StaticModelService);
         let catalog = admit_model_execution(
             &service,
+            "user-1",
             &ModelSelection {
                 offering_id: "offer-server".into(),
             },
@@ -213,6 +214,7 @@ mod tests {
 
         let endpoint = admit_model_execution(
             &service,
+            "user-1",
             &ModelSelection {
                 offering_id: "offer-edge".into(),
             },
@@ -250,6 +252,7 @@ mod tests {
         for context_window in [None, Some(0)] {
             let error = admit_model_execution(
                 &service,
+                "user-1",
                 &ModelSelection {
                     offering_id: "offer-edge".into(),
                 },
@@ -285,6 +288,7 @@ mod tests {
         let service: Arc<dyn ModelService> = Arc::new(StaticModelService);
         let error = admit_model_execution(
             &service,
+            "user-1",
             &ModelSelection {
                 offering_id: "offer-requested".into(),
             },

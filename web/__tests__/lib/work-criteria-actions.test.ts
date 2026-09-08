@@ -513,7 +513,10 @@ test("acquires branch control with exact attachment and causal basis", async () 
   });
 });
 
-test("reauthenticates before sending one sealed forced takeover", async () => {
+test.each([
+  { password: "correct horse battery staple" },
+  { memoriaProof: `msu_${"a".repeat(64)}` },
+])("reauthenticates before sending one sealed forced takeover: %j", async credential => {
   const authorization = {
     proof: "opaque-step-up-proof",
     purpose: "session_forced_takeover",
@@ -540,11 +543,11 @@ test("reauthenticates before sending one sealed forced takeover", async () => {
         writer_epoch: 4,
         canonical_root_hash: "a".repeat(64),
       },
-      password: "correct horse battery staple",
+      ...credential,
     }),
   ).resolves.toEqual({ ok: true, operation });
   expect(reauthenticate).toHaveBeenCalledWith(
-    "correct horse battery staple",
+    "memoriaProof" in credential ? credential : credential.password,
     "session_forced_takeover",
   );
   expect(controlWorkBranch).toHaveBeenCalledWith("work-1", "branch-1", {
@@ -563,6 +566,10 @@ test("reauthenticates before sending one sealed forced takeover", async () => {
   expect(reauthenticate.mock.invocationCallOrder[0]).toBeLessThan(
     controlWorkBranch.mock.invocationCallOrder[0]!,
   );
+});
+
+test.each([null, "invalid", 42, [], {}])("rejects malformed reauthentication input before contacting Astra: %j", async input => {
+  await expect(forceTakeoverWorkBranchAction(input as never)).resolves.toMatchObject({ ok:false, status:400 });
 });
 
 test("observes and aborts the same durable control operation", async () => {

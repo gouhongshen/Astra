@@ -301,6 +301,8 @@ pub fn chat_run_delegations_resume(run_id: &str) -> String {
 
 pub const AUTH_REGISTER: &str = "/auth/register";
 pub const AUTH_LOGIN: &str = "/auth/login";
+pub const AUTH_MEMORIA: &str = "/auth/memoria";
+pub const AUTH_METHODS: &str = "/auth/methods";
 pub const AUTH_REFRESH: &str = "/auth/refresh";
 pub const AUTH_LOGOUT: &str = "/auth/logout";
 pub const AUTH_REAUTHENTICATE: &str = "/auth/reauthenticate";
@@ -310,6 +312,18 @@ pub const HEALTH: &str = "/health";
 
 pub const MODELS: &str = "/models";
 pub const MODEL_ACCESS: &str = "/model-access";
+pub const ME_MODELS: &str = "/me/models";
+pub const ME_MODEL_VALIDATE_ENDPOINT: &str = "/me/models/validate-endpoint";
+
+#[inline]
+pub fn me_model(model_id: &str) -> String {
+    format!("{ME_MODELS}/{}", model_segment(model_id))
+}
+
+#[inline]
+pub fn me_model_check(model_id: &str) -> String {
+    format!("{}/check", me_model(model_id))
+}
 
 #[inline]
 pub fn model(name: &str) -> String {
@@ -635,6 +649,9 @@ mod tests {
             "/models/bedrock%2Fclaude%3Fvariant%231"
         );
         assert_eq!(MODEL_ACCESS, "/model-access");
+        assert_eq!(ME_MODELS, "/me/models");
+        assert_eq!(me_model("model/id"), "/me/models/model%2Fid");
+        assert_eq!(me_model_check("model/id"), "/me/models/model%2Fid/check");
     }
 
     #[test]

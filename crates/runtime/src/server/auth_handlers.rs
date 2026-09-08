@@ -1,6 +1,31 @@
 use axum::extract::Extension;
+use serde_json::Value;
 
 use super::*;
+
+#[cfg(test)]
+fn memory_access_for_scopes(scopes: &[String]) -> Option<&'static str> {
+    astra_services::auth::memoria::memory_access_for_scopes(scopes).map(|v| v.as_str())
+}
+
+pub(super) async fn auth_methods_handler(State(state): State<AppState>) -> Json<Value> {
+    let provider = state.auth_service.memoria_credentials().map(|r| r.provider);
+    Json(serde_json::json!({
+        "password": true,
+        "memoria": provider.and_then(|p| p.web_url.map(|url| serde_json::json!({
+            "issuer": p.issuer, "authorization_url": url
+        })))
+    }))
+}
+
+pub(super) async fn auth_memoria_disconnect_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state.auth_service.disconnect_memoria(&user.user_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
 pub(super) async fn auth_register_handler(
     Extension(trace): Extension<RequestTrace>,
@@ -81,6 +106,27 @@ pub(super) async fn auth_login_handler(
     Ok(Json(AuthTokenResponse::from(tokens)))
 }
 
+pub(super) async fn auth_memoria_handler(
+    Extension(trace): Extension<RequestTrace>,
+    State(state): State<AppState>,
+    Json(request): Json<AuthMemoriaRequest>,
+) -> Result<Json<AuthMemoriaResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let login = state
+        .auth_service
+        .login_memoria(request.connection_key.trim())
+        .await?;
+    tracing::info!(target: "astra_runtime::auth", request_id = %trace.request_id, "Memoria login succeeded");
+    Ok(Json(AuthMemoriaResponse {
+        user_id: login.tokens.user_id,
+        access_token: login.tokens.access_token,
+        refresh_token: login.tokens.refresh_token,
+        token_type: login.tokens.token_type,
+        expires_in: login.tokens.expires_in,
+        memory_access: login.memory_access.as_str().to_string(),
+        granted_scopes: login.granted_scopes,
+    }))
+}
+
 pub(super) async fn auth_refresh_handler(
     Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
@@ -126,7 +172,7 @@ pub(super) async fn auth_reauthenticate_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<AuthReauthenticateRequest>,
-) -> Result<Json<AuthReauthenticateResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let proof = state
         .auth_service
@@ -139,7 +185,26 @@ pub(super) async fn auth_reauthenticate_handler(
         purpose = proof.purpose.as_str(),
         "reauthentication proof issued"
     );
-    Ok(Json(AuthReauthenticateResponse::from(proof)))
+    Ok(axum::response::IntoResponse::into_response((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(AuthReauthenticateResponse::from(proof)),
+    )))
+}
+
+pub(super) async fn auth_reauthentication_options_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    Ok(axum::response::IntoResponse::into_response((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(
+            state
+                .auth_service
+                .reauthentication_options(&user.user_id)
+                .await?,
+        ),
+    )))
 }
 
 pub(super) async fn auth_me_handler(
@@ -168,6 +233,9 @@ async fn memory_proxy_call_for_user(
     endpoint: &str,
     body: serde_json::Value,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let requires_write = method != reqwest::Method::GET
+        && !endpoint.ends_with("/retrieve")
+        && !endpoint.ends_with("/search");
     let requested_scope = memory_proxy_scope(&body, user_id)?;
     if let Some(scope) = requested_scope.as_ref() {
         ensure_memory_proxy_session_owner(state, scope).await?;
@@ -182,32 +250,45 @@ async fn memory_proxy_call_for_user(
     } else {
         None
     };
+    let strict_validation_scope = match strict_recall_scope.as_ref() {
+        Some(scope) => Some(
+            astra_memoria::MemoryScope::new(
+                &memoria_owner_id_for_user(state, user_id).await?,
+                &scope.session_id,
+            )
+            .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?,
+        ),
+        None => None,
+    };
     let body = apply_memory_proxy_identity(body, user_id, endpoint);
     let strict_recall_limit = strict_recall_scope
         .as_ref()
         .map(|_| strict_session_recall_limit(&body));
 
-    let mut response = state
-        .memoria_forwarder
-        .forward(method, endpoint, body)
-        .await
-        .map_err(|error| {
-            tracing::warn!(
-                target: "astra_runtime::auth",
-                endpoint = endpoint,
-                error = %error,
-                "memory proxy forward failed"
-            );
-            if error.contains("not configured") {
-                error_response(StatusCode::SERVICE_UNAVAILABLE, &error)
-            } else if let Some(status) = parse_memoria_forward_status(&error) {
-                error_response(status, &error)
-            } else {
-                internal_error(&error)
-            }
-        })?;
+    let mut response =
+        forward_memoria_for_user(state, user_id, requires_write, method, endpoint, body)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "astra_runtime::auth",
+                    endpoint = endpoint,
+                    error = %error,
+                    "memory proxy forward failed"
+                );
+                if error.contains("not configured") {
+                    error_response(StatusCode::SERVICE_UNAVAILABLE, &error)
+                } else if error.contains("disabled by the user")
+                    || error.contains("not enabled for this Astra account")
+                {
+                    error_response(StatusCode::FORBIDDEN, &error)
+                } else if let Some(status) = parse_memoria_forward_status(&error) {
+                    error_response(status, &error)
+                } else {
+                    internal_error(&error)
+                }
+            })?;
 
-    if let Some(scope) = strict_recall_scope.as_ref() {
+    if let Some(scope) = strict_validation_scope.as_ref() {
         if let Err(error) = astra_memoria::validate_strict_recall_payload(&response, scope) {
             tracing::error!(
                 target: "astra_runtime::auth",
@@ -239,10 +320,15 @@ async fn memory_proxy_call_for_user(
                 "memory_type": "working",
                 "limit": limit,
             });
-            match state
-                .memoria_forwarder
-                .forward(reqwest::Method::GET, "/v1/memories", list_request)
-                .await
+            match forward_memoria_for_user(
+                state,
+                user_id,
+                false,
+                reqwest::Method::GET,
+                "/v1/memories",
+                list_request,
+            )
+            .await
             {
                 Ok(working) => {
                     if let Err(error) =
@@ -295,6 +381,95 @@ async fn memory_proxy_call_for_user(
     }
 
     Ok(Json(response))
+}
+
+async fn memoria_owner_id_for_user(
+    state: &AppState,
+    user_id: &str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    if state.memoria_forwarder_is_override {
+        return Ok(user_id.to_string());
+    }
+    let Some(resolver) = state.auth_service.memoria_credentials() else {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Memoria connection is not configured",
+        ));
+    };
+    resolver
+        .resolve(user_id)
+        .await
+        .map_err(internal_error)?
+        .map(|credential| credential.owner)
+        .ok_or_else(|| error_response(StatusCode::FORBIDDEN, "memory access is not enabled"))
+}
+
+async fn forward_memoria_for_user(
+    state: &AppState,
+    user_id: &str,
+    requires_write: bool,
+    method: reqwest::Method,
+    endpoint: &str,
+    mut body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    // Explicit composition overrides are used by bounded in-process fixtures
+    // and custom deployments. They are never inferred from a configured
+    // server master key, so normal production requests remain BYOK-only.
+    if state.memoria_forwarder_is_override {
+        return state
+            .memoria_forwarder
+            .forward(method, endpoint, body)
+            .await;
+    }
+    let resolver = state
+        .auth_service
+        .memoria_credentials()
+        .ok_or("Memoria connection is not configured")?;
+    let credential = resolver
+        .resolve(user_id)
+        .await?
+        .ok_or("memory access is not enabled for this Astra account")?;
+    if !credential.access.allows(requires_write) {
+        return Err("memory access is disabled by the user".into());
+    }
+    let connection_key = credential.key;
+    if let Some(object) = body.as_object_mut() {
+        object.remove("user_id");
+    }
+    let url = format!(
+        "{}{}",
+        resolver.provider.base_url.trim_end_matches('/'),
+        endpoint
+    );
+    let request = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "Memoria HTTP client unavailable")?
+        .request(method.clone(), url)
+        .bearer_auth(connection_key)
+        .header("X-Memoria-Tool", "astra")
+        .timeout(std::time::Duration::from_secs(30));
+    let response = if method == reqwest::Method::GET {
+        request.query(&body)
+    } else {
+        request.json(&body)
+    }
+    .send()
+    .await
+    .map_err(|error| format!("Memoria request failed: {error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("Memoria response read error: {error}"))?;
+    if !status.is_success() {
+        let bounded: String = text.chars().take(4096).collect();
+        return Err(format!("Memoria error {status}: {bounded}"));
+    }
+    if text.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(&text).map_err(|error| format!("Memoria parse error: {error}"))
 }
 
 const MAX_STRICT_SESSION_RECALL_ITEMS: usize = 50;
@@ -685,9 +860,8 @@ async fn memoria_management_proxy_call(
         body.unwrap_or_else(|| serde_json::json!({})),
         &user.user_id,
     );
-    state
-        .memoria_forwarder
-        .forward(method, endpoint, body)
+    let requires_write = method != reqwest::Method::GET;
+    forward_memoria_for_user(state, &user.user_id, requires_write, method, endpoint, body)
         .await
         .map(Json)
         .map_err(|error| {
@@ -699,6 +873,12 @@ async fn memoria_management_proxy_call(
             );
             if error.contains("not configured") {
                 error_response(StatusCode::SERVICE_UNAVAILABLE, &error)
+            } else if error.contains("disabled by the user")
+                || error.contains("not enabled for this Astra account")
+            {
+                error_response(StatusCode::FORBIDDEN, &error)
+            } else if let Some(status) = parse_memoria_forward_status(&error) {
+                error_response(status, &error)
             } else {
                 internal_error(&error)
             }
@@ -885,11 +1065,38 @@ pub(super) async fn memoria_proxy_consolidate_handler(
 mod tests {
     use super::{
         apply_memoria_management_identity, apply_memory_proxy_identity, encode_memoria_memory_id,
-        exact_memory_ids_for_user_purge, is_strict_session_recall, memory_proxy_scope,
-        normalize_exact_memory_purge_receipt, parse_memoria_forward_status,
+        exact_memory_ids_for_user_purge, is_strict_session_recall, memory_access_for_scopes,
+        memory_proxy_scope, normalize_exact_memory_purge_receipt, parse_memoria_forward_status,
     };
     use axum::http::StatusCode;
     use serde_json::json;
+
+    #[test]
+    fn memoria_scope_sets_map_only_to_supported_access_modes() {
+        let strings = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            memory_access_for_scopes(&strings(&["identity:read"])),
+            Some("none")
+        );
+        assert_eq!(
+            memory_access_for_scopes(&strings(&["memory:read", "identity:read"])),
+            Some("read_only")
+        );
+        assert_eq!(
+            memory_access_for_scopes(&strings(&["memory:write", "identity:read", "memory:read",])),
+            Some("read_write")
+        );
+        assert_eq!(memory_access_for_scopes(&strings(&["memory:read"])), None);
+        assert_eq!(
+            memory_access_for_scopes(&strings(&["identity:read", "admin"])),
+            None
+        );
+    }
 
     #[test]
     fn apply_memory_proxy_identity_overwrites_user_but_preserves_authorized_session() {

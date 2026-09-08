@@ -3233,7 +3233,9 @@ fn build_provider_request_body_with_cache_capability(
                     body["system"] = Value::Array(system);
                 }
                 if let Some(max_out) = max_output_tokens {
-                    body["max_tokens"] = json!(max_out);
+                    astra_core::model_wire::apply_chat_output_token_limit(
+                        &mut body, provider, max_out,
+                    );
                 }
                 if let Some(temp) = temperature {
                     body["temperature"] = json!(temp);
@@ -3277,7 +3279,7 @@ fn build_provider_request_body_with_cache_capability(
             }
             if let Some(max_out) = max_output_tokens {
                 // When thinking is active, providers like DeepSeek allocate a
-                // thinking_budget that must be LESS than max_completion_tokens.
+                // thinking_budget that must be LESS than the output token limit.
                 // If max_out is too small, the request will 400. Bump to at
                 // least thinking_budget + a headroom for the visible answer.
                 //
@@ -3295,7 +3297,7 @@ fn build_provider_request_body_with_cache_capability(
                         tracing::debug!(
                             user_max = max_out,
                             bumped_to = required_floor,
-                            "max_completion_tokens bumped to fit thinking budget"
+                            "output token limit bumped to fit thinking budget"
                         );
                         required_floor
                     } else {
@@ -3304,7 +3306,11 @@ fn build_provider_request_body_with_cache_capability(
                 } else {
                     max_out
                 };
-                body["max_completion_tokens"] = json!(effective_max);
+                astra_core::model_wire::apply_chat_output_token_limit(
+                    &mut body,
+                    provider,
+                    effective_max,
+                );
             }
             if let Some(temp) = temperature {
                 body["temperature"] = json!(temp);
@@ -4796,6 +4802,21 @@ async fn call_llm_and_collect_with_total_budget(
         // `ControlledProviderAttemptObserver` above. Keep deadline ownership in
         // that single layer so a durable-admission stall is classified as an
         // inference-ledger failure instead of racing an outer provider timer.
+        let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
+            Some(
+                astra_services::byok_endpoint::endpoint_client(&url)
+                    .await
+                    .map_err(|error| {
+                        astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::InvalidRequest,
+                            error,
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let client = compatible_client.as_deref().unwrap_or(client);
         let observed_attempt = match attempt_observer {
             Some(observer) => Some(observer.begin_attempt(prepared_request.identity()).await?),
             None => None,
@@ -6949,6 +6970,18 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     );
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
+    let compatible_client = if provider == astra_services::byok_endpoint::COMPATIBLE_PROVIDER {
+        Some(
+            astra_services::byok_endpoint::endpoint_client(&url)
+                .await
+                .map_err(|error| {
+                    astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
+                })?,
+        )
+    } else {
+        None
+    };
+    let client = compatible_client.as_deref().unwrap_or(client);
     let observed_attempt = match attempt_observer {
         Some(observer) => Some(observer.begin_attempt(prepared_request.identity()).await?),
         None => None,
@@ -7526,6 +7559,82 @@ pub(crate) fn parse_openai_sse_json_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_byok_compatible_reuses_openai_message_and_tool_wire_format() {
+        let messages = vec![json!({"role":"user","content":"Use the calculator"})];
+        let tools = vec![json!({"type":"function", "function":{
+            "name":"calculator", "description":"Add numbers",
+            "parameters":{"type":"object", "properties":{"a":{"type":"number"}}}
+        }})];
+        for streaming in [false, true] {
+            let body = build_provider_request_body(
+                &messages,
+                &tools,
+                "upstream-model",
+                "openai-compatible",
+                Some(128),
+                None,
+                streaming,
+                &ThinkingConfig::Off,
+            );
+            let expected = build_provider_request_body(
+                &messages,
+                &tools,
+                "upstream-model",
+                "openai",
+                Some(128),
+                None,
+                streaming,
+                &ThinkingConfig::Off,
+            );
+            assert_eq!(body, expected);
+            assert_eq!(body["model"], "upstream-model");
+            assert_eq!(body["tools"][0]["function"]["name"], "calculator");
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_byok_compatible_blocks_private_endpoint_in_both_transports() {
+        let messages = vec![json!({"role":"user","content":"hello"})];
+        for streaming in [false, true] {
+            let call = LlmCall {
+                purpose: astra_turn_types::InferencePurpose::SubAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    model_name: "test-model",
+                    wire_model_name: None,
+                    api_key: "sk-private-secret",
+                    base_url: "http://127.0.0.1:9/v1",
+                    provider: "openai-compatible",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(128),
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            };
+            let result = if streaming {
+                call_llm_and_collect(call, LlmCancel::None).await
+            } else {
+                call_llm_nonstream(
+                    global_llm_client(),
+                    call,
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+            };
+            let error = result.expect_err("private endpoint must fail before network I/O");
+            assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+            assert!(error.message.contains("HTTPS"));
+            assert!(!error.to_string().contains("sk-private-secret"));
+        }
+    }
     use axum::Router;
     use axum::body::Body;
     use axum::extract::State;
@@ -16775,9 +16884,53 @@ mod tests {
         assert!(stop_slot["properties"].get("slots").is_none());
     }
 
-    // --- Regression: max_completion_tokens bump respects user's ceiling ---
     #[test]
-    fn max_completion_tokens_honors_user_when_above_floor() {
+    fn build_provider_request_body_output_limits_follow_provider_contract() {
+        for (provider, model, limit, forbidden) in [
+            ("openai", "o3", "max_completion_tokens", "max_tokens"),
+            ("openai", "gpt-4o", "max_completion_tokens", "max_tokens"),
+            (
+                "openai-compatible",
+                "custom-model",
+                "max_completion_tokens",
+                "max_tokens",
+            ),
+            (
+                "deepseek",
+                "deepseek-v4-flash",
+                "max_tokens",
+                "max_completion_tokens",
+            ),
+            (
+                "anthropic",
+                "claude-sonnet-4-5",
+                "max_tokens",
+                "max_completion_tokens",
+            ),
+        ] {
+            for streaming in [false, true] {
+                let body = build_provider_request_body(
+                    &[json!({"role": "user", "content": "hi"})],
+                    &[],
+                    model,
+                    provider,
+                    Some(4096),
+                    None,
+                    streaming,
+                    &ThinkingConfig::Off,
+                );
+                assert_eq!(
+                    body[limit], 4096,
+                    "{provider}, streaming={streaming}: {body}"
+                );
+                assert!(body.get(forbidden).is_none(), "{provider}: {body}");
+            }
+        }
+    }
+
+    // --- Regression: output-limit bump respects user's ceiling ---
+    #[test]
+    fn deepseek_max_tokens_honors_user_when_above_floor() {
         use astra_turn_core::thinking_config::ThinkingConfig;
         // User sets 128K, thinking budget is 32K → floor = 40K → must keep 128K.
         let thinking = ThinkingConfig::Enabled {
@@ -16794,14 +16947,15 @@ mod tests {
             &thinking,
         );
         assert_eq!(
-            body["max_completion_tokens"].as_u64(),
+            body["max_tokens"].as_u64(),
             Some(128_000),
             "user ceiling above floor must not be bumped"
         );
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]
-    fn max_completion_tokens_bumps_when_user_below_floor() {
+    fn deepseek_max_tokens_bumps_when_user_below_floor() {
         use astra_turn_core::thinking_config::ThinkingConfig;
         // User sets 8K, thinking budget is 32K → floor = 32K + 8K = 40K → bump to 40K.
         let thinking = ThinkingConfig::Enabled {
@@ -16818,14 +16972,15 @@ mod tests {
             &thinking,
         );
         assert_eq!(
-            body["max_completion_tokens"].as_u64(),
+            body["max_tokens"].as_u64(),
             Some(40_192),
             "configured max below thinking_budget+headroom must be bumped to floor"
         );
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]
-    fn max_completion_tokens_unchanged_when_thinking_off() {
+    fn deepseek_max_tokens_unchanged_when_thinking_off() {
         use astra_turn_core::thinking_config::ThinkingConfig;
         let body = build_provider_request_body(
             &[json!({"role": "user", "content": "hi"})],
@@ -16838,10 +16993,11 @@ mod tests {
             &ThinkingConfig::Off,
         );
         assert_eq!(
-            body["max_completion_tokens"].as_u64(),
+            body["max_tokens"].as_u64(),
             Some(4_096),
             "thinking=off must never bump user's max"
         );
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     #[test]

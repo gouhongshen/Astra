@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button";
 import {
   abortWorkBranchControlAction,
   forceTakeoverWorkBranchAction,
+  getWorkReauthenticationOptionsAction,
   observeWorkBranchControlAction,
 } from "@/app/(workspace)/works/[workId]/actions";
 
@@ -96,6 +97,7 @@ export function WorkTurnComposer({
   const [takingControl, setTakingControl] = useState(false);
   const [confirmingTakeover, setConfirmingTakeover] = useState(false);
   const [takeoverPassword, setTakeoverPassword] = useState("");
+  const [takeoverMethod, setTakeoverMethod] = useState<{ method: "password" } | { method: "memoria"; verification_url: string }>({ method: "password" });
   const [controlOperation, setControlOperation] =
     useState<WorkBranchControlOperationV2 | null>(null);
   const [abortingControl, setAbortingControl] = useState(false);
@@ -397,6 +399,9 @@ export function WorkTurnComposer({
       controlRequestId.current ?? `web-work-control:${crypto.randomUUID()}`;
     controlRequestId.current = requestId;
     try {
+      // A failed exchange may already have consumed the one-time evidence.
+      // Do not leave it available for an accidental retry.
+      if (takeoverMethod.method === "memoria") setTakeoverPassword("");
       const result = await forceTakeoverWorkBranchAction({
         workId,
         branchId,
@@ -404,7 +409,7 @@ export function WorkTurnComposer({
         requestId,
         expectedBranchRevision: branchRevision,
         expectedControlBasis: currentControlBasis,
-        password: takeoverPassword,
+        ...(takeoverMethod.method === "memoria" ? { memoriaProof: takeoverPassword } : { password: takeoverPassword }),
       });
       if (!mounted.current) return;
       if (!result.ok) {
@@ -417,9 +422,9 @@ export function WorkTurnComposer({
         }
         setError(
           result.status === 401
-            ? "Your password was not accepted or your sign-in expired. Nothing was moved."
+            ? "Identity verification was not accepted or your sign-in expired. Nothing was moved."
             : result.code === "reauthentication_required" || result.status === 403
-              ? "Your password was not accepted. Nothing was moved."
+              ? "Identity verification was not accepted. Nothing was moved."
             : result.retryable
               ? "This Work could not move here yet. You can safely try again."
               : "This Work could not continue on this device.",
@@ -508,6 +513,11 @@ export function WorkTurnComposer({
                       effects are kept for review and are not repeated automatically.
                     </p>
                     <div className="mt-3 flex flex-wrap items-center gap-2">
+                      {takeoverMethod.method === "memoria" ? (
+                        <a className="basis-full text-sm text-accent underline" href={`${takeoverMethod.verification_url}?purpose=session_forced_takeover`} target="_blank" rel="noopener noreferrer">
+                          Verify your identity by email, then paste the one-time proof below
+                        </a>
+                      ) : null}
                       <input
                         type="password"
                         value={takeoverPassword}
@@ -518,9 +528,9 @@ export function WorkTurnComposer({
                             void continueHere();
                           }
                         }}
-                        autoComplete="current-password"
-                        placeholder="Confirm with your password"
-                        aria-label="Password"
+                        autoComplete={takeoverMethod.method === "memoria" ? "off" : "current-password"}
+                        placeholder={takeoverMethod.method === "memoria" ? "One-time verification proof" : "Confirm with your password"}
+                        aria-label={takeoverMethod.method === "memoria" ? "One-time verification proof" : "Password"}
                         className="min-w-56 flex-1 rounded-control border border-border bg-surface px-3 py-2 text-sm text-text outline-none focus:border-accent"
                       />
                       <Button
@@ -550,7 +560,16 @@ export function WorkTurnComposer({
                 <Button size="sm" variant="secondary" onClick={viewLive}>
                   Keep viewing
                 </Button>
-                <Button size="sm" onClick={() => setConfirmingTakeover(true)}>
+                <Button size="sm" disabled={takingControl} onClick={async () => {
+                  setTakingControl(true);
+                  try {
+                    setTakeoverMethod(await getWorkReauthenticationOptionsAction());
+                    setTakeoverPassword("");
+                    setConfirmingTakeover(true);
+                  } catch {
+                    setError("Unable to load identity verification. Please try again.");
+                  } finally { setTakingControl(false); }
+                }}>
                   Continue here
                 </Button>
               </div>

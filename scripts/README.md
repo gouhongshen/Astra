@@ -263,6 +263,12 @@ reconciliation at the actual publication boundary.
 `scripts/reconcile-docker-candidate-tag.sh` creates or verifies one immutable,
 run-scoped staging tag per server platform so registry cleanup cannot discard
 an otherwise retained recovery candidate.
+`scripts/copy-immutable-container-tag.sh` copies a verified manifest between
+repositories only after `scripts/inspect-harbor-artifact.py` resolves the exact
+target through Harbor's structured API. A 404 from that artifact endpoint
+permits first publication for either a new repository or a new tag;
+authentication, network, malformed-response, and registry failures fail closed.
+An existing tag is accepted only when its digest already matches the source.
 
 ### `scripts/verify_github_release_assets.py`
 

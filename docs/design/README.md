@@ -12,6 +12,7 @@ These documents describe target contracts. They should not be read as proof that
 | Domain | Canonical document | Owns |
 | --- | --- | --- |
 | System architecture | [ARCHITECTURE.md](ARCHITECTURE.md) | Runtime shape, state layers, system-wide invariants. |
+| Authentication | [authentication.md](authentication.md) | Issuer-scoped identity, scoped credentials, session revocation and login discovery. |
 | Documentation architecture | [documentation-architecture.md](documentation-architecture.md) | Documentation class rules, domain ownership, and migration policy. |
 | Agent/provider model | [agent-backbone-capacity-provider.md](agent-backbone-capacity-provider.md) | Shared backbone semantics and capacity provider contract. |
 | Runtime lifecycle | [runtime-lifecycle.md](runtime-lifecycle.md) | Session, run, turn, task, plan, cancel, resume, recovery. |

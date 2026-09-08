@@ -56,6 +56,7 @@ impl crate::session_memory::MemoryInferenceResolver for PoolMemoryInferenceResol
         let offerings = match astra_services::models::resolve_memory_offerings(
             settings,
             &self.encryptor,
+            user_id,
             Some(pool),
         )
         .await
@@ -72,29 +73,14 @@ impl crate::session_memory::MemoryInferenceResolver for PoolMemoryInferenceResol
         };
         offerings
             .into_iter()
-            .filter_map(|offering| {
-                let offering_id = offering.offering_id.clone();
-                let model_name = offering.model.model_name.clone();
-                match crate::memory_hooks::DurableMemoryInferenceClient::from_offering(
-                    offering,
+            .map(|offering| {
+                Arc::new(crate::memory_hooks::DurableMemoryInferenceClient::new(
+                    offering.offering_id,
+                    offering.model.model_name,
                     self.pool.clone(),
+                    self.encryptor.clone(),
                     user_id,
-                ) {
-                    Ok(client) => {
-                        Some(std::sync::Arc::new(client)
-                            as crate::memory_hooks::MemoryInferenceClient)
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "astra_runtime::memory_model",
-                            %offering_id,
-                            %model_name,
-                            %error,
-                            "memory model execution configuration is invalid"
-                        );
-                        None
-                    }
-                }
+                )) as crate::memory_hooks::MemoryInferenceClient
             })
             .collect()
     }
@@ -171,23 +157,23 @@ impl MatrixCloudRuntime {
     /// Also spins up the [`crate::session_memory::MemoryExtractionService`]
     /// here, because it needs all three of: encryptor (for selector
     /// resolve), ingestion sender (for events), and a [`MemoriaPort`]
-    /// (the sole persistence target for L1 session memory). If
-    /// [`HttpMemoriaPort::from_env`] returns `None` (no Memoria
-    /// endpoint configured / offline), the service is NOT built —
-    /// extraction is opt-in on connectivity, not silent fallback.
-    pub fn with_encryptor(mut self, enc: Arc<astra_services::FernetTokenEncryptor>) -> Self {
+    /// (the sole persistence target for L1 session memory). The port resolves
+    /// each owner's consented credential at operation time; users without
+    /// write access never cause a Memoria request.
+    pub fn with_encryptor(
+        mut self,
+        enc: Arc<astra_services::FernetTokenEncryptor>,
+        memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
+    ) -> Self {
         self.encryptor = Some(Arc::clone(&enc));
         let ingestion = self.ingestion.lock().ok().and_then(|g| g.as_ref().cloned());
-        let memoria = crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env();
-        if let (Some(ingestion), Some(memoria)) = (ingestion, memoria) {
+        if let (Some(ingestion), Some(memoria_client)) = (ingestion, memoria_client) {
             let resolver: Arc<dyn crate::session_memory::MemoryInferenceResolver> =
                 Arc::new(PoolMemoryInferenceResolver {
                     pool: self.shared_pool.clone(),
                     encryptor: Arc::clone(&enc),
                 });
             let broker = Arc::new(crate::session_memory::BackgroundActivityBroker::new());
-            let memoria_client: Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort> =
-                Arc::new(memoria);
             let svc = Arc::new(
                 crate::session_memory::MemoryExtractionService::new_owner_scoped_template(
                     resolver,

@@ -1296,6 +1296,17 @@ test-online:
 # test-online because pressure timings are operational evidence, not a normal
 # per-case correctness budget.
 .PHONY: test-memoria-online-contract
+# Scoped auth contract requires a separately provisioned Memoria API with the
+# scoped-key capability. Explicit selection fails if required inputs are absent.
+.PHONY: test-memoria-auth-online-contract
+test-memoria-auth-online-contract:
+	@test -n "$$ASTRA_TEST_MEMORIA_URL" || { echo "ASTRA_TEST_MEMORIA_URL is required"; exit 2; }
+	@test -n "$$ASTRA_TEST_MEMORIA_MASTER_KEY" || { echo "ASTRA_TEST_MEMORIA_MASTER_KEY is required"; exit 2; }
+	@test -n "$$ASTRA_TEST_DATABASE" || { echo "ASTRA_TEST_DATABASE must explicitly designate an isolated DB"; exit 2; }
+	ASTRA_TEST_DB_IT=1 ASTRA_DATABASE="$$ASTRA_TEST_DATABASE" ASTRA_DATABASE_PREFIX="" \
+		CARGO_INCREMENTAL=0 cargo test --locked -p astra-services --features external-contract-tests \
+		--test memoria_live_contract_it -- --ignored
+
 test-memoria-online-contract:
 	@if [ ! -f .env ]; then echo "❌ .env is required for the real Memoria contract"; exit 2; fi
 	@set -a; . ./.env; set +a; \

@@ -53,6 +53,16 @@ pub async fn prefetch_memories_with_client(
     session_id: &str,
     top_k: u32,
 ) -> MemoryPrefetchResult {
+    match client.admits_operation(false).await {
+        Ok(true) => {}
+        Ok(false) => return MemoryPrefetchResult::default(),
+        Err(_) => {
+            return MemoryPrefetchResult {
+                outcome: astra_turn_types::MemoryRetrievalOutcome::Unavailable,
+                ..Default::default()
+            };
+        }
+    }
     if user_msg.trim().is_empty() {
         return MemoryPrefetchResult::default();
     }
@@ -169,6 +179,16 @@ pub async fn prefetch_session_start_memories_with_client(
     user_id: &str,
     session_id: &str,
 ) -> SessionStartPrefetchResult {
+    match client.admits_operation(false).await {
+        Ok(true) => {}
+        Ok(false) => return SessionStartPrefetchResult::default(),
+        Err(_) => {
+            return SessionStartPrefetchResult {
+                outcome: astra_turn_types::MemoryRetrievalOutcome::Unavailable,
+                ..Default::default()
+            };
+        }
+    }
     let started = Instant::now();
 
     // Two structured queries in parallel:

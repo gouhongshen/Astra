@@ -31,10 +31,12 @@ vi.mock("next/navigation", () => ({
 const forceTakeover = vi.hoisted(() => vi.fn());
 const observeControl = vi.hoisted(() => vi.fn());
 const abortControl = vi.hoisted(() => vi.fn());
+const reauthOptions = vi.hoisted(() => vi.fn());
 vi.mock("@/app/(workspace)/works/[workId]/actions", () => ({
   forceTakeoverWorkBranchAction: forceTakeover,
   observeWorkBranchControlAction: observeControl,
   abortWorkBranchControlAction: abortControl,
+  getWorkReauthenticationOptionsAction: reauthOptions,
 }));
 
 import { StrictMode } from "react";
@@ -43,6 +45,7 @@ import { WorkTurnComposer } from "@/components/app/work-turn-composer";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  reauthOptions.mockResolvedValue({ method: "password" });
   streamHarness.instances.length = 0;
   Object.defineProperty(globalThis.crypto, "randomUUID", {
     configurable: true,
@@ -57,6 +60,29 @@ test("keeps continuation unavailable without a durable attachment", () => {
   expect(screen.getByRole("button", { name: "Send guidance" })).toBeDisabled();
   expect(screen.getByPlaceholderText(/Reconnect to continue/i)).toBeInTheDocument();
   expect(streamHarness.instances).toHaveLength(0);
+});
+
+test("Memoria takeover requests fresh verification and submits no password", async () => {
+  reauthOptions.mockResolvedValue({ method: "memoria", verification_url: "https://thememoria.ai/astra/reauthenticate" });
+  forceTakeover.mockResolvedValue({ ok:false, status:403, code:"reauthentication_required", retryable:false });
+  render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" branchRevision={3} controlBasis={{ writer_epoch:4, canonical_root_hash:"a".repeat(64) }} />);
+  fireEvent.change(screen.getByRole("textbox", { name:"Guide this Work" }), {target:{value:"Continue"}});
+  fireEvent.click(screen.getByRole("button", {name:"Send guidance"}));
+  act(() => {
+    streamHarness.instances[0]!.options.onEvent({ type:"error", code:"writer_conflict", message:"Active elsewhere", retryable:false, http_status:409, action_hints:["refresh_work"] });
+    streamHarness.instances[0]!.options.onStateChange("disconnected");
+  });
+  fireEvent.click(screen.getByRole("button", {name:"Continue here"}));
+  const input = await screen.findByLabelText("One-time verification proof");
+  expect(screen.queryByLabelText("Password")).not.toBeInTheDocument();
+  expect(screen.getByRole("link", {name:/Verify your identity/})).toHaveAttribute("href", "https://thememoria.ai/astra/reauthenticate?purpose=session_forced_takeover");
+  const fresh = `msu_${"a".repeat(64)}`;
+  fireEvent.change(input, {target:{value:fresh}});
+  fireEvent.click(screen.getByRole("button", {name:"Confirm"}));
+  await waitFor(() => expect(forceTakeover).toHaveBeenCalled());
+  expect(forceTakeover.mock.calls[0][0]).toMatchObject({ memoriaProof:fresh });
+  expect(forceTakeover.mock.calls[0][0]).not.toHaveProperty("password");
+  expect(await screen.findByLabelText("One-time verification proof")).toHaveValue("");
 });
 
 test("submits one typed Work turn and applies only decoded visible text", async () => {
@@ -278,7 +304,7 @@ test("confirms forced takeover and resumes the same durable turn", async () => {
   expect(screen.queryByRole("button", { name: "Reconnect" })).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Continue here" }));
   expect(forceTakeover).not.toHaveBeenCalled();
-  fireEvent.change(screen.getByLabelText("Password"), {
+  fireEvent.change(await screen.findByLabelText("Password"), {
     target: { value: "correct horse battery staple" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
@@ -350,7 +376,7 @@ test("stops a durable takeover only while the server marks it abortable", async 
     }),
   );
   fireEvent.click(screen.getByRole("button", { name: "Continue here" }));
-  fireEvent.change(screen.getByLabelText("Password"), { target: { value: "password" } });
+  fireEvent.change(await screen.findByLabelText("Password"), { target: { value: "password" } });
   fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
 
   fireEvent.click(await screen.findByRole("button", { name: "Stop moving" }));

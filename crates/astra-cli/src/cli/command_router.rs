@@ -4,8 +4,8 @@ use crate::cli::arg_render::{
     render_review_args, render_team_args,
 };
 use crate::cli::auth_flow::{
-    clear_profile_auth, do_login, do_register, is_auth_error, parse_auth_tokens,
-    save_refreshed_profile_tokens,
+    clear_profile_auth, do_login, do_memoria_browser_login, do_memoria_login_with_key, do_register,
+    is_auth_error, parse_auth_tokens, save_refreshed_profile_tokens,
 };
 use crate::cli::cli_config::cli_args::{
     AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
@@ -775,6 +775,85 @@ pub(crate) fn execute_cli_command<'a>(
     ))
 }
 
+async fn find_personal_model_id(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let body = api
+        .get_bearer_path_query_text(token, paths::ME_MODELS, &[])
+        .await
+        .map_err(map_thin_err)?;
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| format!("Invalid /me/models response: {error}"))?;
+    let items = value
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "Invalid /me/models response: items is missing".to_string())?;
+    Ok(items.iter().find_map(|item| {
+        (item.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            .then(|| item.get("model_id").and_then(serde_json::Value::as_str))
+            .flatten()
+            .map(str::to_string)
+    }))
+}
+
+fn personal_model_id_prompt() -> inquire::Text<'static, 'static> {
+    inquire::Text::new("Model ID from your provider:")
+        .with_help_message("Copy the exact model ID from your provider's API documentation; this is sent to the provider.")
+}
+
+fn personal_model_alias_prompt(model: &str) -> inquire::Text<'_, '_> {
+    inquire::Text::new("Configuration alias in Astra:")
+        .with_default(model)
+        .with_help_message("Press Enter to use the model ID, or choose a unique alias (e.g. work-model). Use this alias with astra chat --model <alias>.")
+}
+
+#[cfg(test)]
+mod personal_model_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn provider_id_has_explanation_but_no_guessed_default() {
+        let prompt = personal_model_id_prompt();
+        assert_eq!(prompt.message, "Model ID from your provider:");
+        assert_eq!(prompt.default, None);
+        assert!(
+            prompt
+                .help_message
+                .unwrap()
+                .contains("sent to the provider")
+        );
+    }
+
+    #[test]
+    fn alias_defaults_to_exact_provider_model_id() {
+        for model in ["deepseek-v4-flash", "vendor/model-1", "kimi-k2.6"] {
+            let prompt = personal_model_alias_prompt(model);
+            assert_eq!(prompt.message, "Configuration alias in Astra:");
+            assert_eq!(prompt.default, Some(model));
+            assert!(
+                prompt
+                    .help_message
+                    .unwrap()
+                    .contains("astra chat --model <alias>")
+            );
+        }
+    }
+}
+
+fn read_model_api_key_from_stdin() -> Result<String, String> {
+    let mut api_key = String::new();
+    std::io::stdin()
+        .read_to_string(&mut api_key)
+        .map_err(|error| format!("Failed to read model API key from stdin: {error}"))?;
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Err("Model API key from stdin cannot be empty".to_string());
+    }
+    Ok(api_key)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_cli_command_impl(
     command: Option<Command>,
@@ -1016,9 +1095,22 @@ async fn execute_cli_command_impl(
                     .magenta()
                     .bold()
             );
-            let username = prompt_or("Username", args.username)?;
-            let password = prompt_password_masked("Password", args.password)?;
-            do_login(api, profile.as_deref(), &username, &password).await?;
+            if args.username.is_some() || args.password.is_some() {
+                let username = prompt_or("Username", args.username)?;
+                let password = prompt_password_masked("Password", args.password)?;
+                do_login(api, profile.as_deref(), &username, &password).await?;
+            } else if args.manual {
+                let connection_key = prompt_password_masked("Memoria connection key", None)?;
+                do_memoria_login_with_key(api, profile.as_deref(), &connection_key).await?;
+            } else {
+                if let Some(website) = crate::cli::auth_flow::discover_login_website(api).await? {
+                    do_memoria_browser_login(api, profile.as_deref(), &website).await?;
+                } else {
+                    let username = prompt_or("Username", None)?;
+                    let password = prompt_password_masked("Password", None)?;
+                    do_login(api, profile.as_deref(), &username, &password).await?;
+                }
+            }
             eprintln!(
                 "{}",
                 "  ✓  Logged in. Run `astra` to start chatting.".green()
@@ -2032,13 +2124,164 @@ async fn execute_cli_command_impl(
             Ok(ExitCode::Success)
         }
 
-        Some(Command::Model(ModelCmd::Show(args))) => {
+        Some(Command::Model(ModelCmd::Add(args))) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let interactive =
+                !args.api_key_stdin && std::io::IsTerminal::is_terminal(&std::io::stdin());
+            let wizard = args.provider.is_none() || args.model.is_none() || args.name.is_none();
+            let required_text =
+                |value: Option<String>, label: &str, flag: &str| -> Result<String, String> {
+                    let value = match value {
+                        Some(value) => value,
+                        None if interactive => inquire::Text::new(&format!("{label}:"))
+                            .prompt()
+                            .map_err(|e| e.to_string())?,
+                        None => return Err(format!("{flag} is required in non-interactive mode")),
+                    };
+                    if value.trim().is_empty() {
+                        return Err(format!("{label} must not be empty"));
+                    }
+                    Ok(value.trim().to_string())
+                };
+            let provider = match args.provider {
+                Some(provider) => provider,
+                None if interactive => {
+                    let label = inquire::Select::new(
+                        "Model provider:",
+                        vec!["OpenAI", "Anthropic", "DeepSeek", "OpenAI-compatible"],
+                    )
+                    .prompt()
+                    .map_err(|e| e.to_string())?;
+                    label.to_ascii_lowercase()
+                }
+                None => return Err("--provider is required in non-interactive mode".into()),
+            };
+            let base_url = if provider == "openai-compatible" {
+                Some(required_text(
+                    args.base_url,
+                    "API base URL (HTTPS, including /v1 when required)",
+                    "--base-url",
+                )?)
+            } else {
+                if args.base_url.is_some() {
+                    return Err("Use --provider openai-compatible to configure --base-url".into());
+                }
+                None
+            };
+            if let Some(base_url) = &base_url {
+                api.post_bearer_path_json_text(
+                    &token,
+                    paths::ME_MODEL_VALIDATE_ENDPOINT,
+                    &serde_json::json!({ "base_url": base_url }),
+                )
+                .await
+                .map_err(map_thin_err)?;
+            }
+            let model = match args.model {
+                None if interactive => Some(
+                    personal_model_id_prompt()
+                        .prompt()
+                        .map_err(|e| e.to_string())?,
+                ),
+                value => value,
+            };
+            let model = required_text(model, "Model ID from your provider", "--model")?;
+            let name = match args.name {
+                None if interactive => Some(
+                    personal_model_alias_prompt(&model)
+                        .prompt()
+                        .map_err(|e| e.to_string())?,
+                ),
+                value => value,
+            };
+            let name = required_text(name, "Configuration alias in Astra", "configuration alias")?;
+            let context_window = if wizard && interactive {
+                inquire::CustomType::<i32>::new("Context window (tokens):")
+                    .with_default(args.context_window)
+                    .prompt()
+                    .map_err(|e| e.to_string())?
+            } else {
+                args.context_window
+            };
+            if context_window <= 0 {
+                return Err("Context window must be positive".into());
+            }
+            let is_default = if wizard && interactive && !args.default {
+                inquire::Confirm::new("Use this as your default model?")
+                    .with_default(true)
+                    .prompt()
+                    .map_err(|e| e.to_string())?
+            } else {
+                args.default
+            };
+            let api_key = if args.api_key_stdin {
+                read_model_api_key_from_stdin()?
+            } else {
+                prompt_password_masked(
+                    "Model API key (input hidden; press Enter to confirm)",
+                    None,
+                )?
+            };
+            let payload = serde_json::json!({
+                "name": name,
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "api_key": api_key,
+                "context_window": context_window,
+                "is_default": is_default,
+            });
             let body = api
-                .get_model_text(&token, &args.model_name)
+                .post_bearer_path_json_text(&token, paths::ME_MODELS, &payload)
                 .await
                 .map_err(map_thin_err)?;
             print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Model(ModelCmd::Show(args))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let body = if let Some(model_id) =
+                find_personal_model_id(api, &token, &args.model_name).await?
+            {
+                api.get_bearer_path_query_text(&token, &paths::me_model(&model_id), &[])
+                    .await
+                    .map_err(map_thin_err)?
+            } else {
+                api.get_model_text(&token, &args.model_name)
+                    .await
+                    .map_err(map_thin_err)?
+            };
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Model(ModelCmd::Probe(args))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let model_id = find_personal_model_id(api, &token, &args.model_name)
+                .await?
+                .ok_or_else(|| format!("Personal model '{}' not found", args.model_name))?;
+            let body = api
+                .post_bearer_path_empty_text(&token, &paths::me_model_check(&model_id))
+                .await
+                .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Model(ModelCmd::Delete(args))) => {
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let model_id = find_personal_model_id(api, &token, &args.model_name)
+                .await?
+                .ok_or_else(|| format!("Personal model '{}' not found", args.model_name))?;
+            api.delete_bearer_path_text(&token, &paths::me_model(&model_id))
+                .await
+                .map_err(map_thin_err)?;
+            stdout_println!(
+                "{} Deleted personal model {}",
+                theme::icon_ok(),
+                args.model_name
+            );
             Ok(ExitCode::Success)
         }
 
