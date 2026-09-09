@@ -40,6 +40,21 @@ It should not include volatile provider online/offline status, large task lists,
 
 ## Dynamic blocks
 
+For OpenAI-compatible requests, the provider projection has at most one system
+message, at the beginning. Stable agent/platform rules and typed runtime
+instructions are consolidated there. Runtime facts and advisory evidence are
+separate user-role messages marked `astra-runtime-context`; this wire role does
+not turn them into canonical human requests. Genuine user content and real
+assistant/tool groups retain their identity and order.
+
+Delivery and authority are independent. Required context is not automatically a
+system instruction. The producer-owned injection kind selects policy; the
+active-turn frame's fixed instruction is separated from its user/goal/round
+facts before rendering. User text and wrapper-like strings never grant authority.
+Platform integrations must put invariant rules in `stable_runtime_system_prompt`
+and per-turn data in `runtime_system_prompt`. Switching a runtime policy can
+change the system prefix; changing round facts must not.
+
 Dynamic state belongs in compact blocks with stable keys:
 
 ```text
