@@ -52,7 +52,7 @@ fn collect_simple_commands(node: Node<'_>, source: &str, commands: &mut Vec<Vec<
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CommandWord {
     Literal(String),
     Dynamic {
@@ -1041,7 +1041,6 @@ fn resolve_xargs_command(
 ) -> DestructiveCommandResolution {
     const OPTIONS_WITH_VALUE: &[&str] = &[
         "-E",
-        "-I",
         "-L",
         "-n",
         "--max-args",
@@ -1055,8 +1054,8 @@ fn resolve_xargs_command(
         "-d",
         "--delimiter",
     ];
-    const LONG_OPTIONS_WITH_OPTIONAL_INLINE_VALUE: &[&str] = &["--eof", "--replace", "--max-lines"];
-    const OPTIONS_WITH_ATTACHED_VALUE: &[&str] = &["-E", "-I", "-L", "-n", "-P", "-s", "-a", "-d"];
+    const LONG_OPTIONS_WITH_OPTIONAL_INLINE_VALUE: &[&str] = &["--eof", "--max-lines"];
+    const OPTIONS_WITH_ATTACHED_VALUE: &[&str] = &["-E", "-L", "-n", "-P", "-s", "-a", "-d"];
     const FLAGS: &[&str] = &[
         "-0",
         "--null",
@@ -1072,6 +1071,7 @@ fn resolve_xargs_command(
     ];
     const TERMINAL_FLAGS: &[&str] = &["--help", "--version"];
 
+    let mut replacement = None;
     let mut index = 0;
     while let Some(word) = words.get(index) {
         let Some(argument) = word.literal() else {
@@ -1087,6 +1087,27 @@ fn resolve_xargs_command(
         let option = argument.split_once('=').map_or(argument, |(name, _)| name);
         if TERMINAL_FLAGS.contains(&argument) {
             return DestructiveCommandResolution::Safe;
+        }
+        if argument == "-I" {
+            let Some(value) = words.get(index + 1).and_then(CommandWord::literal) else {
+                return DestructiveCommandResolution::Ambiguous;
+            };
+            replacement = Some(value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument
+            .strip_prefix("-I")
+            .filter(|value| !value.is_empty())
+        {
+            replacement = Some(value);
+            index += 1;
+            continue;
+        }
+        if option == "--replace" {
+            replacement = Some(argument.split_once('=').map_or("{}", |(_, value)| value));
+            index += 1;
+            continue;
         }
         if LONG_OPTIONS_WITH_OPTIONAL_INLINE_VALUE.contains(&option) {
             index += 1;
@@ -1119,8 +1140,35 @@ fn resolve_xargs_command(
     if index == words.len() {
         DestructiveCommandResolution::Safe
     } else {
-        resolve_destructive_command(&words[index..], shell_depth)
+        match replacement {
+            Some(marker) => resolve_replaced_command(&words[index..], marker, shell_depth),
+            None => resolve_destructive_command(&words[index..], shell_depth),
+        }
     }
+}
+
+/// Replacement preserves argv boundaries but not literal contents. Reuse the
+/// normal resolver so data arguments stay allowed while executable/script and
+/// option boundaries must still be statically known.
+fn resolve_replaced_command(
+    words: &[CommandWord],
+    marker: &str,
+    shell_depth: usize,
+) -> DestructiveCommandResolution {
+    if marker.is_empty() {
+        return DestructiveCommandResolution::Ambiguous;
+    }
+    let replaced: Vec<_> = words
+        .iter()
+        .map(|word| match word.literal() {
+            Some(value) if value.contains(marker) => CommandWord::Dynamic {
+                may_split: false,
+                proven_find_path: false,
+            },
+            _ => word.clone(),
+        })
+        .collect();
+    resolve_destructive_command(&replaced, shell_depth)
 }
 
 fn resolve_find_commands(
@@ -1172,7 +1220,7 @@ fn resolve_find_commands(
         {
             return DestructiveCommandResolution::Ambiguous;
         }
-        match resolve_destructive_command(&words[command_start..command_end], shell_depth) {
+        match resolve_replaced_command(&words[command_start..command_end], "{}", shell_depth) {
             DestructiveCommandResolution::Safe => {}
             DestructiveCommandResolution::ChildRisks(risks) => child_risks.extend(risks),
             result => return result,
@@ -1191,6 +1239,12 @@ fn is_find_expression_start(argument: &str) -> bool {
 }
 
 fn find_predicate_operand_count(argument: &str) -> usize {
+    if let Some(suffix) = argument.strip_prefix("-newer") {
+        let bytes = suffix.as_bytes();
+        if bytes.len() == 2 && b"acmB".contains(&bytes[0]) && b"acmBt".contains(&bytes[1]) {
+            return 1;
+        }
+    }
     match argument {
         "-fprintf" => 2,
         "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" | "-regex"

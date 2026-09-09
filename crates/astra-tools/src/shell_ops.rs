@@ -5229,6 +5229,63 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
+    fn validate_execute_bash_preserves_dispatch_replacement_boundaries() {
+        for option in [
+            "-I{}",
+            "-I {}",
+            "--replace",
+            "--replace={}",
+            "-ITOKEN",
+            "--replace=TOKEN",
+        ] {
+            let marker = if option.contains("TOKEN") {
+                "TOKEN"
+            } else {
+                "{}"
+            };
+            for (child, allowed) in [
+                (format!("sh -c '{marker}'"), false),
+                (format!("env sh -c 'printf ok; {marker}'"), false),
+                (format!("printf '%s' '{marker}'"), true),
+                (format!("sh -c 'printf %s \"$1\"' sh '{marker}'"), true),
+            ] {
+                let command = format!("printf input | xargs {option} {child}");
+                assert_eq!(
+                    validate_execute_bash_command(&command).is_ok(),
+                    allowed,
+                    "{command}"
+                );
+            }
+        }
+        for (child, allowed) in [
+            ("sh -c '{}'", false),
+            ("sh -c 'printf ok; {}'", false),
+            ("printf '%s' '{}'", true),
+            ("sh -c 'printf %s \"$1\"' sh '{}'", true),
+        ] {
+            let command = format!("find . -exec {child} \\;");
+            assert_eq!(
+                validate_execute_bash_command(&command).is_ok(),
+                allowed,
+                "{command}"
+            );
+        }
+        for predicate in ["-neweram", "-newermm", "-newerBa"] {
+            let command = format!("find . {predicate} '-exec' -print");
+            assert!(validate_execute_bash_command(&command).is_ok(), "{command}");
+        }
+        assert!(validate_execute_bash_command("find . -newermt '2026-01-01' -print").is_ok());
+        for command in [
+            "find . -neweram $reference -print",
+            "find . -neweram",
+            "find . -neweram '-exec' -exec truncate -s 0 fixture \\;",
+            "printf input | xargs -I \"$marker\" sh -c '{}'",
+        ] {
+            assert!(validate_execute_bash_command(command).is_err(), "{command}");
+        }
+    }
+
+    #[test]
     fn validate_execute_bash_preserves_dispatched_shell_risks() {
         for (script, allowed) in [
             ("printf hello", true),
