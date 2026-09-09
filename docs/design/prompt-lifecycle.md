@@ -123,8 +123,11 @@ current and immediately prior text remains in canonical conversation messages
 and is never recopied into the cached system prefix. Required runtime context
 remains model-visible through the role required by the selected wire shape,
 without changing its typed runtime ownership. For automatic-prefix protocols a
-changed system message after the conversation boundary is a volatile suffix,
-not a changed leading-system identity. Planned diagnostics are explicitly
+dynamic context message after the conversation boundary is a volatile suffix,
+not a changed leading-system identity. OpenAI-compatible requests consolidate
+policy into one leading system and project runtime facts as marked user
+context, as specified in [context-and-prompt.md](context-and-prompt.md).
+Planned diagnostics are explicitly
 labelled as a pre-client projection. Provider-final diagnostics come only from
 the immutable prepared-body receipt and fingerprint the ordered message,
 system, conversation, and tool-schema sequences after every provider
