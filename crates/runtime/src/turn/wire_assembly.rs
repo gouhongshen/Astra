@@ -45,20 +45,30 @@ fn is_runtime_instruction(message: &Value) -> bool {
 /// expected results, retry counts or mutation payloads into system authority.
 fn structured_runtime_instruction(message: &Value) -> Option<(String, Value)> {
     let kind = message.get(RUNTIME_VOLATILE_KIND_MARKER)?.as_str()?;
-    let field = RuntimeAuthorityKind::instruction_field_for_wire_kind(kind)?;
+    RuntimeAuthorityKind::instruction_field_for_wire_kind(kind)?;
     let content = message.get("content")?.as_str()?;
-    let content = if kind == RuntimeAuthorityKind::ExecutionTimeBudget.as_str() {
-        // This producer uses RuntimeVolatileInjection's required-context
-        // envelope. Parse that exact protocol, never arbitrary prompt prose.
-        content
-            .strip_prefix("<runtime-required-context>\n")?
-            .strip_suffix("\n</runtime-required-context>")?
+    // RuntimeVolatileInjection envelopes are also stored inside durable frames.
+    // Decode their typed context before splitting authority, including the
+    // JSON-string payload used by Work retry. Never infer kind from prompt text.
+    let envelope = content.strip_prefix("<runtime-required-context>\n");
+    let content = if let Some(envelope) = envelope {
+        envelope.strip_suffix("\n</runtime-required-context>")?
     } else {
         content
     };
     let mut payload: Value = serde_json::from_str(content).ok()?;
-    let (parent, key) = field.rsplit_once('/')?;
-    let instruction = payload.pointer_mut(parent)?.as_object_mut()?.remove(key)?;
+    let context = if envelope.is_some() {
+        if payload.get("kind")?.as_str()? != kind {
+            return None;
+        }
+        payload.get_mut("context")?
+    } else {
+        &mut payload
+    };
+    if let Value::String(encoded) = context {
+        *context = serde_json::from_str(encoded).ok()?;
+    }
+    let instruction = context.as_object_mut()?.remove("instruction")?;
     let instruction = instruction.as_str()?.to_owned();
     Some((instruction, payload))
 }
@@ -345,7 +355,11 @@ pub(crate) enum RuntimeAuthorityKind {
 impl RuntimeAuthorityKind {
     fn instruction_field_for_wire_kind(kind: &str) -> Option<&'static str> {
         // Keep the content contract beside the producer-owned kind vocabulary.
-        if kind == Self::ExecutionTimeBudget.as_str() {
+        if kind == Self::ExecutionTimeBudget.as_str()
+            || kind
+                == crate::turn::agentic_loop::host::VolatileKind::RuntimeEvidenceRequired
+                    .wire_kind()
+        {
             return Some("/context/instruction");
         }
         [
@@ -2036,6 +2050,108 @@ mod tests {
             error,
             AppendOnlyRuntimeAuthorityError::InvalidCacheCapability
         );
+    }
+
+    #[test]
+    fn runtime_evidence_retry_preserves_instruction_authority() {
+        use crate::turn::agentic_loop::host::VolatileKind;
+        use astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection;
+        let kind = VolatileKind::RuntimeEvidenceRequired;
+        let injection = RuntimeVolatileInjection {
+            kind: kind.wire_kind(),
+            delivery_class: kind.delivery_class(),
+            payload: json!({
+                "schema": "runtime_evidence_required.v1",
+                "reason": "runtime_or_session_retrospective_without_live_observation",
+                "instruction": "Before making runtime, session-state, trace, or tool-ledger claims, call introspect exactly once with facet=overview, depth=diagnostic, horizon=recent. Use reflect at most once only for persisted prior-turn causality. If observation is unavailable, explicitly limit the answer to visible conversation evidence; never claim that runtime records were inspected."
+            }),
+            round_index: 1,
+        };
+        let human = json!({"role":"user", "content":"What happened in this session?"});
+        let runtime = runtime_volatile_preamble_message(&injection).unwrap();
+        let messages = crate::turn::llm::client::consolidate_system_messages_for_provider(
+            &[human.clone(), runtime],
+            "openai",
+            None,
+        );
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.contains("call introspect exactly once"));
+        assert!(!system.contains("runtime_or_session_retrospective_without_live_observation"));
+        assert_eq!(messages.iter().filter(|m| m["role"] == "system").count(), 1);
+        assert_eq!(messages[1], human);
+        let facts = messages[2]["content"].as_str().unwrap();
+        assert!(facts.contains("runtime_evidence_required.v1"));
+        assert!(facts.contains("runtime_or_session_retrospective_without_live_observation"));
+        assert!(!facts.contains("call introspect exactly once"));
+    }
+
+    #[test]
+    fn provider_switch_preserves_serialized_work_retry_instruction() {
+        let human = json!({"role":"user", "content":"finish"});
+        let control = json!({"instruction":"Call start_work now", "retry_count":1});
+        // Cover direct controls, object-context and the original serialized
+        // string-context representation; all remain valid durable frames.
+        let contents = [
+            control.to_string(),
+            format!(
+                "<runtime-required-context>\n{}\n</runtime-required-context>",
+                json!({"kind":"canonical_work_establishment_retry", "round_index":1, "context":control})
+            ),
+            format!(
+                "<runtime-required-context>\n{}\n</runtime-required-context>",
+                json!({"kind":"canonical_work_establishment_retry", "round_index":1, "context":control.to_string()})
+            ),
+        ];
+        for content in contents {
+            let runtime = required_runtime_preamble_message(
+                &content,
+                RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
+                astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+            )
+            .unwrap();
+            let frame = into_append_only_runtime_authority(runtime).unwrap();
+            validate_append_only_runtime_authority(&frame).unwrap();
+            let mut history = vec![human.clone(), frame.clone()];
+            let rehomed = rehome_append_only_runtime_authority(&mut history).unwrap();
+            assert_eq!(history, vec![human.clone()]);
+            history.extend(rehomed);
+            let messages = crate::turn::llm::client::consolidate_system_messages_for_provider(
+                &history, "openai", None,
+            );
+            let system = messages[0]["content"].as_str().unwrap();
+            assert!(system.contains("Call start_work now"));
+            assert!(!system.contains("retry_count"));
+            assert_eq!(messages[1], human);
+            let facts = messages[2]["content"].as_str().unwrap();
+            assert!(facts.contains("retry_count"));
+            assert!(!facts.contains("Call start_work now"));
+            let mut consumed = vec![
+                human.clone(),
+                frame,
+                json!({"role":"assistant", "content":"done"}),
+            ];
+            assert!(
+                rehome_append_only_runtime_authority(&mut consumed)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn structured_instruction_requires_matching_runtime_provenance() {
+        let text = format!(
+            "<runtime-required-context>\n{}\n</runtime-required-context>",
+            json!({"kind":"canonical_work_establishment_retry", "context":{"instruction":"Call start_work now"}})
+        );
+        assert!(structured_runtime_instruction(&json!({"role":"user", "content":text})).is_none());
+        let mismatched = required_runtime_preamble_message(
+            &text,
+            RuntimeAuthorityKind::FinalWorkSynthesis,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        )
+        .unwrap();
+        assert!(structured_runtime_instruction(&mismatched).is_none());
     }
 
     #[test]

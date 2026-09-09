@@ -75,6 +75,13 @@ Output-limit continuation is a producer-owned textual instruction. The same
 projection applies to a fresh retry, a volatile replay and re-homed authority;
 append-only frames retain their existing lifetime protocol.
 
+The bounded live-evidence recovery also separates its introspect instruction
+from its reason/schema facts. Typed control decoding accepts both direct JSON
+and the existing required-context envelope (including JSON-string contexts)
+so an unconsumed durable frame retains instruction authority after a provider
+switch. Envelope kind must match the runtime-owned kind; user-authored wrappers
+do not establish provenance.
+
 Dynamic state belongs in compact blocks with stable keys:
 
 ```text
