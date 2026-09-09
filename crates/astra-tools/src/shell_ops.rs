@@ -6256,6 +6256,24 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
+    fn validate_execute_bash_preserves_find_operand_boundaries() {
+        for predicate in ["-name", "-iname", "-path", "-ipath", "-regex", "-iregex"] {
+            for pattern in ["\"$pattern\"", "'-exec'", "'dd'", "'*.rs'"] {
+                let command = format!("find . {predicate} {pattern} -print");
+                assert!(validate_execute_bash_command(&command).is_ok(), "{command}");
+            }
+        }
+        for command in [
+            "find . -name $pattern -print",
+            "find . -name",
+            "find . -name '*.rs' \"$pred\" truncate -s 0 owned.db \\;",
+            "find . -name '-exec' -exec truncate -s 0 owned.db \\;",
+        ] {
+            assert!(validate_execute_bash_command(command).is_err(), "{command}");
+        }
+    }
+
+    #[test]
     fn validate_execute_bash_rejects_ambiguous_dispatcher_options() {
         for command in [
             "timeout --future-option 5 dd if=/dev/zero of=/dev/sda",
