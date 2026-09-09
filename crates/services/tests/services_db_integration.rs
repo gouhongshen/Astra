@@ -93,7 +93,10 @@ async fn session_creation_returns_database_generated_fields_after_commit() {
     assert_eq!(record.event_count, 0);
     chrono::NaiveDateTime::parse_from_str(&record.created_at, "%Y-%m-%dT%H:%M:%S")
         .expect("database-generated creation timestamp");
-    assert_eq!(record.updated_at.as_deref(), Some(record.created_at.as_str()));
+    assert_eq!(
+        record.updated_at.as_deref(),
+        Some(record.created_at.as_str())
+    );
     assert_eq!(record.ended_at, None);
 
     // Do not verify persistence with an immediate pooled SELECT: its snapshot
