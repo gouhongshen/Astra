@@ -16277,6 +16277,38 @@ mod tests {
         )
         .expect("start context JSON");
         assert_eq!(start_payload["schema"], "active_work_attempt_start.v1");
+        let body = crate::turn::llm::client::build_provider_request_body(
+            &[
+                json!({"role":"system", "content":"stable"}),
+                start_context.clone(),
+                json!({"role":"user", "content":"execute assigned task"}),
+            ],
+            &[],
+            "test-model",
+            "openai",
+            Some(1024),
+            None,
+            false,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        );
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("Execute only this assigned WorkItem")
+        );
+        assert!(
+            !body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("One direct evidence result")
+        );
+        assert!(
+            body["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("One direct evidence result")
+        );
         assert!(
             start_payload["instruction"].as_str().is_some_and(
                 |instruction| instruction.contains("every payload and verification field")
@@ -16340,6 +16372,35 @@ mod tests {
         .expect("valid synthesis JSON");
         assert_eq!(payload["schema"], "final_work_synthesis.v1");
         let instruction = payload["instruction"].as_str().expect("instruction");
+        let body = crate::turn::llm::client::build_provider_request_body(
+            &[
+                json!({"role":"system", "content":"stable"}),
+                message.clone(),
+                json!({"role":"user", "content":"summarize the outcome"}),
+            ],
+            &[],
+            "test-model",
+            "openai",
+            Some(1024),
+            None,
+            false,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        );
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains(instruction)
+        );
+        assert_eq!(
+            body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["role"] == "system")
+                .count(),
+            1
+        );
         assert!(instruction.contains("direct evidence"));
         assert!(instruction.contains("index/home page"));
         assert!(instruction.contains("omit tool names"));
@@ -21297,6 +21358,138 @@ mod tests {
     }
 
     #[test]
+    fn deadline_producer_keeps_instruction_separate_from_timestamp() {
+        let content = ServerAgenticLoopHost::execution_time_budget_context(
+            ExecutionDeadlineAuthority {
+                deadline_unix_ms: 123456789,
+            },
+            7,
+        )
+        .unwrap();
+        let message = crate::turn::wire_assembly::required_runtime_preamble_message(
+            &content,
+            crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
+            astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+        )
+        .unwrap();
+        let body = crate::turn::llm::client::build_provider_request_body(
+            &[
+                json!({"role":"system", "content":"stable"}),
+                message,
+                json!({"role":"user", "content":"finish"}),
+            ],
+            &[],
+            "test-model",
+            "openai",
+            Some(1024),
+            None,
+            false,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        );
+        let system = body["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("finish or hand off before this deadline"));
+        assert!(!system.contains("123456789"));
+        assert!(
+            body["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("123456789")
+        );
+    }
+
+    #[test]
+    fn work_retry_and_output_cap_producers_keep_system_authority_in_provider_body() {
+        use crate::turn::wire_assembly::RuntimeAuthorityKind;
+        let human = json!({"role":"user", "content":"finish the task exactly"});
+        let base = vec![
+            json!({"role":"system", "content":"stable policy"}),
+            human.clone(),
+            json!({"role":"assistant", "content":"partial answer"}),
+        ];
+        let capability =
+            astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
+                None, "openai",
+            );
+        for retry_count in [1, 2] {
+            let retry =
+                ServerAgenticLoopHost::canonical_work_establishment_retry_preamble(retry_count);
+            for (content, kind, instruction) in [
+                (
+                    retry["content"].as_str().unwrap(),
+                    RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry,
+                    "Call start_work now",
+                ),
+                (
+                    output_cap_continuation_prompt(),
+                    RuntimeAuthorityKind::OutputCapContinuation,
+                    "Continue from its last point",
+                ),
+            ] {
+                let (messages, frame) = ServerAgenticLoopHost::project_required_runtime_authority(
+                    &base,
+                    &base,
+                    content,
+                    kind,
+                    astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+                    "openai",
+                    capability,
+                )
+                .unwrap();
+                assert!(frame.is_none());
+                let body = crate::turn::llm::client::build_provider_request_body(
+                    &messages,
+                    &[],
+                    "test-model",
+                    "openai",
+                    Some(1024),
+                    None,
+                    false,
+                    &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                );
+                let wire = body["messages"].as_array().unwrap();
+                assert_eq!(
+                    wire.iter()
+                        .filter(|message| message["role"] == "system")
+                        .count(),
+                    1
+                );
+                let system = wire[0]["content"].as_str().unwrap();
+                assert!(system.contains(instruction));
+                assert!(!system.contains("\"retry\":"));
+                assert_eq!(wire[1], human);
+                assert_eq!(wire[2], base[2]);
+                if kind == RuntimeAuthorityKind::CanonicalWorkEstablishmentRetry {
+                    assert!(
+                        wire[3]["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains(&format!("\"retry\":{retry_count}"))
+                    );
+                    let replay = crate::turn::wire_assembly::runtime_volatile_preamble_message(
+                        &astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+                            kind: "canonical_work_establishment_retry".into(),
+                            delivery_class: astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
+                            payload: Value::String(content.to_owned()), round_index: 1,
+                        }).unwrap();
+                    let mut replay_messages = base.clone();
+                    replay_messages.push(replay);
+                    let replay_body = crate::turn::llm::client::build_provider_request_body(
+                        &replay_messages,
+                        &[],
+                        "test-model",
+                        "openai",
+                        Some(1024),
+                        None,
+                        false,
+                        &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                    );
+                    assert_eq!(replay_body["messages"], body["messages"]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn output_cap_continuation_merges_suffix_without_duplication() {
         assert_eq!(
             merge_output_cap_continuation("partial answer", " and the rest"),
@@ -22738,7 +22931,36 @@ mod tests {
             .unwrap();
         assert!(msgs.len() >= 2, "should have system + user messages");
         assert_eq!(msgs[0]["role"], "system");
-        assert_eq!(msgs[0]["content"], "system prompt text");
+        assert!(
+            msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("system prompt text")
+        );
+        assert!(
+            msgs[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("active_turn_focus_policy.v1")
+        );
+        let body = crate::turn::llm::client::build_provider_request_body(
+            &msgs,
+            &[],
+            "test-model",
+            "openai",
+            Some(1024),
+            None,
+            false,
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+        );
+        let wire = body["messages"].as_array().unwrap();
+        assert_eq!(
+            wire.iter()
+                .filter(|message| message["role"] == "system")
+                .count(),
+            1
+        );
+        assert_eq!(wire.last(), state.messages.last());
     }
 
     #[tokio::test]
@@ -30262,11 +30484,28 @@ mod tests {
             .filter(|message| message["role"] == "user")
         {
             let content = message["content"].as_str().unwrap_or_default();
+            if content.starts_with("<astra-runtime-context>\n") {
+                assert!(content.ends_with("\n</astra-runtime-context>"));
+                continue;
+            }
             assert!(!content.contains("Turn Budget"));
             assert!(!content.contains("Capabilities"));
             assert!(!content.contains("Turn-start session execution state"));
             assert!(!content.contains("<system-reminder>"));
         }
+        assert_eq!(
+            captured_request_messages
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .count(),
+            1
+        );
+        assert!(captured_request_messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("<astra-runtime-context>\n"))
+        }));
         assert_eq!(
             llm_events[1]["metadata"]["response"]["outcome"].as_str(),
             Some("success_stop")

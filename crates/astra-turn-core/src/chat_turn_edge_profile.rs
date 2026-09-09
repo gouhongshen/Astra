@@ -79,6 +79,7 @@ impl RuntimeVolatileInjection {
                 | "session_hook_context"
                 | "plan_mode_marker"
                 | "harness_boundary"
+                | "output_cap_continuation"
         )
     }
     /// Separate producer-owned instructions from per-round facts before text

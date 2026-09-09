@@ -67,6 +67,14 @@ OpenAI-compatible layouts, typed policies join the leading system, while facts
 use the marked user-context projection. The invariant focus policy applies to
 all layouts; exact turn text stays outside the system prefix.
 
+Work start/retry/synthesis/mutation controls and deadline context contain both
+instructions and facts. Their producer-owned kind declares the structured
+instruction field: only that field joins the leading system; objectives,
+expected results, retry counts, mutations and deadlines stay in user context.
+Output-limit continuation is a producer-owned textual instruction. The same
+projection applies to a fresh retry, a volatile replay and re-homed authority;
+append-only frames retain their existing lifetime protocol.
+
 Dynamic state belongs in compact blocks with stable keys:
 
 ```text

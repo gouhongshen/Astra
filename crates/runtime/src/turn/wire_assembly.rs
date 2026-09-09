@@ -40,6 +40,29 @@ fn is_runtime_instruction(message: &Value) -> bool {
         || kind == "read_only_effect_boundary"
 }
 
+/// These producer-owned kinds encode a JSON instruction alongside Work facts.
+/// Extract only the explicit instruction field; never promote objectives,
+/// expected results, retry counts or mutation payloads into system authority.
+fn structured_runtime_instruction(message: &Value) -> Option<(String, Value)> {
+    let kind = message.get(RUNTIME_VOLATILE_KIND_MARKER)?.as_str()?;
+    let field = RuntimeAuthorityKind::instruction_field_for_wire_kind(kind)?;
+    let content = message.get("content")?.as_str()?;
+    let content = if kind == RuntimeAuthorityKind::ExecutionTimeBudget.as_str() {
+        // This producer uses RuntimeVolatileInjection's required-context
+        // envelope. Parse that exact protocol, never arbitrary prompt prose.
+        content
+            .strip_prefix("<runtime-required-context>\n")?
+            .strip_suffix("\n</runtime-required-context>")?
+    } else {
+        content
+    };
+    let mut payload: Value = serde_json::from_str(content).ok()?;
+    let (parent, key) = field.rsplit_once('/')?;
+    let instruction = payload.pointer_mut(parent)?.as_object_mut()?.remove(key)?;
+    let instruction = instruction.as_str()?.to_owned();
+    Some((instruction, payload))
+}
+
 /// Only the provider projection changes roles. Canonical runtime provenance,
 /// append-only frames and genuine human/tool messages remain untouched.
 pub(crate) fn project_runtime_roles(messages: &[Value]) -> Vec<Value> {
@@ -50,6 +73,12 @@ pub(crate) fn project_runtime_roles(messages: &[Value]) -> Vec<Value> {
     }
     for original in messages {
         let mut message = original.clone();
+        if is_runtime_system_context(original)
+            && let Some((instruction, facts)) = structured_runtime_instruction(original)
+        {
+            projected.push(serde_json::json!({"role":"system", "content": instruction}));
+            message["content"] = Value::String(facts.to_string());
+        }
         if is_runtime_system_context(original) && !is_runtime_instruction(original) {
             message["role"] = Value::String("user".into());
             match message.get_mut("content") {
@@ -314,6 +343,21 @@ pub(crate) enum RuntimeAuthorityKind {
 }
 
 impl RuntimeAuthorityKind {
+    fn instruction_field_for_wire_kind(kind: &str) -> Option<&'static str> {
+        // Keep the content contract beside the producer-owned kind vocabulary.
+        if kind == Self::ExecutionTimeBudget.as_str() {
+            return Some("/context/instruction");
+        }
+        [
+            Self::ActiveWorkAttemptStart,
+            Self::PendingWorkGraphMutations,
+            Self::FinalWorkSynthesis,
+            Self::CanonicalWorkEstablishmentRetry,
+        ]
+        .into_iter()
+        .any(|candidate| candidate.as_str() == kind)
+        .then_some("/instruction")
+    }
     const fn as_str(self) -> &'static str {
         match self {
             Self::EdgeRequiredContext => "edge_required_context",
@@ -364,7 +408,14 @@ pub(crate) fn decision_feedback_preamble_message(text: &str) -> Option<Value> {
 pub(crate) fn runtime_volatile_preamble_message(
     injection: &astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection,
 ) -> Option<Value> {
-    let text = if injection.is_system_instruction() {
+    let text = if RuntimeAuthorityKind::instruction_field_for_wire_kind(&injection.kind)
+        == Some("/instruction")
+    {
+        match &injection.payload {
+            Value::String(text) => text.clone(),
+            payload => payload.to_string(),
+        }
+    } else if injection.is_system_instruction() {
         injection.system_instruction()?
     } else {
         injection.render_for_prompt()?
