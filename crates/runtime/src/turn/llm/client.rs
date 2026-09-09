@@ -2203,6 +2203,28 @@ pub(crate) fn build_provider_request_body_with_overrides(
 ) -> Value {
     let sanitized_overrides =
         sanitize_request_body_overrides_for_thinking(thinking, request_body_overrides);
+    // Direct body-building callers use the same projection as streaming and
+    // non-streaming dispatch. Already projected requests take the borrowed path.
+    let projected_messages;
+    let needs_role_projection = messages
+        .iter()
+        .any(crate::turn::wire_assembly::is_runtime_system_context)
+        || messages
+            .iter()
+            .filter(|message| message["role"] == "system")
+            .count()
+            > 1;
+    let messages = if matches!(
+        llm_provider_protocol(provider),
+        LlmProviderProtocol::OpenAiCompatible
+    ) && needs_role_projection
+    {
+        projected_messages =
+            consolidate_system_messages_for_provider(messages, provider, model_name, None);
+        projected_messages.as_slice()
+    } else {
+        messages
+    };
     let marker_stripped_messages;
     let messages = if messages.iter().any(|message| {
         crate::turn::wire_assembly::is_required_runtime_preamble(message)
@@ -2540,21 +2562,15 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
 pub(crate) fn consolidate_system_messages_for_provider(
     messages: &[Value],
     provider: &str,
-    model_name: &str,
-    explicit_cache_capability: Option<CacheCapability>,
+    _model_name: &str,
+    _explicit_cache_capability: Option<CacheCapability>,
 ) -> Vec<Value> {
     let protocol = llm_provider_protocol(provider);
-    let cache_cap = CacheCapability::from_explicit_or_provider_model(
-        explicit_cache_capability,
-        provider,
-        model_name,
-    );
-    let preserve_runtime_system_tail = matches!(protocol, LlmProviderProtocol::AnthropicMessages)
-        || (matches!(protocol, LlmProviderProtocol::OpenAiCompatible)
-            && !matches!(
-                cache_cap.volatile_placement,
-                VolatilePlacement::CurrentUserOnly
-            ));
+    if matches!(protocol, LlmProviderProtocol::OpenAiCompatible) {
+        let projected = crate::turn::wire_assembly::project_runtime_roles(messages);
+        return consolidate_system_messages_inner(&projected, false);
+    }
+    let preserve_runtime_system_tail = matches!(protocol, LlmProviderProtocol::AnthropicMessages);
     consolidate_system_messages_inner(messages, preserve_runtime_system_tail)
 }
 
@@ -8714,7 +8730,7 @@ mod tests {
     }
 
     #[test]
-    fn consolidate_for_openai_preserves_runtime_system_at_current_turn_boundary() {
+    fn consolidate_for_openai_projects_runtime_data_at_current_turn_boundary() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
         )
@@ -8731,10 +8747,15 @@ mod tests {
 
         assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
-        assert_eq!(out[0]["content"], "stable");
+        assert!(out[0]["content"].as_str().unwrap().contains("stable"));
         assert_eq!(out[1]["role"], "user");
-        assert_eq!(out[3]["role"], "system");
-        assert_eq!(out[3]["content"], "required resume context");
+        assert_eq!(out[3]["role"], "user");
+        assert!(
+            out[3]["content"]
+                .as_str()
+                .unwrap()
+                .contains("required resume context")
+        );
         assert_eq!(out[4]["content"], "hi");
         assert!(
             out.iter().all(|message| message
@@ -8745,7 +8766,7 @@ mod tests {
     }
 
     #[test]
-    fn consolidate_for_strict_history_openai_moves_required_runtime_to_initial_system() {
+    fn consolidate_for_strict_history_openai_keeps_runtime_data_as_user() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
         )
@@ -8760,19 +8781,24 @@ mod tests {
 
         let out = consolidate_system_messages_for_provider(&msgs, "openai", "MiniMax-M2.7", None);
 
-        assert_eq!(out.len(), 4);
+        assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
-        assert_eq!(out[0]["content"], "stable\n\nrequired resume context");
+        assert!(
+            !out[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("required resume context")
+        );
         assert!(
             out.iter()
                 .skip(1)
                 .all(|message| { message.get("role").and_then(Value::as_str) != Some("system") })
         );
-        assert_eq!(out[3]["content"], "hi");
+        assert_eq!(out[4]["content"], "hi");
     }
 
     #[test]
-    fn explicit_current_user_only_capability_overrides_provider_model_heuristic() {
+    fn explicit_cache_capability_does_not_elevate_runtime_data_to_system() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
         )
@@ -8797,15 +8823,20 @@ mod tests {
             Some(explicit),
         );
 
-        assert_eq!(out.len(), 4);
+        assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
-        assert_eq!(out[0]["content"], "stable\n\nrequired resume context");
+        assert!(
+            !out[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("required resume context")
+        );
         assert!(
             out.iter()
                 .skip(1)
                 .all(|message| message.get("role").and_then(Value::as_str) != Some("system"))
         );
-        assert_eq!(out[3]["content"], "hi");
+        assert_eq!(out[4]["content"], "hi");
     }
 
     #[test]
@@ -10664,7 +10695,61 @@ mod tests {
     }
 
     #[test]
-    fn build_openai_body_keeps_real_tool_result_before_tail_runtime_system() {
+    fn openai_single_system_contract_covers_moi_context_and_runtime_policy() {
+        use crate::turn::wire_assembly::{
+            required_runtime_preamble_message, runtime_instruction_message,
+        };
+        let user = json!({"role":"user", "content":"Translate only this sentence."});
+        for history in [
+            vec![],
+            vec![
+                json!({"role":"user", "content":"previous question"}),
+                json!({"role":"assistant", "content":"previous answer"}),
+            ],
+        ] {
+            let mut messages =
+                vec![json!({"role":"system", "content":"Astra and MOI stable policy"})];
+            messages.extend(history);
+            messages.push(
+                required_runtime_preamble_message(
+                    "Current date: 2026-09-09\nAttachments: report.pdf",
+                )
+                .unwrap(),
+            );
+            messages.push(runtime_instruction_message("Read-only plan mode.").unwrap());
+            messages.push(
+                required_runtime_preamble_message("Current goal: Translate only this sentence.")
+                    .unwrap(),
+            );
+            messages.push(user.clone());
+            let body = build_provider_request_body(
+                &messages,
+                &[],
+                "customer-qwen",
+                "openai",
+                Some(1024),
+                None,
+                false,
+                &ThinkingConfig::Off,
+            );
+            let wire = body["messages"].as_array().unwrap();
+            assert_eq!(wire.iter().filter(|m| m["role"] == "system").count(), 1);
+            assert_eq!(wire[0]["role"], "system");
+            let policy = wire[0]["content"].as_str().unwrap();
+            assert!(policy.contains("Read-only plan mode."));
+            assert!(!policy.contains("report.pdf"));
+            assert!(!policy.contains("Current goal:"));
+            assert_eq!(wire.last(), Some(&user));
+            assert!(!body.to_string().contains("__astra_runtime_"));
+            assert!(
+                wire.iter()
+                    .any(|m| m["role"] == "user" && m.to_string().contains("report.pdf"))
+            );
+        }
+    }
+
+    #[test]
+    fn build_openai_body_keeps_real_tool_result_before_tail_runtime_data() {
         let runtime = crate::turn::wire_assembly::runtime_system_context_message(
             "round runtime context",
             false,
@@ -10711,8 +10796,20 @@ mod tests {
         assert_eq!(provider_messages[3]["role"], "tool");
         assert_eq!(provider_messages[3]["tool_call_id"], "call-real");
         assert_eq!(provider_messages[3]["content"], "real tool result");
-        assert_eq!(provider_messages[4]["role"], "system");
-        assert_eq!(provider_messages[4]["content"], "round runtime context");
+        assert_eq!(provider_messages[4]["role"], "user");
+        assert!(
+            provider_messages[4]["content"]
+                .as_str()
+                .unwrap()
+                .contains("round runtime context")
+        );
+        assert_eq!(
+            provider_messages
+                .iter()
+                .filter(|m| m["role"] == "system")
+                .count(),
+            1
+        );
         assert!(
             provider_messages.iter().all(|message| {
                 message.get("content").and_then(Value::as_str)

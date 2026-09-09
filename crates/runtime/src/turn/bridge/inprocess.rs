@@ -1941,6 +1941,7 @@ fn required_runtime_text_for_bridge(
         .filter(|injection| {
             injection.delivery_class
                 == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+                && !injection.is_system_instruction()
         })
         .filter_map(|injection| injection.render_for_prompt()),
     );

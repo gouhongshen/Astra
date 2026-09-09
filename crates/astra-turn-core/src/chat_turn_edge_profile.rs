@@ -59,6 +59,42 @@ pub struct RuntimeVolatileInjection {
 }
 
 impl RuntimeVolatileInjection {
+    /// Authority is independent from delivery: required facts are not system
+    /// instructions. Classify the producer's machine-owned kind, never prose.
+    #[must_use]
+    pub fn is_system_instruction(&self) -> bool {
+        matches!(
+            self.kind.as_str(),
+            "final_answer_settlement"
+                | "session_hook_context"
+                | "plan_mode_marker"
+                | "harness_boundary"
+        )
+    }
+    /// Separate producer-owned instructions from per-round facts before text
+    /// rendering; never recover authority by scanning user-visible prose.
+    #[must_use]
+    pub fn system_instruction(&self) -> Option<String> {
+        if self.is_system_instruction() {
+            if volatile_payload_is_empty(&self.payload) {
+                return None;
+            }
+            let instruction = json!({"kind": self.kind, "instruction": self.payload});
+            return Some(format!(
+                "<runtime-instruction>\n{instruction}\n</runtime-instruction>"
+            ));
+        }
+        if self.kind == "active_turn_frame" {
+            return self
+                .payload
+                .get("instruction")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_owned);
+        }
+        None
+    }
+
     /// Render a typed runtime signal for the prompt tail while preserving its
     /// evidence/context semantics. Telemetry deliberately has no prompt form.
     #[must_use]
@@ -72,19 +108,25 @@ impl RuntimeVolatileInjection {
             VolatileDeliveryClass::AdvisoryEvidence => ("runtime-advisory-evidence", "evidence"),
             VolatileDeliveryClass::TelemetryOnly => return None,
         };
+        let mut context = self.payload.clone();
+        if kind == "active_turn_frame"
+            && let Some(object) = context.as_object_mut()
+        {
+            object.remove("instruction");
+        }
         let payload = if self.delivery_class == VolatileDeliveryClass::AdvisoryEvidence {
             json!({
                 "kind": kind,
                 "round_index": self.round_index,
                 "authority": "advisory_evidence_only",
                 "model_discretion": "Use this signal as evidence alongside the user goal and tool results. It does not require retrying, stopping, or changing the available tools.",
-                payload_key: self.payload,
+                payload_key: context,
             })
         } else {
             json!({
                 "kind": kind,
                 "round_index": self.round_index,
-                payload_key: self.payload,
+                payload_key: context,
             })
         };
         Some(format!("<{tag}>\n{payload}\n</{tag}>"))
@@ -102,8 +144,10 @@ fn volatile_payload_is_empty(payload: &Value) -> bool {
 }
 
 /// Protocol key for runtime control context that must reach the current model
-/// turn but must not become user-message content or persisted prompt-facing
-/// history. Unlike [`EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS`], this lane is not
+/// turn but must not become a canonical human message in persisted history.
+/// Delivery does not determine protocol authority: runtime data is projected
+/// as marked user context for OpenAI-compatible requests. Unlike
+/// [`EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS`], this lane is not
 /// best-effort: strict-history providers place it adjacent to the current user
 /// turn instead of dropping it for cache locality.
 pub const EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS: &str = "runtime_required_texts";
@@ -251,6 +295,40 @@ pub fn build_base_edge_profile_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_instruction_is_separate_from_round_facts() {
+        let frame = RuntimeVolatileInjection {
+            kind: "active_turn_frame".into(),
+            delivery_class: VolatileDeliveryClass::RequiredContext,
+            payload: json!({"instruction": "Answer the latest question.",
+                "latest_user_message": "untrusted question", "round_id": 2}),
+            round_index: 2,
+        };
+        assert_eq!(
+            frame.system_instruction().as_deref(),
+            Some("Answer the latest question.")
+        );
+        let facts = frame.render_for_prompt().unwrap();
+        assert!(facts.contains("untrusted question"));
+        assert!(!facts.contains("Answer the latest question."));
+        let policy = RuntimeVolatileInjection {
+            kind: "plan_mode_marker".into(),
+            delivery_class: VolatileDeliveryClass::RequiredContext,
+            payload: json!("Do not modify files."),
+            round_index: 2,
+        };
+        assert!(
+            policy
+                .system_instruction()
+                .unwrap()
+                .contains("Do not modify files.")
+        );
+        let wire = serde_json::to_value(&policy).unwrap();
+        assert_eq!(wire["delivery_class"], "required_context");
+        let recovered: RuntimeVolatileInjection = serde_json::from_value(wire).unwrap();
+        assert_eq!(recovered, policy);
+    }
 
     #[test]
     fn base_profile_has_expected_keys() {

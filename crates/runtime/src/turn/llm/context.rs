@@ -1452,7 +1452,7 @@ pub(crate) fn assemble_context_pipeline(
     let round_within_turn = state.current_round_index;
     let inject_volatile = cache_cap.should_inject_volatile_on_round(round_within_turn);
 
-    let (system_messages, mut volatile_preamble) = match cache_cap.volatile_placement {
+    let (mut system_messages, mut volatile_preamble) = match cache_cap.volatile_placement {
         VolatilePlacement::MarkerIsolated => {
             let stable_content: Vec<Value> = pipeline_output
                 .serialized
@@ -1500,6 +1500,15 @@ pub(crate) fn assemble_context_pipeline(
             (system, preamble)
         }
     };
+    for injection in
+        astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
+            input.runtime_signals.edge_profile,
+        )
+    {
+        if let Some(instruction) = injection.system_instruction() {
+            system_messages.push(json!({"role": "system", "content": instruction}));
+        }
+    }
     let mut required_runtime_texts = astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
         input.runtime_signals.edge_profile,
         astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
@@ -1512,6 +1521,7 @@ pub(crate) fn assemble_context_pipeline(
         .filter(|injection| {
             injection.delivery_class
                 == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext
+                && !injection.is_system_instruction()
         })
         .filter_map(|injection| injection.render_for_prompt()),
     );
@@ -2653,14 +2663,18 @@ mod context_cache_contract_tests {
             .join("\n");
         assert!(user_text.contains("相关的测试够硬核吗"));
         assert_eq!(
-            messages[4],
-            json!({"role": "user", "content": "相关的测试够硬核吗？"})
+            messages.last().unwrap(),
+            &json!({"role": "user", "content": "相关的测试够硬核吗？"})
         );
-        assert_eq!(messages[3]["role"], "system");
-        let runtime_system_text = message_text(&messages[3]);
+        let runtime_context = messages
+            .iter()
+            .find(|message| message_text(message).contains("<runtime-required-context>"))
+            .expect("active-turn facts must remain model-visible");
+        let runtime_system_text = message_text(runtime_context);
         assert!(runtime_system_text.contains("<runtime-required-context>"));
         assert!(runtime_system_text.contains("\"turn_id\":7"));
         assert!(runtime_system_text.contains("\"round_id\":3"));
+        assert!(!runtime_system_text.contains("\"instruction\""));
         assert!(!message_text(&messages[0]).contains("<runtime-required-context>"));
         assert!(
             state.volatile_pending.is_empty(),
