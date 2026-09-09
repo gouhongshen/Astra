@@ -5229,6 +5229,38 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
+    fn validate_execute_bash_preserves_xargs_appended_argv() {
+        assert!(
+            validate_execute_bash_command("printf '%s\\0' truncate -s 0 fixture | xargs -0 env")
+                .is_err()
+        );
+        for child in [
+            "sh",
+            "env",
+            "env sh",
+            "timeout 5 env",
+            "sh --",
+            "sh -c",
+            "busybox sh",
+        ] {
+            let command = format!("printf '%s\\0' -c 'truncate -s 0 fixture' | xargs -0 {child}");
+            assert!(
+                validate_execute_bash_command(&command).is_err(),
+                "{command}"
+            );
+        }
+        for child in [
+            "printf '%s'",
+            "env printf '%s'",
+            "sh -c 'printf %s \"$1\"' sh",
+            "env sh -c 'printf ok'",
+        ] {
+            let command = format!("printf input | xargs {child}");
+            assert!(validate_execute_bash_command(&command).is_ok(), "{command}");
+        }
+    }
+
+    #[test]
     fn validate_execute_bash_preserves_dispatch_replacement_boundaries() {
         assert!(
             validate_execute_bash_command("printf input | xargs -Ish sh -c 'printf ok'").is_ok()

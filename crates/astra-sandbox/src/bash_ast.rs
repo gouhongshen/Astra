@@ -315,10 +315,13 @@ fn nested_shell_script(words: &[CommandWord]) -> NestedShellScript<'_> {
         let Some(argument) = word.literal() else {
             return NestedShellScript::Ambiguous;
         };
-        if argument == "--"
-            || argument == "-"
-            || (!argument.starts_with('-') && !argument.starts_with('+'))
-        {
+        if argument == "--" || argument == "-" {
+            return match words.get(argument_index + 1) {
+                Some(CommandWord::Dynamic { .. }) => NestedShellScript::Ambiguous,
+                _ => NestedShellScript::None,
+            };
+        }
+        if !argument.starts_with('-') && !argument.starts_with('+') {
             return NestedShellScript::None;
         }
 
@@ -1142,7 +1145,16 @@ fn resolve_xargs_command(
     } else {
         match replacement {
             Some(marker) => resolve_replaced_command(&words[index..], marker, false, shell_depth),
-            None => resolve_destructive_command(&words[index..], shell_depth),
+            None => {
+                // Input supplies an unknown argv suffix, not just data: it can
+                // complete an unfinished launcher or shell option boundary.
+                let mut child = words[index..].to_vec();
+                child.push(CommandWord::Dynamic {
+                    may_split: true,
+                    proven_find_path: false,
+                });
+                resolve_destructive_command(&child, shell_depth)
+            }
         }
     }
 }
