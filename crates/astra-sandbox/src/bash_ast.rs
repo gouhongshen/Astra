@@ -253,20 +253,11 @@ fn analyze_bash_risks_ast_inner(command: &str, shell_depth: usize) -> Vec<Comman
                     ctx.push(CommandRisk::RemoteCodeExecution);
                 }
                 DestructiveCommandResolution::Safe => {}
-            }
-            match nested_shell_script(&words) {
-                NestedShellScript::Script(script) if shell_depth < 16 => {
-                    // Quoted `sh -c` input is a new shell program, unlike
-                    // heredoc input to Python/Node. Parse it as Bash so a real
-                    // destructive command cannot hide behind a shell wrapper.
-                    for risk in analyze_bash_risks_ast_inner(script, shell_depth + 1) {
+                DestructiveCommandResolution::ChildRisks(risks) => {
+                    for risk in risks {
                         ctx.push(risk);
                     }
                 }
-                NestedShellScript::Script(_) | NestedShellScript::Ambiguous => {
-                    ctx.push(CommandRisk::RemoteCodeExecution);
-                }
-                NestedShellScript::None => {}
             }
         }
         let mut cursor = node.walk();
@@ -417,6 +408,7 @@ const DESTRUCTIVE_COMMANDS: &[&str] = &[
 enum DestructiveCommandResolution {
     Safe,
     Destructive(String),
+    ChildRisks(Vec<CommandRisk>),
     Ambiguous,
 }
 
@@ -449,11 +441,8 @@ fn resolve_destructive_command(
         }
         NestedShellScript::Script(script) => {
             let nested_risks = analyze_bash_risks_ast_inner(script, shell_depth + 1);
-            if let Some(name) = nested_risks.into_iter().find_map(|risk| match risk {
-                CommandRisk::DestructiveCommand(name) => Some(name),
-                _ => None,
-            }) {
-                return DestructiveCommandResolution::Destructive(name);
+            if !nested_risks.is_empty() {
+                return DestructiveCommandResolution::ChildRisks(nested_risks);
             }
         }
         NestedShellScript::Ambiguous => return DestructiveCommandResolution::Ambiguous,
@@ -1140,6 +1129,7 @@ fn resolve_find_commands(
 ) -> DestructiveCommandResolution {
     let mut index = 0;
     let mut expression_started = false;
+    let mut child_risks = Vec::new();
     while index < words.len() {
         let Some(argument) = words[index].literal() else {
             // Quoting proves one argv entry, but not that its value is a path:
@@ -1184,11 +1174,16 @@ fn resolve_find_commands(
         }
         match resolve_destructive_command(&words[command_start..command_end], shell_depth) {
             DestructiveCommandResolution::Safe => {}
+            DestructiveCommandResolution::ChildRisks(risks) => child_risks.extend(risks),
             result => return result,
         }
         index = command_end + 1;
     }
-    DestructiveCommandResolution::Safe
+    if child_risks.is_empty() {
+        DestructiveCommandResolution::Safe
+    } else {
+        DestructiveCommandResolution::ChildRisks(child_risks)
+    }
 }
 
 fn is_find_expression_start(argument: &str) -> bool {
