@@ -64,6 +64,65 @@ async fn setup_pool_and_settings() -> (SharedPool, MatrixOneSettings) {
     common::setup_pool_and_settings().await
 }
 
+#[tokio::test]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn session_creation_returns_database_fields_and_commits_before_success() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let user_id = format!("session-create-it-{}", Uuid::new_v4());
+    let service = DatabaseSessionService::new(settings).with_pool(shared);
+    let metadata = serde_json::Map::from_iter([("marker".into(), serde_json::json!(user_id))]);
+    let record = service
+        .create_session(
+            user_id.clone(),
+            astra_services::auth::session::SessionCreateRequestData {
+                title: Some("Session creation visibility".into()),
+                agent_id: Some("test-agent".into()),
+                metadata: Some(metadata.clone()),
+            },
+        )
+        .await
+        .expect("create session and commit");
+
+    // Check the actual database values, including generated timestamps, rather
+    // than accepting a response synthesized from the request before commit.
+    let row = sqlx::query(
+        "SELECT title, agent_id, status, event_count, \
+         DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at, \
+         DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s') AS updated_at \
+         FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&record.session_id)
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("session must be committed after successful creation");
+    assert_eq!(record.user_id, user_id);
+    assert_eq!(record.metadata, metadata);
+    assert_eq!(record.title.as_deref(), Some(row.get::<&str, _>("title")));
+    assert_eq!(
+        record.agent_id.as_deref(),
+        Some(row.get::<&str, _>("agent_id"))
+    );
+    assert_eq!(record.status, row.get::<String, _>("status"));
+    assert_eq!(record.event_count, row.get::<i64, _>("event_count"));
+    assert_eq!(record.created_at, row.get::<String, _>("created_at"));
+    assert_eq!(record.updated_at, Some(row.get::<String, _>("updated_at")));
+    assert_eq!(record.ended_at, None);
+
+    for table in [
+        "agent_sessions",
+        "agent_session_lifecycle_fences",
+        "auth_audit_logs",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("clean up test-owned rows");
+    }
+}
+
 async fn cleanup_skills_by_ids(pool: &sqlx::Pool<sqlx::MySql>, ids: &[String]) {
     for id in ids {
         let _ = sqlx::query("DELETE FROM skills_registry WHERE skill_id = ?")
