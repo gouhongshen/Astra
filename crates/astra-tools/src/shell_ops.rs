@@ -6256,6 +6256,30 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
+    fn validate_execute_bash_preserves_dispatched_shell_risks() {
+        for (script, allowed) in [
+            ("printf hello", true),
+            ("tool=truncate; \"$tool\" -s 0 fixture", false),
+            ("eval \"$code\"", false),
+            ("truncate -s 0 fixture", false),
+        ] {
+            for command in [
+                format!("sh -c '{script}'"),
+                format!("printf x | xargs sh -c '{script}'"),
+                format!("find . -exec sh -c '{script}' \\;"),
+                format!("printf x | xargs env sh -c '{script}'"),
+                format!("find . -exec sh -c 'printf hello > out' \\; -exec sh -c '{script}' \\;"),
+            ] {
+                assert_eq!(
+                    validate_execute_bash_command(&command).is_ok(),
+                    allowed,
+                    "{command}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn validate_execute_bash_preserves_find_operand_boundaries() {
         for predicate in ["-name", "-iname", "-path", "-ipath", "-regex", "-iregex"] {
             for pattern in ["\"$pattern\"", "'-exec'", "'dd'", "'*.rs'"] {
