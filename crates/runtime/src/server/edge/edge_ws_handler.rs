@@ -676,13 +676,16 @@ async fn handle_edge_connection(
         workspace_id.clone(),
         pool_tx,
     );
-    // Reconcile publication as a cancellable future polled alongside the
-    // WebSocket. A slow or half-open control-plane write must not prevent Ping,
-    // ToolResult, Close, or heartbeat handling. Dropping this connection future
-    // cancels the in-flight database attempt as well.
-    let mut registration_release = registration_lease.claim_id.as_ref().map(|_| {
-        reconcile_edge_registry_release(edge_registry.clone(), registration_lease.clone())
-    });
+    // Independently poll publication and its deadline even while a message or
+    // heartbeat handler awaits database resources. JoinSet aborts on owner drop;
+    // normal teardown also joins cancellation before durable unregister.
+    let mut registration_release = tokio::task::JoinSet::new();
+    if registration_lease.claim_id.is_some() {
+        registration_release.spawn(reconcile_edge_registry_release(
+            edge_registry.clone(),
+            registration_lease.clone(),
+        ));
+    }
     drop(reconnect_guard);
     // Release the per-key reconnect lock entry now that the reconnect is done.
     state
@@ -1061,13 +1064,27 @@ async fn handle_edge_connection(
                         }
                     }
                 }
-                released = async {
-                    match registration_release.as_mut() {
-                        Some(release) => release.as_mut().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    registration_release = None;
+                released = registration_release.join_next(), if !registration_release.is_empty() => {
+                    let released = match released {
+                        Some(Ok(released)) => released,
+                        Some(Err(error)) => {
+                            tracing::error!(
+                                target: "astra_runtime::edge_ws",
+                                user_id = %user_id,
+                                edge_agent_id = %edge_agent_id,
+                                %error,
+                                "edge WebSocket: registration publication task failed"
+                            );
+                            let _ = send_edge_msg(
+                                &ws_sink_write,
+                                EdgeServerMessage::Closing {
+                                    reason: "edge registry publication unavailable".into(),
+                                },
+                            ).await;
+                            break;
+                        }
+                        None => unreachable!("publication task exists while join is enabled"),
+                    };
                     if released {
                         tracing::info!(
                             target: "astra_runtime::edge_ws",
@@ -1099,6 +1116,9 @@ async fn handle_edge_connection(
     read_loop.await;
 
     // ── Cleanup ──────────────────────────────────────────────────────
+    // Aborting alone only schedules cancellation. Joining guarantees the
+    // publication future has dropped its transaction/connection first.
+    registration_release.shutdown().await;
     forward_task.abort();
     // Drop cancel sender so the dispatch task can break its loop cleanly.
     drop(dispatch_cancel_tx);

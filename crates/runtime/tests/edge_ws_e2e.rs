@@ -1168,6 +1168,21 @@ struct BlockingLeaseEdgeRegistry {
     release_attempts: AtomicUsize,
     release_outcomes: std::sync::Mutex<std::collections::VecDeque<Result<bool, String>>>,
     block_first_release: bool,
+    block_every_release: bool,
+    active_releases: AtomicUsize,
+    database_connection: tokio::sync::Semaphore,
+    live_pool: Option<sqlx::MySqlPool>,
+    heartbeat_completed: Notify,
+    heartbeat_started: Notify,
+    unregister_completed: Notify,
+}
+
+struct ReleaseDropSentinel<'a>(&'a AtomicUsize);
+
+impl Drop for ReleaseDropSentinel<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl BlockingLeaseEdgeRegistry {
@@ -1202,6 +1217,13 @@ impl BlockingLeaseEdgeRegistry {
             release_attempts: AtomicUsize::new(0),
             release_outcomes: std::sync::Mutex::new(outcomes.into_iter().collect()),
             block_first_release,
+            block_every_release: false,
+            active_releases: AtomicUsize::new(0),
+            database_connection: tokio::sync::Semaphore::new(1),
+            live_pool: None,
+            heartbeat_completed: Notify::new(),
+            heartbeat_started: Notify::new(),
+            unregister_completed: Notify::new(),
         }
     }
 }
@@ -1265,8 +1287,15 @@ impl astra_services::multi_agent::EdgeRegistryService for BlockingLeaseEdgeRegis
         _lease: &astra_services::multi_agent::EdgeRegistrationLease,
     ) -> Result<bool, String> {
         let attempt = self.release_attempts.fetch_add(1, Ordering::SeqCst);
+        let _connection = self.database_connection.acquire().await.unwrap();
+        let _transaction = match &self.live_pool {
+            Some(pool) => Some(pool.begin().await.expect("publication transaction")),
+            None => None,
+        };
+        self.active_releases.fetch_add(1, Ordering::SeqCst);
+        let _sentinel = ReleaseDropSentinel(&self.active_releases);
         self.claim_release_started.notify_one();
-        if self.block_first_release && attempt == 0 {
+        if self.block_every_release || (self.block_first_release && attempt == 0) {
             self.claim_release_gate.notified().await;
         }
         self.release_outcomes
@@ -1283,6 +1312,14 @@ impl astra_services::multi_agent::EdgeRegistryService for BlockingLeaseEdgeRegis
         _edge_id_header: &str,
         _registration_claim_id: Option<&str>,
     ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
+        if self.block_every_release {
+            // A one-connection pool makes heartbeat wait for the pending
+            // publication attempt to time out and drop its resource.
+            assert_eq!(self.active_releases.load(Ordering::SeqCst), 1);
+            self.heartbeat_started.notify_one();
+            let _connection = self.database_connection.acquire().await.unwrap();
+            self.heartbeat_completed.notify_one();
+        }
         Ok(())
     }
 
@@ -1307,6 +1344,19 @@ impl astra_services::multi_agent::EdgeRegistryService for BlockingLeaseEdgeRegis
         _edge_agent_id: &str,
         _edge_id_header: &str,
     ) -> Result<bool, String> {
+        assert_eq!(
+            self.active_releases.load(Ordering::SeqCst),
+            0,
+            "release must be dropped before durable unregister starts"
+        );
+        let _connection = self.database_connection.acquire().await.unwrap();
+        if let Some(pool) = &self.live_pool {
+            sqlx::query("SELECT 1")
+                .execute(pool)
+                .await
+                .expect("unregister can acquire the released database connection");
+        }
+        self.unregister_completed.notify_one();
         Ok(true)
     }
 }
@@ -1390,7 +1440,41 @@ async fn edge_ws_close_during_registration_rolls_back_without_pool_commit() {
 
 #[tokio::test]
 async fn pending_claim_release_does_not_block_websocket_messages_or_disconnect() {
-    let registry = Arc::new(BlockingLeaseEdgeRegistry::new());
+    pending_release_disconnect(false, None).await;
+}
+
+#[tokio::test]
+async fn pending_claim_release_deadline_runs_while_heartbeat_waits_for_its_resource() {
+    pending_release_disconnect(true, None).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live MatrixOne: ASTRA_TEST_DB_IT=1 and MATRIXONE_* settings"]
+async fn pending_claim_release_disconnect_returns_live_database_connection() {
+    assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+    let settings = astra_core::MatrixOneSettings::from_env();
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(2))
+        .connect_with(
+            sqlx::mysql::MySqlConnectOptions::new()
+                .host(&settings.host)
+                .port(settings.port)
+                .username(&settings.user)
+                .password(&settings.password)
+                .database(&settings.database),
+        )
+        .await
+        .unwrap();
+    pending_release_disconnect(false, Some(pool.clone())).await;
+    pool.close().await;
+}
+
+async fn pending_release_disconnect(wait_for_heartbeat: bool, live_pool: Option<sqlx::MySqlPool>) {
+    let mut registry = BlockingLeaseEdgeRegistry::new();
+    registry.block_every_release = wait_for_heartbeat;
+    registry.live_pool = live_pool;
+    let registry = Arc::new(registry);
     let state = AppState::new(
         ServiceInfo::new("edge-auth-order-test", "0.0.0-test", ""),
         Arc::new(StubHealthChecker),
@@ -1463,7 +1547,42 @@ async fn pending_claim_release_does_not_block_websocket_messages_or_disconnect()
     let pong: serde_json::Value = serde_json::from_str(&pong.into_text().unwrap()).unwrap();
     assert_eq!(pong["type"], "edge_pong");
 
+    if wait_for_heartbeat {
+        // Establish the socket with real time, then deterministically start a
+        // fresh pending publication attempt just before heartbeat is due.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(24)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            registry.claim_release_started.notified(),
+        )
+        .await
+        .expect("retry acquired the connection before heartbeat");
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            registry.heartbeat_started.notified(),
+        )
+        .await
+        .expect("heartbeat started while publication holds the connection");
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            registry.heartbeat_completed.notified(),
+        )
+        .await
+        .expect("heartbeat must acquire the resource released by publication timeout");
+        tokio::time::resume();
+    }
     ws.close(None).await.expect("close websocket");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        registry.unregister_completed.notified(),
+    )
+    .await
+    .expect("durable unregister must complete after release cancellation");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while observed_state
             .edge_connection_pool
