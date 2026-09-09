@@ -1366,7 +1366,7 @@ fn resolve_xargs_command(
         DestructiveCommandResolution::Safe
     } else {
         match replacement {
-            Some(marker) => resolve_replaced_command(&words[index..], marker, shell_depth),
+            Some(marker) => resolve_replaced_command(&words[index..], marker, false, shell_depth),
             None => resolve_destructive_command(&words[index..], shell_depth),
         }
     }
@@ -1378,6 +1378,7 @@ fn resolve_xargs_command(
 fn resolve_replaced_command(
     words: &[CommandWord],
     marker: &str,
+    replace_executable: bool,
     shell_depth: usize,
 ) -> DestructiveCommandResolution {
     if marker.is_empty() {
@@ -1385,11 +1386,14 @@ fn resolve_replaced_command(
     }
     let replaced: Vec<_> = words
         .iter()
-        .map(|word| match word.literal() {
-            Some(value) if value.contains(marker) => CommandWord::Dynamic {
-                may_split: false,
-                proven_find_path: false,
-            },
+        .enumerate()
+        .map(|(index, word)| match word.literal() {
+            Some(value) if (replace_executable || index > 0) && value.contains(marker) => {
+                CommandWord::Dynamic {
+                    may_split: false,
+                    proven_find_path: false,
+                }
+            }
             _ => word.clone(),
         })
         .collect();
@@ -1445,7 +1449,8 @@ fn resolve_find_commands(
         {
             return DestructiveCommandResolution::Ambiguous;
         }
-        match resolve_replaced_command(&words[command_start..command_end], "{}", shell_depth) {
+        match resolve_replaced_command(&words[command_start..command_end], "{}", true, shell_depth)
+        {
             DestructiveCommandResolution::Safe => {}
             DestructiveCommandResolution::ChildRisks(risks) => child_risks.extend(risks),
             result => return result,

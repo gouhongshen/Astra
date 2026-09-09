@@ -6257,6 +6257,9 @@ printf 'probe.txt:1:needle\n'
 
     #[test]
     fn validate_execute_bash_preserves_dispatch_replacement_boundaries() {
+        assert!(
+            validate_execute_bash_command("printf input | xargs -Ish sh -c 'printf ok'").is_ok()
+        );
         for option in [
             "-I{}",
             "-I {}",
