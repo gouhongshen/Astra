@@ -1403,11 +1403,21 @@ async fn edge_registry_registration_claim_serializes_cross_pod_setup() {
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 async fn edge_registry_finalized_claim_is_renewed_and_fences_a_third_generation() {
+    expired_finalized_claim_survives_displaced_cleanup(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+async fn edge_registry_expired_finalized_claim_publishes_after_displaced_cleanup() {
+    expired_finalized_claim_survives_displaced_cleanup(true).await;
+}
+
+async fn expired_finalized_claim_survives_displaced_cleanup(publish_third: bool) {
     require_env();
     let pool = common::setup_pool().await.get().clone();
     let first_pod = DatabaseEdgeRegistryService::new(pool.clone());
-    let second_pod = DatabaseEdgeRegistryService::new(pool.clone());
-    let third_pod = DatabaseEdgeRegistryService::new(pool.clone());
+    let second_pod = DatabaseEdgeRegistryService::new(common::setup_pool().await.get().clone());
+    let third_pod = DatabaseEdgeRegistryService::new(common::setup_pool().await.get().clone());
     let user_id = format!("user_{}", unique_suffix());
     let edge_agent_id = format!("agent_{}", unique_suffix());
 
@@ -1512,8 +1522,42 @@ async fn edge_registry_finalized_claim_is_renewed_and_fences_a_third_generation(
             .await,
         Err(astra_services::multi_agent::HeartbeatError::Superseded)
     ));
-    assert!(third_pod.rollback_registration(&third).await.unwrap());
-    assert!(third_pod.list_by_user(&user_id).await.unwrap().is_empty());
+    assert!(third.previous.is_none());
+    assert!(
+        second_pod
+            .unregister_generation(&user_id, &edge_agent_id, "edge-second")
+            .await
+            .unwrap()
+    );
+    let state: (i8, Option<String>, Option<String>, i8) = sqlx::query_as(
+        "SELECT registration_state, registration_claim_id, registration_previous_edge_id, \
+                registration_claim_expires_at > NOW(6) \
+         FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&edge_agent_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, (0, third.claim_id.clone(), None, 1));
+
+    if publish_third {
+        assert!(third_pod.finalize_registration(&third).await.unwrap());
+        assert!(third_pod.release_registration(&third).await.unwrap());
+        // Repeated cleanup must also leave the published successor intact.
+        assert!(
+            !second_pod
+                .unregister_generation(&user_id, &edge_agent_id, "edge-second")
+                .await
+                .unwrap()
+        );
+        let published = third_pod.list_by_user(&user_id).await.unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].edge_id, "edge-third");
+    } else {
+        assert!(third_pod.rollback_registration(&third).await.unwrap());
+        assert!(third_pod.list_by_user(&user_id).await.unwrap().is_empty());
+    }
 }
 
 #[tokio::test]

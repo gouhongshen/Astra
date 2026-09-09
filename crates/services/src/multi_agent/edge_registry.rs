@@ -1099,6 +1099,10 @@ impl DatabaseEdgeRegistryService {
                 // unchanged until finalize_registration(), so the published
                 // predecessor remains heartbeatable and routable while setup is
                 // pending.
+                // Taking an expired finalized claim abandons its unpublished
+                // owner and predecessor atomically. Keep the old edge_id for
+                // fenced cleanup, but use state 0 so that cleanup preserves the
+                // new setup claim instead of clearing it as the owner's claim.
                 let updated = sqlx::query(
                     "UPDATE edge_agent_registry \
                      SET registration_claim_id = ?, \
@@ -1106,7 +1110,11 @@ impl DatabaseEdgeRegistryService {
                          hostname = CASE WHEN registration_state = 1 THEN hostname ELSE NULL END, \
                          worktree_path = CASE WHEN registration_state = 1 THEN worktree_path ELSE NULL END, \
                          capabilities_json = CASE WHEN registration_state = 1 THEN capabilities_json ELSE NULL END, \
-                         workspace_id = CASE WHEN registration_state = 1 THEN workspace_id ELSE NULL END \
+                         workspace_id = CASE WHEN registration_state = 1 THEN workspace_id ELSE NULL END, \
+                         registration_previous_edge_id = CASE WHEN registration_state = 2 \
+                             THEN NULL ELSE registration_previous_edge_id END, \
+                         registration_state = CASE WHEN registration_state = 2 \
+                             THEN 0 ELSE registration_state END \
                      WHERE user_id = ? AND registry_id = ? AND edge_id = ? \
                        AND (registration_claim_id IS NULL \
                             OR registration_claim_expires_at < NOW(6))",
