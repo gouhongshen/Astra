@@ -45,6 +45,43 @@ It should not include volatile provider online/offline status, large task lists,
 
 ## Dynamic blocks
 
+For OpenAI-compatible requests, the provider projection has at most one system
+message, at the beginning. Stable agent/platform rules and typed runtime
+instructions are consolidated there. Runtime facts and advisory evidence are
+separate user-role messages marked `astra-runtime-context`; this wire role does
+not turn them into canonical human requests. Genuine user content and real
+assistant/tool groups retain their identity and order.
+
+Delivery and authority are independent. Required context is not automatically a
+system instruction. The producer-owned injection kind selects policy; the
+active-turn frame's fixed instruction is separated from its user/goal/round
+facts before rendering. User text and wrapper-like strings never grant authority.
+Platform integrations must put invariant rules in `stable_runtime_system_prompt`
+and per-turn data in `runtime_system_prompt`. Switching a runtime policy can
+change the system prefix; changing round facts must not.
+
+The explicitly selected append-only layout keeps its existing runtime-owned
+user frames, lifetimes, and durable history protocol. It is already a single-
+system wire shape and is not flattened into ordinary human messages. On other
+OpenAI-compatible layouts, typed policies join the leading system, while facts
+use the marked user-context projection. The invariant focus policy applies to
+all layouts; exact turn text stays outside the system prefix.
+
+Work start/retry/synthesis/mutation controls and deadline context contain both
+instructions and facts. Their producer-owned kind declares the structured
+instruction field: only that field joins the leading system; objectives,
+expected results, retry counts, mutations and deadlines stay in user context.
+Output-limit continuation is a producer-owned textual instruction. The same
+projection applies to a fresh retry, a volatile replay and re-homed authority;
+append-only frames retain their existing lifetime protocol.
+
+The bounded live-evidence recovery also separates its introspect instruction
+from its reason/schema facts. Typed control decoding accepts both direct JSON
+and the existing required-context envelope (including JSON-string contexts)
+so an unconsumed durable frame retains instruction authority after a provider
+switch. Envelope kind must match the runtime-owned kind; user-authored wrappers
+do not establish provenance.
+
 Dynamic state belongs in compact blocks with stable keys:
 
 ```text
