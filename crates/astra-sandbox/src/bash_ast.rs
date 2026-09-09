@@ -129,6 +129,9 @@ fn command_words(node: Node<'_>, source: &str) -> Option<Vec<CommandWord>> {
 /// every other dynamic spelling is kept conservative because unquoted field
 /// splitting, arrays, `$@`, or substitutions can change command boundaries.
 fn dynamic_word_may_split(node: Node<'_>, source: &str) -> bool {
+    if node.kind() == "raw_string" {
+        return false;
+    }
     if node.kind() != "string" {
         return true;
     }
@@ -1150,6 +1153,17 @@ fn resolve_find_commands(
             continue;
         };
         expression_started |= is_find_expression_start(argument);
+        let operand_count = find_predicate_operand_count(argument);
+        if operand_count > 0 {
+            index += 1;
+            for _ in 0..operand_count {
+                let Ok(next) = consume_single_argv(words, index) else {
+                    return DestructiveCommandResolution::Ambiguous;
+                };
+                index = next;
+            }
+            continue;
+        }
         if !matches!(argument, "-exec" | "-execdir" | "-ok" | "-okdir") {
             index += 1;
             continue;
@@ -1179,6 +1193,19 @@ fn resolve_find_commands(
 
 fn is_find_expression_start(argument: &str) -> bool {
     argument.starts_with('-') || matches!(argument, "!" | "(" | ")" | ",")
+}
+
+fn find_predicate_operand_count(argument: &str) -> usize {
+    match argument {
+        "-fprintf" => 2,
+        "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" | "-regex"
+        | "-iregex" | "-lname" | "-ilname" | "-type" | "-xtype" | "-size" | "-user" | "-group"
+        | "-uid" | "-gid" | "-perm" | "-inum" | "-links" | "-samefile" | "-newer" | "-anewer"
+        | "-cnewer" | "-amin" | "-atime" | "-cmin" | "-ctime" | "-mmin" | "-mtime" | "-used"
+        | "-fstype" | "-maxdepth" | "-mindepth" | "-regextype" | "-printf" | "-fprint"
+        | "-fprint0" | "-fls" => 1,
+        _ => 0,
+    }
 }
 
 fn command_basename(raw: &str) -> String {
@@ -1493,6 +1520,20 @@ mod tests {
             fixture.to_string_lossy()
         );
         assert_eq!(std::fs::read(&fixture).expect("read fixture"), b"unchanged");
+        for name in ["example.rs", "-exec", "dd"] {
+            std::fs::write(temp_dir.path().join(name), b"unchanged").unwrap();
+            let pattern = if name == "example.rs" { "*.rs" } else { name };
+            let output = Command::new("sh")
+                .args(["-c", "find . -name \"$1\" -print", "sh", pattern])
+                .current_dir(temp_dir.path())
+                .output()
+                .expect("run find pattern probe");
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                format!("./{name}")
+            );
+        }
     }
 
     #[test]
