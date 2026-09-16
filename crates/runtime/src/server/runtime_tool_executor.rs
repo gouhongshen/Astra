@@ -3017,7 +3017,7 @@ impl RuntimeToolExecutor {
             name,
             args,
         );
-        if let Some(offer) = self.selected_offer_for_request(&request) {
+        if let Some(offer) = self.selected_offer_for_request(&request, None) {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
@@ -3041,11 +3041,14 @@ impl RuntimeToolExecutor {
         identity: &astra_turn_types::ToolInvocationIdentity,
         name: &str,
         args: &Value,
+        resolved_provider_policy: Option<
+            &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
+        >,
     ) -> ToolExecutionRequest {
         let mut request = self
             .execution_binding
             .tool_execution_request_for_invocation(identity, name, args);
-        if let Some(offer) = self.selected_offer_for_request(&request) {
+        if let Some(offer) = self.selected_offer_for_request(&request, resolved_provider_policy) {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
@@ -3079,11 +3082,18 @@ impl RuntimeToolExecutor {
     fn selected_offer_for_request(
         &self,
         request: &ToolExecutionRequest,
+        resolved_provider_policy: Option<
+            &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
+        >,
     ) -> Option<SelectedToolOfferSnapshot> {
         // Primary path: use the pre-computed offer from surface assembly.
         // This avoids TOCTOU between admission time and execution time.
         if let Some(offer) = self.current_selected_tool_offer(&request.tool_name) {
-            return Some(offer);
+            return Some(Self::bind_request_scoped_offer_to_provider_policy(
+                &request.tool_name,
+                offer,
+                resolved_provider_policy,
+            ));
         }
         // Fallback for request-scoped MCP tools: these are dynamically discovered
         // and may not have been available during surface assembly.
@@ -3105,18 +3115,53 @@ impl RuntimeToolExecutor {
                         &astra_runtime_env::ToolRegistry::builtins(),
                         context,
                     );
-                return decision.selected_offer.map(|offer| {
-                    SelectedToolOfferSnapshot::new_with_route_digest_and_native(
-                        offer.tool_name,
-                        offer.provider_id,
-                        offer.route,
-                        Some(offer.schema_digest),
-                        offer.native_tool_id,
-                    )
-                });
+                return decision
+                    .selected_offer
+                    .map(|offer| {
+                        SelectedToolOfferSnapshot::new_with_route_digest_and_native(
+                            offer.tool_name,
+                            offer.provider_id,
+                            offer.route,
+                            Some(offer.schema_digest),
+                            offer.native_tool_id,
+                        )
+                    })
+                    .map(|offer| {
+                        Self::bind_request_scoped_offer_to_provider_policy(
+                            &request.tool_name,
+                            offer,
+                            resolved_provider_policy,
+                        )
+                    });
             }
         }
         None
+    }
+
+    fn bind_request_scoped_offer_to_provider_policy(
+        tool_name: &str,
+        offer: SelectedToolOfferSnapshot,
+        resolved_provider_policy: Option<
+            &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
+        >,
+    ) -> SelectedToolOfferSnapshot {
+        if !matches!(
+            offer.route,
+            crate::server::tool_route_selection::ToolExecutionRouteKind::RequestScopedMcp
+        ) {
+            return offer;
+        }
+        let Some(policy) = resolved_provider_policy else {
+            return offer;
+        };
+        let descriptor = &policy.descriptor;
+        SelectedToolOfferSnapshot::new_with_route_digest_and_native(
+            tool_name,
+            descriptor.identity.provider_binding.as_str(),
+            offer.route,
+            Some(descriptor.descriptor_version.to_string()),
+            descriptor.identity.native_tool_id.as_str(),
+        )
     }
 
     fn request_with_selected_offer_route(
@@ -3232,7 +3277,12 @@ impl RuntimeToolExecutor {
                 );
             }
         };
-        let mut request = self.tool_execution_request_for_invocation(&identity, name, args);
+        let mut request = self.tool_execution_request_for_invocation(
+            &identity,
+            name,
+            args,
+            resolved_provider_policy,
+        );
         request.policy.resolved_provider_policy = resolved_provider_policy.cloned();
         request.policy.permission_grant = permission_grant.cloned();
         self.execute_request_with_metadata(request).await
@@ -3278,7 +3328,12 @@ impl RuntimeToolExecutor {
                 ));
             }
         };
-        let mut request = self.tool_execution_request_for_invocation(&identity, name, args);
+        let mut request = self.tool_execution_request_for_invocation(
+            &identity,
+            name,
+            args,
+            resolved_provider_policy,
+        );
         request.policy.resolved_provider_policy = resolved_provider_policy.cloned();
         request.policy.permission_grant = permission_grant.cloned();
         request.policy.task_resolution_authority = task_resolution_authority
@@ -5911,6 +5966,7 @@ mod tests {
             &identity,
             "bash",
             &json!({"command": "pwd"}),
+            None,
         );
         assert!(invocation.runtime_edge_dispatch_authorization.is_some());
         assert!(invocation.runtime_edge_dispatch_authorization_required);
@@ -10963,6 +11019,52 @@ esac
             offer.route,
             crate::server::tool_route_selection::ToolExecutionRouteKind::RequestScopedMcp
         );
+    }
+
+    #[test]
+    fn request_scoped_mcp_invocation_offer_uses_resolved_provider_identity() {
+        let (exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__moi-tools__bash",
+                "description": "Run a command in the MOI sandbox.",
+                "parameters": {"type": "object"}
+            }
+        })]);
+        let policy = semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::Disabled,
+        );
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "run-1",
+            "turn-1",
+            "call-1",
+        )
+        .unwrap();
+
+        let mut request = exec.tool_execution_request_for_invocation(
+            &identity,
+            "mcp__moi-tools__bash",
+            &json!({"command": "pwd"}),
+            Some(&policy),
+        );
+        let offer = request.selected_offer.as_ref().expect("selected MCP offer");
+        assert_eq!(offer.provider_id, "binding-a");
+        assert_eq!(offer.native_tool_id.as_deref(), Some("native-read"));
+        assert_eq!(offer.schema_digest.as_deref(), Some("descriptor-v1"));
+        assert_eq!(offer.offer_id, "mcp__moi-tools__bash@binding-a");
+
+        request.policy.resolved_provider_policy = Some(policy);
+        request.policy.admission_snapshot =
+            Some(crate::server::tool_execution_binding::ToolExecutionAdmissionSnapshot::default());
+        crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::resolve(
+            &request,
+            crate::server::tool_route_selection::ToolExecutionRouteKind::RequestScopedMcp,
+            &astra_runtime_env::ToolRegistry::builtins(),
+        )
+        .expect("resolved provider identity must agree with the selected offer");
     }
 
     #[test]
