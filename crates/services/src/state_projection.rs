@@ -23,6 +23,35 @@ pub const PROTECTED_COMPACTION_CATEGORIES: &[&str] = &[
     "delegation_state",
 ];
 
+const STATE_ITEM_ID_MAX_BYTES: usize = 128;
+
+/// Builds a stable state-item identity without exceeding the storage contract.
+/// Existing readable identities are preserved; only composite identities that
+/// exceed the column limit are represented by their full SHA-256 digest.
+pub fn bounded_state_item_id(kind: &str, components: &[&str]) -> String {
+    let readable = std::iter::once("state")
+        .chain(std::iter::once(kind))
+        .chain(components.iter().copied())
+        .collect::<Vec<_>>()
+        .join("-");
+    if readable.len() <= STATE_ITEM_ID_MAX_BYTES {
+        return readable;
+    }
+
+    let mut hasher = Sha256::new();
+    for component in std::iter::once(kind).chain(components.iter().copied()) {
+        hasher.update((component.len() as u64).to_be_bytes());
+        hasher.update(component.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let categorized = format!("state-{kind}-{digest:x}");
+    if categorized.len() <= STATE_ITEM_ID_MAX_BYTES {
+        categorized
+    } else {
+        format!("state-{digest:x}")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactionInvariant {
     pub id: &'static str,
@@ -566,7 +595,10 @@ impl DatabaseStateProjectionStore {
                 },
             })?;
         self.upsert_state_item(StateItemUpsert {
-            item_id: Some(format!("state-summary-{session_id}-{compaction_run_id}")),
+            item_id: Some(bounded_state_item_id(
+                "summary",
+                &[session_id, compaction_run_id],
+            )),
             user_id: user_id.to_string(),
             session_id: session_id.to_string(),
             scope: "session".to_string(),
@@ -834,7 +866,7 @@ impl DatabaseStateProjectionStore {
                 source,
             })?;
         let payload_hash = content_hash(&payload_json);
-        let item_id = format!("state-delegation-{}", record.delegation_id);
+        let item_id = bounded_state_item_id("delegation", &[&record.delegation_id]);
         let mut tx =
             self.pool
                 .get()
@@ -966,7 +998,8 @@ impl DatabaseStateProjectionStore {
                 })?;
         for (idx, target) in targets.iter().enumerate() {
             let item_key = format!("bubble:{source_run_id}:{}", target.depth);
-            let item_id = format!("state-{item_key}");
+            let item_id =
+                bounded_state_item_id("bubble", &[source_run_id, &target.depth.to_string()]);
             let payload = json!({
                 "bubble_seq": idx + 1,
                 "severity": severity,
@@ -1097,7 +1130,7 @@ impl DatabaseStateProjectionStore {
         _llm_probe: Option<&dyn SkillActivationLlmProbe>,
     ) -> Result<(), StateProjectionError> {
         let event_id = format!("event-{}", Uuid::new_v4());
-        let item_id = format!("state-active-skill-{session_id}-{skill_name}");
+        let item_id = bounded_state_item_id("active-skill", &[session_id, skill_name]);
         let payload = json!({
             "skill_name": skill_name,
             "version_id": version_id,
@@ -1687,6 +1720,28 @@ pub fn validate_state_mutation(mutation: &str) -> Result<(), StateProjectionErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_item_id_preserves_readable_identity_when_it_fits() {
+        assert_eq!(
+            bounded_state_item_id("summary", &["session-1", "run-1"]),
+            "state-summary-session-1-run-1"
+        );
+    }
+
+    #[test]
+    fn state_item_id_hashes_overlong_composites_stably() {
+        let session_id = "s".repeat(64);
+        let run_id = "r".repeat(68);
+        let first = bounded_state_item_id("decision", &[&session_id, &run_id, "2"]);
+        let repeated = bounded_state_item_id("decision", &[&session_id, &run_id, "2"]);
+        let next_turn = bounded_state_item_id("decision", &[&session_id, &run_id, "3"]);
+
+        assert!(first.len() <= STATE_ITEM_ID_MAX_BYTES);
+        assert!(first.starts_with("state-decision-"));
+        assert_eq!(first, repeated);
+        assert_ne!(first, next_turn);
+    }
 
     fn delegation_projection_upsert() -> DelegationProjectionUpsert {
         DelegationProjectionUpsert {

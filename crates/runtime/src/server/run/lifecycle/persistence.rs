@@ -25,6 +25,7 @@ use astra_services::runs::{
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::skills::SkillService;
+use astra_services::state_projection::bounded_state_item_id;
 use astra_services::{
     DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
 };
@@ -1391,9 +1392,9 @@ async fn persist_server_loop_projection_state(
         let preview = truncate_for_projection(final_text, 480);
         let result = store
             .upsert_state_item(StateItemUpsert {
-                item_id: Some(format!(
-                    "state-decision-{session_id}-{run_id}-{}",
-                    state.session_turn
+                item_id: Some(bounded_state_item_id(
+                    "decision",
+                    &[session_id, run_id, &state.session_turn.to_string()],
                 )),
                 user_id: user_id.to_string(),
                 session_id: session_id.to_string(),
@@ -1483,7 +1484,7 @@ async fn persist_server_loop_projection_state(
             Ok(results) if results.iter().all(|(_, violations)| *violations == 0) => {
                 let result = store
                     .upsert_state_item(StateItemUpsert {
-                        item_id: Some(format!("state-summary-{session_id}-{run_id}")),
+                        item_id: Some(bounded_state_item_id("summary", &[session_id, run_id])),
                         user_id: user_id.to_string(),
                         session_id: session_id.to_string(),
                         scope: "session".to_string(),
