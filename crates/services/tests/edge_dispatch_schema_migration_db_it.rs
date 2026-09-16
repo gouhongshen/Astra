@@ -1,4 +1,4 @@
-//! MatrixOne integration coverage for the 48f edge-dispatch schema upgrade.
+//! MatrixOne integration coverage for core schema upgrades.
 //!
 //! Run with:
 //!   ASTRA_TEST_DB_IT=1 cargo test -p astra-services \
@@ -6,8 +6,14 @@
 
 mod common;
 
-use astra_core::MatrixOneSettings;
-use astra_services::storage::{CORE_SCHEMA_CONTRACT_VERSION, ensure_core_schema};
+use astra_core::{MatrixOneSettings, SharedPool};
+use astra_services::{
+    AuthPrincipal, AuthPrincipalOrigin, AuthProviderAuthorizedRequestContext, AuthUserRecord,
+    DatabaseSessionService, ProviderSessionCreationIdentity, SessionCreateRequestData,
+    SessionService,
+    resource_governor::{LimitCheck, ResourceLimitKind},
+    storage::{CORE_SCHEMA_CONTRACT_VERSION, ensure_core_schema},
+};
 use sqlx::{MySql, Pool, Row, mysql::MySqlPoolOptions, query};
 use uuid::Uuid;
 
@@ -283,6 +289,137 @@ async fn assert_active_legacy_schema_blocks_upgrade(db: &IsolatedDatabase) -> Re
     Ok(())
 }
 
+async fn assert_v77_session_schema_upgrades_before_session_creation(
+    db: &IsolatedDatabase,
+) -> Result<(), String> {
+    ensure_core_schema(&db.settings, "mysql")
+        .await
+        .map_err(|error| format!("bootstrap current schema fixture: {error}"))?;
+    query("ALTER TABLE agent_sessions DROP COLUMN provider_creation_hash")
+        .execute(&db.pool)
+        .await
+        .map_err(|error| format!("restore v77 agent_sessions shape: {error}"))?;
+    query(
+        "UPDATE astra_schema_contracts SET contract_version = '2026-09-15-v77'
+         WHERE component = 'astra-core'",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("restore v77 core schema marker: {error}"))?;
+    query(
+        "UPDATE astra_schema_table_contracts SET contract_version = '2026-09-15-v77'
+         WHERE component = 'astra-core'",
+    )
+    .execute(&db.pool)
+    .await
+    .map_err(|error| format!("restore v77 table catalog markers: {error}"))?;
+
+    let pre_upgrade_columns: i64 = query(
+        "SELECT COUNT(*) AS row_count FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'agent_sessions'
+           AND COLUMN_NAME = 'provider_creation_hash'",
+    )
+    .bind(&db.settings.database)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("load v77 provider session column count: {error}"))?
+    .try_get("row_count")
+    .map_err(|error| format!("decode v77 provider session column count: {error}"))?;
+    if pre_upgrade_columns != 0 {
+        return Err("v77 fixture unexpectedly contains provider_creation_hash".to_string());
+    }
+
+    ensure_core_schema(&db.settings, "mysql")
+        .await
+        .map_err(|error| format!("upgrade v77 session schema: {error}"))?;
+    let post_upgrade_columns: i64 = query(
+        "SELECT COUNT(*) AS row_count FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'agent_sessions'
+           AND COLUMN_NAME = 'provider_creation_hash'",
+    )
+    .bind(&db.settings.database)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(|error| format!("load upgraded provider session column count: {error}"))?
+    .try_get("row_count")
+    .map_err(|error| format!("decode upgraded provider session column count: {error}"))?;
+    if post_upgrade_columns != 1 {
+        return Err("v78 upgrade did not create provider_creation_hash".to_string());
+    }
+
+    let shared = SharedPool::new(&db.settings)
+        .await
+        .map_err(|error| format!("connect upgraded session service: {error}"))?;
+    let sessions = DatabaseSessionService::new(db.settings.clone()).with_pool(shared.clone());
+    let ordinary_user = format!("v77-ordinary-{}", Uuid::new_v4().simple());
+    sessions
+        .create_session(
+            ordinary_user,
+            SessionCreateRequestData {
+                agent_id: None,
+                title: Some("ordinary session after v77 upgrade".to_string()),
+                metadata: None,
+            },
+        )
+        .await
+        .map_err(|error| format!("create ordinary session after v77 upgrade: {error:?}"))?;
+
+    let provider_user = format!("v77-provider-{}", Uuid::new_v4().simple());
+    let principal = AuthPrincipal {
+        user: AuthUserRecord {
+            user_id: provider_user.clone(),
+            username: provider_user.clone(),
+            email: "v77-provider@example.test".to_string(),
+            display_name: None,
+        },
+        session_id: None,
+        origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
+            AuthProviderAuthorizedRequestContext {
+                provider_id: "provider-v77-upgrade".to_string(),
+                external_subject: provider_user,
+                provider_scope_id: "scope-v77-upgrade".to_string(),
+                request_authorization_id: "request-v77-upgrade".to_string(),
+                edge_agent_id: None,
+            },
+        ),
+    };
+    let identity = ProviderSessionCreationIdentity::from_principal(
+        &principal,
+        "client-session-ref-v77-upgrade",
+    )
+    .map_err(|error| format!("derive provider session identity: {error:?}"))?;
+    let request = SessionCreateRequestData {
+        agent_id: None,
+        title: Some("provider session after v77 upgrade".to_string()),
+        metadata: None,
+    };
+    let created = sessions
+        .create_provider_session(identity.clone(), request.clone(), LimitCheck::Allowed)
+        .await
+        .map_err(|error| format!("create provider session after v77 upgrade: {error:?}"))?;
+    if !created.created {
+        return Err("first provider session request must create the session".to_string());
+    }
+    let replayed = sessions
+        .create_provider_session(
+            identity,
+            request,
+            LimitCheck::Denied {
+                limit: ResourceLimitKind::DailySessions,
+                reason: "replay must not consume quota".to_string(),
+            },
+        )
+        .await
+        .map_err(|error| format!("replay provider session after v77 upgrade: {error:?}"))?;
+    if replayed.created || replayed.session.session_id != created.session.session_id {
+        return Err("provider session replay did not reuse the upgraded session".to_string());
+    }
+
+    drop(sessions);
+    shared.close().await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
 async fn edge_pending_dispatch_schema_upgrade_preserves_terminal_rows_and_rejects_active_rows() {
@@ -296,4 +433,13 @@ async fn edge_pending_dispatch_schema_upgrade_preserves_terminal_rows_and_reject
     let active_result = assert_active_legacy_schema_blocks_upgrade(&active_db).await;
     active_db.cleanup().await;
     active_result.expect("active legacy edge dispatch upgrade block");
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn v77_session_schema_upgrade_supports_ordinary_and_provider_creation() {
+    let db = IsolatedDatabase::new().await;
+    let result = assert_v77_session_schema_upgrades_before_session_creation(&db).await;
+    db.cleanup().await;
+    result.expect("v77 session schema upgrade");
 }
