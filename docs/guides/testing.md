@@ -186,6 +186,32 @@ Optionally set **`ASTRA_AUTO_CREATE_DATABASE=1`** so the first
 `ensure_core_schema` (server or online tests) runs `CREATE DATABASE IF NOT
 EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
 
+### Durable provider concurrency and cancellation
+
+The ignored runtime test
+`db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable` runs the
+durable lifecycle against a loopback HTTP/SSE model gateway. It keeps one
+provider request open, verifies that another writer for the same Session is
+rejected, proves a different user cannot read, attach, or cancel that run, and
+requires independent Sessions for two users to complete while the first run is
+still active. It then verifies a terminal reader replay, durable cancellation,
+reservation release, and reuse of the cancelled Session plus a new Session.
+
+Run this focused check only with a disposable MatrixOne database and an
+admission snapshot of at least three global provider slots and two slots per
+owner:
+
+```bash
+ASTRA_TEST_DB_IT=1 cargo test -p astra-runtime --lib \
+  db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable -- \
+  --ignored --nocapture
+```
+
+This is an execution isolation and lifecycle contract. Its bounded timeouts do
+not claim deployment-scale throughput; use the Work pressure and multi-server
+capacity probes for many readers, multiple server processes, provider quotas,
+and latency measurements.
+
 ## Recommended Workflow
 
 ### Optional thinking-protocol compatibility checks

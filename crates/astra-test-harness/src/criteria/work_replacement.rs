@@ -493,7 +493,11 @@ mod tests {
             json!([{
                 "result_graph_revision": 2,
                 "added_item_ids": ["fresh"],
-                "revised_item_ids": [cancelled],
+                "revised_items": [{
+                    "item_id": cancelled,
+                    "from_revision": 1,
+                    "declaration_state": "cancelled"
+                }],
                 "added_dependencies": [],
                 "removed_dependencies": [],
             }])

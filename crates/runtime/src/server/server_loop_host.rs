@@ -46035,5 +46035,109 @@ mod tests {
 
             server.abort();
         }
+
+        #[cfg(feature = "e2e-hooks")]
+        #[tokio::test]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        async fn read_only_admission_keeps_a_typed_plan_proposal_text_only() {
+            let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
+            let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
+            let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
+            let proposal = serde_json::json!({
+                "context_id": "work-plan-context-v1:7f2a",
+                "proposal_status": "pending_admission",
+                "reason": "decompose the migration into bounded outcomes",
+                "additions": [
+                    {
+                        "item_id": "implementation",
+                        "kind": "task",
+                        "objective": "implement the migration",
+                        "expected_result": "the new identity path is present"
+                    },
+                    {
+                        "item_id": "verification",
+                        "kind": "milestone",
+                        "objective": "verify the migration",
+                        "expected_result": "focused checks pass"
+                    }
+                ],
+                "dependencies": [{
+                    "predecessor_item_id": "implementation",
+                    "successor_item_id": "verification"
+                }]
+            });
+            let (gateway_url, requests, server) = spawn_gateway(
+                axum::http::StatusCode::OK,
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": "{\"work_lifecycle\":\"not_required\",\"workspace_mutation\":\"read_only\",\"execution_topology\":\"primary\"}"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 8, "completion_tokens": 12}
+                }),
+            )
+            .await;
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "plan-user".to_string(),
+                "plan-session".to_string(),
+            )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                true, false,
+            ))
+            .with_test_inference_ledger(
+                crate::turn::llm::durable::TestInferenceLedgerPersistence::default(),
+            )
+            .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3_000))))
+            .with_turn_intent_policy(TurnIntentExecutionPolicy::Auto)
+            .with_test_llm_rounds(vec![json!({
+                "full_text": proposal.to_string(),
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            })])
+            .build();
+            let mut state = create_durable_execution_test_state("plan-session");
+            state.message = "prepare a typed non-authoritative plan proposal".to_string();
+            state.user_intent = state.message.clone();
+
+            assert_eq!(
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable,
+                "the built-in admission judge runs as a sidecar and leaves primary execution alive"
+            );
+            assert!(host.pending_work_admission_judge.is_some());
+            assert!(!host.resolve_pending_work_admission(true).await);
+            host.flush_completed_work_admission_phase(&mut state);
+
+            run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .expect("a read-only proposal must complete without an action retry");
+
+            assert_eq!(state.final_text, proposal.to_string());
+            assert_eq!(state.llm_rounds_completed, 1);
+            assert!(state.interruption.is_none());
+            assert!(!state.task_profile.mutates_workspace);
+            assert!(!state.task_profile.verification_required);
+            let intent = state
+                .turn_intent
+                .as_ref()
+                .expect("the sidecar decision must cross the typed turn boundary");
+            assert_eq!(intent.work_lifecycle, WorkLifecycleIntent::NotRequired);
+            assert_eq!(
+                intent.workspace_mutation,
+                astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
+            );
+            assert_eq!(
+                intent.mutation_completion_scope,
+                astra_config::user_profile::MutationCompletionScope::Unknown
+            );
+            assert!(host.pending_work_establishment.is_none());
+            assert_eq!(state.total_tool_calls, 0);
+            assert_eq!(requests.lock().await.len(), 1);
+
+            server.abort();
+        }
     }
 }

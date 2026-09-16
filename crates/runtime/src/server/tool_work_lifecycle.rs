@@ -412,28 +412,44 @@ fn task_board_update_from_snapshot(
     })
 }
 
-async fn load_canonical_task_board(
+async fn load_canonical_task_board_with_admission_mutations(
     executor: &RuntimeToolExecutor,
-) -> Result<WorkTaskBoardUpdateV1, ToolResult> {
+) -> Result<(WorkTaskBoardUpdateV1, Vec<AppliedGraphMutationSummary>), ToolResult> {
+    let snapshot = load_canonical_task_snapshot(executor).await?;
     let binding = executor
         .work_binding
         .get()
         .ok_or_else(|| ToolResult::error("canonical Work binding unavailable".to_string()))?;
-    let snapshot = binding
+    let board = task_board_update_from_snapshot(binding, &snapshot, None, None)?;
+    Ok((board, all_applied_admission_mutations(&snapshot)))
+}
+
+async fn load_canonical_task_snapshot(
+    executor: &RuntimeToolExecutor,
+) -> Result<WorkTaskExecutionSnapshot, ToolResult> {
+    let binding = executor
+        .work_binding
+        .get()
+        .ok_or_else(|| ToolResult::error("canonical Work binding unavailable".to_string()))?;
+    binding
         .repository
         .load_task_execution_snapshot_for_session(&binding.owner_id, &binding.session_id)
         .await
-        .map_err(|error| {
-            ToolResult::error(format!("could not load canonical Work board: {error}"))
-        })?;
-    task_board_update_from_snapshot(binding, &snapshot, None, None)
+        .map_err(|error| ToolResult::error(format!("could not load canonical Work board: {error}")))
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct AppliedGraphMutationRevisionSummary {
+    item_id: String,
+    from_revision: i64,
+    declaration_state: String,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 struct AppliedGraphMutationSummary {
     result_graph_revision: i64,
     added_item_ids: Vec<String>,
-    revised_item_ids: Vec<String>,
+    revised_items: Vec<AppliedGraphMutationRevisionSummary>,
     added_dependencies: Vec<InitialWorkDependency>,
     removed_dependencies: Vec<InitialWorkDependency>,
 }
@@ -455,14 +471,82 @@ fn applied_graph_mutation_summary(
             .iter()
             .map(|item| item.item_id.clone())
             .collect(),
-        revised_item_ids: group
+        revised_items: group
             .revisions
             .iter()
-            .map(|revision| revision.item_id.clone())
+            .map(|revision| AppliedGraphMutationRevisionSummary {
+                item_id: revision.item_id.clone(),
+                from_revision: revision.expected_revision,
+                declaration_state: revision.declaration_state.to_string(),
+            })
             .collect(),
         added_dependencies: group.dependencies.clone(),
         removed_dependencies: group.dependency_removals.clone(),
     }
+}
+
+fn applied_admission_mutations_for_attempt(
+    snapshot: &WorkTaskExecutionSnapshot,
+    attempt_id: &WorkItemAttemptId,
+    item: &WorkItemRevisionRef,
+) -> (Vec<AppliedGraphMutationSummary>, bool) {
+    applied_admission_mutation_receipt_for_attempt(
+        snapshot.applied_graph_mutations(),
+        attempt_id,
+        item,
+    )
+}
+
+fn applied_admission_mutation_receipt_for_attempt(
+    mutations: &[astra_services::work::WorkAppliedGraphMutation],
+    attempt_id: &WorkItemAttemptId,
+    item: &WorkItemRevisionRef,
+) -> (Vec<AppliedGraphMutationSummary>, bool) {
+    let attribution_available = mutations
+        .iter()
+        .all(|mutation| mutation.trigger_association_known);
+    if !attribution_available {
+        return (
+            mutations
+                .iter()
+                .map(|mutation| {
+                    applied_graph_mutation_summary(
+                        &mutation.group,
+                        mutation.result_graph_revision.get(),
+                    )
+                })
+                .collect(),
+            false,
+        );
+    }
+    (
+        mutations
+            .iter()
+            .filter(|mutation| {
+                mutation.trigger_attempt_id.as_ref() == Some(attempt_id)
+                    && mutation.trigger_item.as_ref() == Some(item)
+            })
+            .map(|mutation| {
+                applied_graph_mutation_summary(
+                    &mutation.group,
+                    mutation.result_graph_revision.get(),
+                )
+            })
+            .collect(),
+        true,
+    )
+}
+
+fn all_applied_admission_mutations(
+    snapshot: &WorkTaskExecutionSnapshot,
+) -> Vec<AppliedGraphMutationSummary> {
+    snapshot
+        .applied_graph_mutations()
+        .iter()
+        .map(|mutation| {
+            applied_graph_mutation_summary(&mutation.group, mutation.result_graph_revision.get())
+        })
+        .collect()
 }
 
 pub(super) fn active_primary_attempt_board_event(
@@ -870,6 +954,7 @@ async fn established_work_receipt(
             "graph_state": graph_state,
             "item_count": snapshot.items().len(),
             "requested_goal": requested_goal,
+            "applied_admission_mutations": all_applied_admission_mutations(&snapshot),
             "task_board_update": task_board_update,
             "next_action": "inspect_existing_work_or_run_next_work_item",
         })
@@ -1500,13 +1585,13 @@ pub(super) async fn execute_start_work(
             ));
         }
     }
-    let applied_admission_mutations =
+    let _reconciled_admission_mutations =
         match reconcile_admitted_graph_mutations(executor, invocation).await {
             Ok(Some(applied)) => {
                 graph_revision = applied.graph_revision;
-                applied.changes
+                Some(applied.changes)
             }
-            Ok(None) => Vec::new(),
+            Ok(None) => None,
             Err(result) => {
                 let _ = establishment
                     .record_error(&establishment_request, &result.output)
@@ -1593,6 +1678,7 @@ pub(super) async fn execute_start_work(
             Ok(update) => update,
             Err(error) => return error,
         };
+    let applied_admission_mutations = all_applied_admission_mutations(&snapshot);
     ToolResult::text(
         json!({
             "status": "started",
@@ -1791,10 +1877,11 @@ pub(super) async fn execute_run_next_work_item(
         );
     };
     if let Some(active) = executor.active_primary_work_attempt() {
-        let task_board_update = match load_canonical_task_board(executor).await {
-            Ok(update) => update,
-            Err(error) => return error,
-        };
+        let (task_board_update, applied_admission_mutations) =
+            match load_canonical_task_board_with_admission_mutations(executor).await {
+                Ok(receipt) => receipt,
+                Err(error) => return error,
+            };
         return ToolResult::text(
             json!({
                 "status": "assigned",
@@ -1805,6 +1892,7 @@ pub(super) async fn execute_run_next_work_item(
                 "expected_result": active.expected_result,
                 "completion_rule": "settle_immediately_when_expected_result_is_satisfied_without_broadening_scope",
                 "execution": "primary_session_resumed",
+                "applied_admission_mutations": applied_admission_mutations,
                 "task_board_update": task_board_update,
                 "next_action": "resume_this_task_then_call_settle_work_item"
             })
@@ -1837,10 +1925,11 @@ pub(super) async fn execute_run_next_work_item(
     match restore_primary_attempt_from_selection(executor, run_id, &selected).await {
         Ok(Some(restored)) => {
             let active = restored.active;
-            let task_board_update = match load_canonical_task_board(executor).await {
-                Ok(update) => update,
-                Err(error) => return error,
-            };
+            let (task_board_update, applied_admission_mutations) =
+                match load_canonical_task_board_with_admission_mutations(executor).await {
+                    Ok(receipt) => receipt,
+                    Err(error) => return error,
+                };
             return ToolResult::text(
                 json!({
                     "status": "assigned",
@@ -1851,6 +1940,7 @@ pub(super) async fn execute_run_next_work_item(
                     "expected_result": active.expected_result,
                     "completion_rule": "settle_immediately_when_expected_result_is_satisfied_without_broadening_scope",
                     "execution": "primary_session_resumed",
+                    "applied_admission_mutations": applied_admission_mutations,
                     "task_board_update": task_board_update,
                     "next_action": "resume_this_task_then_call_settle_work_item"
                 })
@@ -1873,13 +1963,15 @@ pub(super) async fn execute_run_next_work_item(
             WorkTaskExecutionNext::Complete => ("complete", None),
             WorkTaskExecutionNext::Ready(_) => unreachable!("handled above"),
         };
-        let task_board_update = match load_canonical_task_board(executor).await {
-            Ok(update) => update,
-            Err(error) => return error,
-        };
+        let (task_board_update, applied_admission_mutations) =
+            match load_canonical_task_board_with_admission_mutations(executor).await {
+                Ok(receipt) => receipt,
+                Err(error) => return error,
+            };
         return ToolResult::text(
             json!({
                 "status": status,
+                "applied_admission_mutations": applied_admission_mutations,
                 "task_board_update": task_board_update,
                 "item_id": item_id.map(|id| id.as_str().to_string()),
                 "next_action": "inspect_or_update_canonical_work_before_another_execution_attempt"
@@ -1936,10 +2028,11 @@ pub(super) async fn execute_run_next_work_item(
             "Work task was admitted but could not be activated: {error}"
         ));
     }
-    let task_board_update = match load_canonical_task_board(executor).await {
-        Ok(update) => update,
-        Err(error) => return error,
-    };
+    let (task_board_update, applied_admission_mutations) =
+        match load_canonical_task_board_with_admission_mutations(executor).await {
+            Ok(receipt) => receipt,
+            Err(error) => return error,
+        };
     ToolResult::text(
         json!({
             "status": "assigned",
@@ -1950,6 +2043,7 @@ pub(super) async fn execute_run_next_work_item(
             "expected_result": item.expected_result,
             "completion_rule": "settle_immediately_when_expected_result_is_satisfied_without_broadening_scope",
             "execution": "primary_session",
+            "applied_admission_mutations": applied_admission_mutations,
             "task_board_update": task_board_update,
             "next_action": "execute_this_task_directly_then_call_settle_work_item"
         })
@@ -2121,12 +2215,63 @@ pub(super) async fn execute_settle_work_item(
             let settlement_transition = canonical_settlement_transition(&settled_task);
             // A replay may observe the graph mutation already committed. Publish
             // durable state on every settlement, not an invocation-local delta.
-            let task_board_update = match load_canonical_task_board(executor).await {
-                Ok(update) => update,
+            let snapshot = match load_canonical_task_snapshot(executor).await {
+                Ok(snapshot) => snapshot,
                 Err(error) => {
                     return committed_settlement_resume_error(executor, &active, error.output);
                 }
             };
+            let binding = match executor.work_binding.get() {
+                Some(binding) => binding,
+                None => {
+                    return committed_settlement_resume_error(
+                        executor,
+                        &active,
+                        "canonical Work binding unavailable".to_string(),
+                    );
+                }
+            };
+            let task_board_update =
+                match task_board_update_from_snapshot(binding, &snapshot, None, None) {
+                    Ok(update) => update,
+                    Err(error) => {
+                        return committed_settlement_resume_error(executor, &active, error.output);
+                    }
+                };
+            let settled_item = WorkItemRevisionRef {
+                item_id: match WorkItemId::parse(recorded.item_id.clone()) {
+                    Ok(item_id) => item_id,
+                    Err(error) => {
+                        return committed_settlement_resume_error(
+                            executor,
+                            &active,
+                            format!("settlement item identity is corrupt: {error}"),
+                        );
+                    }
+                },
+                revision: match WorkItemRevision::new(recorded.item_revision) {
+                    Ok(revision) => revision,
+                    Err(error) => {
+                        return committed_settlement_resume_error(
+                            executor,
+                            &active,
+                            format!("settlement item revision is corrupt: {error}"),
+                        );
+                    }
+                },
+            };
+            let settled_attempt = match WorkItemAttemptId::parse(recorded.attempt_id.clone()) {
+                Ok(attempt_id) => attempt_id,
+                Err(error) => {
+                    return committed_settlement_resume_error(
+                        executor,
+                        &active,
+                        format!("settlement attempt identity is corrupt: {error}"),
+                    );
+                }
+            };
+            let (applied_admission_mutations, admission_mutation_attribution_available) =
+                applied_admission_mutations_for_attempt(&snapshot, &settled_attempt, &settled_item);
             if let Err(error) =
                 executor.advance_active_primary_work_attempt(&active.attempt_id, successor)
             {
@@ -2148,6 +2293,17 @@ pub(super) async fn execute_settle_work_item(
                     "execution_status": execution_status.as_str(),
                     "status_scope": "task_graph_execution",
                     "settlement_transition": settlement_transition,
+                    "applied_admission_mutations": applied_admission_mutations,
+                    "applied_admission_mutations_scope": if admission_mutation_attribution_available {
+                        "settled_attempt"
+                    } else {
+                        "cumulative_recovery"
+                    },
+                    "applied_admission_mutation_attribution": if admission_mutation_attribution_available {
+                        "exact"
+                    } else {
+                        "unavailable"
+                    },
                     "task_board_update": task_board_update,
                     "next_task": next_task,
                     "next_action": next_action,
@@ -2254,8 +2410,9 @@ mod tests {
     use super::{
         InitialWorkItem, InitialWorkTask, StartWorkActivation, StartWorkArgs,
         TaskGraphExecutionStatus, WORK_ERROR_KIND_ALREADY_BOUND, WORK_ERROR_KIND_NOT_BOUND,
-        applied_graph_mutation_summary, board_settled_task, canonical_settlement_transition,
-        canonical_start_work_payload, compile_initial_task_graph, confirmed_assignment,
+        applied_admission_mutation_receipt_for_attempt, applied_graph_mutation_summary,
+        board_settled_task, canonical_settlement_transition, canonical_start_work_payload,
+        compile_initial_task_graph, confirmed_assignment,
         decode_canonical_work_establishment_payload, execute_run_next_work_item,
         execute_start_work, initial_declared_tasks, start_work_operation_id,
         task_board_display_text, task_graph_execution_status, validate_initial_task_list,
@@ -2268,8 +2425,8 @@ mod tests {
         DatabaseWorkEstablishmentService, InternalSessionId, RecordedWorkAttemptSettlement,
         WorkAttemptOutcome, WorkEstablishmentPhase, WorkEstablishmentState, WorkItemAttemptId,
         WorkItemDeclarationState, WorkItemDelivery, WorkItemDeliveryStatus, WorkItemExecution,
-        WorkItemExecutionStatus, WorkItemId, WorkItemKind, WorkItemRevision, WorkItemText,
-        WorkOwnerId, WorkRepository, WorkRepositoryError, WorkTaskExecutionItem,
+        WorkItemExecutionStatus, WorkItemId, WorkItemKind, WorkItemRevision, WorkItemRevisionRef,
+        WorkItemText, WorkOwnerId, WorkRepository, WorkRepositoryError, WorkTaskExecutionItem,
         WorkTaskExecutionNext,
     };
     use astra_tools::tool_engine::{ToolInvocationAdmissionSource, ToolInvocationMetadata};
@@ -2769,7 +2926,14 @@ mod tests {
             .expect("mutation receipt is serializable");
         assert_eq!(value["result_graph_revision"], 7);
         assert_eq!(value["added_item_ids"], json!(["task-new"]));
-        assert_eq!(value["revised_item_ids"], json!(["task-old"]));
+        assert_eq!(
+            value["revised_items"],
+            json!([{
+                "item_id": "task-old",
+                "from_revision": 1,
+                "declaration_state": "ready"
+            }])
+        );
         assert_eq!(
             value["added_dependencies"][0]["predecessor_item_id"],
             "task-old"
@@ -2779,6 +2943,93 @@ mod tests {
             "task-new"
         );
         assert_eq!(value["removed_dependencies"], json!([]));
+    }
+
+    #[test]
+    fn settlement_mutation_receipt_is_exact_when_attribution_is_complete() {
+        let first_attempt = WorkItemAttemptId::parse("attempt-a").expect("attempt");
+        let second_attempt = WorkItemAttemptId::parse("attempt-b").expect("attempt");
+        let first_item = WorkItemRevisionRef {
+            item_id: WorkItemId::parse("task-1").expect("item"),
+            revision: WorkItemRevision::INITIAL,
+        };
+        let second_item = WorkItemRevisionRef {
+            item_id: WorkItemId::parse("task-2").expect("item"),
+            revision: WorkItemRevision::INITIAL,
+        };
+        let mutation = |item_id: &str,
+                        trigger_attempt_id: WorkItemAttemptId,
+                        trigger_item: WorkItemRevisionRef| {
+            astra_services::work::WorkAppliedGraphMutation {
+                group: astra_services::work::WorkEstablishmentMutationGroup {
+                    operation_id: "operation".into(),
+                    tool_call_id: item_id.into(),
+                    after_initial_tasks: vec![1],
+                    trigger_items: vec![trigger_item.clone()],
+                    additions: vec![astra_services::work::WorkEstablishmentItem {
+                        item_id: item_id.into(),
+                        kind: "task",
+                        objective: "An admitted task".into(),
+                        expected_result: "A durable result".into(),
+                    }],
+                    revisions: vec![],
+                    dependencies: vec![],
+                    dependency_removals: vec![],
+                },
+                result_graph_revision: astra_services::work::GraphRevision::new(2)
+                    .expect("graph revision"),
+                trigger_attempt_id: Some(trigger_attempt_id),
+                trigger_item: Some(trigger_item),
+                trigger_association_known: true,
+            }
+        };
+        let mutations = vec![
+            mutation("task-a", first_attempt.clone(), first_item.clone()),
+            mutation("task-b", second_attempt, second_item),
+        ];
+        let (receipt, attribution_available) =
+            applied_admission_mutation_receipt_for_attempt(&mutations, &first_attempt, &first_item);
+
+        assert!(attribution_available);
+        assert_eq!(receipt.len(), 1);
+        assert_eq!(receipt[0].added_item_ids, vec!["task-a".to_string()]);
+    }
+
+    #[test]
+    fn settlement_mutation_receipt_falls_back_to_cumulative_when_attribution_is_unknown() {
+        let item = WorkItemRevisionRef {
+            item_id: WorkItemId::parse("task-1").expect("item"),
+            revision: WorkItemRevision::INITIAL,
+        };
+        let mutation = astra_services::work::WorkAppliedGraphMutation {
+            group: astra_services::work::WorkEstablishmentMutationGroup {
+                operation_id: "operation".into(),
+                tool_call_id: "task-a".into(),
+                after_initial_tasks: vec![1],
+                trigger_items: vec![item.clone()],
+                additions: vec![astra_services::work::WorkEstablishmentItem {
+                    item_id: "task-a".into(),
+                    kind: "task",
+                    objective: "An older admitted task".into(),
+                    expected_result: "A durable result".into(),
+                }],
+                revisions: vec![],
+                dependencies: vec![],
+                dependency_removals: vec![],
+            },
+            result_graph_revision: astra_services::work::GraphRevision::new(3)
+                .expect("graph revision"),
+            trigger_attempt_id: None,
+            trigger_item: None,
+            trigger_association_known: false,
+        };
+        let attempt = WorkItemAttemptId::parse("attempt-current").expect("attempt");
+        let (receipt, attribution_available) =
+            applied_admission_mutation_receipt_for_attempt(&[mutation], &attempt, &item);
+
+        assert!(!attribution_available);
+        assert_eq!(receipt.len(), 1);
+        assert_eq!(receipt[0].added_item_ids, vec!["task-a".to_string()]);
     }
 
     #[test]

@@ -1228,6 +1228,16 @@ impl<'a> SuiteRunner<'a> {
         );
 
         let retry_attempted = attempts.len() > 1;
+        let execution = if cleanup_enabled && !owned_session_ids.is_empty() {
+            Some(crate::pipeline_analysis::analyze_execution_traces(
+                cleanup_captures.values(),
+                owned_session_ids.len(),
+            ))
+        } else {
+            session
+                .as_ref()
+                .map(crate::pipeline_analysis::analyze_execution_trace)
+        };
         CaseRunReport {
             case_name: case.name.clone(),
             model: model.to_string(),
@@ -1244,6 +1254,7 @@ impl<'a> SuiteRunner<'a> {
             criteria: det,
             steps: step_results,
             attempts,
+            execution,
             session,
             session_captures: cleanup_captures.into_values().collect(),
             reproducer,
@@ -1431,6 +1442,7 @@ impl<'a> SuiteRunner<'a> {
             attempts: Vec::new(),
             session: None,
             session_captures: Vec::new(),
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1476,6 +1488,7 @@ impl<'a> SuiteRunner<'a> {
             attempts: Vec::new(),
             session: None,
             session_captures: Vec::new(),
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -1531,6 +1544,7 @@ impl<'a> SuiteRunner<'a> {
             attempts: Vec::new(),
             session: None,
             session_captures: Vec::new(),
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,

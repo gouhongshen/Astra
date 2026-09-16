@@ -1498,6 +1498,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::work",
         product_owner="Work plan proposal lifecycle and review",
     ),
+    "work_proposal_trigger_attempts": TableMetadata(
+        semantic_owner="astra_services::work::proposals",
+        state_class="durable deferred-admission trigger association fact",
+        primary_query="exact settlement trigger by owner_id/work_id/branch_id/proposal_id with attempt and immutable item revision",
+        retention_policy="retain the association while its accepted graph revision or branch recovery can expose provenance; delete with the owning branch cleanup operation",
+        rebuildability="not rebuildable after the exact settlement attempt and item revision are lost; an unavailable legacy association remains explicitly unknown",
+        merge_guidance="keep trigger provenance separate from work_proposals lifecycle and work_graph_revisions acceptance; the graph revision owns applied truth while this row owns the settlement association",
+        migration_owner="astra_services::work",
+        product_owner="deferred Work admission receipt provenance",
+    ),
     "work_check_runs": TableMetadata(
         semantic_owner="astra_services::work::checks",
         state_class="immutable Work check execution evidence",

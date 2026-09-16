@@ -53,6 +53,12 @@ read paths:
 - **Events** arrive as `AppEvent` (translated from the on-the-wire
   `TuiAppEvent` by `chat_widget::bridge::translate`). `ChatWidget::handle_event`
   is a single `match` that mutates `history` / `active_cell`.
+- **Draw notifications** are coalesced presentation wakes, not a second event
+  log. The scheduler keeps at most one pending wake and the next draw reads
+  the reducer's newest state. Runtime and input events use their own durable
+  or backpressured paths, so reducing redraw notifications cannot discard
+  business facts. A delayed scheduler anchors its frame limit to the last
+  successfully delivered wake instead of an obsolete timer deadline.
 - **Agent runs** use the same transcript item browser as the root run. The
   run navigator only selects a conversation; it never substitutes a task
   summary for that run's working record.

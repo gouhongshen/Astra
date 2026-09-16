@@ -8,8 +8,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::{
-    WorkItemId, WorkItemRevision, WorkItemRevisionRef, WorkProposalId,
-    WorkProposalInvocationIdentity, WorkProposalKind,
+    GraphRevision, WorkItemAttemptId, WorkItemId, WorkItemRevision, WorkItemRevisionRef,
+    WorkProposalId, WorkProposalInvocationIdentity, WorkProposalKind,
 };
 use crate::{WorkAdmissionDecision, WorkAdmissionGraphMutation, WorkAdmissionTask};
 
@@ -47,6 +47,29 @@ pub struct WorkEstablishmentMutationGroup {
     pub revisions: Vec<WorkEstablishmentItemRevision>,
     pub dependencies: Vec<WorkEstablishmentDependency>,
     pub dependency_removals: Vec<WorkEstablishmentDependency>,
+}
+
+/// A deferred admission mutation that has already been accepted into the
+/// canonical graph.  The group is immutable admission data; the graph
+/// revision is the durable result recorded by the accepted plan proposal.
+/// Keeping both in the execution snapshot lets recovery publish the same
+/// mutation fact after a response was lost, without scanning proposal history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkAppliedGraphMutation {
+    pub group: WorkEstablishmentMutationGroup,
+    pub result_graph_revision: GraphRevision,
+    /// The exact primary attempt whose settlement made this mutation eligible.
+    /// Immediate admission mutations have no trigger attempt.
+    pub trigger_attempt_id: Option<WorkItemAttemptId>,
+    /// The initial item reference recorded beside the trigger attempt.  This
+    /// is retained as an integrity fact even though runtime receipts usually
+    /// match the stronger attempt identity.
+    pub trigger_item: Option<WorkItemRevisionRef>,
+    /// `false` means the accepted graph revision predates the trigger
+    /// association (or the association was otherwise unavailable). Runtime
+    /// receipts must then publish the cumulative accepted set instead of
+    /// pretending that the current settlement caused it.
+    pub trigger_association_known: bool,
 }
 
 impl WorkEstablishmentMutationGroup {

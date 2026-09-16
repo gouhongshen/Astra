@@ -652,6 +652,10 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
             "work_terminal_cuts",
             &["owner_id", "work_id", "branch_id", "graph_revision"][..],
         ),
+        (
+            "work_proposal_trigger_attempts",
+            &["owner_id", "work_id", "branch_id", "proposal_id"][..],
+        ),
         ("work_branches", &["owner_id", "work_id", "branch_id"][..]),
         (
             "work_branch_deletion_operations",
@@ -764,6 +768,34 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
             .any(|column| column == "last_revision"),
         "WorkItem identities require one global revision allocator across sibling branches"
     );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "work_graph_revisions",
+            "idx_work_graph_revision_patch_ref"
+        )
+        .await,
+        ["owner_id", "work_id", "patch_ref", "revision"],
+        "accepted graph lookup must remain bounded after proposal pruning"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "work_proposal_trigger_attempts",
+            "idx_work_proposal_trigger_attempt"
+        )
+        .await,
+        [
+            "owner_id",
+            "work_id",
+            "branch_id",
+            "trigger_attempt_id",
+            "proposal_id"
+        ],
+        "trigger provenance lookup must remain owner and branch scoped"
+    );
     assert!(
         column_names(&pool, &schema, "work_item_revisions")
             .await
@@ -788,6 +820,7 @@ async fn work_foundation_schema_has_single_owner_and_session_binding() {
         "work_item_edges",
         "work_branches",
         "work_branch_deletion_operations",
+        "work_proposal_trigger_attempts",
     ] {
         let contract = contracts
             .iter()

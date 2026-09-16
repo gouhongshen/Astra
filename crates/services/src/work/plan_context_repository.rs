@@ -601,7 +601,7 @@ pub(super) async fn load_task_execution_snapshot_in_transaction(
         deliveries,
         graph.edges,
     )?;
-    let (pending, has_unapplied) =
+    let (pending, has_unapplied, applied) =
         super::establishment_plan_repository::load_graph_mutation_barrier(
             transaction,
             owner_id,
@@ -610,6 +610,7 @@ pub(super) async fn load_task_execution_snapshot_in_transaction(
         )
         .await?;
     snapshot.set_graph_mutation_barrier(pending, has_unapplied);
+    snapshot.set_applied_graph_mutations(applied);
     Ok(snapshot)
 }
 

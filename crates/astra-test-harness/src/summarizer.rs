@@ -70,6 +70,32 @@ fn build_summary_payload(report: &SuiteReport) -> serde_json::Value {
                 "tool_calls": r.outcome.tool_calls_count,
                 "tools_used": r.outcome.tools_used,
                 "failure_class": r.failure_class.as_ref().map(|c| c.to_string()),
+                "execution": r.execution.as_ref().map(|execution| serde_json::json!({
+                    "scope": match execution.scope {
+                        crate::pipeline_analysis::ExecutionTraceScope::Session => "session",
+                        crate::pipeline_analysis::ExecutionTraceScope::CaseAttempts => "case_attempts",
+                    },
+                    "expected_capture_count": execution.expected_capture_count,
+                    "captured_capture_count": execution.captured_capture_count,
+                    "total_tool_calls": execution.total_tool_calls,
+                    "executed_tool_calls": execution.executed_tool_calls,
+                    "successful_tool_calls": execution.successful_tool_calls,
+                    "failed_tool_calls": execution.failed_tool_calls,
+                    "rejected_tool_calls": execution.rejected_tool_calls,
+                    "reused_tool_calls": execution.reused_tool_calls,
+                    "suppressed_tool_calls": execution.suppressed_tool_calls,
+                    "deferred_tool_calls": execution.deferred_tool_calls,
+                    "unknown_outcome_tool_calls": execution.unknown_outcome_tool_calls,
+                    "unknown_disposition_tool_calls": execution.unknown_disposition_tool_calls,
+                    "settlement_attempts": execution.settlement_attempts,
+                    "successful_settlements": execution.successful_settlements,
+                    "rejected_settlements": execution.rejected_settlements,
+                    "runtime_rejection_reasons": execution.runtime_rejection_reasons,
+                    "evidence_complete": execution.evidence_complete,
+                    "skipped_lines": execution.skipped_lines,
+                    "dropped_lines": execution.dropped_lines,
+                    "integrity_errors": execution.integrity_errors,
+                })),
                 "attempts": attempts,
                 "criteria": criteria,
                 "output_preview": output_preview,
@@ -224,6 +250,7 @@ pub async fn summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline_analysis::ExecutionTraceReport;
     use crate::report::{AttemptRecord, CaseRunReport, CaseRunStatus, SuiteReport};
     use crate::runner::RunOutcome;
 
@@ -252,6 +279,13 @@ mod tests {
                 attempts: Vec::new(),
                 session: None,
                 session_captures: Vec::new(),
+                execution: Some(ExecutionTraceReport {
+                    total_tool_calls: 3,
+                    executed_tool_calls: 1,
+                    successful_tool_calls: 1,
+                    suppressed_tool_calls: 2,
+                    ..Default::default()
+                }),
                 reproducer: None,
                 digest: None,
                 digest_error: None,
@@ -271,6 +305,9 @@ mod tests {
         assert!(run.get("criteria").is_some());
         assert!(run.get("output_preview").is_some());
         assert!(run.get("has_warnings").is_some());
+        assert_eq!(run["execution"]["executed_tool_calls"], 1);
+        assert_eq!(run["execution"]["successful_tool_calls"], 1);
+        assert_eq!(run["execution"]["suppressed_tool_calls"], 2);
         // Must NOT contain large fields
         assert!(run.get("stderr").is_none());
         assert!(run.get("session").is_none());
@@ -292,6 +329,7 @@ mod tests {
             attempts: Vec::new(),
             session: None,
             session_captures: Vec::new(),
+            execution: None,
             reproducer: None,
             digest: None,
             digest_error: None,
@@ -331,6 +369,7 @@ mod tests {
                 }],
                 session: None,
                 session_captures: Vec::new(),
+                execution: None,
                 reproducer: None,
                 digest: None,
                 digest_error: None,

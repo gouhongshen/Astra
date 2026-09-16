@@ -1,7 +1,7 @@
 use super::graph_repository::decode_persisted_graph;
 use super::{
-    GraphRevision, InternalSessionId, WorkBranchId, WorkId, WorkItemAttemptId, WorkItemRevision,
-    WorkItemRevisionRef, WorkItemText, WorkOwnerId, WorkTaskExecutionNext,
+    GraphRevision, InternalSessionId, WorkBranchId, WorkId, WorkItemAttemptId, WorkItemId,
+    WorkItemRevision, WorkItemRevisionRef, WorkItemText, WorkOwnerId, WorkTaskExecutionNext,
     validate_resource_identity,
 };
 use crate::runs::{DurableRunStatusKind, durable_run_status_kind};
@@ -776,7 +776,7 @@ impl DatabaseWorkAttemptSettlementService {
         let mut tx = self.pool.get().begin().await.map_err(persistence)?;
 
         let current = sqlx::query(
-            "SELECT work_id, branch_id FROM work_item_attempts
+            "SELECT work_id, branch_id, work_item_id, work_item_revision FROM work_item_attempts
              WHERE owner_id = ? AND attempt_id = ? AND executor_run_id = ?
                AND execution_mode = 'primary'",
         )
@@ -789,6 +789,20 @@ impl DatabaseWorkAttemptSettlementService {
         .ok_or(WorkAttemptSettlementError::UnboundRun)?;
         let work_id: String = current.try_get("work_id").map_err(persistence)?;
         let branch_id: String = current.try_get("branch_id").map_err(persistence)?;
+        let trigger_item = WorkItemRevisionRef {
+            item_id: WorkItemId::parse(
+                current
+                    .try_get::<String, _>("work_item_id")
+                    .map_err(persistence)?,
+            )
+            .map_err(|error| WorkAttemptSettlementError::Persistence(error.to_string()))?,
+            revision: WorkItemRevision::new(
+                current
+                    .try_get::<i64, _>("work_item_revision")
+                    .map_err(persistence)?,
+            )
+            .map_err(|error| WorkAttemptSettlementError::Persistence(error.to_string()))?,
+        };
         let branch = sqlx::query(
             "SELECT session_id FROM work_branches
              WHERE owner_id = ? AND work_id = ? AND branch_id = ?
@@ -824,6 +838,35 @@ impl DatabaseWorkAttemptSettlementService {
         )
         .await
         .map_err(|error| WorkAttemptSettlementError::Persistence(error.to_string()))?;
+        // Only a newly inserted Delivered settlement can make a deferred
+        // trigger set complete. A retry of an already recorded attempt must
+        // preserve the original association instead of claiming every
+        // pending group on the branch; membership in the immutable trigger
+        // set proves the exact item edge of this transition.
+        let due_groups = if settlement_inserted {
+            snapshot
+                .pending_graph_mutations()
+                .iter()
+                .filter(|group| group.trigger_items.iter().any(|item| item == &trigger_item))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if !due_groups.is_empty() {
+            super::establishment_plan_repository::record_graph_mutation_trigger_attempts(
+                &mut tx,
+                &owner,
+                &session_id,
+                &snapshot,
+                &due_groups,
+                &WorkItemAttemptId::parse(attempt_id.to_string())
+                    .map_err(|error| WorkAttemptSettlementError::Persistence(error.to_string()))?,
+                &trigger_item,
+            )
+            .await
+            .map_err(|error| WorkAttemptSettlementError::Persistence(error.to_string()))?;
+        }
         let advance = match snapshot.next_foreground_task() {
             WorkTaskExecutionNext::Ready(item) => {
                 let executor = sqlx::query(
@@ -1135,8 +1178,10 @@ impl DatabaseWorkAttemptSettlementService {
 }
 
 /// An ordinary replay may only read its existing cut. The exceptional missing
-/// cut is recoverable only when durable admission and an accepted deferred
-/// patch prove why this Delivered attempt could not publish it initially.
+/// cut is recoverable only when durable admission, an accepted graph revision,
+/// and its exact trigger marker prove why this Delivered attempt could not
+/// publish it initially. Legacy accepted revisions without that marker remain
+/// conservative and do not guess a terminal owner.
 async fn accepted_deferred_mutation_owns_completion(
     tx: &mut Transaction<'_, MySql>,
     owner_id: &str,
@@ -1221,50 +1266,70 @@ async fn accepted_deferred_mutation_owns_completion(
         let proposal_id = group
             .proposal_id(owner_id, &session_id, work_id, branch_id)
             .map_err(WorkAttemptSettlementError::Persistence)?;
-        let accepted: Option<i8> = sqlx::query_scalar(
-            "SELECT 1 FROM work_proposals WHERE owner_id = ? AND work_id = ? AND branch_id = ?
-             AND proposal_id = ? AND proposal_kind = 'plan_patch' AND status = 'accepted'
-             AND result_graph_revision = ? LIMIT 1",
+        // The graph revision is the acceptance authority and survives
+        // proposal-queue pruning. The marker is only trigger provenance; a
+        // missing marker is a legacy/unknown association and must not be
+        // reconstructed from timestamps or a later current attempt.
+        let accepted = sqlx::query(
+            "SELECT t.trigger_attempt_id, t.trigger_item_id, t.trigger_item_revision
+             FROM work_graph_revisions g
+             LEFT JOIN work_proposal_trigger_attempts t
+               ON t.owner_id = g.owner_id
+              AND t.work_id = g.work_id
+              AND t.branch_id = ?
+              AND t.proposal_id = g.patch_ref
+             WHERE g.owner_id = ? AND g.work_id = ? AND g.revision = ?
+               AND g.patch_ref = ? LIMIT 1",
         )
+        .bind(branch_id)
         .bind(owner_id)
         .bind(work_id)
-        .bind(branch_id)
-        .bind(proposal_id.as_str())
         .bind(graph_revision.get())
+        .bind(proposal_id.as_str())
         .fetch_optional(&mut **tx)
         .await
         .map_err(persistence)?;
-        if accepted.is_some() {
-            let owner = WorkOwnerId::parse(owner_id)
-                .map_err(|e| WorkAttemptSettlementError::Persistence(e.to_string()))?;
-            let work = WorkId::parse(work_id)
-                .map_err(|e| WorkAttemptSettlementError::Persistence(e.to_string()))?;
-            let branch = WorkBranchId::parse(branch_id)
-                .map_err(|e| WorkAttemptSettlementError::Persistence(e.to_string()))?;
-            let (executions, deliveries) = super::plan_context_repository::load_item_executions(
-                tx,
-                &owner,
-                &work,
-                &branch,
-                &group.trigger_items,
-            )
-            .await
+        let Some(accepted) = accepted else {
+            continue;
+        };
+        let marker_attempt = accepted
+            .try_get::<Option<String>, _>("trigger_attempt_id")
+            .map_err(persistence)?;
+        let marker_item = accepted
+            .try_get::<Option<String>, _>("trigger_item_id")
+            .map_err(persistence)?;
+        let marker_revision = accepted
+            .try_get::<Option<i64>, _>("trigger_item_revision")
+            .map_err(persistence)?;
+        if marker_attempt.as_deref() != Some(attempt_id)
+            || marker_item.as_deref() != Some(item_id.as_str())
+            || marker_revision != Some(item_revision)
+        {
+            continue;
+        }
+
+        let owner = WorkOwnerId::parse(owner_id)
             .map_err(|e| WorkAttemptSettlementError::Persistence(e.to_string()))?;
-            let all_delivered = group.trigger_items.iter().all(|item| {
-                deliveries.get(item).is_some_and(|delivery| {
-                    delivery.status == super::WorkItemDeliveryStatus::Delivered
-                })
-            });
-            let last_trigger = executions
-                .values()
-                .filter_map(|execution| execution.run.as_ref())
-                .max_by(|left, right| {
-                    left.updated_at
-                        .cmp(&right.updated_at)
-                        .then_with(|| left.attempt_id.cmp(&right.attempt_id))
-                });
-            return Ok(all_delivered
-                && last_trigger.is_some_and(|attempt| attempt.attempt_id.as_str() == attempt_id));
+        let work = WorkId::parse(work_id)
+            .map_err(|e| WorkAttemptSettlementError::Persistence(e.to_string()))?;
+        let branch = WorkBranchId::parse(branch_id)
+            .map_err(|e| WorkAttemptSettlementError::Persistence(e.to_string()))?;
+        let (_, deliveries) = super::plan_context_repository::load_item_executions(
+            tx,
+            &owner,
+            &work,
+            &branch,
+            &group.trigger_items,
+        )
+        .await
+        .map_err(|e| WorkAttemptSettlementError::Persistence(e.to_string()))?;
+        let all_delivered = group.trigger_items.iter().all(|item| {
+            deliveries
+                .get(item)
+                .is_some_and(|delivery| delivery.status == super::WorkItemDeliveryStatus::Delivered)
+        });
+        if all_delivered {
+            return Ok(true);
         }
     }
     Ok(false)

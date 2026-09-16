@@ -182,19 +182,53 @@ referenced initial tasks must be delivered before the mutation is committed.
 The immutable establishment decision retains these triggers beyond establishment
 completion. Scheduling, including settlement's automatic successor allocation,
 must apply due mutations before selecting another task or declaring completion.
-Accepted proposals mark applied mutations, so recovery replays the same operation
-and item identities without repeating semantic admission. Settlement and resume
+Accepted graph revisions mark applied mutations, so recovery replays the same
+operation and item identities without repeating semantic admission even after
+terminal proposal rows leave the bounded proposal queue. Settlement and resume
 receipts publish the durable graph revision and canonical task states, including
 retired declarations, even when a mutation committed before replay. A failed
 post-commit receipt read resumes through `run_next_work_item`; its receipt must
 restore the board even when the graph is already complete. These receipts read
 one canonical snapshot after settlement or task allocation so the live board
 observes cancellation and replacement together with successor assignment. The
+accepted `propose_work_plan` receipt also exposes bounded `applied_mutations`
+arrays for added items, revised source revisions and declaration states, and
+dependency additions or removals. Those arrays describe the accepted proposal
+at its recorded graph revision; they do not guess a revised item's target
+revision because shared item identities may allocate different successors on
+sibling branches.
 `start_work` result separately reports declared task count and any already
 applied admission graph changes, so a server-applied addition or revision is
 visible as a completed change and is not proposed again by the model.
+The `settle_work_item` receipt narrows that field to the admission changes
+whose trigger was the exact settled attempt and item revision. That association
+is committed under the branch lock before reconciliation, so a crash between
+settlement and proposal application replays the same receipt instead of
+claiming an empty change set or attributing a later trigger's change to an
+earlier attempt. Resume and `run_next_work_item` receipts expose the bounded
+cumulative accepted set, while the settlement receipt remains an exact
+per-attempt explanation. If a pre-association accepted graph revision is
+recovered, the receipt says
+`applied_admission_mutation_attribution: "unavailable"` and publishes the
+cumulative set with `applied_admission_mutations_scope: "cumulative_recovery"`;
+it never guesses
+which current attempt caused that historical change.
+Terminal-cut recovery uses the same exact marker; a legacy accepted revision
+without one stays recoverable only through an explicit repair path and cannot
+silently assign terminal ownership to a current attempt.
 Initial-candidate references are not aliases for arbitrary later replacements;
 conflicting retirement/prerequisite lifetimes are rejected before establishment.
+
+The canonical schema now includes the durable trigger-association table and a
+composite `work_graph_revisions(owner_id, work_id, patch_ref, revision)` index.
+Fresh installations receive both from the schema manifest. Existing databases
+must provision both through the repository's schema migration process (or use a
+fresh-schema cutover) before deploying a binary that verifies this contract.
+Bootstrap may create a newly absent table from the manifest, but it fails closed
+with an explicit cutover error when an existing Work table has an incompatible
+shape, such as a missing mandatory index. `CREATE TABLE IF NOT EXISTS` and the
+manifest's index declaration are not an in-place upgrade mechanism for an
+existing Work table.
 
 Tasks are durable work items projected into UI boards.
 

@@ -141,8 +141,8 @@ pub use establishment_operation::{
     WorkEstablishmentRequest, WorkEstablishmentState,
 };
 pub use establishment_plan::{
-    WorkEstablishmentDependency, WorkEstablishmentItem, WorkEstablishmentItemRevision,
-    WorkEstablishmentMutationGroup, WorkEstablishmentPlan,
+    WorkAppliedGraphMutation, WorkEstablishmentDependency, WorkEstablishmentItem,
+    WorkEstablishmentItemRevision, WorkEstablishmentMutationGroup, WorkEstablishmentPlan,
     compile_initial_work_establishment_graph, compile_work_establishment_plan,
     decode_work_establishment_payload,
 };
@@ -328,6 +328,7 @@ pub(crate) const WORK_GRAPH_REVISIONS_CREATE_SQL: &str =
     reason VARCHAR(512) NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     PRIMARY KEY (owner_id, work_id, revision),
+    INDEX idx_work_graph_revision_patch_ref (owner_id, work_id, patch_ref, revision),
     CONSTRAINT chk_work_graph_revision CHECK (revision > 0),
     CONSTRAINT chk_work_graph_parent CHECK (parent_revision IS NULL OR parent_revision > 0),
     CONSTRAINT chk_work_graph_item_count CHECK (item_count >= 0 AND item_count <= 256),
@@ -956,6 +957,29 @@ pub(crate) const WORK_PROPOSALS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS w
     )
 )";
 
+/// Durable association between an accepted deferred admission mutation and
+/// the exact primary settlement that made its trigger set complete.  The
+/// proposal itself remains the graph mutation authority; this narrow relation
+/// only makes its user-visible receipt replay-stable.
+pub(crate) const WORK_PROPOSAL_TRIGGER_ATTEMPTS_CREATE_SQL: &str =
+    "CREATE TABLE IF NOT EXISTS work_proposal_trigger_attempts (
+    owner_id VARCHAR(128) NOT NULL,
+    work_id VARCHAR(64) NOT NULL,
+    branch_id VARCHAR(64) NOT NULL,
+    proposal_id VARCHAR(64) NOT NULL,
+    trigger_attempt_id VARCHAR(64) NOT NULL,
+    trigger_item_id VARCHAR(64) NOT NULL,
+    trigger_item_revision BIGINT NOT NULL,
+    created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (owner_id, work_id, branch_id, proposal_id),
+    INDEX idx_work_proposal_trigger_attempt (
+        owner_id, work_id, branch_id, trigger_attempt_id, proposal_id
+    ),
+    CONSTRAINT chk_work_proposal_trigger_attempt_revision CHECK (
+        trigger_item_revision > 0
+    )
+)";
+
 pub(crate) const WORK_CHECK_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work_check_runs (
     owner_id VARCHAR(128) NOT NULL,
     work_id VARCHAR(64) NOT NULL,
@@ -1359,6 +1383,10 @@ pub(crate) const WORK_SCHEMA_TABLES: &[(&str, &str)] = &[
         WORK_PROPOSAL_SEQUENCES_CREATE_SQL,
     ),
     ("work_proposals", WORK_PROPOSALS_CREATE_SQL),
+    (
+        "work_proposal_trigger_attempts",
+        WORK_PROPOSAL_TRIGGER_ATTEMPTS_CREATE_SQL,
+    ),
     ("work_check_runs", WORK_CHECK_RUNS_CREATE_SQL),
     (
         "work_acceptance_decisions",
@@ -2057,6 +2085,7 @@ mod tests {
             "work_item_revisions",
             "work_item_edges",
             "work_graph_revisions",
+            "work_proposal_trigger_attempts",
             "work_check_runs",
             "work_item_attempts",
             "work_terminal_cuts",

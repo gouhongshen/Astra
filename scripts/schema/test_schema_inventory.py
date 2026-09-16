@@ -115,6 +115,7 @@ class SchemaInventoryTest(unittest.TestCase):
             "work_patch_commit_operations",
             "work_proposal_sequences",
             "work_proposals",
+            "work_proposal_trigger_attempts",
             "work_check_runs",
             "work_acceptance_decisions",
             "work_current_gap_acceptances",
@@ -130,7 +131,7 @@ class SchemaInventoryTest(unittest.TestCase):
             row["table"] for row in self.inventory["tables"] if row["domain"] == "work"
         }
         self.assertEqual(expected, actual)
-        self.assertEqual(31, len(actual))
+        self.assertEqual(32, len(actual))
 
     def test_storage_and_work_metadata_are_explicit_and_closed_world(self) -> None:
         inventory_names = {row["table"] for row in self.inventory["tables"]}

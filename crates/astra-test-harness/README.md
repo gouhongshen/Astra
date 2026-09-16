@@ -343,6 +343,15 @@ tool or reasoning cases into identical failures. A negative case can still use
 `capability: memory` while leaving `requires_memoria` false when its contract
 is specifically to verify behavior without invoking the memory backend.
 
+When a report includes `execution`, its `scope` is authoritative: `session`
+describes one selected journal, while `case_attempts` aggregates every
+captured root-attempt journal. `captured_capture_count` must equal
+`expected_capture_count` and `evidence_complete` must be true before a
+`case_attempts` projection can be treated as complete case attribution; a
+complete `session` projection proves only that selected session. Rejected,
+reused, suppressed, and deferred calls remain counted in their own buckets and never
+inflate `executed_tool_calls` or settlement success.
+
 ## FAIL report artifacts
 
 On FAIL, each case report includes:

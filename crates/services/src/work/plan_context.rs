@@ -328,6 +328,7 @@ pub struct WorkTaskExecutionSnapshot {
     items: Vec<WorkTaskExecutionItem>,
     dependencies: Vec<WorkItemEdge>,
     pending_graph_mutations: Vec<super::WorkEstablishmentMutationGroup>,
+    applied_graph_mutations: Vec<super::WorkAppliedGraphMutation>,
     has_unapplied_graph_mutations: bool,
 }
 
@@ -405,6 +406,7 @@ impl WorkTaskExecutionSnapshot {
             items,
             dependencies,
             pending_graph_mutations: Vec::new(),
+            applied_graph_mutations: Vec::new(),
             has_unapplied_graph_mutations: false,
         })
     }
@@ -425,6 +427,14 @@ impl WorkTaskExecutionSnapshot {
         &self.pending_graph_mutations
     }
 
+    /// Accepted deferred admission mutations are retained in the same
+    /// bounded snapshot as the execution graph.  Runtime receipts can use
+    /// this projection after recovery without querying unbounded proposal
+    /// history or mistaking an already-applied mutation for a no-op.
+    pub fn applied_graph_mutations(&self) -> &[super::WorkAppliedGraphMutation] {
+        &self.applied_graph_mutations
+    }
+
     pub(crate) fn set_graph_mutation_barrier(
         &mut self,
         pending: Vec<super::WorkEstablishmentMutationGroup>,
@@ -432,6 +442,13 @@ impl WorkTaskExecutionSnapshot {
     ) {
         self.pending_graph_mutations = pending;
         self.has_unapplied_graph_mutations = has_unapplied;
+    }
+
+    pub(crate) fn set_applied_graph_mutations(
+        &mut self,
+        applied: Vec<super::WorkAppliedGraphMutation>,
+    ) {
+        self.applied_graph_mutations = applied;
     }
 
     /// Whether exactly one completed primary attempt from this durable Run

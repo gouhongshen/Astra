@@ -467,6 +467,9 @@ fn work_receipt_for_model(tool_name: &str, content: &str) -> Option<String> {
         "blocker_kind",
         "dispatch_error",
         "status_scope",
+        "applied_admission_mutations",
+        "applied_admission_mutations_scope",
+        "applied_admission_mutation_attribution",
     ] {
         if let Some(value) = object.get(name) {
             projected.insert(name.to_string(), value.clone());
@@ -1326,6 +1329,19 @@ mod tests {
             "work_id": "work-1",
             "goal": "long user goal that is already in the conversation",
             "initial_item_count": 2,
+            "applied_admission_mutations_scope": "cumulative_recovery",
+            "applied_admission_mutation_attribution": "unavailable",
+            "applied_admission_mutations": [{
+                "result_graph_revision": 2,
+                "added_item_ids": ["task-new"],
+                "revised_items": [{
+                    "item_id": "task-old",
+                    "from_revision": 1,
+                    "declaration_state": "cancelled"
+                }],
+                "added_dependencies": [],
+                "removed_dependencies": []
+            }],
             "initial_task": {
                 "item_id": "task-1",
                 "objective": "Inspect the source",
@@ -1374,6 +1390,18 @@ mod tests {
         assert!(projected.get("opaque_internal_field").is_none());
         assert!(projected.get("declared_tasks").is_none());
         assert!(projected.get("runnable_items").is_none());
+        assert_eq!(
+            projected["applied_admission_mutations"][0]["revised_items"][0]["declaration_state"],
+            "cancelled"
+        );
+        assert_eq!(
+            projected["applied_admission_mutations_scope"],
+            "cumulative_recovery"
+        );
+        assert_eq!(
+            projected["applied_admission_mutation_attribution"],
+            "unavailable"
+        );
         assert_eq!(
             projected["settlement_transition"]["authority"],
             "canonical_work_state"

@@ -486,9 +486,60 @@ fn accepted_result(proposal: &RecordedWorkPlanProposal) -> astra_tools::ToolResu
             "payload_hash": proposal.payload_hash.as_str(),
             "result_branch_revision": resolution.result_branch_revision.map(WorkBranchRevision::get),
             "result_graph_revision": resolution.result_graph_revision.map(|revision| revision.get()),
+            "applied_mutations": applied_mutations(&proposal.proposal),
         })
         .to_string(),
     )
+}
+
+/// Project the immutable graph patch into a bounded receipt for the model.
+///
+/// An accepted proposal is already canonicalized and persisted, so this
+/// summary is replay-stable and does not need to query the current board. The
+/// receipt intentionally reports the pinned source revision, but not a target
+/// revision: sibling branches allocate successor revisions under a shared
+/// item identity, so the target is not derivable from this proposal alone.
+fn applied_mutations(proposal: &NewWorkPlanProposal) -> Value {
+    let added_items = proposal
+        .additions
+        .iter()
+        .map(|item| {
+            json!({
+                "item_id": item.item_id.as_str(),
+                "revision": WorkItemRevision::INITIAL.get(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let revised_items = proposal
+        .revisions
+        .iter()
+        .map(|revision| {
+            json!({
+                "item_id": revision.item_id.as_str(),
+                "from_revision": revision.expected_revision.get(),
+                "declaration_state": revision.declaration_state.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let dependencies = |edges: &[WorkItemEdge]| {
+        edges
+            .iter()
+            .map(|edge| {
+                json!({
+                    "predecessor_item_id": edge.predecessor_item_id.as_str(),
+                    "successor_item_id": edge.successor_item_id.as_str(),
+                    "kind": edge.kind.as_str(),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+
+    json!({
+        "added_items": added_items,
+        "revised_items": revised_items,
+        "dependencies_added": dependencies(&proposal.dependencies),
+        "dependencies_removed": dependencies(&proposal.dependency_removals),
+    })
 }
 
 fn verify_retry_identity(
@@ -1000,6 +1051,93 @@ mod tests {
             canonical_plan_identity_arguments(&first).expect("identity"),
             canonical_plan_identity_arguments(&advanced).expect("identity"),
             "typed mutation content remains part of retry identity"
+        );
+    }
+
+    #[test]
+    fn applied_mutation_receipt_reports_each_canonical_graph_change() {
+        let proposal = NewWorkPlanProposal {
+            owner_id: WorkOwnerId::parse("owner").expect("owner"),
+            work_id: WorkId::parse("work").expect("work"),
+            branch_id: WorkBranchId::parse("branch").expect("branch"),
+            proposal_id: WorkProposalId::parse("proposal").expect("proposal"),
+            expected_work_revision: astra_services::work::WorkRevision::INITIAL,
+            expected_goal_revision: astra_services::work::GoalRevision::INITIAL,
+            expected_criteria_set_revision: astra_services::work::CriterionSetRevision::INITIAL,
+            expected_branch_revision: WorkBranchRevision::INITIAL,
+            expected_graph_revision: astra_services::work::GraphRevision::INITIAL,
+            additions: vec![NewWorkItem {
+                item_id: WorkItemId::parse("task-successor").expect("item id"),
+                kind: WorkItemKind::Task,
+                objective: WorkItemText::parse("Implement the successor").expect("objective"),
+                expected_result: WorkItemText::parse("Successor is verified").expect("result"),
+            }],
+            revisions: vec![
+                WorkItemRevisionChange::new(
+                    WorkItemId::parse("task-live").expect("item id"),
+                    WorkItemRevision::INITIAL,
+                    WorkItemKind::Task,
+                    WorkItemText::parse("Continue the live task").expect("objective"),
+                    WorkItemText::parse("Live task is verified").expect("result"),
+                    WorkItemDeclarationState::Active,
+                ),
+                WorkItemRevisionChange::new(
+                    WorkItemId::parse("task-old").expect("item id"),
+                    WorkItemRevision::new(3).expect("revision"),
+                    WorkItemKind::Task,
+                    WorkItemText::parse("Retire the old task").expect("objective"),
+                    WorkItemText::parse("Retirement is recorded").expect("result"),
+                    WorkItemDeclarationState::Cancelled,
+                ),
+            ],
+            dependencies: vec![WorkItemEdge {
+                predecessor_item_id: WorkItemId::parse("task-old").expect("predecessor"),
+                successor_item_id: WorkItemId::parse("task-successor").expect("successor"),
+                kind: WorkItemEdgeKind::Dependency,
+            }],
+            dependency_removals: vec![WorkItemEdge {
+                predecessor_item_id: WorkItemId::parse("task-live").expect("predecessor"),
+                successor_item_id: WorkItemId::parse("task-old").expect("successor"),
+                kind: WorkItemEdgeKind::Dependency,
+            }],
+            reason: WorkChangeReason::parse("Replace obsolete execution path").expect("reason"),
+            source_kind: WorkProposalSourceKind::Model,
+            source_ref: WorkChangeRef::parse("model-invocation").expect("source"),
+        };
+
+        let expected = json!({
+            "added_items": [{"item_id": "task-successor", "revision": 1}],
+            "revised_items": [
+                {
+                    "item_id": "task-live",
+                    "from_revision": 1,
+                    "declaration_state": "active"
+                },
+                {
+                    "item_id": "task-old",
+                    "from_revision": 3,
+                    "declaration_state": "cancelled"
+                }
+            ],
+            "dependencies_added": [{
+                "predecessor_item_id": "task-old",
+                "successor_item_id": "task-successor",
+                "kind": "dependency"
+            }],
+            "dependencies_removed": [{
+                "predecessor_item_id": "task-live",
+                "successor_item_id": "task-old",
+                "kind": "dependency"
+            }]
+        });
+        assert_eq!(applied_mutations(&proposal), expected);
+        assert!(
+            applied_mutations(&proposal)["revised_items"]
+                .as_array()
+                .expect("revised item receipt")
+                .iter()
+                .all(|item| item.get("to_revision").is_none()),
+            "the target revision is allocated per shared item identity and is not proposal-local"
         );
     }
 

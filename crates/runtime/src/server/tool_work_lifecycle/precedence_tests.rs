@@ -9,7 +9,7 @@ use astra_services::work::{
     InternalSessionId, NewWorkAttemptSettlement, PrimaryWorkAttemptAdvance,
     WorkAttemptExecutionMode, WorkAttemptOutcome, WorkAttemptSettlementError, WorkItemAttemptId,
     WorkItemDeclarationState, WorkItemExecutionStatus, WorkItemId, WorkItemRevision,
-    WorkItemRevisionRef, WorkOwnerId, WorkRepository,
+    WorkItemRevisionRef, WorkOwnerId, WorkRepository, compile_work_establishment_plan,
 };
 use astra_services::{WorkAdmissionDecision, WorkAdmissionGraphMutation, WorkAdmissionTask};
 use astra_tools::tool_engine::{ToolInvocationAdmissionSource, ToolInvocationMetadata};
@@ -500,6 +500,94 @@ async fn delayed_cancel_and_add_apply_only_after_delivered_and_recover_once() {
         "mutation reconciliation itself must not create an assignment"
     );
 
+    // The acceptance graph revision and the exact trigger association are
+    // durable facts, so a fresh reader can explain the change before any
+    // successor assignment or receipt replay occurs.
+    let applied = repository
+        .load_task_execution_snapshot_for_session(&owner, &session)
+        .await
+        .expect("applied mutation snapshot");
+    assert_eq!(applied.applied_graph_mutations().len(), 1);
+    let applied_mutation = &applied.applied_graph_mutations()[0];
+    assert_eq!(
+        applied_mutation
+            .trigger_attempt_id
+            .as_ref()
+            .map(WorkItemAttemptId::as_str),
+        Some(active.attempt_id.as_str())
+    );
+    assert_eq!(
+        applied_mutation.trigger_item,
+        Some(WorkItemRevisionRef {
+            item_id: WorkItemId::parse("task-1").expect("trigger item"),
+            revision: WorkItemRevision::INITIAL,
+        })
+    );
+    assert!(applied_mutation.trigger_association_known);
+
+    // Queue retention is independent of the canonical acceptance fact. A
+    // terminal proposal may be pruned without making an already-applied
+    // graph mutation pending again.
+    let proposal_id = applied_mutation
+        .group
+        .proposal_id(
+            owner.as_str(),
+            session.as_str(),
+            applied.basis().work_id.as_str(),
+            applied.basis().branch_id.as_str(),
+        )
+        .expect("mutation proposal identity");
+    sqlx::query(
+        "DELETE FROM work_proposals
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND proposal_id = ?",
+    )
+    .bind(owner.as_str())
+    .bind(applied.basis().work_id.as_str())
+    .bind(applied.basis().branch_id.as_str())
+    .bind(proposal_id.as_str())
+    .execute(pool.get())
+    .await
+    .expect("prune terminal proposal");
+    let pruned = repository
+        .load_task_execution_snapshot_for_session(&owner, &session)
+        .await
+        .expect("snapshot after proposal pruning");
+    assert!(pruned.pending_graph_mutations().is_empty());
+    assert_eq!(pruned.applied_graph_mutations().len(), 1);
+
+    // A pre-association accepted revision is still applied, but its historic
+    // trigger cannot be reconstructed. Never infer that it belongs to the
+    // current attempt.
+    sqlx::query(
+        "DELETE FROM work_proposal_trigger_attempts
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND proposal_id = ?",
+    )
+    .bind(owner.as_str())
+    .bind(applied.basis().work_id.as_str())
+    .bind(applied.basis().branch_id.as_str())
+    .bind(proposal_id.as_str())
+    .execute(pool.get())
+    .await
+    .expect("remove trigger association for legacy recovery");
+    let legacy = repository
+        .load_task_execution_snapshot_for_session(&owner, &session)
+        .await
+        .expect("legacy accepted snapshot");
+    assert_eq!(legacy.applied_graph_mutations().len(), 1);
+    assert!(!legacy.applied_graph_mutations()[0].trigger_association_known);
+    let active_attempt_id =
+        WorkItemAttemptId::parse(active.attempt_id.clone()).expect("active attempt identity");
+    let (legacy_receipt, attribution_available) = super::applied_admission_mutations_for_attempt(
+        &legacy,
+        &active_attempt_id,
+        &WorkItemRevisionRef {
+            item_id: WorkItemId::parse("task-1").expect("trigger item"),
+            revision: WorkItemRevision::INITIAL,
+        },
+    );
+    assert!(!attribution_available);
+    assert_eq!(legacy_receipt.len(), 1);
+
     // Crash after the mutation proposal commits but before assignment. A
     // fresh executor must recover from that exact durable boundary.
     let recovery_temp = TempDir::new().expect("recovery workspace");
@@ -521,6 +609,18 @@ async fn delayed_cancel_and_add_apply_only_after_delivered_and_recover_once() {
         .as_str()
         .expect("attempt id")
         .to_string();
+    assert_eq!(
+        assigned["applied_admission_mutations"][0]["added_item_ids"],
+        json!([addition_id.clone()])
+    );
+    assert_eq!(
+        assigned["applied_admission_mutations"][0]["revised_items"][0],
+        json!({
+            "item_id": "task-2",
+            "from_revision": 1,
+            "declaration_state": "cancelled"
+        })
+    );
 
     let committed = repository
         .load_task_execution_snapshot_for_session(&owner, &session)
@@ -579,14 +679,313 @@ async fn delayed_cancel_and_add_apply_only_after_delivered_and_recover_once() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn trigger_marker_conflict_rolls_back_settlement_and_delivery() {
+    let pool = setup_pool().await;
+    let owner = WorkOwnerId::parse(format!("owner-{}", Uuid::new_v4())).expect("owner");
+    let session = InternalSessionId::parse(format!("session-{}", Uuid::new_v4())).expect("session");
+    let run_id = format!("run-{}", Uuid::new_v4());
+    crate::server::work_test_support::cleanup_work_owner(&pool, owner.as_str()).await;
+    admit_running_test_session(
+        &pool,
+        &owner,
+        &session,
+        &run_id,
+        "Deferred marker transaction rollback",
+    )
+    .await;
+
+    let goal = "Keep trigger settlement atomic with its deferred mutation receipt";
+    let initial = vec![
+        task("Deliver transaction trigger", "Trigger evidence", &[]),
+        task("Remain available", "Available evidence", &[]),
+    ];
+    let decision = required_decision(
+        goal,
+        initial.clone(),
+        vec![WorkAdmissionGraphMutation::Add {
+            task: task("Add after transaction trigger", "Added evidence", &[]),
+            after_initial_tasks: vec![1],
+        }],
+    );
+    let args = start_args(goal, &initial);
+    let turn_id = "deferred-marker-transaction";
+    let workspace = TempDir::new().expect("workspace");
+    let (executor, request, _) = establish(
+        &pool,
+        &owner,
+        &session,
+        &run_id,
+        turn_id,
+        &args,
+        &decision,
+        workspace.path(),
+    )
+    .await;
+    let active = executor
+        .active_primary_work_attempt()
+        .expect("trigger attempt");
+    let plan = compile_work_establishment_plan(
+        &request.operation_id,
+        &initial,
+        decision.deferred_graph_mutations(),
+    )
+    .expect("compiled deferred mutation");
+    let group = &plan.mutation_groups[0];
+    let proposal_id = group
+        .proposal_id(
+            owner.as_str(),
+            session.as_str(),
+            request.work_id.as_str(),
+            request.branch_id.as_str(),
+        )
+        .expect("mutation proposal identity");
+    let conflicting_attempt = format!("conflicting-attempt-{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO work_proposal_trigger_attempts
+         (owner_id, work_id, branch_id, proposal_id, trigger_attempt_id,
+          trigger_item_id, trigger_item_revision)
+         VALUES (?, ?, ?, ?, ?, 'task-1', 1)",
+    )
+    .bind(owner.as_str())
+    .bind(request.work_id.as_str())
+    .bind(request.branch_id.as_str())
+    .bind(proposal_id.as_str())
+    .bind(&conflicting_attempt)
+    .execute(pool.get())
+    .await
+    .expect("seed conflicting trigger marker");
+
+    let result = DatabaseWorkAttemptSettlementService::new(pool.clone())
+        .record_and_advance_primary(
+            owner.as_str(),
+            &active.attempt_id,
+            &run_id,
+            -1,
+            delivered(),
+            successor_attempt_id("marker-conflict-successor"),
+        )
+        .await;
+    assert!(
+        matches!(&result, Err(WorkAttemptSettlementError::Persistence(_))),
+        "marker conflict must abort the settlement transaction: {result:?}"
+    );
+
+    let outcome: Option<String> = sqlx::query_scalar(
+        "SELECT outcome FROM work_item_attempts
+         WHERE owner_id = ? AND attempt_id = ?",
+    )
+    .bind(owner.as_str())
+    .bind(active.attempt_id.as_str())
+    .fetch_one(pool.get())
+    .await
+    .expect("settlement outcome after rollback");
+    assert!(
+        outcome.is_none(),
+        "delivery must roll back with the conflicting marker"
+    );
+    let marker_attempt: String = sqlx::query_scalar(
+        "SELECT trigger_attempt_id FROM work_proposal_trigger_attempts
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND proposal_id = ?",
+    )
+    .bind(owner.as_str())
+    .bind(request.work_id.as_str())
+    .bind(request.branch_id.as_str())
+    .bind(proposal_id.as_str())
+    .fetch_one(pool.get())
+    .await
+    .expect("conflicting marker remains authoritative");
+    assert_eq!(marker_attempt, conflicting_attempt);
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn multi_trigger_mutation_records_only_the_final_settlement() {
+    let pool = setup_pool().await;
+    let owner = WorkOwnerId::parse(format!("owner-{}", Uuid::new_v4())).expect("owner");
+    let session = InternalSessionId::parse(format!("session-{}", Uuid::new_v4())).expect("session");
+    let run_id = format!("run-{}", Uuid::new_v4());
+    crate::server::work_test_support::cleanup_work_owner(&pool, owner.as_str()).await;
+    admit_running_test_session(
+        &pool,
+        &owner,
+        &session,
+        &run_id,
+        "Multiple deferred mutation triggers",
+    )
+    .await;
+
+    let goal = "Wait for both trigger tasks before applying one deferred cancellation";
+    let initial = vec![
+        task("Deliver first trigger", "First trigger evidence", &[]),
+        task("Deliver final trigger", "Final trigger evidence", &[]),
+        task("Cancel after both triggers", "Cancelled declaration", &[]),
+    ];
+    let decision = required_decision(
+        goal,
+        initial.clone(),
+        vec![WorkAdmissionGraphMutation::Cancel {
+            target_initial_candidate: 3,
+            target: initial[2].clone(),
+            after_initial_tasks: vec![1, 2],
+        }],
+    );
+    let args = start_args(goal, &initial);
+    let workspace = TempDir::new().expect("workspace");
+    let (executor, request, _) = establish(
+        &pool,
+        &owner,
+        &session,
+        &run_id,
+        "multiple-deferred-triggers",
+        &args,
+        &decision,
+        workspace.path(),
+    )
+    .await;
+    let first = executor
+        .active_primary_work_attempt()
+        .expect("first trigger attempt");
+    let second_attempt = successor_attempt_id("second-trigger");
+    let service = DatabaseWorkAttemptSettlementService::new(pool.clone());
+    let first_advance = service
+        .record_and_advance_primary(
+            owner.as_str(),
+            &first.attempt_id,
+            &run_id,
+            -1,
+            delivered(),
+            second_attempt.clone(),
+        )
+        .await
+        .expect("settle first trigger");
+    assert!(
+        matches!(
+            first_advance.advance,
+            PrimaryWorkAttemptAdvance::Assigned { .. }
+        ),
+        "the second trigger must be assigned before the group is due: {:?}",
+        first_advance.advance
+    );
+
+    let second_advance = service
+        .record_and_advance_primary(
+            owner.as_str(),
+            second_attempt.as_str(),
+            &run_id,
+            -1,
+            delivered(),
+            successor_attempt_id("after-two-triggers"),
+        )
+        .await
+        .expect("settle final trigger");
+    assert_eq!(
+        second_advance.advance,
+        PrimaryWorkAttemptAdvance::GraphMutationPending,
+        "the mutation must wait for explicit reconciliation"
+    );
+
+    let repository = DatabaseWorkRepository::new(pool.clone());
+    let pending = repository
+        .load_task_execution_snapshot_for_session(&owner, &session)
+        .await
+        .expect("pending multi-trigger graph");
+    assert_eq!(pending.pending_graph_mutations().len(), 1);
+    let proposal_id = pending.pending_graph_mutations()[0]
+        .proposal_id(
+            owner.as_str(),
+            session.as_str(),
+            request.work_id.as_str(),
+            request.branch_id.as_str(),
+        )
+        .expect("multi-trigger proposal identity");
+    let marker_attempt: Option<String> = sqlx::query_scalar(
+        "SELECT trigger_attempt_id FROM work_proposal_trigger_attempts
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND proposal_id = ?",
+    )
+    .bind(owner.as_str())
+    .bind(request.work_id.as_str())
+    .bind(request.branch_id.as_str())
+    .bind(proposal_id.as_str())
+    .fetch_optional(pool.get())
+    .await
+    .expect("load final trigger marker");
+    assert_eq!(marker_attempt.as_deref(), Some(second_attempt.as_str()));
+
+    // Replaying the first trigger while the group is still pending must not
+    // overwrite the final trigger association.
+    let replay_first = service
+        .record_and_advance_primary(
+            owner.as_str(),
+            &first.attempt_id,
+            &run_id,
+            -1,
+            delivered(),
+            successor_attempt_id("replay-first-trigger"),
+        )
+        .await
+        .expect("replay first trigger");
+    assert_eq!(
+        replay_first.advance,
+        PrimaryWorkAttemptAdvance::GraphMutationPending
+    );
+    let marker_after_first_replay: String = sqlx::query_scalar(
+        "SELECT trigger_attempt_id FROM work_proposal_trigger_attempts
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND proposal_id = ?",
+    )
+    .bind(owner.as_str())
+    .bind(request.work_id.as_str())
+    .bind(request.branch_id.as_str())
+    .bind(proposal_id.as_str())
+    .fetch_one(pool.get())
+    .await
+    .expect("marker after first replay");
+    assert_eq!(marker_after_first_replay, second_attempt.as_str());
+
+    reconcile_admitted_graph_mutations(&executor, invocation(&run_id, "apply-two-trigger"))
+        .await
+        .expect("apply multi-trigger mutation")
+        .expect("one applied mutation");
+    let replay_second = service
+        .record_and_advance_primary(
+            owner.as_str(),
+            second_attempt.as_str(),
+            &run_id,
+            -1,
+            delivered(),
+            successor_attempt_id("replay-final-trigger"),
+        )
+        .await
+        .expect("replay final trigger");
+    assert_eq!(
+        replay_second.advance,
+        PrimaryWorkAttemptAdvance::Complete,
+        "the final trigger replay may finish the canonical graph"
+    );
+    let marker_after_second_replay: String = sqlx::query_scalar(
+        "SELECT trigger_attempt_id FROM work_proposal_trigger_attempts
+         WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND proposal_id = ?",
+    )
+    .bind(owner.as_str())
+    .bind(request.work_id.as_str())
+    .bind(request.branch_id.as_str())
+    .bind(proposal_id.as_str())
+    .fetch_one(pool.get())
+    .await
+    .expect("marker after final replay");
+    assert_eq!(marker_after_second_replay, second_attempt.as_str());
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
     let pool = setup_pool().await;
-    for recovery_window in 0..4 {
+    for recovery_window in 0..5 {
         let case = match recovery_window {
             0 => "settlement-committed-before-mutation",
             1 => "mutation-committed-before-terminal-cut",
             2 => "settlement-committed-before-receipt-read-failure",
-            _ => "fresh-executor-before-terminal-cut",
+            3 => "fresh-executor-before-terminal-cut",
+            _ => "proposal-pruned-before-terminal-cut",
         };
         let owner = WorkOwnerId::parse(format!("owner-{}", Uuid::new_v4())).expect("owner");
         let session =
@@ -633,15 +1032,22 @@ async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
             .expect("task-1 attempt");
         let settlement = delivered();
 
-        DatabaseWorkAttemptSettlementService::new(pool.clone())
-            .record_for_attempt(
+        let precommit = DatabaseWorkAttemptSettlementService::new(pool.clone())
+            .record_and_advance_primary(
                 owner.as_str(),
                 &active.attempt_id,
                 &run_id,
+                -1,
                 settlement.clone(),
+                successor_attempt_id("precommit-mutation-pending"),
             )
             .await
             .expect("precommit exact task delivery");
+        assert_eq!(
+            precommit.advance,
+            PrimaryWorkAttemptAdvance::GraphMutationPending,
+            "{case} must persist the trigger association before reconciliation"
+        );
         let repository = DatabaseWorkRepository::new(pool.clone());
         let pre_replay = repository
             .load_task_execution_snapshot_for_session(&owner, &session)
@@ -669,6 +1075,32 @@ async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
                 0,
                 "mutation commit must not impersonate terminal settlement"
             );
+        }
+        if recovery_window == 4 {
+            let graph = repository
+                .load_task_execution_snapshot_for_session(&owner, &session)
+                .await
+                .expect("accepted graph before proposal pruning");
+            let proposal_id = graph.applied_graph_mutations()[0]
+                .group
+                .proposal_id(
+                    owner.as_str(),
+                    session.as_str(),
+                    request.work_id.as_str(),
+                    request.branch_id.as_str(),
+                )
+                .expect("accepted mutation proposal identity");
+            sqlx::query(
+                "DELETE FROM work_proposals
+                 WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND proposal_id = ?",
+            )
+            .bind(owner.as_str())
+            .bind(request.work_id.as_str())
+            .bind(request.branch_id.as_str())
+            .bind(proposal_id.as_str())
+            .execute(pool.get())
+            .await
+            .expect("prune accepted proposal before terminal recovery");
         }
         if recovery_window == 3 {
             let repair_temp = TempDir::new().expect("terminal-cut repair workspace");
