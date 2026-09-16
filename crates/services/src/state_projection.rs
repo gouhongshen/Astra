@@ -34,6 +34,14 @@ pub fn bounded_state_item_id(kind: &str, components: &[&str]) -> String {
         .chain(components.iter().copied())
         .collect::<Vec<_>>()
         .join("-");
+    bounded_state_item_id_from_readable(readable, kind, components)
+}
+
+fn bounded_state_item_id_from_readable(
+    readable: String,
+    kind: &str,
+    components: &[&str],
+) -> String {
     if readable.len() <= STATE_ITEM_ID_MAX_BYTES {
         return readable;
     }
@@ -50,6 +58,15 @@ pub fn bounded_state_item_id(kind: &str, components: &[&str]) -> String {
     } else {
         format!("state-{digest:x}")
     }
+}
+
+fn bounded_bubble_state_item_id(source_run_id: &str, depth: u32) -> String {
+    let depth = depth.to_string();
+    bounded_state_item_id_from_readable(
+        format!("state-bubble:{source_run_id}:{depth}"),
+        "bubble",
+        &[source_run_id, &depth],
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -998,8 +1015,7 @@ impl DatabaseStateProjectionStore {
                 })?;
         for (idx, target) in targets.iter().enumerate() {
             let item_key = format!("bubble:{source_run_id}:{}", target.depth);
-            let item_id =
-                bounded_state_item_id("bubble", &[source_run_id, &target.depth.to_string()]);
+            let item_id = bounded_bubble_state_item_id(source_run_id, target.depth);
             let payload = json!({
                 "bubble_seq": idx + 1,
                 "severity": severity,
@@ -1726,6 +1742,14 @@ mod tests {
         assert_eq!(
             bounded_state_item_id("summary", &["session-1", "run-1"]),
             "state-summary-session-1-run-1"
+        );
+    }
+
+    #[test]
+    fn bubble_state_item_id_preserves_existing_short_format() {
+        assert_eq!(
+            bounded_bubble_state_item_id("run-1", 0),
+            "state-bubble:run-1:0"
         );
     }
 
