@@ -37,7 +37,9 @@ idempotency is scoped to the authenticated registrant; subsequent read, chat
 resolution and disable operations address the binding by ID and do not re-match
 the caller's user or principal scope. Product authorization remains the
 integrating application's responsibility. Session/run ownership and data/tool
-authorization are unchanged.
+authorization are unchanged. This is a transitional addressing contract; the
+complete contract persists the registering provider and requires both provider
+identity and binding ID for lookup, runtime use and disable operations.
 
 ## Web integration
 

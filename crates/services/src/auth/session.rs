@@ -1122,7 +1122,7 @@ mod tests {
 
     #[test]
     fn provider_session_identity_is_stable_and_partitioned() {
-        let principal = provider_principal("moi", "a", "bc");
+        let principal = provider_principal("provider-a", "a", "bc");
         let identity =
             ProviderSessionCreationIdentity::from_principal(&principal, "conversation-1").unwrap();
         assert_eq!(
@@ -1133,8 +1133,8 @@ mod tests {
         crate::validate_persisted_session_id(&identity.session_id).unwrap();
         for different in [
             provider_principal("other", "a", "bc"),
-            provider_principal("moi", "ab", "c"),
-            provider_principal("moi", "a", "other"),
+            provider_principal("provider-a", "ab", "c"),
+            provider_principal("provider-a", "a", "other"),
         ] {
             assert_ne!(
                 identity,
@@ -1161,7 +1161,7 @@ mod tests {
 
     #[test]
     fn provider_session_identity_rejects_invalid_reference_and_non_request_credentials() {
-        let mut principal = provider_principal("moi", "user", "workspace");
+        let mut principal = provider_principal("provider-a", "user", "scope-a");
         for invalid in ["", " padded", "padded ", "line\nbreak", &"x".repeat(256)] {
             let error =
                 ProviderSessionCreationIdentity::from_principal(&principal, invalid).unwrap_err();

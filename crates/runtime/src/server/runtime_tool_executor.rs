@@ -11027,8 +11027,8 @@ esac
         exec.set_request_scoped_mcp_schemas(vec![json!({
             "type": "function",
             "function": {
-                "name": "mcp__moi-tools__bash",
-                "description": "Run a command in the MOI sandbox.",
+                "name": "mcp__provider-tools__read",
+                "description": "Read data through a provider-managed MCP tool.",
                 "parameters": {"type": "object"}
             }
         })]);
@@ -11046,15 +11046,15 @@ esac
 
         let mut request = exec.tool_execution_request_for_invocation(
             &identity,
-            "mcp__moi-tools__bash",
-            &json!({"command": "pwd"}),
+            "mcp__provider-tools__read",
+            &json!({"path": "report.txt"}),
             Some(&policy),
         );
         let offer = request.selected_offer.as_ref().expect("selected MCP offer");
         assert_eq!(offer.provider_id, "binding-a");
         assert_eq!(offer.native_tool_id.as_deref(), Some("native-read"));
         assert_eq!(offer.schema_digest.as_deref(), Some("descriptor-v1"));
-        assert_eq!(offer.offer_id, "mcp__moi-tools__bash@binding-a");
+        assert_eq!(offer.offer_id, "mcp__provider-tools__read@binding-a");
 
         request.policy.resolved_provider_policy = Some(policy);
         request.policy.admission_snapshot =

@@ -164,6 +164,11 @@ pub trait AgentBindingService: Send + Sync {
         request: AgentBindingCreateRequestData,
     ) -> Result<AgentBindingRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Transitional addressing contract: authenticated callers resolve a
+    /// binding by its opaque ID. Registration ownership still scopes creation
+    /// and idempotency. The complete contract must persist the registering
+    /// provider and require both provider identity and binding ID for lookup,
+    /// runtime use, and disable operations.
     async fn get_binding(
         &self,
         id: String,

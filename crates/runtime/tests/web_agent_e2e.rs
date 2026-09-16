@@ -57,6 +57,7 @@ use crate::test_support::{
 const SECRET: &str = "web-agent-e2e-secret";
 const TOKEN: &str = "Bearer web-agent-e2e-token";
 const PROVIDER_TOKEN: &str = "Bearer web-agent-e2e-provider-token";
+const PROVIDER_ID: &str = "test-provider";
 const USER_ID: &str = "web-agent-e2e-user";
 const DEFAULT_MODEL_OFFERING_ID: &str = "model-test-model";
 const DEFAULT_TEST_EDGE_AGENT_ID: &str = "web-agent-e2e-edge";
@@ -205,7 +206,7 @@ impl AuthService for StubAuth {
         if authorization == Some(PROVIDER_TOKEN) {
             return Ok(AuthPrincipal {
                 user: AuthUserRecord {
-                    user_id: "provider_authorized:moi:web-agent-e2e-user".to_string(),
+                    user_id: format!("provider_authorized:{PROVIDER_ID}:web-agent-e2e-user"),
                     username: "web-agent-e2e-user".to_string(),
                     email: String::new(),
                     display_name: None,
@@ -213,7 +214,7 @@ impl AuthService for StubAuth {
                 session_id: None,
                 origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
                     AuthProviderAuthorizedRequestContext {
-                        provider_id: "moi".to_string(),
+                        provider_id: PROVIDER_ID.to_string(),
                         external_subject: "web-agent-e2e-user".to_string(),
                         provider_scope_id: "web-agent-e2e-workspace".to_string(),
                         request_authorization_id: "web-agent-e2e-authorization".to_string(),
@@ -830,7 +831,7 @@ async fn create_e2e_agent_binding(
         service,
         AgentBindingOwnerScope::from_principal(&AuthPrincipal {
             user: AuthUserRecord {
-                user_id: "provider_authorized:moi:agent-binding-registrar".to_string(),
+                user_id: format!("provider_authorized:{PROVIDER_ID}:agent-binding-registrar"),
                 username: "agent-binding-registrar".to_string(),
                 email: String::new(),
                 display_name: None,
@@ -838,7 +839,7 @@ async fn create_e2e_agent_binding(
             session_id: None,
             origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
                 AuthProviderAuthorizedRequestContext {
-                    provider_id: "moi".to_string(),
+                    provider_id: PROVIDER_ID.to_string(),
                     external_subject: "agent-binding-registrar".to_string(),
                     provider_scope_id: "agent-binding-registry".to_string(),
                     request_authorization_id: "agent-binding-registration".to_string(),

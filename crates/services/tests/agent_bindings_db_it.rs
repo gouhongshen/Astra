@@ -124,7 +124,7 @@ async fn database_agent_bindings_read_and_disable_by_id_only() {
     let (shared_pool, settings) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get().clone();
     let service = DatabaseAgentBindingService::new(settings).with_pool(shared_pool);
-    let owner = AgentBindingOwnerScope::for_internal_user("moi-binding-registrar");
+    let owner = AgentBindingOwnerScope::for_internal_user("provider-binding-registrar");
     let suffix = Uuid::new_v4().simple().to_string();
     let binding = service
         .create_binding(owner.clone(), binding_request(&suffix))

@@ -28,9 +28,9 @@ async fn provider_session_creation_is_idempotent_across_service_instances() {
         session_id: None,
         origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
             AuthProviderAuthorizedRequestContext {
-                provider_id: "moi".to_string(),
+                provider_id: "provider-a".to_string(),
                 external_subject: user_id.clone(),
-                provider_scope_id: "workspace".to_string(),
+                provider_scope_id: "scope-a".to_string(),
                 request_authorization_id: "request".to_string(),
                 edge_agent_id: None,
             },
