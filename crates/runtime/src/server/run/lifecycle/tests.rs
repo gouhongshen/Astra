@@ -7479,6 +7479,8 @@ struct FaultInjectedRunStateStore {
     append_events_before_load_call: HashMap<usize, FaultInjectedEventAppend>,
     claim_before_interaction_resolution: bool,
     interaction_resolution_claimed: std::sync::atomic::AtomicBool,
+    interaction_wait_entered: Option<Arc<tokio::sync::Notify>>,
+    interaction_wait_release: Option<Arc<tokio::sync::Notify>>,
     counters: StdMutex<FaultInjectedRunStoreCounters>,
     append_delay: Duration,
     terminal_transition_delay: Duration,
@@ -7510,6 +7512,8 @@ impl FaultInjectedRunStateStore {
             append_events_before_load_call: HashMap::new(),
             claim_before_interaction_resolution: false,
             interaction_resolution_claimed: std::sync::atomic::AtomicBool::new(false),
+            interaction_wait_entered: None,
+            interaction_wait_release: None,
             counters: StdMutex::new(FaultInjectedRunStoreCounters::default()),
             append_delay: Duration::ZERO,
             terminal_transition_delay: Duration::ZERO,
@@ -7540,6 +7544,16 @@ impl FaultInjectedRunStateStore {
 
     fn with_recovery_claim_before_interaction_resolution(mut self) -> Self {
         self.claim_before_interaction_resolution = true;
+        self
+    }
+
+    fn with_paused_interaction_wait(
+        mut self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.interaction_wait_entered = Some(entered);
+        self.interaction_wait_release = Some(release);
         self
     }
 
@@ -7881,6 +7895,12 @@ impl RunStateStore for FaultInjectedRunStateStore {
         &self,
         request: astra_services::runs::AtomicRunInteractionWaitRequest<'_>,
     ) -> Result<astra_services::runs::DurableRunInteractionWaitOutcome, String> {
+        if let Some(entered) = &self.interaction_wait_entered {
+            entered.notify_one();
+        }
+        if let Some(release) = &self.interaction_wait_release {
+            release.notified().await;
+        }
         self.inner.begin_run_interaction_wait(request).await
     }
 
@@ -19369,6 +19389,131 @@ async fn provider_interaction_wait_is_registered_and_resolved_durably() {
         "provider_interaction_resolved"
     );
     assert_eq!(durable.events[4]["event_type"], "run_resumed");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_submission_before_wait_admission_resumes_the_original_gate() {
+    let wait_entered = Arc::new(tokio::sync::Notify::new());
+    let wait_release = Arc::new(tokio::sync::Notify::new());
+    let store = FaultInjectedRunStateStore::new(&[], &[])
+        .with_paused_interaction_wait(Arc::clone(&wait_entered), Arc::clone(&wait_release));
+    let svc = test_service_with_store(Arc::new(store));
+    svc.run_engine
+        .start_run("provider-pre-wait", "user-1", "provider-session")
+        .await
+        .unwrap();
+    let gate = DurableRunUserPromptGate::new(
+        "user-1".into(),
+        "provider-session".into(),
+        "provider-pre-wait".into(),
+        Some(4),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        None,
+    )
+    .with_provider_run_owner(Some(astra_services::runs::ProviderRunOwner {
+        provider_id: "moi".into(),
+        provider_scope_id: "workspace-a".into(),
+    }))
+    .with_timeout(Duration::from_secs(1));
+    let interaction = tokio::spawn(async move {
+        astra_tools::ProviderInteractionGate::request_interaction(
+            &gate,
+            &astra_turn_types::ProviderInteractionRequest {
+                request_id: "provider-pre-wait-request".into(),
+                payload: json!({"type": "provider.test.select"}),
+                timeout_ms: None,
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), wait_entered.notified())
+        .await
+        .expect("gate must pause after registration and before wait admission");
+    let required = svc
+        .run_engine
+        .load_run_interaction_event(
+            "user-1",
+            "provider-pre-wait",
+            "provider-pre-wait-request",
+            "provider_interaction_required",
+        )
+        .await
+        .unwrap();
+    assert!(required.is_some(), "durable replay can expose the request");
+    assert!(matches!(
+        svc.run_engine
+            .resolve_run_interaction(
+                "user-1",
+                "provider-session",
+                "provider-pre-wait",
+                "provider-pre-wait-request",
+                astra_services::runs::DurableRunInteractionKind::Provider,
+                json!({
+                    "request_id": "provider-pre-wait-request",
+                    "outcome": "submitted",
+                    "payload": {"selected": "early-option"},
+                }),
+            )
+            .await
+            .unwrap(),
+        astra_services::runs::DurableRunInteractionResolveOutcome::Queued(_)
+    ));
+    let queued = svc
+        .run_engine
+        .load_run("user-1", "provider-pre-wait")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(queued.status, STATUS_RUNNING);
+    assert!(queued.events.iter().any(|event| {
+        event.get("event_type").and_then(Value::as_str)
+            == Some("provider_interaction_response_queued")
+    }));
+    assert!(queued.events.iter().all(|event| {
+        event.get("event_type").and_then(Value::as_str) != Some("provider_interaction_resolved")
+    }));
+
+    wait_release.notify_one();
+    let decision = tokio::time::timeout(Duration::from_secs(1), interaction)
+        .await
+        .expect("the original gate must consume the queued response")
+        .expect("provider interaction task must not panic");
+    assert_eq!(
+        decision,
+        astra_tools::ProviderInteractionDecision::Submitted(json!({
+            "selected": "early-option"
+        }))
+    );
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "provider-pre-wait")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_RUNNING);
+    assert_eq!(durable.waiting_for, None);
+    let event_types = durable
+        .events
+        .iter()
+        .map(|event| event.get("event_type").and_then(Value::as_str).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        &event_types[1..],
+        &[
+            "provider_interaction_required",
+            "provider_interaction_response_queued",
+            "interaction_wait_started",
+            "provider_interaction_resolved",
+            "run_resumed",
+        ]
+    );
+    assert_eq!(
+        durable.events[4]["data"]["_durable_resolution"]["disposition"],
+        "resumed"
+    );
 }
 
 #[derive(Clone, Copy)]
