@@ -33089,6 +33089,7 @@ mod tests {
         assert_eq!(
             event_types,
             vec![
+                "run_created",
                 "provider_interaction_required",
                 PROVIDER_INTERACTION_RESPONSE_QUEUED_EVENT_TYPE,
                 "interaction_wait_started",
