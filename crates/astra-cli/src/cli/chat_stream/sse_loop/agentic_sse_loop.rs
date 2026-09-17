@@ -244,7 +244,7 @@ fn non_empty_json_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 fn interruption_visible_text(interruption: &Value, kind: Option<&str>) -> String {
-    let mut text = non_empty_json_str(interruption, "user_message")
+    non_empty_json_str(interruption, "user_message")
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| {
             let kind = kind.unwrap_or("interrupted");
@@ -258,16 +258,7 @@ fn interruption_visible_text(interruption: &Value, kind: Option<&str>) -> String
                 ""
             };
             format!("[{kind}] Turn interrupted.{suffix}")
-        });
-
-    if let Some(detail) = non_empty_json_str(interruption, "error_detail")
-        && !text.contains(detail)
-    {
-        text.push_str("\n\nStop reason: ");
-        text.push_str(detail);
-    }
-
-    text
+        })
 }
 
 pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
@@ -591,11 +582,7 @@ mod tests {
             Some("budget_exhausted")
         );
         assert!(result.full_text.contains("46 tool call(s) completed"));
-        assert!(
-            result
-                .full_text
-                .contains("model kept calling tools after the runtime injected")
-        );
+        assert!(!result.full_text.contains("model kept calling tools"));
     }
 
     #[test]
@@ -618,11 +605,7 @@ mod tests {
                 .full_text
                 .starts_with("[harness_blocked] Turn interrupted.")
         );
-        assert!(
-            result
-                .full_text
-                .contains("Stop reason: required harness capability is unavailable")
-        );
+        assert!(!result.full_text.contains("required harness capability"));
     }
 
     #[test]
@@ -646,7 +629,7 @@ mod tests {
                 .starts_with("[interrupted] Turn interrupted.")
         );
         assert!(
-            result
+            !result
                 .full_text
                 .contains("missing kind should not look completed")
         );
