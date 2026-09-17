@@ -1933,11 +1933,7 @@ fn approval_decision_from_shared_event(
     event: &Value,
 ) -> Result<astra_tools::ApprovalDecision, String> {
     let data = event.get("data").unwrap_or(event);
-    if data
-        .pointer("/_durable_resolution/disposition")
-        .and_then(Value::as_str)
-        != Some("resumed")
-    {
+    if !interaction_has_durable_resume_authority(data) {
         return Err(
             "approval was recorded without durable resume authority; the stale run must stop"
                 .to_string(),
@@ -1967,22 +1963,16 @@ fn ask_user_decision_from_shared_event(event: &Value) -> astra_tools::AskUserDec
         .and_then(Value::as_str)
         .unwrap_or("error")
     {
-        "submitted"
-            if data
-                .pointer("/_durable_resolution/disposition")
-                .and_then(Value::as_str)
-                == Some("resumed") =>
-        {
-            data.get("answers")
-                .cloned()
-                .and_then(|answers| serde_json::from_value(answers).ok())
-                .map(astra_tools::AskUserDecision::Submitted)
-                .unwrap_or_else(|| {
-                    astra_tools::AskUserDecision::Error(
-                        "durable ask_user response contains invalid answers".to_string(),
-                    )
-                })
-        }
+        "submitted" if interaction_has_durable_resume_authority(data) => data
+            .get("answers")
+            .cloned()
+            .and_then(|answers| serde_json::from_value(answers).ok())
+            .map(astra_tools::AskUserDecision::Submitted)
+            .unwrap_or_else(|| {
+                astra_tools::AskUserDecision::Error(
+                    "durable ask_user response contains invalid answers".to_string(),
+                )
+            }),
         "submitted" => astra_tools::AskUserDecision::Error(
             "ask_user response was recorded without durable resume authority".to_string(),
         ),
@@ -2006,7 +1996,7 @@ fn provider_interaction_decision_from_shared_event(
         .and_then(Value::as_str)
         .unwrap_or("error")
     {
-        "submitted" => data
+        "submitted" if interaction_has_durable_resume_authority(data) => data
             .get("payload")
             .filter(|payload| payload.is_object())
             .cloned()
@@ -2016,6 +2006,10 @@ fn provider_interaction_decision_from_shared_event(
                     "durable provider interaction response contains invalid payload".to_string(),
                 )
             }),
+        "submitted" => astra_tools::ProviderInteractionDecision::Error(
+            "provider interaction response was recorded without durable resume authority"
+                .to_string(),
+        ),
         "cancelled" => astra_tools::ProviderInteractionDecision::Cancelled,
         "timed_out" => astra_tools::ProviderInteractionDecision::Timeout,
         _ => astra_tools::ProviderInteractionDecision::Error(
@@ -2025,6 +2019,12 @@ fn provider_interaction_decision_from_shared_event(
                 .to_string(),
         ),
     }
+}
+
+fn interaction_has_durable_resume_authority(data: &Value) -> bool {
+    data.pointer("/_durable_resolution/disposition")
+        .and_then(Value::as_str)
+        == Some("resumed")
 }
 
 enum DurableServerInteractionWaitStart {

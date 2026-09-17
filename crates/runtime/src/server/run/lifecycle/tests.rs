@@ -7477,6 +7477,8 @@ struct FaultInjectedRunStateStore {
     mutate_before_status_call: HashMap<usize, FaultInjectedStatusMutation>,
     mutate_before_generation_append_call: HashMap<usize, FaultInjectedStatusMutation>,
     append_events_before_load_call: HashMap<usize, FaultInjectedEventAppend>,
+    claim_before_interaction_resolution: bool,
+    interaction_resolution_claimed: std::sync::atomic::AtomicBool,
     counters: StdMutex<FaultInjectedRunStoreCounters>,
     append_delay: Duration,
     terminal_transition_delay: Duration,
@@ -7506,6 +7508,8 @@ impl FaultInjectedRunStateStore {
             mutate_before_status_call: HashMap::new(),
             mutate_before_generation_append_call: HashMap::new(),
             append_events_before_load_call: HashMap::new(),
+            claim_before_interaction_resolution: false,
+            interaction_resolution_claimed: std::sync::atomic::AtomicBool::new(false),
             counters: StdMutex::new(FaultInjectedRunStoreCounters::default()),
             append_delay: Duration::ZERO,
             terminal_transition_delay: Duration::ZERO,
@@ -7531,6 +7535,11 @@ impl FaultInjectedRunStateStore {
 
     fn with_failed_status_run(mut self, run_id: &str) -> Self {
         self.fail_status_run_ids.insert(run_id.to_string());
+        self
+    }
+
+    fn with_recovery_claim_before_interaction_resolution(mut self) -> Self {
+        self.claim_before_interaction_resolution = true;
         self
     }
 
@@ -7884,6 +7893,18 @@ impl RunStateStore for FaultInjectedRunStateStore {
         kind: astra_services::runs::DurableRunInteractionKind,
         response_data: serde_json::Value,
     ) -> Result<astra_services::runs::DurableRunInteractionResolveOutcome, String> {
+        if self.claim_before_interaction_resolution
+            && !self
+                .interaction_resolution_claimed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let claims = self.inner.claim_recoverable_active_runs(1).await?;
+            if claims.len() != 1 || claims[0].run.run_id != run_id {
+                return Err(format!(
+                    "injected recovery claim did not acquire expected run {run_id}"
+                ));
+            }
+        }
         self.inner
             .resolve_run_interaction(
                 user_id,
@@ -19348,6 +19369,163 @@ async fn provider_interaction_wait_is_registered_and_resolved_durably() {
         "provider_interaction_resolved"
     );
     assert_eq!(durable.events[4]["event_type"], "run_resumed");
+}
+
+#[derive(Clone, Copy)]
+enum RejectedProviderResolution {
+    Superseded,
+    OwnerGenerationLost,
+}
+
+async fn assert_rejected_provider_submission_fails_closed(rejection: RejectedProviderResolution) {
+    let suffix = match rejection {
+        RejectedProviderResolution::Superseded => "superseded",
+        RejectedProviderResolution::OwnerGenerationLost => "authority-lost",
+    };
+    let run_id = format!("provider-interaction-{suffix}");
+    let request_id = format!("provider-request-{suffix}");
+    let store = match rejection {
+        RejectedProviderResolution::Superseded => FaultInjectedRunStateStore::new(&[], &[]),
+        RejectedProviderResolution::OwnerGenerationLost => {
+            FaultInjectedRunStateStore::new(&[], &[])
+                .with_recovery_claim_before_interaction_resolution()
+        }
+    };
+    let svc = test_service_with_store(Arc::new(store));
+    svc.run_engine
+        .start_run(&run_id, "user-1", "provider-session")
+        .await
+        .unwrap();
+    let gate = DurableRunUserPromptGate::new(
+        "user-1".into(),
+        "provider-session".into(),
+        run_id.clone(),
+        Some(4),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        None,
+    )
+    .with_provider_run_owner(Some(astra_services::runs::ProviderRunOwner {
+        provider_id: "moi".into(),
+        provider_scope_id: "workspace-a".into(),
+    }))
+    .with_timeout(Duration::from_secs(1));
+    let interaction_request_id = request_id.clone();
+    let interaction = tokio::spawn(async move {
+        astra_tools::ProviderInteractionGate::request_interaction(
+            &gate,
+            &astra_turn_types::ProviderInteractionRequest {
+                request_id: interaction_request_id,
+                payload: json!({"type": "provider.test.select"}),
+                timeout_ms: None,
+            },
+        )
+        .await
+    });
+
+    wait_for_durable_run_status(&svc.run_engine, "user-1", &run_id, STATUS_WAITING).await;
+    if matches!(rejection, RejectedProviderResolution::Superseded) {
+        svc.run_engine
+            .append_event(
+                "user-1",
+                "provider-session",
+                &run_id,
+                json!({
+                    "event_type": "user_intent",
+                    "idempotency_key": format!("user-intent:{run_id}"),
+                    "data": {"intent_id": "newer-user-intent"},
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    let outcome = svc
+        .run_engine
+        .resolve_run_interaction(
+            "user-1",
+            "provider-session",
+            &run_id,
+            &request_id,
+            astra_services::runs::DurableRunInteractionKind::Provider,
+            json!({
+                "request_id": request_id,
+                "outcome": "submitted",
+                "payload": {"selected": "stale-option"},
+            }),
+        )
+        .await
+        .unwrap();
+    match rejection {
+        RejectedProviderResolution::Superseded => assert!(matches!(
+            outcome,
+            astra_services::runs::DurableRunInteractionResolveOutcome::Superseded { .. }
+        )),
+        RejectedProviderResolution::OwnerGenerationLost => assert!(matches!(
+            outcome,
+            astra_services::runs::DurableRunInteractionResolveOutcome::AuthorityLost {
+                reason:
+                    astra_services::runs::DurableRunInteractionAuthorityLoss::OwnerGenerationMismatch {
+                        actual_owner_generation: 1,
+                    },
+                ..
+            }
+        )),
+    }
+
+    let decision = tokio::time::timeout(Duration::from_secs(1), interaction)
+        .await
+        .expect("provider gate must observe the rejected durable response")
+        .expect("provider interaction task must not panic");
+    assert!(matches!(
+        decision,
+        astra_tools::ProviderInteractionDecision::Error(ref error)
+            if error.contains("without durable resume authority")
+    ));
+    let durable = svc
+        .run_engine
+        .load_run("user-1", &run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_WAITING);
+    let resolution = durable
+        .events
+        .iter()
+        .find(|event| {
+            event.get("event_type").and_then(Value::as_str) == Some("provider_interaction_resolved")
+                && event.pointer("/data/request_id").and_then(Value::as_str)
+                    == Some(request_id.as_str())
+        })
+        .expect("rejected provider response must remain in the durable audit log");
+    assert_eq!(resolution["data"]["outcome"], "submitted");
+    assert_eq!(
+        resolution["data"]["_durable_resolution"]["disposition"],
+        match rejection {
+            RejectedProviderResolution::Superseded => "superseded",
+            RejectedProviderResolution::OwnerGenerationLost => "authority_lost",
+        }
+    );
+    assert!(
+        durable
+            .events
+            .iter()
+            .all(|event| event.get("event_type").and_then(Value::as_str) != Some("run_resumed"))
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn superseded_provider_submission_is_audited_without_resuming_execution() {
+    assert_rejected_provider_submission_fails_closed(RejectedProviderResolution::Superseded).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn authority_lost_provider_submission_is_audited_without_resuming_execution() {
+    assert_rejected_provider_submission_fails_closed(
+        RejectedProviderResolution::OwnerGenerationLost,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
