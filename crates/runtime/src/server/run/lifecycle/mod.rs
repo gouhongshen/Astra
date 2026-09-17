@@ -1867,6 +1867,7 @@ async fn project_shared_run_interaction_resolution(
     let expected_waiting_for = match resolved_event_type {
         "approval_resolved" => Some("tool_approval"),
         "ask_user_resolved" => Some("user_input"),
+        "provider_interaction_resolved" => Some("provider_interaction"),
         _ => None,
     };
     // Re-read the bounded authoritative tail before changing the process-local
@@ -2890,7 +2891,11 @@ impl DurableRunUserPromptGate {
     /// transition are already durable. This method must never append another
     /// event or manufacture local authority when the transaction did not
     /// commit.
-    async fn project_durable_wait(&self, event: Value) {
+    async fn project_durable_wait(
+        &self,
+        event: Value,
+        kind: astra_services::runs::DurableRunInteractionKind,
+    ) {
         let indexed_event = load_exact_indexed_interaction_event(
             &self.run_engine,
             &self.user_id,
@@ -2907,7 +2912,7 @@ impl DurableRunUserPromptGate {
             let mut runs = self.runs.write().await;
             runs.get_mut(&self.context.run_id).map(|run| {
                 run.status = RunStatus::Waiting;
-                run.waiting_for = Some("user_input".to_string());
+                run.waiting_for = Some(kind.waiting_for().to_string());
                 run.events.push(event);
                 run.live_tx.clone()
             })
@@ -2961,7 +2966,11 @@ impl astra_tools::AskUserGate for DurableRunUserPromptGate {
         .await
         {
             Ok(DurableServerInteractionWaitStart::Waiting) => {
-                self.project_durable_wait(required_event).await;
+                self.project_durable_wait(
+                    required_event,
+                    astra_services::runs::DurableRunInteractionKind::AskUser,
+                )
+                .await;
                 None
             }
             Ok(DurableServerInteractionWaitStart::AlreadyResolved(event)) => Some(event),
@@ -3109,6 +3118,10 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
         };
         let event = json!({
             "event_type": "provider_interaction_required",
+            "idempotency_key": format!(
+                "server-provider-interaction-required:{}",
+                request.request_id
+            ),
             "data": {
                 "request_id": &request.request_id,
                 "session_id": &self.context.session_id,
@@ -3133,7 +3146,11 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
         .await
         {
             Ok(DurableServerInteractionWaitStart::Waiting) => {
-                self.project_durable_wait(event).await;
+                self.project_durable_wait(
+                    event,
+                    astra_services::runs::DurableRunInteractionKind::Provider,
+                )
+                .await;
                 None
             }
             Ok(DurableServerInteractionWaitStart::AlreadyResolved(event)) => Some(event),

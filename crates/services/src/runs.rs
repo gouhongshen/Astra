@@ -2203,6 +2203,20 @@ pub enum DurableRunInteractionKind {
 }
 
 impl DurableRunInteractionKind {
+    const ALL: [Self; 3] = [Self::Approval, Self::AskUser, Self::Provider];
+
+    fn from_required_event_type(event_type: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.required_event_type() == event_type)
+    }
+
+    fn from_resolved_event_type(event_type: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.resolved_event_type() == event_type)
+    }
+
     pub fn required_event_type(self) -> &'static str {
         match self {
             Self::Approval => "approval_required",
@@ -3018,16 +3032,12 @@ fn validate_interaction_batch_registration(
     for event in request.events {
         let request_id = extract_interaction_request_id(event);
         let idempotency_key = extract_optional_string(event, "idempotency_key");
-        let event_kind = match extract_event_type(event).as_str() {
-            "approval_required" => DurableRunInteractionKind::Approval,
-            "ask_user_prompted" => DurableRunInteractionKind::AskUser,
-            _ => {
-                return Err(
+        let event_kind =
+            DurableRunInteractionKind::from_required_event_type(extract_event_type(event).as_str())
+                .ok_or_else(|| {
                     "interaction registration accepts only identified canonical interaction facts"
-                        .to_string(),
-                );
-            }
-        };
+                        .to_string()
+                })?;
         if batch_kind.is_some_and(|kind| kind != event_kind) {
             return Err("interaction registration batch mixes interaction kinds".to_string());
         }
@@ -3076,7 +3086,7 @@ fn prepared_interaction_registration_batch(
     }))
     .map_err(|error| {
         format!(
-            "serialize approval registration identity for run {}: {error}",
+            "serialize interaction registration identity for run {}: {error}",
             request.run_id
         )
     })?;
@@ -3095,7 +3105,7 @@ fn prepared_interaction_registration_batch(
                 .and_then(serde_json::Value::as_object_mut)
                 .ok_or_else(|| {
                     format!(
-                        "approval registration event {batch_index} for run {} has no object data",
+                        "interaction registration event {batch_index} for run {} has no object data",
                         request.run_id
                     )
                 })?;
@@ -5881,11 +5891,9 @@ fn close_unresolved_interactions_in_memory(run: &mut DurableRunRecord, status: &
         .events
         .iter()
         .filter_map(|event| {
-            let kind = match extract_event_type(event).as_str() {
-                "approval_resolved" => DurableRunInteractionKind::Approval,
-                "ask_user_resolved" => DurableRunInteractionKind::AskUser,
-                _ => return None,
-            };
+            let kind = DurableRunInteractionKind::from_resolved_event_type(
+                extract_event_type(event).as_str(),
+            )?;
             Some((kind, extract_interaction_request_id(event)?))
         })
         .collect::<HashSet<_>>();
@@ -5893,11 +5901,9 @@ fn close_unresolved_interactions_in_memory(run: &mut DurableRunRecord, status: &
         .events
         .iter()
         .filter_map(|required| {
-            let kind = match extract_event_type(required).as_str() {
-                "approval_required" => DurableRunInteractionKind::Approval,
-                "ask_user_prompted" => DurableRunInteractionKind::AskUser,
-                _ => return None,
-            };
+            let kind = DurableRunInteractionKind::from_required_event_type(
+                extract_event_type(required).as_str(),
+            )?;
             let request_id = extract_interaction_request_id(required)?;
             (!resolved.contains(&(kind, request_id.clone()))).then(|| {
                 terminal_interaction_resolution_event(kind, required, &request_id, status, run)
@@ -7962,7 +7968,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     .collect::<Vec<_>>();
                 if matching.len() > 1 {
                     return Err(format!(
-                        "approval registration identity {request_id} has duplicate durable facts"
+                        "interaction registration identity {request_id} has duplicate durable facts"
                     ));
                 }
                 let Some((index, existing)) = matching.first().copied() else {
@@ -7974,7 +7980,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     || !run_events_have_same_immutable_payload(existing, expected)
                 {
                     return Err(format!(
-                        "immutable approval registration conflict for request {request_id}"
+                        "immutable interaction registration conflict for request {request_id}"
                     ));
                 }
                 existing_indices.push(index);
@@ -7992,13 +7998,13 @@ impl RunStateStore for InMemoryRunStateStore {
                 .count();
             if durable_batch_count != existing_indices.len() {
                 return Err(format!(
-                    "approval registration batch {registration_batch_id} has {} unexpected durable facts",
+                    "interaction registration batch {registration_batch_id} has {} unexpected durable facts",
                     durable_batch_count.saturating_sub(existing_indices.len())
                 ));
             }
             if !existing_indices.is_empty() && existing_indices.len() != registration_events.len() {
                 return Err(format!(
-                    "partial approval registration is invalid: {} of {} facts exist",
+                    "partial interaction registration is invalid: {} of {} facts exist",
                     existing_indices.len(),
                     registration_events.len()
                 ));
@@ -8011,7 +8017,7 @@ impl RunStateStore for InMemoryRunStateStore {
                     .any(|(offset, index)| *index != first + offset)
                 {
                     return Err(
-                        "durable approval registration facts are not one contiguous ordered batch"
+                        "durable interaction registration facts are not one contiguous ordered batch"
                             .to_string(),
                     );
                 }
@@ -11481,7 +11487,11 @@ impl DatabaseRunStateStore {
              FROM agent_run_events required
              FORCE INDEX (idx_agent_run_events_control_type_idx)
              WHERE required.user_id = ? AND required.run_id = ?
-               AND required.event_type IN ('approval_required', 'ask_user_prompted')
+               AND required.event_type IN (
+                    'approval_required',
+                    'ask_user_prompted',
+                    'provider_interaction_required'
+               )
                AND NOT EXISTS (
                  SELECT 1 FROM agent_run_events resolved
                  FORCE INDEX (idx_agent_run_events_interaction)
@@ -11491,7 +11501,9 @@ impl DatabaseRunStateStore {
                    AND ((required.event_type = 'approval_required'
                          AND resolved.event_type = 'approval_resolved')
                      OR (required.event_type = 'ask_user_prompted'
-                         AND resolved.event_type = 'ask_user_resolved'))
+                         AND resolved.event_type = 'ask_user_resolved')
+                     OR (required.event_type = 'provider_interaction_required'
+                         AND resolved.event_type = 'provider_interaction_resolved'))
                )
              ORDER BY required.event_idx ASC",
         )
@@ -11509,19 +11521,14 @@ impl DatabaseRunStateStore {
                     source,
                 )
             })?;
-            let kind = match required_event_type.as_str() {
-                "approval_required" => DurableRunInteractionKind::Approval,
-                "ask_user_prompted" => DurableRunInteractionKind::AskUser,
-                _ => {
-                    return Err(DatabaseRunStateStoreError::Database {
-                        operation: "decode_terminal_unresolved_interaction_kind",
-                        entity: run.run_id.clone(),
-                        source: sqlx::Error::Protocol(format!(
-                            "unsupported durable interaction event type {required_event_type}"
-                        )),
-                    });
-                }
-            };
+            let kind = DurableRunInteractionKind::from_required_event_type(&required_event_type)
+                .ok_or_else(|| DatabaseRunStateStoreError::Database {
+                    operation: "decode_terminal_unresolved_interaction_kind",
+                    entity: run.run_id.clone(),
+                    source: sqlx::Error::Protocol(format!(
+                        "unsupported durable interaction event type {required_event_type}"
+                    )),
+                })?;
             let request_id: String = row.try_get("interaction_request_id").map_err(|source| {
                 db_error(
                     "decode_terminal_unresolved_interaction_request",
@@ -18968,7 +18975,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     .to_string()
                 })?;
                 return Err(format!(
-                    "approval registration identity {request_id} has duplicate durable facts"
+                    "interaction registration identity {request_id} has duplicate durable facts"
                 ));
             }
             if let Some(row) = existing.first() {
@@ -18999,7 +19006,7 @@ impl RunStateStore for DatabaseRunStateStore {
                         .to_string()
                     })?;
                     return Err(format!(
-                        "immutable approval registration conflict for request {request_id}"
+                        "immutable interaction registration conflict for request {request_id}"
                     ));
                 }
                 existing_indices.push(row.try_get::<i64, _>("event_idx").map_err(|source| {
@@ -19042,7 +19049,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 .to_string()
             })?;
             return Err(format!(
-                "approval registration batch {registration_batch_id} has an unexpected durable fact set"
+                "interaction registration batch {registration_batch_id} has an unexpected durable fact set"
             ));
         }
         if !existing_indices.is_empty() && existing_indices.len() != registration_events.len() {
@@ -19055,7 +19062,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 .to_string()
             })?;
             return Err(format!(
-                "partial approval registration is invalid: {} of {} facts exist",
+                "partial interaction registration is invalid: {} of {} facts exist",
                 existing_indices.len(),
                 registration_events.len()
             ));
@@ -19076,7 +19083,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     .to_string()
                 })?;
                 return Err(
-                    "durable approval registration facts are not one contiguous ordered batch"
+                    "durable interaction registration facts are not one contiguous ordered batch"
                         .to_string(),
                 );
             }
@@ -23693,6 +23700,8 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "approval_required",
     "approval_batch_required",
     "user_prompt_required",
+    "provider_interaction_required",
+    "provider_interaction_resolved",
     // Run lifecycle + framing.
     "run_started",
     "run_error",
@@ -24173,6 +24182,15 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         }
         "ask_user_prompted" | "user_prompt_required" => {
             let mut out = serde_json::json!({ "type": "user_prompt_required" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
+        "provider_interaction_required" | "provider_interaction_resolved" => {
+            let mut out = serde_json::json!({ "type": event_type });
             if let Some(obj) = out.as_object_mut() {
                 for (k, v) in &data {
                     obj.insert(k.clone(), v.clone());
@@ -26145,6 +26163,28 @@ mod tests {
                     "context": "terminal interaction closure fixture",
                     "questions": [],
                     "timeout_ms": null,
+                },
+            }
+        })
+    }
+
+    fn provider_interaction_required_event(
+        request_id: &str,
+        session_id: &str,
+    ) -> serde_json::Value {
+        json!({
+            "event_type": "provider_interaction_required",
+            "idempotency_key": format!("provider_interaction:{request_id}:required"),
+            "data": {
+                "request_id": request_id,
+                "session_id": session_id,
+                "interaction": {
+                    "request_id": request_id,
+                    "payload": {"type": "provider.test.select"},
+                },
+                "provider_run_owner": {
+                    "provider_id": "test-provider",
+                    "provider_scope_id": "test-scope",
                 },
             }
         })
@@ -31194,6 +31234,7 @@ mod tests {
             let run_id = format!("term-all-r-{suffix}");
             let approval_id = format!("approval-{status}");
             let ask_user_id = format!("ask-user-{status}");
+            let provider_id = format!("provider-{status}");
             insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
             let mut run = durable_run_record(&run_id);
             run.user_id = user_id.clone();
@@ -31204,7 +31245,15 @@ mod tests {
                 .expect("insert terminal interaction run");
             let approval = [approval_required_event(&approval_id, "bash", &session_id)];
             let ask_user = [ask_user_prompted_event(&ask_user_id, &session_id)];
-            for events in [approval.as_slice(), ask_user.as_slice()] {
+            let provider = [provider_interaction_required_event(
+                &provider_id,
+                &session_id,
+            )];
+            for events in [
+                approval.as_slice(),
+                ask_user.as_slice(),
+                provider.as_slice(),
+            ] {
                 assert_eq!(
                     store
                         .register_guarded_interaction_batch(
@@ -31264,6 +31313,7 @@ mod tests {
             for (event_type, request_id) in [
                 ("approval_resolved", approval_id.as_str()),
                 ("ask_user_resolved", ask_user_id.as_str()),
+                ("provider_interaction_resolved", provider_id.as_str()),
             ] {
                 let (index, event) = terminal
                     .events
@@ -31315,6 +31365,15 @@ mod tests {
                             "request_id": ask_user_id,
                             "outcome": "submitted",
                             "answers": {"answers": []},
+                        }),
+                    ),
+                    (
+                        provider_id.as_str(),
+                        DurableRunInteractionKind::Provider,
+                        json!({
+                            "request_id": provider_id,
+                            "outcome": "submitted",
+                            "payload": {"selected": "test-option"},
                         }),
                     ),
                 ] {
@@ -32053,7 +32112,7 @@ mod tests {
             .await
             .expect_err("a subset retry cannot masquerade as the complete provider batch");
         assert!(
-            subset_error.contains("immutable approval registration conflict"),
+            subset_error.contains("immutable interaction registration conflict"),
             "{subset_error}"
         );
 
@@ -32070,7 +32129,7 @@ mod tests {
             .await
             .expect_err("same immutable identity with a new payload must fail closed");
         assert!(
-            error.contains("immutable approval registration conflict"),
+            error.contains("immutable interaction registration conflict"),
             "{error}"
         );
 
@@ -33628,6 +33687,43 @@ mod tests {
         unknown["version"] = json!("execution_handoff_v2");
         unknown["phase"] = json!("shutdown");
         assert!(checkpoint_metadata("handoff", &unknown.to_string()).is_err());
+    }
+
+    #[test]
+    fn provider_interactions_keep_their_public_shape_for_live_and_replay() {
+        let owner = json!({
+            "provider_id": "moi",
+            "provider_scope_id": "workspace-a",
+        });
+        for event_type in [
+            "provider_interaction_required",
+            "provider_interaction_resolved",
+        ] {
+            let data = json!({
+                "run_id": "run-1",
+                "interaction_id": "provider-request-1",
+                "provider_run_owner": owner,
+            });
+            let expected = json!({
+                "type": event_type,
+                "run_id": "run-1",
+                "interaction_id": "provider-request-1",
+                "provider_run_owner": owner,
+            });
+
+            assert_eq!(
+                transform_run_event_for_client({
+                    let mut event = data.clone();
+                    event["type"] = json!(event_type);
+                    event
+                }),
+                expected
+            );
+            assert_eq!(
+                transform_run_event_for_client(make_event(event_type, data)),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -36455,8 +36551,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.contains("partial approval registration")
-                || error.contains("immutable approval registration conflict")
+            error.contains("partial interaction registration")
+                || error.contains("immutable interaction registration conflict")
         );
         let durable = store
             .load_run("u1", "approval-exact-set")
@@ -36512,7 +36608,7 @@ mod tests {
                 },)
                 .await
                 .unwrap_err()
-                .contains("immutable approval registration conflict")
+                .contains("immutable interaction registration conflict")
         );
         let durable = exact_store
             .load_run("u1", "approval-exact-subset")
@@ -36702,18 +36798,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_terminal_status_closes_approval_and_ask_user_with_stable_authority_loss() {
+    async fn every_terminal_status_closes_all_interactions_with_stable_authority_loss() {
         for status in [STATUS_CANCELLED, STATUS_FAILED, STATUS_COMPLETED] {
             let run_id = format!("terminal-interactions-{status}");
             let approval_id = format!("approval-{status}");
             let ask_user_id = format!("ask-user-{status}");
+            let provider_id = format!("provider-{status}");
             let store = InMemoryRunStateStore::new();
             store.insert_run(durable_run_record(&run_id)).await.unwrap();
             let approval = [approval_required_event(&approval_id, "bash", "s1")];
             let ask_user = [ask_user_prompted_event(&ask_user_id, "s1")];
+            let provider = [provider_interaction_required_event(&provider_id, "s1")];
             for (kind, events) in [
                 (DurableRunInteractionKind::Approval, approval.as_slice()),
                 (DurableRunInteractionKind::AskUser, ask_user.as_slice()),
+                (DurableRunInteractionKind::Provider, provider.as_slice()),
             ] {
                 assert_eq!(
                     store
@@ -36766,6 +36865,7 @@ mod tests {
             let closure_indices = [
                 ("approval_resolved", approval_id.as_str()),
                 ("ask_user_resolved", ask_user_id.as_str()),
+                ("provider_interaction_resolved", provider_id.as_str()),
             ]
             .map(|(event_type, request_id)| {
                 let (index, event) = terminal
@@ -36839,6 +36939,11 @@ mod tests {
                 "outcome": "submitted",
                 "answers": {"answers": []},
             });
+            let provider_response = json!({
+                "request_id": provider_id,
+                "outcome": "submitted",
+                "payload": {"selected": "test-option"},
+            });
             let event_count = terminal.events.len();
             for _ in 0..2 {
                 for (request_id, kind, response) in [
@@ -36851,6 +36956,11 @@ mod tests {
                         ask_user_id.as_str(),
                         DurableRunInteractionKind::AskUser,
                         ask_user_response.clone(),
+                    ),
+                    (
+                        provider_id.as_str(),
+                        DurableRunInteractionKind::Provider,
+                        provider_response.clone(),
                     ),
                 ] {
                     assert!(matches!(
