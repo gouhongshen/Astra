@@ -5161,6 +5161,10 @@ async fn call_llm_and_collect_with_total_budget(
                     )
                     .await?;
                 }
+                // This transport failure is the newest provider attempt outcome.
+                // Do not let structured metadata from an earlier gateway response
+                // replace the final connection failure after retries are exhausted.
+                last_model_gateway_error = None;
                 last_err = error.message.clone();
                 last_kind = error.kind;
                 if retry_safe {
@@ -14444,6 +14448,91 @@ mod tests {
             .unwrap()
     }
 
+    async fn mock_retryable_503_moi_model_gateway(State(Hit(c)): State<Hit>) -> Response {
+        c.fetch_add(1, Ordering::SeqCst);
+        Response::builder()
+            .status(503)
+            .header(
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER,
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1,
+            )
+            .body(Body::from(
+                r#"{"error":{"code":"temporary_unavailable","retryable":true,"action":"retry"}}"#,
+            ))
+            .unwrap()
+    }
+
+    async fn spawn_single_retryable_moi_gateway_503_server() -> (String, Arc<AtomicU32>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind single-response gateway listener");
+        let addr = listener.local_addr().expect("single-response local_addr");
+        let responses = Arc::new(AtomicU32::new(0));
+        let responses_for_server = responses.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept gateway request");
+            drop(listener);
+
+            let mut request = vec![0_u8; 8192];
+            let _ = socket.read(&mut request).await;
+            let body =
+                r#"{"error":{"code":"temporary_unavailable","retryable":true,"action":"retry"}}"#;
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\n{}: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER,
+                astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1,
+                body.len(),
+                body,
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write gateway response");
+            responses_for_server.fetch_add(1, Ordering::SeqCst);
+            let _ = socket.shutdown().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        (format!("http://{addr}"), responses)
+    }
+
+    async fn call_retryable_moi_model_gateway(base_url: &str) -> astra_core::ClassifiedError {
+        reset_rate_limit_cooldown_for_tests();
+        let _backoff = set_test_retry_backoff_ms(0);
+        let headers = HashMap::from([(
+            astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER.to_string(),
+            astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1.to_string(),
+        )]);
+        let messages = vec![json!({"role":"user","content":"x"})];
+        call_llm_and_collect(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                cache_capability: None,
+                route: LlmExecutionRoute {
+                    fixed_temperature: None,
+                    thinking_protocol: None,
+                    model_name: "m",
+                    wire_model_name: None,
+                    api_key: "k",
+                    base_url,
+                    provider: "openai",
+                    header_overrides: Some(&headers),
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: None,
+                temperature: None,
+                has_fallback: false,
+                thinking: &ThinkingConfig::Off,
+            },
+            LlmCancel::None,
+        )
+        .await
+        .expect_err("retryable gateway failures must exhaust the model call")
+    }
+
     async fn call_mock_402_moi_model_gateway(
         header_overrides: Option<&HashMap<String, String>>,
         response_uses_contract: bool,
@@ -14537,6 +14626,45 @@ mod tests {
         assert_eq!(error.details_json, None);
         assert!(!error.message.contains("insufficient_credit"));
         assert!(!error.message.contains("provider secret"));
+    }
+
+    #[tokio::test]
+    async fn moi_model_gateway_retry_returns_the_final_transport_failure() {
+        let (base, responses) = spawn_single_retryable_moi_gateway_503_server().await;
+        let error = call_retryable_moi_model_gateway(&base).await;
+
+        assert_eq!(error.kind, astra_core::ErrorKind::Network);
+        assert_eq!(error.details_json, None);
+        assert!(!error.message.contains("temporary_unavailable"));
+        assert_eq!(responses.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn moi_model_gateway_retry_preserves_the_last_gateway_failure() {
+        let hits = Arc::new(AtomicU32::new(0));
+        let app = Router::new()
+            .route(
+                "/chat/completions",
+                post(mock_retryable_503_moi_model_gateway),
+            )
+            .with_state(Hit(hits.clone()));
+        let base = spawn_local_http_server(app).await;
+        let error = call_retryable_moi_model_gateway(&base).await;
+
+        assert_eq!(error.kind, astra_core::ErrorKind::Unknown);
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("last gateway failure must retain structured details"),
+        )
+        .expect("valid gateway details");
+        assert_eq!(details["source"], "moi_model_gateway");
+        assert_eq!(details["http_status"], 503);
+        assert_eq!(details["error_code"], "temporary_unavailable");
+        assert_eq!(details["retryable"], true);
+        assert_eq!(details["action"], "retry");
+        assert_eq!(hits.load(Ordering::SeqCst), LLM_MAX_RETRIES + 1);
     }
 
     #[tokio::test]
