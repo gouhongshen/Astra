@@ -116,7 +116,7 @@ impl DatabaseToolInvocationLedger {
         let mut tx = self.pool.get().begin().await?;
         if let Some(record) = load_record_in_tx(&mut tx, identity).await? {
             if !record.fingerprint.same_tool_and_arguments(fingerprint) {
-                rollback(tx, "prepare identity conflict").await;
+                let _ = rollback(tx, "prepare identity conflict").await;
                 return Err(ToolInvocationLedgerStoreError::IdentityConflict {
                     identity: Box::new(identity.clone()),
                 });
@@ -125,7 +125,7 @@ impl DatabaseToolInvocationLedger {
             return Ok(ToolInvocationPrepareOutcome::Existing(record));
         }
         if let Err(error) = lock_executable_run(&mut tx, identity).await {
-            rollback(tx, "prepare run admission denied").await;
+            let _ = rollback(tx, "prepare run admission denied").await;
             if matches!(
                 &error,
                 ToolInvocationLedgerStoreError::RunNotExecutable { .. }
@@ -176,7 +176,7 @@ impl DatabaseToolInvocationLedger {
             }
         })?;
         if !record.fingerprint.same_tool_and_arguments(fingerprint) {
-            rollback(tx, "prepare identity conflict").await;
+            let _ = rollback(tx, "prepare identity conflict").await;
             return Err(ToolInvocationLedgerStoreError::IdentityConflict {
                 identity: Box::new(identity.clone()),
             });
@@ -1015,8 +1015,12 @@ impl DatabaseToolInvocationLedger {
         let admission_outcome = match admission_outcome {
             Ok(outcome) => outcome,
             Err(reason) => {
-                rollback(tx, "tool dispatch action admission failed").await;
-                connection.release();
+                if rollback(tx, "tool dispatch action admission failed")
+                    .await
+                    .is_ok()
+                {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
                     identity: Box::new(identity.clone()),
                     reason,
@@ -1026,8 +1030,12 @@ impl DatabaseToolInvocationLedger {
         match admission_outcome {
             crate::runs::TransactionalRunActionAdmission::Granted { .. } => {}
             crate::runs::TransactionalRunActionAdmission::AlreadyStarted { event_index } => {
-                rollback(tx, "tool dispatch action was already started").await;
-                connection.release();
+                if rollback(tx, "tool dispatch action was already started")
+                    .await
+                    .is_ok()
+                {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::ActionAlreadyStarted {
                     identity: Box::new(identity.clone()),
                     event_index,
@@ -1109,8 +1117,12 @@ impl DatabaseToolInvocationLedger {
                             identity: identity.clone(),
                         }
                     })?;
-                    rollback(tx, "superseded tool dispatch closure mismatch").await;
-                    connection.release();
+                    if rollback(tx, "superseded tool dispatch closure mismatch")
+                        .await
+                        .is_ok()
+                    {
+                        connection.release();
+                    }
                     if is_exact_guidance_rejection(&actual, &outcome, &completion_source) {
                         return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
                             identity: Box::new(identity.clone()),
@@ -1153,8 +1165,9 @@ impl DatabaseToolInvocationLedger {
                 });
             }
             crate::runs::TransactionalRunActionAdmission::Inactive { status } => {
-                rollback(tx, "tool dispatch run inactive").await;
-                connection.release();
+                if rollback(tx, "tool dispatch run inactive").await.is_ok() {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::RunNotExecutable {
                     run_id: identity.run_id.clone(),
                     status,
@@ -1163,8 +1176,12 @@ impl DatabaseToolInvocationLedger {
             crate::runs::TransactionalRunActionAdmission::OwnerGenerationMismatch {
                 actual_owner_generation,
             } => {
-                rollback(tx, "tool dispatch owner generation changed").await;
-                connection.release();
+                if rollback(tx, "tool dispatch owner generation changed")
+                    .await
+                    .is_ok()
+                {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::RunOwnerGenerationMismatch {
                     run_id: identity.run_id.clone(),
                     expected_owner_generation: admission.expected_owner_generation,
@@ -1174,8 +1191,12 @@ impl DatabaseToolInvocationLedger {
             crate::runs::TransactionalRunActionAdmission::OwnerMismatch {
                 actual_owner_pod_id,
             } => {
-                rollback(tx, "tool dispatch owner pod changed").await;
-                connection.release();
+                if rollback(tx, "tool dispatch owner pod changed")
+                    .await
+                    .is_ok()
+                {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::RunOwnerMismatch {
                     run_id: identity.run_id.clone(),
                     expected_owner_pod_id: admission.expected_owner_pod_id.clone(),
@@ -1183,8 +1204,9 @@ impl DatabaseToolInvocationLedger {
                 });
             }
             crate::runs::TransactionalRunActionAdmission::Missing => {
-                rollback(tx, "tool dispatch run missing").await;
-                connection.release();
+                if rollback(tx, "tool dispatch run missing").await.is_ok() {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::RunNotFound {
                     user_id: identity.user_id.clone(),
                     run_id: identity.run_id.clone(),
@@ -1213,8 +1235,9 @@ impl DatabaseToolInvocationLedger {
 
         let record = load_record_in_tx(&mut tx, identity).await?;
         if updated != 1 {
-            rollback(tx, "claim-dispatch mismatch").await;
-            connection.release();
+            if rollback(tx, "claim-dispatch mismatch").await.is_ok() {
+                connection.release();
+            }
             return match record {
                 Some(actual) => Err(ToolInvocationLedgerStoreError::StateMismatch {
                     identity: identity.clone(),
@@ -1332,12 +1355,15 @@ impl DatabaseToolInvocationLedger {
             .await?
             .rows_affected(),
             other => {
-                rollback(
+                if rollback(
                     tx,
                     "dispatch commit acknowledgement lost execution authority",
                 )
-                .await;
-                connection.release();
+                .await
+                .is_ok()
+                {
+                    connection.release();
+                }
                 return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
                     identity: Box::new(identity.clone()),
                     reason: format!(
@@ -1351,8 +1377,12 @@ impl DatabaseToolInvocationLedger {
             updated == 1
                 && dispatch_claim_shape_matches_after_db_lease_renewal(record, identity, owner_id)
         }) else {
-            rollback(tx, "dispatch commit acknowledgement recovery mismatch").await;
-            connection.release();
+            if rollback(tx, "dispatch commit acknowledgement recovery mismatch")
+                .await
+                .is_ok()
+            {
+                connection.release();
+            }
             return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
                 identity: Box::new(identity.clone()),
                 reason: format!(
@@ -1473,7 +1503,7 @@ impl DatabaseToolInvocationLedger {
             }
         })?;
         if updated != 1 {
-            rollback(tx, "mark-outcome-unknown mismatch").await;
+            let _ = rollback(tx, "mark-outcome-unknown mismatch").await;
             ensure_dispatched_owner(identity, &record, owner_id)?;
             return Err(ToolInvocationLedgerStoreError::StateMismatch {
                 identity: identity.clone(),
@@ -1559,7 +1589,7 @@ impl DatabaseToolInvocationLedger {
                     identity: identity.clone(),
                 },
             };
-            rollback(tx, "compare-and-complete mismatch").await;
+            let _ = rollback(tx, "compare-and-complete mismatch").await;
             return Err(mismatch);
         }
         let record = record.ok_or_else(|| ToolInvocationLedgerStoreError::NotFound {
@@ -1629,7 +1659,7 @@ impl DatabaseToolInvocationLedger {
                     identity: identity.clone(),
                 },
             };
-            rollback(tx, "semantic-cache-completion mismatch").await;
+            let _ = rollback(tx, "semantic-cache-completion mismatch").await;
             return Err(error);
         }
         let record = record.ok_or_else(|| ToolInvocationLedgerStoreError::NotFound {
@@ -1843,10 +1873,14 @@ fn decode_record(
     Ok(record)
 }
 
-async fn rollback(tx: Transaction<'_, MySql>, context: &'static str) {
-    if let Err(error) = tx.rollback().await {
+/// Returns success only when the checkout is synchronized and safe to reuse.
+/// Callers using `CancellationSafePoolConnection` must keep its close-on-drop
+/// guard armed when this returns an error.
+async fn rollback(tx: Transaction<'_, MySql>, context: &'static str) -> Result<(), sqlx::Error> {
+    tx.rollback().await.map_err(|error| {
         tracing::warn!(context, %error, "tool invocation ledger rollback failed");
-    }
+        error
+    })
 }
 
 /// Validate immutable dispatch shape after the caller has renewed both the

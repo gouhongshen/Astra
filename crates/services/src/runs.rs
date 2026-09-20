@@ -13288,6 +13288,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             if claim_existing {
                 return self
                     .existing_run_start_claim(&record.user_id, &record.run_id, requested_session_id)
@@ -13444,6 +13445,7 @@ impl DatabaseRunStateStore {
                         )
                         .to_string()
                     })?;
+                    connection.release();
                     return self
                         .existing_run_start_claim(
                             &record.user_id,
@@ -13578,6 +13580,7 @@ impl DatabaseRunStateStore {
                         )
                         .to_string()
                     })?;
+                    connection.release();
                     return self
                         .existing_run_start_claim(
                             &record.user_id,

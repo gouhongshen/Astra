@@ -6,7 +6,7 @@
 
 mod common;
 
-use astra_services::runs::{DatabaseRunStateStore, RunStateStore};
+use astra_services::runs::{DatabaseRunStateStore, DurableRunStartClaim, RunStateStore};
 use serial_test::serial;
 use uuid::Uuid;
 
@@ -171,5 +171,53 @@ async fn cancelled_run_event_append_closes_its_physical_checkout() {
         .await
         .expect("retry append after cancellation");
 
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn existing_run_start_claim_releases_rollback_checkout_before_reread() {
+    let shared_pool = common::setup_pool().await;
+    let pool = shared_pool.get();
+    let max_connections = shared_pool.stats().max_connections as usize;
+    assert!(
+        max_connections >= 2,
+        "idempotent replay requires worker and fixture capacity"
+    );
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("run-replay-user-{suffix}");
+    let session_id = format!("run-replay-session-{suffix}");
+    let run_id = format!("run-replay-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let store =
+        DatabaseRunStateStore::new(shared_pool.clone()).with_owner_pod_id(TEST_OWNER_POD_ID);
+    let existing = store
+        .load_run(&user_id, &run_id)
+        .await
+        .expect("load replay fixture")
+        .expect("replay fixture exists");
+
+    // Leave exactly one checkout available. The replay transaction must
+    // release that checkout after rollback before its authoritative reread,
+    // otherwise it waits forever for capacity held by itself.
+    let held = hold_pool_checkouts(pool, max_connections - 1).await;
+    let claim = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store.claim_run_start(existing, Some(&session_id)),
+    )
+    .await
+    .expect("idempotent replay must not self-deadlock")
+    .expect("idempotent replay claim");
+    assert_eq!(
+        claim,
+        DurableRunStartClaim::Existing {
+            session_id: session_id.clone(),
+            start_request_fingerprint: None,
+        }
+    );
+
+    drop(held);
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
