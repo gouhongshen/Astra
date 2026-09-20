@@ -1,3 +1,4 @@
+use crate::CancellationSafePoolConnection;
 use crate::db_row::RowExt as PromptDeltaDbRow;
 use astra_core::{
     SharedPool, matrixone_null_shape_comment, matrixone_statement_with_null_shape,
@@ -6,6 +7,7 @@ use astra_core::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use sqlx::Acquire;
 
 pub(crate) const PROMPT_DIAGNOSTIC_RETENTION_DAYS: u32 = 90;
 const EXPIRED_PROMPT_REQUESTS_SQL: &str =
@@ -556,7 +558,14 @@ pub async fn persist_prompt_request(
     plan: &PromptRequestPlan,
 ) -> Result<PromptRequestPersistResult, String> {
     let db = pool.get();
-    let mut tx = db.begin().await.map_err(|error| error.to_string())?;
+    let mut connection = CancellationSafePoolConnection::acquire(db)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut tx = connection
+        .connection_mut()
+        .begin()
+        .await
+        .map_err(|error| error.to_string())?;
     crate::storage::lock_agent_session_write_fence(&mut tx, &input.session_id, &input.user_id)
         .await
         .map_err(|error| format!("lock prompt diagnostic session fence: {error}"))?;
@@ -774,6 +783,7 @@ pub async fn persist_prompt_request(
     }
 
     tx.commit().await.map_err(|error| error.to_string())?;
+    connection.release();
     if astra_core::history_work::instrumentation_enabled() {
         astra_core::history_work::record_rows(
             astra_core::history_work::HistoryWorkSite::PromptDeltaRows,

@@ -17,12 +17,15 @@ use astra_core::is_duplicate_key_error;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx::{Acquire, Row};
 use std::collections::BTreeMap;
 
 use astra_core::canonical_names::{append_unique_names, normalize_name_list};
 
-use crate::{SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact};
+use crate::{
+    CancellationSafePoolConnection, SessionArtifactJsonRecord, SessionArtifactJsonStore,
+    StoredSessionArtifact,
+};
 
 const STEP_CHECKPOINT_NUMBER_OFFSET: u32 = 1_000_000_000;
 const MAX_CLOUD_RESTORE_CHECKPOINTS: u32 = 200;
@@ -2485,8 +2488,11 @@ impl crate::state_sync::MatrixOneSyncService {
     ) -> Result<(), String> {
         let started_at = std::time::Instant::now();
         let result: Result<usize, String> = async {
-            let mut tx = self
-                .pool
+            let mut connection = CancellationSafePoolConnection::acquire(&self.pool)
+                .await
+                .map_err(|e| format!("push_session_state acquire connection: {e}"))?;
+            let mut tx = connection
+                .connection_mut()
                 .begin()
                 .await
                 .map_err(|e| format!("push_session_state begin: {e}"))?;
@@ -2530,6 +2536,7 @@ impl crate::state_sync::MatrixOneSyncService {
             tx.commit()
                 .await
                 .map_err(|e| format!("push_session_state commit: {e}"))?;
+            connection.release();
             Ok(metadata_json.len())
         }
         .await;
@@ -2594,7 +2601,15 @@ impl crate::state_sync::MatrixOneSyncService {
         };
 
         let event_id = uuid::Uuid::now_v7().to_string();
-        let mut tx = match self.pool.begin().await {
+        let mut connection = match CancellationSafePoolConnection::acquire(&self.pool).await {
+            Ok(connection) => connection,
+            Err(e) => {
+                let err = format!("push_context_trace_signal acquire connection: {e}");
+                log_result("error", Some(&err));
+                return Err(err);
+            }
+        };
+        let mut tx = match connection.connection_mut().begin().await {
             Ok(tx) => tx,
             Err(e) => {
                 let err = format!("push_context_trace_signal begin transaction: {e}");
@@ -2698,6 +2713,7 @@ impl crate::state_sync::MatrixOneSyncService {
             log_result("error", Some(&err));
             return Err(err);
         }
+        connection.release();
 
         log_result("success", None);
         Ok(())

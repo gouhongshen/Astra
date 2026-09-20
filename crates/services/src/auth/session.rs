@@ -1,4 +1,4 @@
-use crate::cancellation_safe_db::CancellationSafePoolConnection;
+use crate::CancellationSafePoolConnection;
 use crate::pagination::MAX_API_LIST_LIMIT;
 use crate::session_lifecycle::{SessionTableDeleteOutcome, hard_delete_session};
 use crate::storage::{log_session_audit, session_record_from_row};
@@ -453,7 +453,14 @@ impl DatabaseSessionService {
             .unwrap_or_else(|| format!("Session {}", Utc::now().format("%Y-%m-%d %H:%M")));
         let metadata = serde_json::Value::Object(request.metadata.unwrap_or_default()).to_string();
 
-        let mut tx = pool.begin().await.map_err(internal_error)?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(internal_error)?;
         crate::storage::lock_agent_session_write_fence(&mut tx, &session_id, &user_id)
             .await
             .map_err(internal_error)?;
@@ -478,6 +485,7 @@ impl DatabaseSessionService {
                     .await?
                     .ok_or_else(|| internal_error("failed to read idempotent session"))?;
                 tx.commit().await.map_err(internal_error)?;
+                connection.release();
                 return Ok(SessionCreationResult {
                     session: record,
                     created: false,
@@ -509,6 +517,7 @@ impl DatabaseSessionService {
             .await?
             .ok_or_else(|| internal_error("failed to read created session"))?;
         tx.commit().await.map_err(internal_error)?;
+        connection.release();
         let details = serde_json::json!({
             "title": record.title,
             "agent_id": record.agent_id,

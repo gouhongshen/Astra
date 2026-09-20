@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::cancellation_safe_db::CancellationSafePoolConnection;
+use crate::CancellationSafePoolConnection;
 use astra_core::SharedPool;
 use astra_turn_types::{
     DEFAULT_CONVERSATION_BRANCH_ID, DispatchCertainty, SessionKeyV1,
@@ -396,6 +396,10 @@ impl DatabaseToolInvocationLedger {
         session_id: &str,
         run_id: &str,
     ) -> Result<ToolInvocationRunReconciliationOutcome, ToolInvocationLedgerStoreError> {
+        // Tool lifecycle work can be cancelled with its owning run. The
+        // physical checkout must remain guarded after the session fence is
+        // acquired so an aborted task cannot strand that fence in the shared
+        // pool.
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
         let mut tx = connection.connection_mut().begin().await?;
         crate::storage::admit_session_event_write(&mut tx, session_id, user_id, false).await?;
@@ -982,7 +986,8 @@ impl DatabaseToolInvocationLedger {
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
         validate_lease_input(owner_id, lease_duration_ms)?;
         let lease_duration_us = lease_duration_us(lease_duration_ms)?;
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.connection_mut().begin().await?;
         // Check Work's provider generation before granting Run action
         // authority. Provider switching must first clear the active Session
         // slot and unresolved invocation ledger, so a live dispatch cannot be
@@ -1011,6 +1016,7 @@ impl DatabaseToolInvocationLedger {
             Ok(outcome) => outcome,
             Err(reason) => {
                 rollback(tx, "tool dispatch action admission failed").await;
+                connection.release();
                 return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
                     identity: Box::new(identity.clone()),
                     reason,
@@ -1021,6 +1027,7 @@ impl DatabaseToolInvocationLedger {
             crate::runs::TransactionalRunActionAdmission::Granted { .. } => {}
             crate::runs::TransactionalRunActionAdmission::AlreadyStarted { event_index } => {
                 rollback(tx, "tool dispatch action was already started").await;
+                connection.release();
                 return Err(ToolInvocationLedgerStoreError::ActionAlreadyStarted {
                     identity: Box::new(identity.clone()),
                     event_index,
@@ -1103,6 +1110,7 @@ impl DatabaseToolInvocationLedger {
                         }
                     })?;
                     rollback(tx, "superseded tool dispatch closure mismatch").await;
+                    connection.release();
                     if is_exact_guidance_rejection(&actual, &outcome, &completion_source) {
                         return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
                             identity: Box::new(identity.clone()),
@@ -1118,6 +1126,7 @@ impl DatabaseToolInvocationLedger {
                     });
                 }
                 if let Err(source) = tx.commit().await {
+                    drop(connection);
                     if matches!(
                         self.get(identity).await,
                         Ok(Some(record))
@@ -1137,6 +1146,7 @@ impl DatabaseToolInvocationLedger {
                         reason: format!("commit superseded not-dispatched closure: {source}"),
                     });
                 }
+                connection.release();
                 return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
                     identity: Box::new(identity.clone()),
                     user_intent_event_index,
@@ -1144,6 +1154,7 @@ impl DatabaseToolInvocationLedger {
             }
             crate::runs::TransactionalRunActionAdmission::Inactive { status } => {
                 rollback(tx, "tool dispatch run inactive").await;
+                connection.release();
                 return Err(ToolInvocationLedgerStoreError::RunNotExecutable {
                     run_id: identity.run_id.clone(),
                     status,
@@ -1153,6 +1164,7 @@ impl DatabaseToolInvocationLedger {
                 actual_owner_generation,
             } => {
                 rollback(tx, "tool dispatch owner generation changed").await;
+                connection.release();
                 return Err(ToolInvocationLedgerStoreError::RunOwnerGenerationMismatch {
                     run_id: identity.run_id.clone(),
                     expected_owner_generation: admission.expected_owner_generation,
@@ -1163,6 +1175,7 @@ impl DatabaseToolInvocationLedger {
                 actual_owner_pod_id,
             } => {
                 rollback(tx, "tool dispatch owner pod changed").await;
+                connection.release();
                 return Err(ToolInvocationLedgerStoreError::RunOwnerMismatch {
                     run_id: identity.run_id.clone(),
                     expected_owner_pod_id: admission.expected_owner_pod_id.clone(),
@@ -1171,6 +1184,7 @@ impl DatabaseToolInvocationLedger {
             }
             crate::runs::TransactionalRunActionAdmission::Missing => {
                 rollback(tx, "tool dispatch run missing").await;
+                connection.release();
                 return Err(ToolInvocationLedgerStoreError::RunNotFound {
                     user_id: identity.user_id.clone(),
                     run_id: identity.run_id.clone(),
@@ -1200,6 +1214,7 @@ impl DatabaseToolInvocationLedger {
         let record = load_record_in_tx(&mut tx, identity).await?;
         if updated != 1 {
             rollback(tx, "claim-dispatch mismatch").await;
+            connection.release();
             return match record {
                 Some(actual) => Err(ToolInvocationLedgerStoreError::StateMismatch {
                     identity: identity.clone(),
@@ -1215,6 +1230,7 @@ impl DatabaseToolInvocationLedger {
             identity: identity.clone(),
         })?;
         if let Err(source) = tx.commit().await {
+            drop(connection);
             // COMMIT acknowledgement loss is not evidence that the claim
             // rolled back. The provider boundary has not been crossed yet,
             // so this same owner may proceed only when an authoritative
@@ -1230,6 +1246,7 @@ impl DatabaseToolInvocationLedger {
                 )
                 .await;
         }
+        connection.release();
         Ok(record)
     }
 
@@ -1241,7 +1258,8 @@ impl DatabaseToolInvocationLedger {
         admission: &ToolInvocationDispatchAdmission,
         original_commit_error: sqlx::Error,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
-        let mut tx = self.pool.get().begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get()).await?;
+        let mut tx = connection.connection_mut().begin().await?;
         validate_execution_binding_generation_in_tx(
             &mut tx,
             identity,
@@ -1319,6 +1337,7 @@ impl DatabaseToolInvocationLedger {
                     "dispatch commit acknowledgement lost execution authority",
                 )
                 .await;
+                connection.release();
                 return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
                     identity: Box::new(identity.clone()),
                     reason: format!(
@@ -1333,6 +1352,7 @@ impl DatabaseToolInvocationLedger {
                 && dispatch_claim_shape_matches_after_db_lease_renewal(record, identity, owner_id)
         }) else {
             rollback(tx, "dispatch commit acknowledgement recovery mismatch").await;
+            connection.release();
             return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
                 identity: Box::new(identity.clone()),
                 reason: format!(
@@ -1340,14 +1360,16 @@ impl DatabaseToolInvocationLedger {
                 ),
             });
         };
-        tx.commit().await.map_err(|recovery_error| {
-            ToolInvocationLedgerStoreError::ActionAdmissionFailed {
+        if let Err(recovery_error) = tx.commit().await {
+            drop(connection);
+            return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
                 identity: Box::new(identity.clone()),
                 reason: format!(
                     "dispatch commit acknowledgement recovery commit failed after {original_commit_error}: {recovery_error}"
                 ),
-            }
-        })?;
+            });
+        }
+        connection.release();
         Ok(recovered)
     }
 

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::CancellationSafePoolConnection;
 use crate::db_row::RowExt as ContextManifestDbRow;
 use crate::observation_capture::{
     DurableCaptureOutcome, ObservationCollisionReceipt, ObservationPayloadDomain,
@@ -8,7 +9,7 @@ use crate::observation_capture::{
 use astra_core::{SharedPool, matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{MySql, QueryBuilder};
+use sqlx::{Connection, MySql, QueryBuilder};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -650,16 +651,22 @@ impl DatabaseContextManifestStore {
         event: SessionEventInsert<'_>,
     ) -> Result<String, ContextManifestError> {
         let event_id = Uuid::new_v4().to_string();
-        let mut tx =
-            self.pool
-                .get()
-                .begin()
-                .await
-                .map_err(|source| ContextManifestError::Database {
-                    operation: event.operation,
-                    entity: event.entity.to_string(),
-                    source,
-                })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| ContextManifestError::Database {
+                operation: event.operation,
+                entity: event.entity.to_string(),
+                source,
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| ContextManifestError::Database {
+                operation: event.operation,
+                entity: event.entity.to_string(),
+                source,
+            })?;
         crate::storage::admit_session_event_write(&mut tx, event.session_id, event.user_id, true)
             .await
             .map_err(|source| ContextManifestError::Database {
@@ -675,6 +682,7 @@ impl DatabaseContextManifestStore {
                 entity: event.entity.to_string(),
                 source,
             })?;
+        connection.release();
         Ok(event_id)
     }
 
@@ -804,16 +812,22 @@ impl DatabaseContextManifestStore {
             }
         })?;
         let artifact_references = aggregate_artifact_references(&items);
-        let mut tx =
-            self.pool
-                .get()
-                .begin()
-                .await
-                .map_err(|source| ContextManifestError::Database {
-                    operation: "begin_context_manifest",
-                    entity: manifest.manifest_id.clone(),
-                    source,
-                })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| ContextManifestError::Database {
+                operation: "acquire_context_manifest_connection",
+                entity: manifest.manifest_id.clone(),
+                source,
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| ContextManifestError::Database {
+                operation: "begin_context_manifest",
+                entity: manifest.manifest_id.clone(),
+                source,
+            })?;
         crate::storage::admit_session_event_write(
             &mut tx,
             &manifest.session_id,
@@ -995,9 +1009,10 @@ impl DatabaseContextManifestStore {
             .await
             .map_err(|source| ContextManifestError::Database {
                 operation: "commit_context_manifest",
-                entity: manifest.manifest_id,
+                entity: manifest.manifest_id.clone(),
                 source,
             })?;
+        connection.release();
         Ok(DurableCaptureOutcome::Inserted)
     }
 

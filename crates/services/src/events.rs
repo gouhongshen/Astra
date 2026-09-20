@@ -9,6 +9,7 @@ use astra_core::{
     is_duplicate_key_error, matrixone_statement_with_null_shape,
 };
 
+use crate::CancellationSafePoolConnection;
 use crate::db_row::RowExt as EventDbRow;
 use crate::pagination::MAX_API_LIST_LIMIT;
 use crate::storage::bump_agent_session_event_count;
@@ -590,8 +591,14 @@ impl EventService for DatabaseEventService {
         let event_type = normalize_required_event_field("event_type", event_type)?;
 
         // Start transaction for atomicity of INSERT event + UPDATE session
-        let mut conn = pool.acquire().await.map_err(internal_error)?;
-        let mut tx = conn.begin().await.map_err(internal_error)?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(internal_error)?;
 
         let client_event_id = normalize_client_event_id(event_id)?;
         let canonical_content = if ingestion_source == EventIngestionSource::SyncOutbox {
@@ -686,6 +693,7 @@ impl EventService for DatabaseEventService {
                         repair_sync_event_session_summary(&mut tx, &session_id, &user_id).await?;
                     }
                     tx.commit().await.map_err(internal_error)?;
+                    connection.release();
                     return Ok(EventCreateOutcome::replayed(existing));
                 }
                 crate::observation_capture::record_observation_collision(
@@ -797,6 +805,7 @@ impl EventService for DatabaseEventService {
                                 .await?;
                         }
                         tx.commit().await.map_err(internal_error)?;
+                        connection.release();
                         return Ok(EventCreateOutcome::replayed(existing));
                     }
                     crate::observation_capture::record_observation_collision(
@@ -863,6 +872,7 @@ impl EventService for DatabaseEventService {
         result.parent_event_ids = normalized_parent_event_ids;
 
         tx.commit().await.map_err(internal_error)?;
+        connection.release();
 
         Ok(EventCreateOutcome::created(result))
     }

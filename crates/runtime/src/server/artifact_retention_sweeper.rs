@@ -1,7 +1,7 @@
 use super::*;
 use astra_services::db_row::{RowDecoder, RowExt};
 use futures_util::{StreamExt, stream};
-use sqlx::Row;
+use sqlx::{Acquire, Row};
 use uuid::Uuid;
 
 const SWEEP_INTERVAL_SECS: u64 = 3_600;
@@ -273,7 +273,9 @@ async fn record_artifact_retention_backlog_warning(
         }),
     );
     let ingestion_write_id = Uuid::new_v4().to_string();
-    let mut tx = pool.get().begin().await?;
+    let mut connection =
+        astra_services::CancellationSafePoolConnection::acquire(pool.get()).await?;
+    let mut tx = connection.connection_mut().begin().await?;
     astra_services::storage::admit_session_event_write(&mut tx, "system", "system", true).await?;
     let insert_result = sqlx::query(
         "INSERT INTO agent_events
@@ -306,6 +308,7 @@ async fn record_artifact_retention_backlog_warning(
     )
     .await?;
     tx.commit().await?;
+    connection.release();
     tracing::warn!(
         target: "astra_runtime::artifact_retention_sweeper",
         scanned,

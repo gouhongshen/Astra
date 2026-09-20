@@ -10579,9 +10579,18 @@ impl DatabaseRunStateStore {
         let terminal_error_code =
             terminal_error_code_from_transition(status, error_message, events);
 
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error("transition_run_status_with_events_begin", run_id, source).to_string()
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("transition_run_status_with_events_acquire", run_id, source).to_string()
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error("transition_run_status_with_events_begin", run_id, source).to_string()
+            })?;
 
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
@@ -10681,6 +10690,7 @@ impl DatabaseRunStateStore {
                     .as_ref()
                     .and_then(|event| replay_recovery_event(&association, &run, event));
                 tx.commit().await.map_err(|error| error.to_string())?;
+                connection.release();
                 return Ok(StatusTransitionCommit {
                     applied: recovery.is_some(),
                     recovery,
@@ -10852,6 +10862,7 @@ impl DatabaseRunStateStore {
         tx.commit().await.map_err(|source| {
             db_error("transition_run_status_with_events_commit", run_id, source).to_string()
         })?;
+        connection.release();
 
         self.repair_run_projection_after_status_for_user(user_id, expected_session_id, run_id)
             .await;
@@ -12126,13 +12137,26 @@ impl DatabaseRunStateStore {
             .map(|tool_name| (tool_name, Uuid::new_v4().to_string()))
             .collect::<Vec<_>>();
         let last_event_id = missing_events.last().map(|(_, event_id)| event_id.as_str());
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error(
-                "begin_record_preview_template_missing_for_tools",
-                run_id,
-                source,
-            )
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "acquire_record_preview_template_missing_for_tools",
+                    run_id,
+                    source,
+                )
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error(
+                    "begin_record_preview_template_missing_for_tools",
+                    run_id,
+                    source,
+                )
+            })?;
         crate::storage::admit_session_event_write(&mut tx, session_id, user_id, true)
             .await
             .map_err(|source| {
@@ -12205,6 +12229,7 @@ impl DatabaseRunStateStore {
         tx.commit()
             .await
             .map_err(|source| db_error("commit_preview_template_missing_events", run_id, source))?;
+        connection.release();
         Ok(())
     }
 
@@ -12697,9 +12722,11 @@ impl DatabaseRunStateStore {
         expected_session_id: &str,
         run_id: &str,
     ) -> DbStoreResult<()> {
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("acquire_sync_run_projection", run_id, source))?;
+        let mut tx = connection
+            .connection_mut()
             .begin()
             .await
             .map_err(|source| db_error("begin_sync_run_projection", run_id, source))?;
@@ -12868,6 +12895,7 @@ impl DatabaseRunStateStore {
         tx.commit()
             .await
             .map_err(|source| db_error("commit_sync_run_projection", run_id, source))?;
+        connection.release();
         Ok(())
     }
 
@@ -12886,9 +12914,18 @@ impl DatabaseRunStateStore {
             return Ok(());
         }
 
-        let mut tx = self
-            .pool
-            .get()
+        // Live fanout is owned by an abortable runtime task. Keep the physical
+        // checkout guarded for the whole transaction: if that task is dropped
+        // while MatrixOne is answering a statement, the connection must be
+        // closed instead of returning an open session-fence transaction to the
+        // shared pool.
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("acquire_append_run_events_batch_connection", run_id, source)
+            })?;
+        let mut tx = connection
+            .connection_mut()
             .begin()
             .await
             .map_err(|source| db_error("begin_append_run_events_batch", run_id, source))?;
@@ -12951,6 +12988,7 @@ impl DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_idempotent_run_event_batch", run_id, source)
             })?;
+            connection.release();
             if let Err(error) = self
                 .sync_projection_for_user(user_id, expected_session_id, run_id)
                 .await
@@ -13015,32 +13053,47 @@ impl DatabaseRunStateStore {
             .swap(false, std::sync::atomic::Ordering::SeqCst);
         #[cfg(not(test))]
         let inject_missing_commit = false;
-        let commit_error = if inject_missing_commit {
+        let (commit_error, connection_reusable) = if inject_missing_commit {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_injected_missing_run_events_batch", run_id, source)
             })?;
-            Some("injected generic append commit acknowledgement loss before commit".to_string())
+            (
+                Some(
+                    "injected generic append commit acknowledgement loss before commit".to_string(),
+                ),
+                true,
+            )
         } else {
             match tx.commit().await {
                 Ok(()) => {
                     #[cfg(test)]
                     {
-                        self.generic_append_commit_ack_loss_once
-                            .swap(false, std::sync::atomic::Ordering::SeqCst)
-                            .then(|| {
-                                "injected generic append commit acknowledgement loss".to_string()
-                            })
+                        (
+                            self.generic_append_commit_ack_loss_once
+                                .swap(false, std::sync::atomic::Ordering::SeqCst)
+                                .then(|| {
+                                    "injected generic append commit acknowledgement loss"
+                                        .to_string()
+                                }),
+                            true,
+                        )
                     }
                     #[cfg(not(test))]
                     {
-                        None
+                        (None, true)
                     }
                 }
-                Err(source) => {
-                    Some(db_error("commit_run_events_batch", run_id, source).to_string())
-                }
+                Err(source) => (
+                    Some(db_error("commit_run_events_batch", run_id, source).to_string()),
+                    false,
+                ),
             }
         };
+        if connection_reusable {
+            connection.release();
+        } else {
+            drop(connection);
+        }
         #[cfg(test)]
         if commit_error.is_some()
             && self
@@ -13188,10 +13241,14 @@ impl DatabaseRunStateStore {
             .last()
             .map_or(-1, |event| event.event_idx);
 
-        let mut tx =
-            self.pool.get().begin().await.map_err(|source| {
-                db_error("insert_run_begin", &record.run_id, source).to_string()
-            })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("insert_run_acquire", &record.run_id, source).to_string())?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
         crate::storage::admit_session_scoped_run_write(
             &mut tx,
             &record.session_id,
@@ -13553,6 +13610,7 @@ impl DatabaseRunStateStore {
         .await?;
         let commit_error = match tx.commit().await {
             Ok(()) => {
+                connection.release();
                 #[cfg(test)]
                 {
                     self.run_create_commit_ack_loss_once
@@ -13569,7 +13627,10 @@ impl DatabaseRunStateStore {
                     None
                 }
             }
-            Err(source) => Some(db_error("insert_run_commit", &record.run_id, source).to_string()),
+            Err(source) => {
+                drop(connection);
+                Some(db_error("insert_run_commit", &record.run_id, source).to_string())
+            }
         };
         if let Some(commit_error) = commit_error {
             let exact_events = self
@@ -13731,10 +13792,16 @@ impl DatabaseRunStateStore {
         // locks through the update and readback: a pod id and a database
         // timestamp are not unique evidence that this invocation won a
         // claim. In particular, two same-pod callers may share both.
-        let mut tx =
-            self.pool.get().begin().await.map_err(|source| {
-                db_error("begin_run_recovery_claim", "active", source).to_string()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("acquire_run_recovery_claim", "active", source).to_string()
             })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| db_error("begin_run_recovery_claim", "active", source).to_string())?;
         let mut candidates = candidates;
         candidates.sort_by(|left, right| {
             (&left.user_id, &left.session_id, &left.run_id).cmp(&(
@@ -13993,6 +14060,7 @@ impl DatabaseRunStateStore {
         tx.commit().await.map_err(|source| {
             db_error("commit_run_recovery_claim", "active", source).to_string()
         })?;
+        connection.release();
         Ok(records)
     }
 
@@ -15965,9 +16033,18 @@ impl RunStateStore for DatabaseRunStateStore {
         request: AtomicRunGuidanceAdmissionRequest<'_>,
     ) -> Result<AtomicRunGuidanceAdmission, String> {
         validate_run_guidance_admission_request(request)?;
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error("admit_run_guidance_begin", request.run_id, source).to_string()
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("admit_run_guidance_acquire", request.run_id, source).to_string()
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error("admit_run_guidance_begin", request.run_id, source).to_string()
+            })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -16163,6 +16240,7 @@ impl RunStateStore for DatabaseRunStateStore {
 
         let commit_error = match tx.commit().await {
             Ok(()) => {
+                connection.release();
                 #[cfg(test)]
                 {
                     self.guidance_commit_ack_loss_once
@@ -16180,6 +16258,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 }
             }
             Err(source) => {
+                drop(connection);
                 Some(db_error("admit_run_guidance_commit", request.run_id, source).to_string())
             }
         };
@@ -16216,14 +16295,28 @@ impl RunStateStore for DatabaseRunStateStore {
                     request.expected_owner_generation, request.run_id
                 )
             })?;
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error(
-                "begin_user_intent_admission_transition",
-                request.run_id,
-                source,
-            )
-            .to_string()
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "acquire_user_intent_admission_transition",
+                    request.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error(
+                    "begin_user_intent_admission_transition",
+                    request.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -16435,6 +16528,7 @@ impl RunStateStore for DatabaseRunStateStore {
 
         let commit_error = match tx.commit().await {
             Ok(()) => {
+                connection.release();
                 #[cfg(test)]
                 {
                     self.user_intent_control_commit_ack_loss_once
@@ -16451,14 +16545,17 @@ impl RunStateStore for DatabaseRunStateStore {
                     None
                 }
             }
-            Err(source) => Some(
-                db_error(
-                    "commit_user_intent_admission_transition",
-                    request.run_id,
-                    source,
+            Err(source) => {
+                drop(connection);
+                Some(
+                    db_error(
+                        "commit_user_intent_admission_transition",
+                        request.run_id,
+                        source,
+                    )
+                    .to_string(),
                 )
-                .to_string(),
-            ),
+            }
         };
         if let Some(commit_error) = commit_error {
             #[cfg(test)]
@@ -16537,9 +16634,18 @@ impl RunStateStore for DatabaseRunStateStore {
                 event_indices: Vec::new(),
             });
         }
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error("begin_terminal_intent_returns", request.run_id, source).to_string()
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("acquire_terminal_intent_returns", request.run_id, source).to_string()
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error("begin_terminal_intent_returns", request.run_id, source).to_string()
+            })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -16778,6 +16884,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .collect::<Vec<_>>();
         let commit_error = match tx.commit().await {
             Ok(()) => {
+                connection.release();
                 #[cfg(test)]
                 {
                     self.user_intent_control_commit_ack_loss_once
@@ -16795,6 +16902,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 }
             }
             Err(source) => {
+                drop(connection);
                 Some(db_error("commit_terminal_intent_returns", request.run_id, source).to_string())
             }
         };
@@ -16836,9 +16944,18 @@ impl RunStateStore for DatabaseRunStateStore {
                     request.expected_owner_generation, request.run_id
                 )
             })?;
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error("begin_user_intent_apply", request.run_id, source).to_string()
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("acquire_user_intent_apply", request.run_id, source).to_string()
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error("begin_user_intent_apply", request.run_id, source).to_string()
+            })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -17295,6 +17412,7 @@ impl RunStateStore for DatabaseRunStateStore {
         event_indices.extend(inserted.iter().map(|row| row.event_idx));
         let commit_error = match tx.commit().await {
             Ok(()) => {
+                connection.release();
                 #[cfg(test)]
                 {
                     self.user_intent_apply_commit_ack_loss_once
@@ -17312,6 +17430,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 }
             }
             Err(source) => {
+                drop(connection);
                 Some(db_error("commit_user_intent_apply", request.run_id, source).to_string())
             }
         };
@@ -17572,10 +17691,14 @@ impl RunStateStore for DatabaseRunStateStore {
         error_message: Option<&str>,
     ) -> Result<bool, String> {
         let terminal_error_code = terminal_error_code_from_message(status, error_message);
-        let mut tx =
-            self.pool.get().begin().await.map_err(|source| {
-                db_error("update_run_status_begin", run_id, source).to_string()
-            })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("update_run_status_acquire", run_id, source).to_string())?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| db_error("update_run_status_begin", run_id, source).to_string())?;
         // Load run metadata inside the transaction so the slot ownership
         // check sees the same row version as the UPDATE, closing the TOCTOU
         // window where a concurrent agent_id flip could misattribute the slot.
@@ -17664,6 +17787,7 @@ impl RunStateStore for DatabaseRunStateStore {
         tx.commit()
             .await
             .map_err(|source| db_error("update_run_status_commit", run_id, source).to_string())?;
+        connection.release();
         if result.rows_affected() > 0
             && let Err(error) = self
                 .sync_projection_for_user(user_id, expected_session_id, run_id)
@@ -17702,9 +17826,18 @@ impl RunStateStore for DatabaseRunStateStore {
             );
         }
         let terminal_origin = None;
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error("update_run_status_if_current_begin", run_id, source).to_string()
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("update_run_status_if_current_acquire", run_id, source).to_string()
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error("update_run_status_if_current_begin", run_id, source).to_string()
+            })?;
         // Load run metadata inside the transaction so the slot ownership
         // check sees the same row version as the UPDATE, closing the TOCTOU
         // window where a concurrent agent_id flip could misattribute the slot.
@@ -17827,6 +17960,7 @@ impl RunStateStore for DatabaseRunStateStore {
         tx.commit().await.map_err(|source| {
             db_error("update_run_status_if_current_commit", run_id, source).to_string()
         })?;
+        connection.release();
         if result.rows_affected() > 0
             && let Err(error) = self
                 .sync_projection_for_user(user_id, expected_session_id, run_id)
@@ -17863,9 +17997,18 @@ impl RunStateStore for DatabaseRunStateStore {
             std::slice::from_ref(&event),
         );
 
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error("transition_run_status_with_event_begin", run_id, source).to_string()
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("transition_run_status_with_event_acquire", run_id, source).to_string()
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error("transition_run_status_with_event_begin", run_id, source).to_string()
+            })?;
 
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
@@ -18030,6 +18173,7 @@ impl RunStateStore for DatabaseRunStateStore {
         tx.commit().await.map_err(|source| {
             db_error("transition_run_status_with_event_commit", run_id, source).to_string()
         })?;
+        connection.release();
 
         self.repair_run_projection_after_status_for_user(user_id, expected_session_id, run_id)
             .await;
@@ -18061,14 +18205,28 @@ impl RunStateStore for DatabaseRunStateStore {
             std::slice::from_ref(&event),
         );
 
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error(
-                "guarded_transition_run_status_with_event_begin",
-                run_id,
-                source,
-            )
-            .to_string()
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "guarded_transition_run_status_with_event_acquire",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error(
+                    "guarded_transition_run_status_with_event_begin",
+                    run_id,
+                    source,
+                )
+                .to_string()
+            })?;
 
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
@@ -18303,6 +18461,7 @@ impl RunStateStore for DatabaseRunStateStore {
             )
             .to_string()
         })?;
+        connection.release();
 
         self.repair_run_projection_after_status_for_user(user_id, expected_session_id, run_id)
             .await;
@@ -18432,9 +18591,18 @@ impl RunStateStore for DatabaseRunStateStore {
                 "generation-fenced append requires an idempotency key on every event".to_string(),
             );
         }
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error("generation_fenced_append_begin", run_id, source).to_string()
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("generation_fenced_append_acquire", run_id, source).to_string()
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error("generation_fenced_append_begin", run_id, source).to_string()
+            })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(&mut tx, user_id, expected_session_id, run_id)
             .await
@@ -18590,6 +18758,7 @@ impl RunStateStore for DatabaseRunStateStore {
         )
         .await?;
         if let Err(source) = tx.commit().await {
+            drop(connection);
             let commit_error = db_error("generation_fenced_append_commit", run_id, source);
             let mut exact = 0usize;
             let mut missing = 0usize;
@@ -18640,6 +18809,8 @@ impl RunStateStore for DatabaseRunStateStore {
                 error = %commit_error,
                 "recovered generation-fenced event commit acknowledgement"
             );
+        } else {
+            connection.release();
         }
         // Accounting-only events are consumed from the durable event stream.
         // Do not perform a full display-projection sync: it could race a
@@ -18840,9 +19011,11 @@ impl RunStateStore for DatabaseRunStateStore {
         };
         let mut checkpoint_id = format!("ckpt-{}", uuid::Uuid::now_v7());
         let created_at = chrono::Utc::now().naive_utc();
-        let mut tx = self
-            .pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| db_error("acquire_save_checkpoint", run_id, source).to_string())?;
+        let mut tx = connection
+            .connection_mut()
             .begin()
             .await
             .map_err(|source| db_error("begin_save_checkpoint", run_id, source).to_string())?;
@@ -18979,6 +19152,7 @@ impl RunStateStore for DatabaseRunStateStore {
         tx.commit()
             .await
             .map_err(|source| db_error("commit_save_checkpoint", run_id, source).to_string())?;
+        connection.release();
         self.sync_projection_for_user(user_id, expected_session_id, run_id)
             .await
             .map_err(|e| e.to_string())?;
@@ -19097,14 +19271,28 @@ impl RunStateStore for DatabaseRunStateStore {
         validate_atomic_tool_request_event(request)?;
         let request_key = extract_optional_string(request.tool_request_event, "idempotency_key")
             .expect("validated tool request idempotency key");
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error(
-                "begin_atomic_guarded_tool_request",
-                request.action.run_id,
-                source,
-            )
-            .to_string()
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "acquire_atomic_guarded_tool_request",
+                    request.action.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error(
+                    "begin_atomic_guarded_tool_request",
+                    request.action.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
         let admission =
             admit_run_action_in_existing_transaction(&mut tx, request.action, &self.owner_pod_id)
                 .await?;
@@ -19333,6 +19521,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tool_request_event_hash: event_row.event_hash.clone(),
         };
         if let Err(source) = tx.commit().await {
+            drop(connection);
             let commit_error = db_error(
                 "commit_atomic_guarded_tool_request",
                 request.action.run_id,
@@ -19462,6 +19651,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .await;
             return Ok(recovered_outcome);
         }
+        connection.release();
         self.patch_run_projection_event_metadata_for_user(
             request.action.user_id,
             request.action.expected_session_id,
@@ -19485,9 +19675,18 @@ impl RunStateStore for DatabaseRunStateStore {
                     request.expected_owner_generation, request.run_id
                 )
             })?;
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error("begin_guarded_interaction_batch", request.run_id, source).to_string()
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("acquire_guarded_interaction_batch", request.run_id, source).to_string()
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error("begin_guarded_interaction_batch", request.run_id, source).to_string()
+            })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -19851,6 +20050,7 @@ impl RunStateStore for DatabaseRunStateStore {
         .await?;
         let commit_error = match tx.commit().await {
             Ok(()) => {
+                connection.release();
                 #[cfg(test)]
                 {
                     self.interaction_registration_commit_ack_loss_once
@@ -19867,9 +20067,13 @@ impl RunStateStore for DatabaseRunStateStore {
                     None
                 }
             }
-            Err(source) => Some(
-                db_error("commit_guarded_interaction_batch", request.run_id, source).to_string(),
-            ),
+            Err(source) => {
+                drop(connection);
+                Some(
+                    db_error("commit_guarded_interaction_batch", request.run_id, source)
+                        .to_string(),
+                )
+            }
         };
         if let Some(commit_error) = commit_error {
             let recovered_batch_count: i64 = sqlx::query_scalar(
@@ -20050,9 +20254,18 @@ impl RunStateStore for DatabaseRunStateStore {
         let queued_response_event_type = kind.queued_response_event_type();
         let mut retried_unknown_commit = false;
         loop {
-            let mut tx = self.pool.get().begin().await.map_err(|source| {
-                db_error("begin_run_interaction_wait", run_id, source).to_string()
-            })?;
+            let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("acquire_run_interaction_wait", run_id, source).to_string()
+                })?;
+            let mut tx = connection
+                .connection_mut()
+                .begin()
+                .await
+                .map_err(|source| {
+                    db_error("begin_run_interaction_wait", run_id, source).to_string()
+                })?;
             let Some(run) = self
                 .load_run_metadata_for_exact_session_tx(
                     &mut tx,
@@ -20273,6 +20486,7 @@ impl RunStateStore for DatabaseRunStateStore {
                             db_error("finalize_queued_interaction_commit", run_id, source)
                                 .to_string()
                         })?;
+                        connection.release();
                         self.patch_run_projection_event_metadata_for_user(
                             user_id,
                             expected_session_id,
@@ -20580,6 +20794,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 .await?;
                 let commit_error = match tx.commit().await {
                     Ok(()) => {
+                        connection.release();
                         #[cfg(test)]
                         {
                             self.interaction_wait_commit_ack_loss_once
@@ -20595,9 +20810,13 @@ impl RunStateStore for DatabaseRunStateStore {
                             None
                         }
                     }
-                    Err(source) => Some(
-                        db_error("promote_queued_interaction_commit", run_id, source).to_string(),
-                    ),
+                    Err(source) => {
+                        drop(connection);
+                        Some(
+                            db_error("promote_queued_interaction_commit", run_id, source)
+                                .to_string(),
+                        )
+                    }
                 };
                 if let Some(commit_error) = commit_error {
                     let exact = self
@@ -20760,6 +20979,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .await?;
             let commit_error = match tx.commit().await {
                 Ok(()) => {
+                    connection.release();
                     #[cfg(test)]
                     {
                         self.interaction_wait_commit_ack_loss_once
@@ -20776,6 +20996,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     }
                 }
                 Err(source) => {
+                    drop(connection);
                     Some(db_error("begin_run_interaction_wait_commit", run_id, source).to_string())
                 }
             };
@@ -20858,9 +21079,18 @@ impl RunStateStore for DatabaseRunStateStore {
             .queued_response_event_type()
             .unwrap_or("interaction_response_queue_unsupported");
         for _ in 0..3 {
-            let mut tx = self.pool.get().begin().await.map_err(|source| {
-                db_error("resolve_run_interaction_begin", run_id, source).to_string()
-            })?;
+            let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("resolve_run_interaction_acquire", run_id, source).to_string()
+                })?;
+            let mut tx = connection
+                .connection_mut()
+                .begin()
+                .await
+                .map_err(|source| {
+                    db_error("resolve_run_interaction_begin", run_id, source).to_string()
+                })?;
             let Some(run) = self
                 .load_run_metadata_for_exact_session_tx(
                     &mut tx,
@@ -21185,6 +21415,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 .await?;
                 let commit_error = match tx.commit().await {
                     Ok(()) => {
+                        connection.release();
                         #[cfg(test)]
                         {
                             self.interaction_commit_ack_loss_once
@@ -21200,9 +21431,13 @@ impl RunStateStore for DatabaseRunStateStore {
                             None
                         }
                     }
-                    Err(source) => Some(
-                        db_error("resolve_queued_interaction_commit", run_id, source).to_string(),
-                    ),
+                    Err(source) => {
+                        drop(connection);
+                        Some(
+                            db_error("resolve_queued_interaction_commit", run_id, source)
+                                .to_string(),
+                        )
+                    }
                 };
                 if let Some(commit_error) = commit_error {
                     let recovered = self
@@ -21346,6 +21581,7 @@ impl RunStateStore for DatabaseRunStateStore {
             .await?;
             let commit_error = match tx.commit().await {
                 Ok(()) => {
+                    connection.release();
                     #[cfg(test)]
                     {
                         self.interaction_commit_ack_loss_once
@@ -21362,6 +21598,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     }
                 }
                 Err(source) => {
+                    drop(connection);
                     Some(db_error("resolve_run_interaction_commit", run_id, source).to_string())
                 }
             };
@@ -22355,9 +22592,23 @@ impl DatabaseRunStateStore {
         // validate the exact run capability before reading the recovered fact
         // in this same transaction, so ownership rotation cannot interleave
         // between authorization and recovery classification.
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error("begin_reconcile_user_intent_reopen", request.run_id, source).to_string()
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "acquire_reconcile_user_intent_reopen",
+                    request.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error("begin_reconcile_user_intent_reopen", request.run_id, source).to_string()
+            })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -22531,9 +22782,23 @@ impl DatabaseRunStateStore {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut tx = self.pool.get().begin().await.map_err(|source| {
-            db_error("begin_reconcile_user_intent_apply", request.run_id, source).to_string()
-        })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error(
+                    "acquire_reconcile_user_intent_apply",
+                    request.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| {
+                db_error("begin_reconcile_user_intent_apply", request.run_id, source).to_string()
+            })?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,

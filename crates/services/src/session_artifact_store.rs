@@ -15,14 +15,14 @@ use std::{
     sync::{LazyLock, RwLock},
 };
 
-use crate::db_row::RowExt as SessionArtifactDbRow;
+use crate::{CancellationSafePoolConnection, db_row::RowExt as SessionArtifactDbRow};
 use astra_core::{MatrixOneSettings, SharedPool};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::{QueryBuilder, Row, query, query_scalar};
+use sqlx::{Connection, QueryBuilder, Row, query, query_scalar};
 use uuid::Uuid;
 
 /// Structured error type for [`SessionArtifactJsonStore`] operations. Replaces
@@ -1930,7 +1930,8 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
         let content_json = serde_json::to_string(&envelope)?;
         let metadata_json = record.metadata.as_ref().map(Value::to_string);
         let pool = self.get_pool().await?;
-        let mut tx = pool.begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
+        let mut tx = connection.connection_mut().begin().await?;
         admit_byte_artifact_session(&mut tx, &record.user_id, &record.session_id).await?;
         // Create the single artifact-level upload lease before locking the
         // catalog row. Every later byte operation acquires this lease first,
@@ -2069,6 +2070,7 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
             .await?;
         }
         tx.commit().await?;
+        connection.release();
         self.load_json_artifact(&record.user_id, &record.session_id, &record.artifact_id)
             .await?
             .ok_or(SessionArtifactStoreError::ArtifactNotFound {
@@ -2101,7 +2103,8 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
         }
         let byte_size = bytes.len() as u64;
         let pool = self.get_pool().await?;
-        let mut tx = pool.begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
+        let mut tx = connection.connection_mut().begin().await?;
         admit_byte_artifact_session(&mut tx, user_id, session_id).await?;
         let lease_live =
             lock_byte_artifact_upload_lease(&mut tx, user_id, session_id, artifact_id).await?;
@@ -2217,6 +2220,7 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        connection.release();
         Ok(SessionArtifactContentChunkReceiptV1 {
             digest: digest.to_string(),
             byte_size,
@@ -2241,7 +2245,8 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
         validate_content_chunk_refs(&chunks)?;
         validate_artifact_references(&references)?;
         let pool = self.get_pool().await?;
-        let mut tx = pool.begin().await?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
+        let mut tx = connection.connection_mut().begin().await?;
         admit_byte_artifact_session(&mut tx, user_id, session_id).await?;
         // An unfinished upload is fenced by the artifact-level lease. Sealed
         // artifacts intentionally have no lease, but still pass through this
@@ -2319,6 +2324,7 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
+            connection.release();
             return self
                 .load_json_artifact(user_id, session_id, artifact_id)
                 .await?
@@ -2430,6 +2436,7 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
         .map_err(SessionArtifactStoreError::Database)
         .and_then(|row| stored_artifact_from_row(&row))?;
         tx.commit().await?;
+        connection.release();
         Ok(artifact)
     }
 

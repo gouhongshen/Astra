@@ -15,11 +15,14 @@ use astra_turn_types::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use sqlx::{MySql, Row, Transaction};
+use sqlx::{Connection, MySql, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{AcquireWriterOutcome, SessionContextCoordinator, SessionContextCoordinatorError};
+use crate::{
+    AcquireWriterOutcome, CancellationSafePoolConnection, SessionContextCoordinator,
+    SessionContextCoordinatorError,
+};
 
 const MAX_IDEMPOTENCY_BYTES: usize = 512;
 const MAX_REASON_BYTES: usize = 1_024;
@@ -85,7 +88,14 @@ impl DatabaseSessionForkCoordinator {
         validate_prepare_request(request)?;
         let request_hash = stable_hash(b"astra.prepare-session-fork.v1\0", request)?;
         let idempotency_hash = identity_hash("prepare", &request.idempotency_key);
-        let mut tx = self.begin("begin_prepare_fork").await?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_prepare_fork_connection", source))?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_prepare_fork", source))?;
 
         if let Some(row) = sqlx::query(
             "SELECT request_hash, manifest_json FROM session_forks
@@ -108,6 +118,7 @@ impl DatabaseSessionForkCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_prepare_retry", source))?;
+            connection.release();
             return Ok(manifest);
         }
 
@@ -177,6 +188,7 @@ impl DatabaseSessionForkCoordinator {
         tx.commit()
             .await
             .map_err(|source| database_error("commit_prepare_fork", source))?;
+        connection.release();
         Ok(manifest)
     }
 

@@ -2,10 +2,11 @@ use astra_core::{SharedPool, matrixone_statement_with_null_shape};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{Acquire, Row};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::CancellationSafePoolConnection;
 use crate::context_manifest::{
     BudgetV1_8k, ContextManifestItemWrite, ContextManifestWrite, DatabaseContextManifestStore,
     artifact_id_from_raw_ref,
@@ -706,16 +707,22 @@ impl DatabaseStateProjectionStore {
             }
         })?;
         let payload_hash = content_hash(&payload_json);
-        let mut tx =
-            self.pool
-                .get()
-                .begin()
-                .await
-                .map_err(|source| StateProjectionError::Database {
-                    operation: "begin_state_item_upsert",
-                    entity: item_id.clone(),
-                    source,
-                })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "acquire_state_item_upsert_connection",
+                entity: item_id.clone(),
+                source,
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "begin_state_item_upsert",
+                entity: item_id.clone(),
+                source,
+            })?;
         crate::storage::admit_session_event_write(&mut tx, &item.session_id, &item.user_id, false)
             .await
             .map_err(|source| {
@@ -810,6 +817,7 @@ impl DatabaseStateProjectionStore {
                 entity: item_id.clone(),
                 source,
             })?;
+        connection.release();
         Ok(item_id)
     }
 
@@ -1199,16 +1207,22 @@ impl DatabaseStateProjectionStore {
                 source,
             })?;
         let payload_hash = content_hash(&payload_json);
-        let mut tx =
-            self.pool
-                .get()
-                .begin()
-                .await
-                .map_err(|source| StateProjectionError::Database {
-                    operation: "begin_skill_activation",
-                    entity: session_id.to_string(),
-                    source,
-                })?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "acquire_skill_activation_connection",
+                entity: session_id.to_string(),
+                source,
+            })?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|source| StateProjectionError::Database {
+                operation: "begin_skill_activation",
+                entity: session_id.to_string(),
+                source,
+            })?;
         crate::storage::admit_session_event_write(&mut tx, session_id, user_id, false)
             .await
             .map_err(|_| StateProjectionError::SessionNotActive {
@@ -1392,7 +1406,9 @@ impl DatabaseStateProjectionStore {
                 operation: "commit_skill_activation",
                 entity: session_id.to_string(),
                 source,
-            })
+            })?;
+        connection.release();
+        Ok(())
     }
 
     pub async fn can_access_artifact(

@@ -3839,13 +3839,26 @@ pub async fn load_inference_canonical_transitions_for_session(
     // Once fenced, recheck admission inside this transaction: a provider
     // attempt that won the intervening race is then observed as a blocker,
     // while later attempts wait until this bounded snapshot is complete.
-    let mut recovery_tx = pool.get().begin().await.map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "begin canonical transition WAL recovery snapshot",
-            error,
-        )
-    })?;
+    let mut recovery_connection = CancellationSafePoolConnection::acquire(pool.get())
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire canonical transition WAL recovery connection",
+                error,
+            )
+        })?;
+    let mut recovery_tx = recovery_connection
+        .connection_mut()
+        .begin()
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "begin canonical transition WAL recovery snapshot",
+                error,
+            )
+        })?;
     match crate::storage::admit_session_event_write(&mut recovery_tx, session_id, user_id, false)
         .await
     {
@@ -4415,6 +4428,7 @@ pub async fn load_inference_canonical_transitions_for_session(
             error,
         )
     })?;
+    recovery_connection.release();
     Ok(vec![receipt])
 }
 
@@ -4429,7 +4443,16 @@ pub async fn retire_inference_canonical_transitions_through_turn(
 ) -> ServiceResult<u64> {
     validate_identity(user_id, "user_id", 128)?;
     validate_identity(session_id, "session_id", 64)?;
-    let mut tx = pool.get().begin().await.map_err(|error| {
+    let mut connection = CancellationSafePoolConnection::acquire(pool.get())
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire inference canonical transition retirement connection",
+                error,
+            )
+        })?;
+    let mut tx = connection.connection_mut().begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "begin inference canonical transition retirement",
@@ -4495,6 +4518,7 @@ pub async fn retire_inference_canonical_transitions_through_turn(
             error,
         )
     })?;
+    connection.release();
     Ok(retired)
 }
 

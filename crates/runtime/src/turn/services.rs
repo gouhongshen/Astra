@@ -9,6 +9,7 @@ use crate::*;
 use astra_core::canonical_names::metadata_tool_name;
 use astra_services::observation_capture::DurableCaptureOutcome;
 use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError};
+use sqlx::Acquire;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct InMemoryTurnReflectionStateStore {
@@ -387,7 +388,14 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
             return Ok(TurnCorePersistOutcome::default());
         }
         let pool = self.get_pool()?;
-        let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|error| error.to_string())?;
         let transcript_owner = plan
             .user_query_event
             .as_ref()
@@ -451,6 +459,7 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
         }
         apply_touched_session_deltas_in_tx(&mut tx, &deltas).await?;
         tx.commit().await.map_err(|error| error.to_string())?;
+        connection.release();
         if !collision_detected
             && let Some(snapshot_link_plan) = plan.snapshot_link_plan.as_ref()
             && let Err(error) = update_snapshot_llm_ids(&pool, snapshot_link_plan).await
@@ -483,7 +492,14 @@ impl TurnToolEventWriter for DatabaseTurnToolEventWriter {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|error| error.to_string())?;
         admit_event_owners_in_tx(
             &mut tx,
             plan.events
@@ -510,6 +526,7 @@ impl TurnToolEventWriter for DatabaseTurnToolEventWriter {
         }
         apply_touched_session_deltas_in_tx(&mut tx, &deltas).await?;
         tx.commit().await.map_err(|error| error.to_string())?;
+        connection.release();
         Ok(())
     }
 }
@@ -525,7 +542,11 @@ impl TraceEventWriter for DatabaseTraceEventWriter {
             return Ok(());
         }
         let pool = self.get_pool()?;
-        let mut tx = pool
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
+        let mut tx = connection
+            .connection_mut()
             .begin()
             .await
             .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
@@ -536,6 +557,7 @@ impl TraceEventWriter for DatabaseTraceEventWriter {
         tx.commit()
             .await
             .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
+        connection.release();
         Ok(())
     }
 }
@@ -774,7 +796,14 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
             return Ok(());
         }
         let pool = self.get_pool()?;
-        let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+        let mut connection = astra_services::CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|error| error.to_string())?;
         admit_event_owners_in_tx(
             &mut tx,
             events
@@ -860,6 +889,7 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
         }
         apply_touched_session_deltas_in_tx(&mut tx, &deltas).await?;
         tx.commit().await.map_err(|error| error.to_string())?;
+        connection.release();
         Ok(())
     }
 }

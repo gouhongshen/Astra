@@ -7,25 +7,25 @@ use sqlx::{MySql, pool::PoolConnection};
 /// return a connection with an in-flight exchange to the pool. Normal paths
 /// call [`Self::release`] after completing every query; timeout/cancellation
 /// paths reach `Drop` and close only that physical connection.
-pub(crate) struct CancellationSafePoolConnection {
+pub struct CancellationSafePoolConnection {
     connection: Option<PoolConnection<MySql>>,
 }
 
 impl CancellationSafePoolConnection {
-    pub(crate) async fn acquire(pool: &sqlx::Pool<MySql>) -> Result<Self, sqlx::Error> {
+    pub async fn acquire(pool: &sqlx::Pool<MySql>) -> Result<Self, sqlx::Error> {
         let connection = pool.acquire().await?;
         Ok(Self {
             connection: Some(connection),
         })
     }
 
-    pub(crate) fn connection_mut(&mut self) -> &mut sqlx::MySqlConnection {
+    pub fn connection_mut(&mut self) -> &mut sqlx::MySqlConnection {
         self.connection
             .as_deref_mut()
             .expect("cancellation-safe connection already released")
     }
 
-    pub(crate) fn release(mut self) {
+    pub fn release(mut self) {
         drop(self.connection.take());
     }
 

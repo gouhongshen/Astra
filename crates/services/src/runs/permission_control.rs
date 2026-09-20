@@ -277,7 +277,14 @@ impl DatabaseRunStateStore {
         request: &RunPermissionModeRequest,
     ) -> Result<RunPermissionModeSelection, String> {
         validate_request(request)?;
-        let mut tx = self.pool.get().begin().await.map_err(|e| e.to_string())?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|e| e.to_string())?;
         let run = self
             .load_run_metadata_for_exact_session_tx(
                 &mut tx,
@@ -317,6 +324,7 @@ impl DatabaseRunStateStore {
         tx.commit().await.map_err(|e| {
             format!("permission request commit unconfirmed; retry same request_id: {e}")
         })?;
+        connection.release();
         selection(&event, idx)
     }
 
@@ -326,7 +334,14 @@ impl DatabaseRunStateStore {
         session_id: &str,
         run_id: &str,
     ) -> Result<Option<RunPermissionModeSnapshot>, String> {
-        let mut tx = self.pool.get().begin().await.map_err(|e| e.to_string())?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|e| e.to_string())?;
         // This hot round-boundary lookup must not fetch checkpoint_json or
         // hydrate the run history. Retain the canonical session/run ownership
         // fence, then read only the root marker and two indexed event rows.
@@ -345,9 +360,10 @@ impl DatabaseRunStateStore {
         if root.is_none() {
             return Ok(None);
         }
-        Ok(Some(
-            Self::permission_snapshot_tx(&mut tx, user_id, run_id).await?,
-        ))
+        let snapshot = Self::permission_snapshot_tx(&mut tx, user_id, run_id).await?;
+        tx.rollback().await.map_err(|e| e.to_string())?;
+        connection.release();
+        Ok(Some(snapshot))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -360,7 +376,14 @@ impl DatabaseRunStateStore {
         selected: &RunPermissionModeSelection,
         round: u32,
     ) -> Result<bool, String> {
-        let mut tx = self.pool.get().begin().await.map_err(|e| e.to_string())?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(|e| e.to_string())?;
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(&mut tx, user_id, session_id, run_id)
             .await
@@ -416,6 +439,7 @@ impl DatabaseRunStateStore {
         tx.commit()
             .await
             .map_err(|e| format!("permission application commit unconfirmed: {e}"))?;
+        connection.release();
         Ok(true)
     }
 }

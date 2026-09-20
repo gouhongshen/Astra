@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{Acquire, Row};
 use tracing;
 use uuid::Uuid;
 
@@ -17,7 +17,6 @@ use astra_core::{
     ErrorResponse, STATUS_CANCELLED, STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool,
     connect_matrixone,
 };
-use astra_services::EdgeContext;
 use astra_services::coordination::AgentProfile;
 use astra_services::runs::{
     AtomicRunTerminalEventReceipt, AtomicRunTerminalSettlementRequest,
@@ -26,6 +25,7 @@ use astra_services::runs::{
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::skills::SkillService;
 use astra_services::state_projection::bounded_state_item_id;
+use astra_services::{CancellationSafePoolConnection, EdgeContext};
 use astra_services::{
     DatabaseContextManifestStore, DatabaseStateProjectionStore, RetrievalStage, StateItemUpsert,
 };
@@ -525,8 +525,11 @@ impl PostLoopPersistContext {
         })?;
         let expected_generation = i64::try_from(expected_generation)
             .map_err(|_| "execution owner generation exceeds i64".to_string())?;
-        let mut tx = pool
-            .get()
+        let mut connection = CancellationSafePoolConnection::acquire(pool.get())
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut tx = connection
+            .connection_mut()
             .begin()
             .await
             .map_err(|error| error.to_string())?;
@@ -579,6 +582,7 @@ impl PostLoopPersistContext {
         )
         .await?;
         tx.commit().await.map_err(|error| error.to_string())?;
+        connection.release();
         if let Some((delta, last_event_id)) = outcome
             .session_event_deltas
             .get(&(self.user_id.clone(), self.session_id.clone()))
@@ -1089,7 +1093,23 @@ async fn persist_server_loop_canonical_append_inner(
             );
         }
     }
-    let mut tx = match pool.get().begin().await {
+    // Root and delegated run tasks are explicitly abortable during shutdown
+    // and ownership loss. Hold the physical checkout outside the SQLx
+    // transaction so cancellation closes it instead of returning a live
+    // session-fence transaction to the shared pool.
+    let mut connection = match CancellationSafePoolConnection::acquire(pool.get()).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            let msg = format!("failed to acquire MO connection: {}", error);
+            tracing::warn!(
+                session_id = %append.session_id,
+                error = %error,
+                "post-loop: failed to acquire canonical MO connection; no persistence attempted"
+            );
+            return Err(msg);
+        }
+    };
+    let mut tx = match connection.connection_mut().begin().await {
         Ok(tx) => tx,
         Err(error) => {
             let msg = format!("failed to begin MO transaction: {}", error);
@@ -1144,6 +1164,7 @@ async fn persist_server_loop_canonical_append_inner(
             .map_err(|error| format!("canonical execution-authority fence failed: {error}"))?;
         if fenced.rows_affected() == 0 {
             let _ = tx.rollback().await;
+            drop(connection);
             if let Some(settlement) = settlement
                 && let Some((store, terminal)) = resolve_existing_atomic_terminal_settlement(
                     pool, &append, state, settlement, None,
@@ -1311,6 +1332,7 @@ async fn persist_server_loop_canonical_append_inner(
             Ok(Some(commit)) => Some((store, commit)),
             Ok(None) => {
                 let _ = tx.rollback().await;
+                drop(connection);
                 return match resolve_existing_atomic_terminal_settlement(
                     pool, &append, state, settlement, None,
                 )
@@ -1347,42 +1369,49 @@ async fn persist_server_loop_canonical_append_inner(
 
     // This commit is authoritative. A failure is surfaced to the lifecycle;
     // there is no independent-write retry path.
-    if let Err(error) = tx.commit().await {
-        let msg = format!("MO transaction commit acknowledgement failed: {error}");
-        if let (Some(settlement), Some((_, staged_terminal))) =
-            (settlement, terminal_commit.as_ref())
-        {
-            match resolve_existing_atomic_terminal_settlement(
-                pool,
-                &append,
-                state,
-                settlement,
-                Some(&staged_terminal.event_receipts),
-            )
-            .await
+    match tx.commit().await {
+        Ok(()) => connection.release(),
+        Err(error) => {
+            // COMMIT acknowledgement failure leaves protocol and transaction
+            // state ambiguous. Discard this checkout before the authoritative
+            // reread so the reconciliation cannot observe through it.
+            drop(connection);
+            let msg = format!("MO transaction commit acknowledgement failed: {error}");
+            if let (Some(settlement), Some((_, staged_terminal))) =
+                (settlement, terminal_commit.as_ref())
             {
-                Ok(Some(_)) => {
-                    tracing::warn!(
-                        session_id = %append.session_id,
-                        run_id = %append.run_id,
-                        error = %error,
-                        "post-loop: commit acknowledgement was lost; exact durable settlement resolved authoritatively"
-                    );
+                match resolve_existing_atomic_terminal_settlement(
+                    pool,
+                    &append,
+                    state,
+                    settlement,
+                    Some(&staged_terminal.event_receipts),
+                )
+                .await
+                {
+                    Ok(Some(_)) => {
+                        tracing::warn!(
+                            session_id = %append.session_id,
+                            run_id = %append.run_id,
+                            error = %error,
+                            "post-loop: commit acknowledgement was lost; exact durable settlement resolved authoritatively"
+                        );
+                    }
+                    Ok(None) => return Err(msg),
+                    Err(resolve_error) => {
+                        return Err(format!(
+                            "{msg}; authoritative commit resolution failed: {resolve_error}"
+                        ));
+                    }
                 }
-                Ok(None) => return Err(msg),
-                Err(resolve_error) => {
-                    return Err(format!(
-                        "{msg}; authoritative commit resolution failed: {resolve_error}"
-                    ));
-                }
+            } else {
+                tracing::warn!(
+                    session_id = %append.session_id,
+                    error = %error,
+                    "post-loop: MO transaction commit acknowledgement failed"
+                );
+                return Err(msg);
             }
-        } else {
-            tracing::warn!(
-                session_id = %append.session_id,
-                error = %error,
-                "post-loop: MO transaction commit acknowledgement failed"
-            );
-            return Err(msg);
         }
     }
     // Event rows and run state are now durable. Update the derived session
