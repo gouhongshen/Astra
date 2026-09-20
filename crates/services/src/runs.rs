@@ -20778,6 +20778,7 @@ impl RunStateStore for DatabaseRunStateStore {
                         )
                         .to_string()
                     })?;
+                    connection.release();
                     if self
                         .load_run_control(user_id, run_id)
                         .await?

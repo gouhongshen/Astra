@@ -6,7 +6,12 @@
 
 mod common;
 
-use astra_services::runs::{DatabaseRunStateStore, DurableRunStartClaim, RunStateStore};
+use astra_services::runs::{
+    AtomicRunInteractionBatchRegistration, AtomicRunInteractionBatchRegistrationRequest,
+    AtomicRunInteractionWaitRequest, DatabaseRunStateStore, DurableRunInteractionKind,
+    DurableRunInteractionResolveOutcome, DurableRunInteractionWaitOutcome, DurableRunStartClaim,
+    RunStateStore,
+};
 use serial_test::serial;
 use uuid::Uuid;
 
@@ -217,6 +222,105 @@ async fn existing_run_start_claim_releases_rollback_checkout_before_reread() {
             start_request_fingerprint: None,
         }
     );
+
+    drop(held);
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn queued_interaction_conflict_releases_rollback_checkout_before_control_reread() {
+    let shared_pool = common::setup_pool().await;
+    let pool = shared_pool.get();
+    let max_connections = shared_pool.stats().max_connections as usize;
+    assert!(
+        max_connections >= 2,
+        "queued interaction conflict requires worker and fixture capacity"
+    );
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("interaction-conflict-user-{suffix}");
+    let session_id = format!("interaction-conflict-session-{suffix}");
+    let run_id = format!("interaction-conflict-run-{suffix}");
+    let request_id = format!("interaction-conflict-request-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let store =
+        DatabaseRunStateStore::new(shared_pool.clone()).with_owner_pod_id(TEST_OWNER_POD_ID);
+    let required = serde_json::json!({
+        "event_type": "approval_required",
+        "idempotency_key": format!("approval:{request_id}:required"),
+        "data": {
+            "request_id": request_id,
+            "session_id": session_id,
+            "tool": "bash",
+            "approval_kind": "standard",
+        }
+    });
+    assert_eq!(
+        store
+            .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                user_id: &user_id,
+                run_id: &run_id,
+                expected_session_id: &session_id,
+                expected_control_epoch: -1,
+                expected_owner_generation: 0,
+                events: std::slice::from_ref(&required),
+            })
+            .await
+            .expect("register queued interaction fixture"),
+        AtomicRunInteractionBatchRegistration::Registered
+    );
+    assert!(matches!(
+        store
+            .resolve_run_interaction(
+                &user_id,
+                &session_id,
+                &run_id,
+                &request_id,
+                DurableRunInteractionKind::Approval,
+                serde_json::json!({
+                    "request_id": request_id,
+                    "outcome": "approved",
+                    "decision": "allow",
+                    "tool": "bash",
+                    "approval_kind": "standard",
+                }),
+            )
+            .await
+            .expect("queue interaction response before wait"),
+        DurableRunInteractionResolveOutcome::Queued(_)
+    ));
+    sqlx::query(
+        "UPDATE agent_runs SET cancellation_requested_at = NOW(6)
+         WHERE user_id = ? AND session_id = ? AND run_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&run_id)
+    .execute(pool)
+    .await
+    .expect("make queued promotion CAS lose authority");
+
+    // Leave one checkout for the wait transaction. Its failed promotion must
+    // release that checkout before the pool-backed cancellation reread.
+    let held = hold_pool_checkouts(pool, max_connections - 1).await;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store.begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+            user_id: &user_id,
+            run_id: &run_id,
+            expected_session_id: &session_id,
+            request_id: &request_id,
+            kind: DurableRunInteractionKind::Approval,
+            expected_control_epoch: -1,
+            expected_owner_generation: 0,
+        }),
+    )
+    .await
+    .expect("queued interaction control reread must not self-deadlock")
+    .expect("queued interaction conflict outcome");
+    assert_eq!(outcome, DurableRunInteractionWaitOutcome::NoLongerActive);
 
     drop(held);
     cleanup(pool, &user_id, &session_id, &run_id).await;
