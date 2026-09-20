@@ -10853,7 +10853,11 @@ impl DatabaseRunStateStore {
         })
     }
 
-    pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(45);
+    // A lease renewal may spend up to 30s acquiring a connection and waiting
+    // on a contended run row. Keep enough durable authority for the completed
+    // attempt, the regular renewal interval, one full retry, and a final
+    // fencing margin without weakening owner/generation checks.
+    pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(120);
     pub const DEFAULT_SESSION_EXECUTION_SLOT_STALE_AFTER: Duration = Duration::from_secs(120);
 
     pub fn new(pool: SharedPool) -> Self {
@@ -28419,6 +28423,14 @@ mod tests {
 
     #[test]
     fn owner_lease_renewal_interval_is_derived_from_ttl() {
+        assert_eq!(
+            DatabaseRunStateStore::DEFAULT_LEASE_TTL,
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            run_owner_lease_renewal_interval(DatabaseRunStateStore::DEFAULT_LEASE_TTL),
+            Duration::from_secs(15)
+        );
         assert_eq!(
             run_owner_lease_renewal_interval(Duration::from_secs(45)),
             Duration::from_secs(15)
