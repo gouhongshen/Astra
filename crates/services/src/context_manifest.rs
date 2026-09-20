@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
+
 use crate::db_row::RowExt as ContextManifestDbRow;
-use astra_core::SharedPool;
+use astra_core::{SharedPool, matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::{MySql, QueryBuilder};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -18,6 +21,11 @@ pub const TURN_INTENT_BENCHMARK_COMPARISON: &str = "benchmark_comparison";
 pub const DELEGATION_MAX_RENDERED_CHILDREN: usize =
     (DELEGATION_ZONE_CAP / DELEGATION_CHILD_FLOOR) as usize;
 pub const SESSION_ARTIFACT_STATUS_EXPIRED: &str = "expired";
+
+/// Keep one manifest write bounded even when a future context assembler emits
+/// many more sections than the current projection. A chunk is still inserted
+/// in the same transaction and under the same session admission lock.
+const CONTEXT_MANIFEST_ITEM_INSERT_BATCH_SIZE: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionArtifactStatusKind {
@@ -763,6 +771,7 @@ impl DatabaseContextManifestStore {
                 source,
             }
         })?;
+        let artifact_references = aggregate_artifact_references(&items);
         let mut tx =
             self.pool
                 .get()
@@ -788,83 +797,99 @@ impl DatabaseContextManifestStore {
                 &manifest.manifest_id,
             )
         })?;
-        sqlx::query(
+        let manifest_insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO context_manifests
              (manifest_id, user_id, session_id, run_id, turn_id, model_provider, model_name,
               context_window_tokens, max_output_tokens, total_estimated_tokens, policy_version,
               tokenizer_id, budget_template_id, turn_intent, reason, dropped_count, manifest_json, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(&manifest.manifest_id)
-        .bind(&manifest.user_id)
-        .bind(&manifest.session_id)
-        .bind(&manifest.run_id)
-        .bind(&manifest.turn_id)
-        .bind(&manifest.model_provider)
-        .bind(&manifest.model_name)
-        .bind(i64::from(manifest.context_window_tokens))
-        .bind(i64::from(manifest.max_output_tokens))
-        .bind(i64::from(manifest.total_estimated_tokens))
-        .bind(&manifest.policy_version)
-        .bind(&manifest.tokenizer_id)
-        .bind(&manifest.budget_template_id)
-        .bind(&manifest.turn_intent)
-        .bind(&reason)
-        .bind(dropped_count)
-        .bind(manifest_json)
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| ContextManifestError::Database {
-            operation: "insert_context_manifest",
-            entity: manifest.manifest_id.clone(),
-            source,
-        })?;
-        for item in items {
-            let referenced_artifact_id = referenced_artifact_id_from_manifest_item(&item);
-            sqlx::query(
-                "INSERT INTO context_manifest_items
-                 (manifest_id, session_id, item_order, zone, source_table, source_id, source_hash,
-                  included, token_estimate, budget_tokens, reason, render_mode, raw_ref, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-            )
+            [
+                manifest.run_id.is_some(),
+                manifest.tokenizer_id.is_some(),
+                manifest.budget_template_id.is_some(),
+                manifest.turn_intent.is_some(),
+            ],
+        );
+        sqlx::query(&manifest_insert_sql)
             .bind(&manifest.manifest_id)
-            .bind(&item.session_id)
-            .bind(item.item_order)
-            .bind(&item.zone)
-            .bind(&item.source_table)
-            .bind(&item.source_id)
-            .bind(&item.source_hash)
-            .bind(if item.included { 1_i8 } else { 0_i8 })
-            .bind(i64::from(item.token_estimate))
-            .bind(i64::from(item.budget_tokens))
-            .bind(&item.reason)
-            .bind(&item.render_mode)
-            .bind(&item.raw_ref)
+            .bind(&manifest.user_id)
+            .bind(&manifest.session_id)
+            .bind(&manifest.run_id)
+            .bind(&manifest.turn_id)
+            .bind(&manifest.model_provider)
+            .bind(&manifest.model_name)
+            .bind(i64::from(manifest.context_window_tokens))
+            .bind(i64::from(manifest.max_output_tokens))
+            .bind(i64::from(manifest.total_estimated_tokens))
+            .bind(&manifest.policy_version)
+            .bind(&manifest.tokenizer_id)
+            .bind(&manifest.budget_template_id)
+            .bind(&manifest.turn_intent)
+            .bind(&reason)
+            .bind(dropped_count)
+            .bind(manifest_json)
             .execute(&mut *tx)
             .await
             .map_err(|source| ContextManifestError::Database {
-                operation: "insert_context_manifest_item",
+                operation: "insert_context_manifest",
                 entity: manifest.manifest_id.clone(),
                 source,
             })?;
-            if let Some(artifact_id) = referenced_artifact_id {
-                sqlx::query(
-                    "UPDATE session_artifacts
-	                     SET referenced_by_manifest_count = referenced_by_manifest_count + 1,
-	                         updated_at = NOW(6)
-	                     WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-                )
-                .bind(&manifest.user_id)
-                .bind(&item.session_id)
-                .bind(&artifact_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|source| ContextManifestError::Database {
-                    operation: "increment_manifest_artifact_ref",
-                    entity: artifact_id,
+        for item_batch in items.chunks(CONTEXT_MANIFEST_ITEM_INSERT_BATCH_SIZE) {
+            let mut query = QueryBuilder::<MySql>::new(
+                "INSERT INTO context_manifest_items
+                 (manifest_id, session_id, item_order, zone, source_table, source_id, source_hash,
+                  included, token_estimate, budget_tokens, reason, render_mode, raw_ref, created_at)
+                 ",
+            );
+            query.push_values(item_batch, |mut values, item| {
+                values
+                    .push_bind(&manifest.manifest_id)
+                    .push_bind(&item.session_id)
+                    .push_bind(item.item_order)
+                    .push_bind(&item.zone)
+                    .push_bind(&item.source_table)
+                    .push_bind(&item.source_id)
+                    .push_bind(&item.source_hash)
+                    .push_bind(if item.included { 1_i8 } else { 0_i8 })
+                    .push_bind(i64::from(item.token_estimate))
+                    .push_bind(i64::from(item.budget_tokens))
+                    .push_bind(&item.reason)
+                    .push_bind(&item.render_mode)
+                    .push_bind(&item.raw_ref)
+                    .push("NOW(6)");
+            });
+            query.push(matrixone_null_shape_comment(
+                item_batch
+                    .iter()
+                    .flat_map(context_manifest_item_nullable_shape),
+            ));
+            query.build().execute(&mut *tx).await.map_err(|source| {
+                ContextManifestError::Database {
+                    operation: "insert_context_manifest_items",
+                    entity: manifest.manifest_id.clone(),
                     source,
-                })?;
-            }
+                }
+            })?;
+        }
+        for ((session_id, artifact_id), reference_count) in artifact_references {
+            sqlx::query(
+                "UPDATE session_artifacts
+                 SET referenced_by_manifest_count = referenced_by_manifest_count + ?,
+                     updated_at = NOW(6)
+                 WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+            )
+            .bind(reference_count)
+            .bind(&manifest.user_id)
+            .bind(&session_id)
+            .bind(&artifact_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|source| ContextManifestError::Database {
+                operation: "increment_manifest_artifact_ref",
+                entity: artifact_id,
+                source,
+            })?;
         }
         tx.commit()
             .await
@@ -1022,6 +1047,10 @@ impl DatabaseContextManifestStore {
     }
 }
 
+fn context_manifest_item_nullable_shape(item: &ContextManifestItemWrite) -> [bool; 2] {
+    [item.source_hash.is_some(), item.raw_ref.is_some()]
+}
+
 pub fn content_hash_with_normalize_version(
     content_hash: &str,
     normalize_version: Option<&str>,
@@ -1091,6 +1120,21 @@ fn referenced_artifact_id_from_manifest_item(item: &ContextManifestItemWrite) ->
         return Some(item.source_id.clone());
     }
     item.raw_ref.as_deref().and_then(artifact_id_from_raw_ref)
+}
+
+fn aggregate_artifact_references(
+    items: &[ContextManifestItemWrite],
+) -> BTreeMap<(String, String), i64> {
+    let mut references = BTreeMap::new();
+    for item in items {
+        let Some(artifact_id) = referenced_artifact_id_from_manifest_item(item) else {
+            continue;
+        };
+        *references
+            .entry((item.session_id.clone(), artifact_id))
+            .or_insert(0) += 1;
+    }
+    references
 }
 
 pub fn cross_session_retrieval_requires_user_filter(
@@ -1320,5 +1364,55 @@ mod tests {
                 column,
             );
         }
+    }
+
+    fn manifest_item_for_reference(
+        session_id: &str,
+        item_order: i32,
+        source_table: &str,
+        source_id: &str,
+        included: bool,
+    ) -> ContextManifestItemWrite {
+        ContextManifestItemWrite {
+            session_id: session_id.to_string(),
+            item_order,
+            zone: "tool_previews".to_string(),
+            source_table: source_table.to_string(),
+            source_id: source_id.to_string(),
+            source_hash: None,
+            included,
+            token_estimate: 10,
+            budget_tokens: 20,
+            reason: "test".to_string(),
+            render_mode: "reference_only".to_string(),
+            raw_ref: None,
+        }
+    }
+
+    #[test]
+    fn artifact_reference_aggregation_preserves_multiplicity_and_scope() {
+        let items = vec![
+            manifest_item_for_reference("source-a", 0, "session_artifacts", "artifact-1", true),
+            manifest_item_for_reference("source-a", 1, "session_artifacts", "artifact-1", false),
+            manifest_item_for_reference("source-b", 2, "session_artifacts", "artifact-1", true),
+            manifest_item_for_reference("source-a", 3, "runtime_messages", "message-1", true),
+        ];
+
+        let references = aggregate_artifact_references(&items);
+
+        assert_eq!(
+            references.get(&("source-a".to_string(), "artifact-1".to_string())),
+            Some(&2)
+        );
+        assert_eq!(
+            references.get(&("source-b".to_string(), "artifact-1".to_string())),
+            Some(&1)
+        );
+        assert_eq!(references.len(), 2);
+    }
+
+    #[test]
+    fn context_manifest_item_batch_size_is_bounded() {
+        assert_eq!(CONTEXT_MANIFEST_ITEM_INSERT_BATCH_SIZE, 128);
     }
 }

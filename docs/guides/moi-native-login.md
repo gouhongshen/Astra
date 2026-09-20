@@ -165,8 +165,13 @@ removed; there is no Astra-specific model allowlist or default override. The
 Catalog TOML convention defaults only seed never-configured slots; changing that
 file does not overwrite an existing administrator selection.
 
-Every catalog lookup and inference admission reads the current policy. Removing
-a model blocks its next admission, including an old session's saved Offering;
+Every catalog lookup and inference admission reads the current policy. Filtering
+out models outside this policy happens before runtime metadata validation: an
+unselected Genesis model with an invalid context size cannot block the product
+catalog. Selected models still require valid metadata; missing values are not
+replaced with defaults. Pagination and response decoding remain strict.
+
+Removing a model blocks its next admission, including an old session's saved Offering;
 changing the default affects subsequent default resolution, not an explicitly
 selected model. An unavailable, cleared or malformed policy never falls back to
 the entire Genesis catalog. An unavailable default is not silently replaced by

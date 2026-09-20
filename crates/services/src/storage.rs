@@ -1396,17 +1396,28 @@ pub async fn lock_agent_session_write_fence(
     session_id: &str,
     user_id: &str,
 ) -> Result<(), sqlx::Error> {
-    query(
-        "INSERT IGNORE INTO agent_session_lifecycle_fences \
-         (session_id, user_id, created_at, updated_at) \
-         VALUES (?, ?, NOW(6), NOW(6))",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await?;
+    // Session creation/backfill establishes the fence before normal child
+    // writes. Fast-path the common case so every manifest/event write does not
+    // pay an INSERT IGNORE round trip. Keep the insert as a repair path for
+    // lazy-created or externally provisioned sessions, then lock the row again
+    // before inspecting its lifecycle state.
+    let state = match lock_existing_agent_session_write_fence(tx, session_id, user_id).await? {
+        AgentSessionWriteFenceState::Missing => {
+            query(
+                "INSERT IGNORE INTO agent_session_lifecycle_fences \
+                 (session_id, user_id, created_at, updated_at) \
+                 VALUES (?, ?, NOW(6), NOW(6))",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .execute(&mut **tx)
+            .await?;
+            lock_existing_agent_session_write_fence(tx, session_id, user_id).await?
+        }
+        state => state,
+    };
 
-    match lock_existing_agent_session_write_fence(tx, session_id, user_id).await? {
+    match state {
         AgentSessionWriteFenceState::Writable => Ok(()),
         AgentSessionWriteFenceState::PendingDelete
         | AgentSessionWriteFenceState::CompletedDelete => Err(sqlx::Error::Protocol(
@@ -1442,6 +1453,45 @@ pub async fn add_agent_session_event_count_or_create(
         .bind(user_id)
         .execute(&mut **tx)
         .await?;
+    if result.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
+/// Update an already-admitted session without reacquiring its lifecycle fence.
+///
+/// This is intentionally `pub(crate)`: callers must have completed
+/// [`admit_session_event_write`] in the same transaction. Keeping that fact in
+/// the function name prevents the optimized path from becoming a general
+/// session mutation API that could bypass deletion admission.
+pub(crate) async fn add_agent_session_event_count_after_admission(
+    tx: &mut Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+    delta: i64,
+    last_event_id: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    if delta <= 0 {
+        return Err(sqlx::Error::Protocol(
+            "add_agent_session_event_count_after_admission requires a positive delta".into(),
+        ));
+    }
+
+    let result = query(
+        "UPDATE agent_sessions
+         SET event_count = event_count + ?,
+             last_event_id = COALESCE(?, last_event_id),
+             updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at),
+             last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at)
+         WHERE session_id = ? AND user_id = ? AND status <> 'deleting'",
+    )
+    .bind(delta)
+    .bind(last_event_id)
+    .bind(session_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
     if result.rows_affected() == 0 {
         return Err(sqlx::Error::RowNotFound);
     }

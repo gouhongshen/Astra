@@ -172,6 +172,11 @@ impl DatabaseModelService {
                 .await
                 .map_err(|_| unavailable())?;
             for model in page.items {
+                // Only product-selected candidates become runtime Offerings.
+                // Unrelated Genesis metadata must not block this product catalog.
+                if !allowed.contains(&model.name) {
+                    continue;
+                }
                 if !matches!(model.model_type.as_str(), "chat_text" | "chat_multimodal")
                     || model.status != "enabled"
                 {
@@ -202,7 +207,6 @@ impl DatabaseModelService {
                 });
             }
             if page.next_page_token.is_empty() {
-                items.retain(|item| allowed.contains(&item.name));
                 let default_offering_id = items
                     .iter()
                     .find(|item| item.name == policy.default_model)
@@ -324,7 +328,7 @@ mod tests {
                 let failure = *state.unavailable.lock().unwrap();
                 let first = query.get("page_token").unwrap().is_empty();
                 let (id, cursor) = if first { ("model-1", "next") } else { ("model-2", "") };
-                let item = serde_json::json!({"id":id,"name":format!("genesis-{id}"),"type": if first {"chat_text"} else {"chat_multimodal"}, "status":if failure == Some("disabled") {"disabled"} else {"enabled"}, "context_window":if failure == Some("context") {0} else {32000}, "max_output_tokens":4096});
+                let item = serde_json::json!({"id":id,"name":format!("genesis-{id}"),"type": if first {"chat_text"} else {"chat_multimodal"}, "status":if failure == Some("disabled") {"disabled"} else {"enabled"}, "context_window":if failure == Some("context") || (first && failure == Some("first_context")) {0} else {32000}, "max_output_tokens":4096});
                 let items = if failure == Some("removed") { vec![] } else { vec![item] };
                 Json(serde_json::json!({"items":items, "next_page_token": if failure == Some("cycle") { "next" } else { cursor }}))
             })).with_state(state.clone());
@@ -418,6 +422,44 @@ mod tests {
                 "{failure}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn unselected_invalid_metadata_does_not_block_later_selected_models() {
+        let (service, state, _server) = fixture().await;
+        let initial = service.genesis_catalog("account-A").await.unwrap();
+        let excluded = initial.items[0].offering_id.clone();
+        *state.unavailable.lock().unwrap() = Some("first_context");
+        *state.policy.lock().unwrap() = serde_json::json!({
+            "code": "OK", "data": {"models": ["genesis-model-2"], "default_model": "genesis-model-2"}
+        });
+        let catalog = service.genesis_catalog("account-A").await.unwrap();
+        assert_eq!(catalog.items.len(), 1);
+        assert_eq!(catalog.items[0].name, "genesis-model-2");
+        assert_eq!(catalog.items[0].context_window, 32000);
+        assert_eq!(
+            catalog.default_offering_id.as_ref(),
+            Some(&catalog.items[0].offering_id)
+        );
+        assert_eq!(state.requests.load(Ordering::SeqCst), 4);
+        assert!(
+            service
+                .admit_genesis("account-A", &catalog.items[0].offering_id)
+                .await
+                .is_ok()
+        );
+        assert!(service.admit_genesis("account-A", &excluded).await.is_err());
+
+        // Selecting the invalid model must still fail, even with a valid default.
+        state.policy.lock().unwrap()["data"]["models"] =
+            serde_json::json!(["genesis-model-1", "genesis-model-2"]);
+        let error = service.genesis_catalog("account-A").await.err().unwrap();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            serde_json::to_string(&error.1.0)
+                .unwrap()
+                .contains("genesis_not_ready")
+        );
     }
 
     #[tokio::test]
