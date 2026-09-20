@@ -15687,7 +15687,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .with_runtime_edge_dispatch_authorization(
                 Self::runtime_edge_dispatch_authorization_context(&request)
                     .expect("runtime executor authorization was validated before run start"),
-            );
+            )
+            .with_admitted_execution_deadline(request.admitted_execution_deadline);
             if let Some(memoria_port) = self
                 .memory_extraction_service
                 .as_ref()
@@ -17179,7 +17180,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Self::runtime_edge_dispatch_authorization_context(&request).expect(
                     "runtime executor authorization was validated before streaming run start",
                 ),
-            );
+            )
+            .with_admitted_execution_deadline(request.admitted_execution_deadline);
             if let Some(memoria_port) = self
                 .memory_extraction_service
                 .as_ref()
