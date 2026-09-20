@@ -2813,9 +2813,13 @@ pub enum AtomicRunUserIntentAdmissionTransition {
 ///
 /// Shared stores must decide this using their own owner identity and database
 /// clock. `Authorized` is the only variant that permits the provider call.
+/// `lease_renewed` is true only when the store directly confirmed that this
+/// operation committed a fresh durable lease. A live-authority reread after
+/// an ambiguous or failed write authorizes the current boundary but must not
+/// be treated as evidence that the lease expiry moved forward.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunExecutionBoundaryAuthorization {
-    Authorized,
+    Authorized { lease_renewed: bool },
     Inactive { status: String },
     OwnerGenerationMismatch { actual_owner_generation: u64 },
     OwnerMismatch { actual_owner_pod_id: Option<String> },
@@ -3438,7 +3442,9 @@ fn execution_boundary_authorization_from_exact_authority(
     authority: ExactLiveRunExecutionAuthority,
 ) -> RunExecutionBoundaryAuthorization {
     match authority {
-        ExactLiveRunExecutionAuthority::Live => RunExecutionBoundaryAuthorization::Authorized,
+        ExactLiveRunExecutionAuthority::Live => RunExecutionBoundaryAuthorization::Authorized {
+            lease_renewed: false,
+        },
         ExactLiveRunExecutionAuthority::Inactive { status } => {
             RunExecutionBoundaryAuthorization::Inactive { status }
         }
@@ -10127,7 +10133,9 @@ impl RunStateStore for InMemoryRunStateStore {
                 status: run.status.clone(),
             });
         }
-        Ok(RunExecutionBoundaryAuthorization::Authorized)
+        Ok(RunExecutionBoundaryAuthorization::Authorized {
+            lease_renewed: false,
+        })
     }
 
     async fn find_blocking_session_run(
@@ -21991,7 +21999,9 @@ impl RunStateStore for DatabaseRunStateStore {
         match update {
             Ok(result) if result.rows_affected() == 1 && !acknowledgement_unknown => {
                 connection.release();
-                return Ok(RunExecutionBoundaryAuthorization::Authorized);
+                return Ok(RunExecutionBoundaryAuthorization::Authorized {
+                    lease_renewed: true,
+                });
             }
             Ok(_) => {}
             Err(update_error) => {
@@ -33583,7 +33593,9 @@ mod tests {
         };
         assert_eq!(
             store.authorize_execution_boundary(request).await.unwrap(),
-            RunExecutionBoundaryAuthorization::Authorized
+            RunExecutionBoundaryAuthorization::Authorized {
+                lease_renewed: true,
+            }
         );
         assert_eq!(
             store
@@ -33592,7 +33604,9 @@ mod tests {
                 .authorize_execution_boundary(request)
                 .await
                 .expect("ambiguous renewal ACK must use an authoritative exact reread"),
-            RunExecutionBoundaryAuthorization::Authorized
+            RunExecutionBoundaryAuthorization::Authorized {
+                lease_renewed: false,
+            }
         );
         assert_eq!(
             DatabaseRunStateStore::new(pool.clone())
@@ -42180,7 +42194,9 @@ mod tests {
         };
         assert_eq!(
             store.authorize_execution_boundary(request).await.unwrap(),
-            RunExecutionBoundaryAuthorization::Authorized
+            RunExecutionBoundaryAuthorization::Authorized {
+                lease_renewed: false,
+            }
         );
         assert_eq!(store.load_run_call_count(), 0);
 

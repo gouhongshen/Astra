@@ -4234,9 +4234,12 @@ impl UserIntentProvider for RunEngine {
                     result = tokio::time::timeout(policy.attempt_wait, authorization) => result,
                 };
                 match result {
-                    Ok(Ok(RunExecutionBoundaryAuthorization::Authorized)) => {
-                        authority.refresh(policy.fence_deadline(authorization_started_at));
-                        outcome = Some(RunExecutionBoundaryAuthorization::Authorized);
+                    Ok(Ok(RunExecutionBoundaryAuthorization::Authorized { lease_renewed })) => {
+                        if lease_renewed {
+                            authority.refresh(policy.fence_deadline(authorization_started_at));
+                        }
+                        outcome =
+                            Some(RunExecutionBoundaryAuthorization::Authorized { lease_renewed });
                         break;
                     }
                     Ok(Ok(resolved)) => {
@@ -4286,7 +4289,7 @@ impl UserIntentProvider for RunEngine {
                 .await?
         };
         Ok(match outcome {
-            RunExecutionBoundaryAuthorization::Authorized => {
+            RunExecutionBoundaryAuthorization::Authorized { .. } => {
                 ProviderBoundaryAuthorization::Authorized
             }
             RunExecutionBoundaryAuthorization::Inactive { status } if status == STATUS_PAUSED => {
@@ -5225,6 +5228,103 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn provider_live_authority_reread_does_not_fabricate_a_new_lease_window() {
+        let store = Arc::new(
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120))
+                .with_lease_renewal_behavior(LeaseRenewalBehavior::Pending)
+                .with_first_provider_authorization_delay(Duration::from_secs(31))
+                .with_provider_authorization_delay(Duration::from_secs(20))
+                .with_provider_authorization_live_reread(),
+        );
+        let engine = RunEngine::new(store.clone());
+        let execution = engine
+            .start_run("provider-live-reread", "user-1", "session-1")
+            .await
+            .expect("run start");
+        let lease_lost = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let guard = engine
+            .start_owner_lease_heartbeat(
+                "user-1".to_string(),
+                "session-1".to_string(),
+                "provider-live-reread".to_string(),
+                execution.owner_generation,
+                test_confirmed_execution_authority(&engine),
+                lease_lost.clone(),
+                cancel.clone(),
+            )
+            .expect("heartbeat-enabled store");
+        let initial_deadline = engine
+            .owner_lease_authority(
+                "user-1",
+                "session-1",
+                "provider-live-reread",
+                execution.owner_generation,
+            )
+            .expect("active lease authority")
+            .current_state()
+            .deadline;
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let authorization = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                UserIntentProvider::authorize_provider_boundary(
+                    &engine,
+                    "user-1",
+                    "session-1",
+                    "provider-live-reread",
+                    UserIntentAdmissionAuthority::DurableOwnerGeneration(
+                        execution.owner_generation,
+                    ),
+                )
+                .await
+            }
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(store.provider_authorizations(), 1);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(store.provider_authorizations(), 2);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            authorization.await.expect("authorization task").unwrap(),
+            ProviderBoundaryAuthorization::Authorized
+        );
+        assert_eq!(
+            engine
+                .owner_lease_authority(
+                    "user-1",
+                    "session-1",
+                    "provider-live-reread",
+                    execution.owner_generation,
+                )
+                .expect("live reread keeps existing authority")
+                .current_state()
+                .deadline,
+            initial_deadline,
+            "a live-authority reread must not claim that durable expiry advanced"
+        );
+
+        tokio::task::yield_now().await;
+        assert_eq!(store.lease_renewals(), 1);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert!(tokio::time::Instant::now() < initial_deadline);
+        assert!(lease_lost.load(Ordering::Acquire));
+        assert!(cancel.is_cancelled());
+        assert_eq!(
+            store.lease_renewals(),
+            1,
+            "the old fence must reject a second attempt that cannot finish safely"
+        );
+        drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn provider_boundary_wait_fails_closed_when_heartbeat_stops() {
         let store = Arc::new(
             FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
@@ -6132,7 +6232,9 @@ mod tests {
         lease_duration: Option<Duration>,
         lease_renewal_behavior: LeaseRenewalBehavior,
         lease_release_behavior: LeaseReleaseBehavior,
+        provider_authorization_first_delay: Option<Duration>,
         provider_authorization_delay: Option<Duration>,
+        provider_authorization_renews_lease: bool,
         provider_authorizations: AtomicUsize,
         lease_renewals: AtomicUsize,
         lease_releases: AtomicUsize,
@@ -6153,7 +6255,9 @@ mod tests {
                 lease_duration: None,
                 lease_renewal_behavior: LeaseRenewalBehavior::Renew,
                 lease_release_behavior: LeaseReleaseBehavior::Succeed,
+                provider_authorization_first_delay: None,
                 provider_authorization_delay: None,
+                provider_authorization_renews_lease: true,
                 provider_authorizations: AtomicUsize::new(0),
                 lease_renewals: AtomicUsize::new(0),
                 lease_releases: AtomicUsize::new(0),
@@ -6192,6 +6296,16 @@ mod tests {
 
         fn with_provider_authorization_delay(mut self, delay: Duration) -> Self {
             self.provider_authorization_delay = Some(delay);
+            self
+        }
+
+        fn with_first_provider_authorization_delay(mut self, delay: Duration) -> Self {
+            self.provider_authorization_first_delay = Some(delay);
+            self
+        }
+
+        fn with_provider_authorization_live_reread(mut self) -> Self {
+            self.provider_authorization_renews_lease = false;
             self
         }
 
@@ -6652,11 +6766,25 @@ mod tests {
             &self,
             request: astra_services::runs::RunExecutionBoundaryAuthorizationRequest<'_>,
         ) -> Result<astra_services::runs::RunExecutionBoundaryAuthorization, String> {
-            self.provider_authorizations.fetch_add(1, Ordering::SeqCst);
-            if let Some(delay) = self.provider_authorization_delay {
+            let attempt = self.provider_authorizations.fetch_add(1, Ordering::SeqCst);
+            let delay = if attempt == 0 {
+                self.provider_authorization_first_delay
+                    .or(self.provider_authorization_delay)
+            } else {
+                self.provider_authorization_delay
+            };
+            if let Some(delay) = delay {
                 tokio::time::sleep(delay).await;
             }
-            self.inner.authorize_execution_boundary(request).await
+            let outcome = self.inner.authorize_execution_boundary(request).await?;
+            Ok(match outcome {
+                astra_services::runs::RunExecutionBoundaryAuthorization::Authorized { .. } => {
+                    astra_services::runs::RunExecutionBoundaryAuthorization::Authorized {
+                        lease_renewed: self.provider_authorization_renews_lease,
+                    }
+                }
+                outcome => outcome,
+            })
         }
 
         async fn release_owner_lease(
