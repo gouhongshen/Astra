@@ -106,6 +106,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                     .map(|id| {
                         HeadlessPreResolvedToolResult::new(
                             id.to_string(),
+                            DELEGATE_TOOL_NAME,
                             format!(
                                 "ERROR: Delegation limit reached ({} delegations already executed this turn). \
                                  You must synthesize the results from previous delegations and respond to the user directly. \
@@ -232,10 +233,8 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
         .map(|result| {
             HeadlessPreResolvedToolResult::new(
                 result.call_id.clone(),
-                astra_turn_core::tool_result_sanitize::tool_result_content_for_model(
-                    DELEGATE_TOOL_NAME,
-                    &result.summary,
-                ),
+                DELEGATE_TOOL_NAME,
+                result.summary.clone(),
                 if result
                     .outcome
                     .as_ref()

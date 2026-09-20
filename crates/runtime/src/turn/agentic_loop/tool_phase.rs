@@ -828,6 +828,7 @@ async fn recover_missing_control_tool_results<H: AgenticLoopHost>(
         };
         pre_resolved_results.push(HeadlessPreResolvedToolResult::new(
             tool_call_id,
+            tool_name,
             recovered.output,
             status,
         ));
@@ -4987,6 +4988,7 @@ mod tests {
             &[start_call],
             &[HeadlessPreResolvedToolResult::new(
                 "fanout-start",
+                "agent_fanout",
                 paginated,
                 ToolResultStatus::Completed,
             )],
@@ -5210,6 +5212,7 @@ mod tests {
             pre_resolved_results,
             vec![HeadlessPreResolvedToolResult::new(
                 "call-fanout",
+                "agent_fanout",
                 recovered_output,
                 ToolResultStatus::Completed,
             )]
@@ -5288,6 +5291,7 @@ mod tests {
             pre_resolved_results,
             vec![HeadlessPreResolvedToolResult::new(
                 "call-fanout",
+                "agent_fanout",
                 recovered_output.clone(),
                 ToolResultStatus::Failed,
             )]

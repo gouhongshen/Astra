@@ -213,7 +213,8 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
     let mut pre_resolved_ids = HashSet::new();
     for result in pre_resolved_results {
         pre_resolved_ids.insert(result.call_id.clone());
-        let content_for_model = tool_result_content_for_model("pre_resolved", &result.content);
+        let content_for_model =
+            tool_result_content_for_model(&result.source_tool_name, &result.content);
         let (mut tool_msg, tr) = openai_tool_roundtrip_values(
             &result.call_id,
             "pre_resolved",
@@ -699,6 +700,93 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn pre_resolved_results_keep_source_tool_model_budgets() {
+        const SKILL_MARKER: &str = "AUTHORING_CONTEXT_MIDDLE";
+        const GENERIC_MARKER: &str = "GENERIC_RESULT_MIDDLE";
+
+        let long_result =
+            |marker: &str| format!("{}\n{marker}\n{}", "a".repeat(4_500), "z".repeat(4_500));
+        let skill_content = long_result(SKILL_MARKER);
+        let generic_content = long_result(GENERIC_MARKER);
+        assert!(
+            skill_content.chars().count()
+                > astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS
+        );
+        assert!(
+            skill_content.chars().count()
+                < astra_turn_core::tool_result_sanitize::SKILL_MODEL_RESULT_CHARS
+        );
+
+        let tool_calls = vec![
+            json!({
+                "id": "skill-call",
+                "type": "function",
+                "function": {"name": "skill", "arguments": "{}"}
+            }),
+            json!({
+                "id": "agent-call",
+                "type": "function",
+                "function": {"name": "agent", "arguments": "{}"}
+            }),
+        ];
+        let pre_resolved = vec![
+            HeadlessPreResolvedToolResult::new(
+                "skill-call",
+                "skill",
+                skill_content.clone(),
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
+            ),
+            HeadlessPreResolvedToolResult::new(
+                "agent-call",
+                "agent",
+                generic_content,
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
+            ),
+        ];
+        let edge_tool_round: Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> = Vec::new();
+        let mut messages = Vec::new();
+        let mut tool_results = Vec::new();
+        let mut step_recorder = StepRecorder::new("test-user", "test-session", "source-budget");
+
+        let _prepared = prepare_headless_tool_round(
+            None,
+            &tool_calls,
+            &tool_calls,
+            &edge_tool_round,
+            "",
+            "",
+            &pre_resolved,
+            &mut messages,
+            &mut tool_results,
+            &mut step_recorder,
+            0,
+        )
+        .await;
+
+        assert_eq!(messages[1]["content"], skill_content);
+        assert!(
+            messages[1]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(SKILL_MARKER)),
+            "skill instructions below the skill-specific budget must remain complete"
+        );
+        let generic_for_model = messages[2]["content"].as_str().unwrap();
+        assert!(
+            generic_for_model.chars().count()
+                <= astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS
+        );
+        assert!(
+            !generic_for_model.contains(GENERIC_MARKER),
+            "ordinary pre-resolved results must retain the generic model budget"
+        );
+
+        assert_eq!(messages[1]["_tool_name"], "pre_resolved");
+        assert_eq!(messages[2]["_tool_name"], "pre_resolved");
+        assert_eq!(tool_results[0]["name"], "pre_resolved");
+        assert_eq!(tool_results[1]["name"], "pre_resolved");
     }
 
     #[test]

@@ -881,6 +881,7 @@ mod tests {
         // Simulate: skill interception resolved call_skill before headless round
         let pre_resolved = vec![HeadlessPreResolvedToolResult::new(
             "call_skill",
+            "skill",
             "Skill instructions here",
             ToolResultStatus::Completed,
         )];
@@ -1016,11 +1017,13 @@ mod tests {
         let pre_resolved = vec![
             HeadlessPreResolvedToolResult::new(
                 "skill:0",
+                "skill",
                 "Skill instructions",
                 ToolResultStatus::Completed,
             ),
             HeadlessPreResolvedToolResult::new(
                 "read_file:1",
+                "read_file",
                 "file contents",
                 ToolResultStatus::Completed,
             ),
@@ -1150,6 +1153,7 @@ mod tests {
         // Skill was pre-resolved; grep will be matched from edge_tool_round
         let pre_resolved = vec![HeadlessPreResolvedToolResult::new(
             "skill:0",
+            "skill",
             "Skill instructions",
             ToolResultStatus::Completed,
         )];

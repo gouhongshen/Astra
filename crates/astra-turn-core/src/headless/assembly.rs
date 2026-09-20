@@ -10,11 +10,14 @@ use crate::tool::args::shape::canonicalize_tool_call_for_execution;
 use crate::tool::categories::is_file_mutation_tool;
 
 /// A tool result already resolved by an upstream runtime interceptor.
-/// Execution status is carried with the result instead of reconstructed from
-/// its model-facing content later in the request pipeline.
+///
+/// The source tool identity is retained for tool-specific model presentation
+/// (sanitization and context budgeting). It is independent from the
+/// `pre_resolved` transport identity used by the headless round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadlessPreResolvedToolResult {
     pub call_id: String,
+    pub source_tool_name: String,
     pub content: String,
     pub status: crate::tool_result_semantics::ToolResultStatus,
 }
@@ -23,11 +26,13 @@ impl HeadlessPreResolvedToolResult {
     #[must_use]
     pub fn new(
         call_id: impl Into<String>,
+        source_tool_name: impl Into<String>,
         content: impl Into<String>,
         status: crate::tool_result_semantics::ToolResultStatus,
     ) -> Self {
         Self {
             call_id: call_id.into(),
+            source_tool_name: source_tool_name.into(),
             content: content.into(),
             status,
         }

@@ -60,6 +60,7 @@ pub(crate) fn record_pre_execution_rejections(
         let logical_name = rejected.logical_name().to_string();
         pre_resolved_results.push(HeadlessPreResolvedToolResult::new(
             call_id.clone(),
+            logical_name.clone(),
             rejected.result.clone(),
             astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
         ));
@@ -814,6 +815,7 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
             .cloned();
         pre_resolved_results.push(HeadlessPreResolvedToolResult::new(
             result.tool_call_id.clone(),
+            result.tool_name.clone(),
             result.result.clone(),
             astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
         ));
@@ -847,6 +849,7 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
     for result in &skill_results {
         pre_resolved_results.push(HeadlessPreResolvedToolResult::new(
             result.tool_call_id.clone(),
+            result.tool_name.clone(),
             result.result.clone(),
             if result.ok {
                 astra_turn_core::tool_result_semantics::ToolResultStatus::Completed
