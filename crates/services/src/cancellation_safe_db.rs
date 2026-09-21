@@ -1,4 +1,6 @@
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use sqlx::{
     Connection, MySql, MySqlConnection, Transaction, TransactionManager,
@@ -24,6 +26,45 @@ pub trait TransactionConnection:
 impl<'a> sealed::TransactionConnection for Transaction<'a, MySql> {}
 impl<'a> TransactionConnection for Transaction<'a, MySql> {}
 
+static POOL_ACQUIRE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static POOL_ACQUIRE_FAILURES: AtomicU64 = AtomicU64::new(0);
+static POOL_ACQUIRE_SLOW: AtomicU64 = AtomicU64::new(0);
+static POOL_ACQUIRE_WAIT_MICROS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DbPoolAcquireTelemetrySnapshot {
+    pub attempts: u64,
+    pub failures: u64,
+    pub slow: u64,
+    pub wait_micros: u64,
+}
+
+pub fn db_pool_acquire_telemetry_snapshot() -> DbPoolAcquireTelemetrySnapshot {
+    DbPoolAcquireTelemetrySnapshot {
+        attempts: POOL_ACQUIRE_ATTEMPTS.load(Ordering::Relaxed),
+        failures: POOL_ACQUIRE_FAILURES.load(Ordering::Relaxed),
+        slow: POOL_ACQUIRE_SLOW.load(Ordering::Relaxed),
+        wait_micros: POOL_ACQUIRE_WAIT_MICROS.load(Ordering::Relaxed),
+    }
+}
+
+async fn acquire_pool_connection(
+    pool: &sqlx::Pool<MySql>,
+) -> Result<PoolConnection<MySql>, sqlx::Error> {
+    POOL_ACQUIRE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let connection = pool.acquire().await;
+    let elapsed = started.elapsed();
+    let elapsed_micros = elapsed.as_micros().try_into().unwrap_or(u64::MAX);
+    POOL_ACQUIRE_WAIT_MICROS.fetch_add(elapsed_micros, Ordering::Relaxed);
+    if elapsed >= astra_core::MATRIXONE_SLOW_POOL_ACQUIRE_AFTER {
+        POOL_ACQUIRE_SLOW.fetch_add(1, Ordering::Relaxed);
+    }
+    connection.inspect_err(|_| {
+        POOL_ACQUIRE_FAILURES.fetch_add(1, Ordering::Relaxed);
+    })
+}
+
 /// A checked-out shared-pool connection that is reusable only after its
 /// caller explicitly proves the MySQL protocol is synchronized.
 ///
@@ -37,7 +78,7 @@ pub struct CancellationSafePoolConnection {
 
 impl CancellationSafePoolConnection {
     pub async fn acquire(pool: &sqlx::Pool<MySql>) -> Result<Self, sqlx::Error> {
-        let connection = pool.acquire().await?;
+        let connection = acquire_pool_connection(pool).await?;
         Ok(Self {
             connection: Some(connection),
         })
@@ -100,7 +141,7 @@ impl TransactionConnection for CancellationSafeTransaction {}
 
 impl CancellationSafeTransaction {
     pub(crate) async fn begin(pool: &sqlx::Pool<MySql>) -> Result<Self, sqlx::Error> {
-        let connection = pool.acquire().await?;
+        let connection = acquire_pool_connection(pool).await?;
         let mut transaction = Self {
             connection: Some(connection),
             transaction_open: false,

@@ -18382,6 +18382,71 @@ async fn ordered_fanout_delivers_progress_live_without_persisting_it() {
     );
 }
 
+#[tokio::test]
+async fn structural_explain_events_share_the_bounded_live_microbatch() {
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let engine = RunEngine::new(store.clone());
+    engine
+        .start_run("run-1", "user-1", "session-1")
+        .await
+        .expect("seed durable run");
+    let runs = Arc::new(RwLock::new(HashMap::new()));
+    let (live_tx, mut live_rx) = broadcast::channel(8);
+    let mut client_event_tx = AttachedStreamDelivery::detached();
+    let mut pending = PendingDurableLiveEvents::default();
+    let durable_tool_terminals = DurableToolTerminalTracker::default();
+    let first = json!({"type": "explain_analyze", "stage": "context"});
+    let second = json!({"type": "explain_analyze", "stage": "model"});
+
+    for event in [first.clone(), second.clone()] {
+        let result = process_ordered_live_fanout_event(
+            event,
+            &mut pending,
+            &engine,
+            &runs,
+            "user-1",
+            "session-1",
+            "run-1",
+            &live_tx,
+            &mut client_event_tx,
+            &durable_tool_terminals,
+        )
+        .await;
+        assert!(result.is_ok(), "admit structural explain event");
+    }
+
+    assert!(
+        store.appended_batches().is_empty(),
+        "structural events must wait for the 25ms or capacity boundary"
+    );
+    assert_eq!(
+        live_rx.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty),
+        "durable events may not be published before their batch commits"
+    );
+
+    flush_durable_live_events(
+        &mut pending,
+        &engine,
+        &runs,
+        "user-1",
+        "session-1",
+        "run-1",
+        &live_tx,
+        &mut client_event_tx,
+        &durable_tool_terminals,
+    )
+    .await
+    .expect("flush structural explain microbatch");
+
+    assert_eq!(
+        store.appended_batches(),
+        vec![vec![first.clone(), second.clone()]]
+    );
+    assert_eq!(live_rx.recv().await.expect("first live explain"), first);
+    assert_eq!(live_rx.recv().await.expect("second live explain"), second);
+}
+
 #[test]
 fn durable_tool_terminal_tracker_matches_exact_occurrences_not_only_call_ids() {
     let tracker = DurableToolTerminalTracker::default();

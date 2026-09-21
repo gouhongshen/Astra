@@ -33,6 +33,98 @@ impl MetricTarget for MetricsRegistryBridge {
     }
 }
 
+fn scrape_database_pool_metrics(state: &AppState) {
+    let registry = state.metrics_registry();
+    registry.register_counter(
+        "astra_db_pool_hot_checkouts_total",
+        "MatrixOne checkouts that reused a recently active connection without an extra PING.",
+    );
+    registry.register_counter(
+        "astra_db_pool_health_checks_total",
+        "MatrixOne idle-connection PING health checks by outcome.",
+    );
+    registry.register_counter(
+        "astra_db_pool_health_check_microseconds_total",
+        "Cumulative time spent in MatrixOne idle-connection PING health checks.",
+    );
+    registry.register_counter(
+        "astra_db_pool_guarded_acquires_total",
+        "Cancellation-safe MatrixOne pool acquisition attempts by outcome.",
+    );
+    registry.register_counter(
+        "astra_db_pool_guarded_acquire_microseconds_total",
+        "Cumulative time spent acquiring cancellation-safe MatrixOne connections.",
+    );
+    registry.register_counter(
+        "astra_db_pool_guarded_slow_acquires_total",
+        "Cancellation-safe MatrixOne pool acquisitions exceeding the configured slow threshold.",
+    );
+    registry.register_gauge(
+        "astra_db_pool_connections",
+        "Current MatrixOne pool connections by state.",
+    );
+
+    let pool = astra_core::matrixone_pool_telemetry_snapshot();
+    registry.set_counter_absolute("astra_db_pool_hot_checkouts_total", &[], pool.hot_checkouts);
+    registry.set_counter_absolute(
+        "astra_db_pool_health_checks_total",
+        &[("outcome", "success")],
+        pool.health_checks
+            .saturating_sub(pool.health_check_failures),
+    );
+    registry.set_counter_absolute(
+        "astra_db_pool_health_checks_total",
+        &[("outcome", "failure")],
+        pool.health_check_failures,
+    );
+    registry.set_counter_absolute(
+        "astra_db_pool_health_check_microseconds_total",
+        &[],
+        pool.health_check_micros,
+    );
+
+    let acquire = astra_services::db_pool_acquire_telemetry_snapshot();
+    registry.set_counter_absolute(
+        "astra_db_pool_guarded_acquires_total",
+        &[("outcome", "success")],
+        acquire.attempts.saturating_sub(acquire.failures),
+    );
+    registry.set_counter_absolute(
+        "astra_db_pool_guarded_acquires_total",
+        &[("outcome", "failure")],
+        acquire.failures,
+    );
+    registry.set_counter_absolute(
+        "astra_db_pool_guarded_acquire_microseconds_total",
+        &[],
+        acquire.wait_micros,
+    );
+    registry.set_counter_absolute(
+        "astra_db_pool_guarded_slow_acquires_total",
+        &[],
+        acquire.slow,
+    );
+
+    if let Some(shared_pool) = state.shared_pool.as_ref() {
+        let stats = shared_pool.stats();
+        registry.set_gauge(
+            "astra_db_pool_connections",
+            &[("state", "open")],
+            f64::from(stats.size),
+        );
+        registry.set_gauge(
+            "astra_db_pool_connections",
+            &[("state", "idle")],
+            stats.num_idle as f64,
+        );
+        registry.set_gauge(
+            "astra_db_pool_connections",
+            &[("state", "max")],
+            f64::from(stats.max_connections),
+        );
+    }
+}
+
 fn register_event_ingestion_metrics(registry: &astra_turn_core::pipeline_metrics::MetricsRegistry) {
     registry.register_gauge(
         "astra_event_ingestion_config_batch_size",
@@ -564,6 +656,7 @@ pub(super) async fn metrics_handler(State(state): State<AppState>) -> impl IntoR
     crate::capacity_model::scrape_capacity_metrics_from_env(&state.metrics_registry());
     scrape_event_ingestion_metrics(&state);
     scrape_history_work_metrics(&state);
+    scrape_database_pool_metrics(&state);
     crate::turn::model_cooldown::rate_limit_cooldown().scrape_metrics(&state.metrics_registry());
     let body = state.metrics_registry().render_prometheus();
     (
@@ -761,6 +854,18 @@ mod tests {
         );
         assert!(
             text.contains("# TYPE astra_ws_run_stream_poll_attempts_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE astra_db_pool_health_checks_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE astra_db_pool_guarded_acquires_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE astra_db_pool_connections gauge"),
             "{text}"
         );
         assert!(

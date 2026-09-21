@@ -998,10 +998,8 @@ async fn process_ordered_live_fanout_event(
     }
 
     if !durable_event_committed && live_delta_event_for_persistence(&event) {
-        let flush_structural_explain_event =
-            event.get("type").and_then(Value::as_str) == Some("explain_analyze");
         pending.push(event);
-        if pending.should_flush() || flush_structural_explain_event {
+        if pending.should_flush() {
             flush_durable_live_events(
                 pending,
                 run_engine,
@@ -16472,8 +16470,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 let mut gap_watch_open = true;
                 let mut control_open = true;
                 let mut pending = PendingDurableLiveEvents::default();
-                let mut flush_interval = tokio::time::interval(DURABLE_LIVE_BATCH_FLUSH_INTERVAL);
-                flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let flush_deadline = tokio::time::sleep(DURABLE_LIVE_BATCH_FLUSH_INTERVAL);
+                tokio::pin!(flush_deadline);
                 loop {
                     tokio::select! {
                         event = fanout_rx.recv() => {
@@ -16512,6 +16510,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 }
                                 break;
                             };
+                            let starts_new_batch = pending.is_empty();
                             if let Err(error) = process_ordered_live_fanout_event(
                                 event,
                                 &mut pending,
@@ -16535,6 +16534,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                     &error.detail,
                                 ).await;
                                 break;
+                            }
+                            if starts_new_batch && !pending.is_empty() {
+                                flush_deadline.as_mut().reset(
+                                    tokio::time::Instant::now() + DURABLE_LIVE_BATCH_FLUSH_INTERVAL,
+                                );
                             }
                         }
                         control = fanout_control_rx.recv(), if control_open => {
@@ -16601,7 +16605,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 break;
                             }
                         }
-                        _ = flush_interval.tick(), if !pending.is_empty() => {
+                        _ = &mut flush_deadline, if !pending.is_empty() => {
                             if let Err(error) = flush_durable_live_events(
                                 &mut pending,
                                 &fanout_run_engine,

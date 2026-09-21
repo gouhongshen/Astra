@@ -9,13 +9,90 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{MySql, Pool, QueryBuilder, mysql::MySqlPoolOptions};
+use sqlx::{Connection, MySql, Pool, QueryBuilder, mysql::MySqlPoolOptions};
+
+/// A recently used MatrixOne connection has just completed a synchronized
+/// protocol exchange, so pinging it again before the next statement adds a
+/// full network round trip without improving correctness. A long-idle
+/// connection still carries a material stale-socket risk, so it is checked
+/// before reuse.
+const MATRIXONE_IDLE_HEALTH_CHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+/// Checkout latency above this boundary is operationally significant for an
+/// interactive turn and is reported separately from statement execution.
+pub const MATRIXONE_SLOW_POOL_ACQUIRE_AFTER: std::time::Duration =
+    std::time::Duration::from_millis(250);
+static MATRIXONE_POOL_HOT_CHECKOUTS: AtomicU64 = AtomicU64::new(0);
+static MATRIXONE_POOL_HEALTH_CHECKS: AtomicU64 = AtomicU64::new(0);
+static MATRIXONE_POOL_HEALTH_CHECK_FAILURES: AtomicU64 = AtomicU64::new(0);
+static MATRIXONE_POOL_HEALTH_CHECK_MICROS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MatrixOnePoolTelemetrySnapshot {
+    pub hot_checkouts: u64,
+    pub health_checks: u64,
+    pub health_check_failures: u64,
+    pub health_check_micros: u64,
+}
+
+pub fn matrixone_pool_telemetry_snapshot() -> MatrixOnePoolTelemetrySnapshot {
+    MatrixOnePoolTelemetrySnapshot {
+        hot_checkouts: MATRIXONE_POOL_HOT_CHECKOUTS.load(Ordering::Relaxed),
+        health_checks: MATRIXONE_POOL_HEALTH_CHECKS.load(Ordering::Relaxed),
+        health_check_failures: MATRIXONE_POOL_HEALTH_CHECK_FAILURES.load(Ordering::Relaxed),
+        health_check_micros: MATRIXONE_POOL_HEALTH_CHECK_MICROS.load(Ordering::Relaxed),
+    }
+}
 
 fn matrixone_pool_options(settings: &MatrixOneSettings) -> MySqlPoolOptions {
     MySqlPoolOptions::new()
         .max_connections(settings.db_pool_max_connections)
         .min_connections(settings.db_pool_min_connections)
-        .test_before_acquire(true)
+        .test_before_acquire(false)
+        .before_acquire(|connection, metadata| {
+            Box::pin(async move {
+                if metadata.idle_for < MATRIXONE_IDLE_HEALTH_CHECK_AFTER {
+                    MATRIXONE_POOL_HOT_CHECKOUTS.fetch_add(1, Ordering::Relaxed);
+                    return Ok(true);
+                }
+
+                MATRIXONE_POOL_HEALTH_CHECKS.fetch_add(1, Ordering::Relaxed);
+                let started = std::time::Instant::now();
+                let result = connection.ping().await;
+                let elapsed = started.elapsed();
+                MATRIXONE_POOL_HEALTH_CHECK_MICROS.fetch_add(
+                    elapsed.as_micros().try_into().unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                if result.is_err() {
+                    MATRIXONE_POOL_HEALTH_CHECK_FAILURES.fetch_add(1, Ordering::Relaxed);
+                }
+                if elapsed >= MATRIXONE_SLOW_POOL_ACQUIRE_AFTER {
+                    tracing::warn!(
+                        target: "astra_core::matrixone_pool",
+                        idle_ms = metadata.idle_for.as_millis(),
+                        elapsed_ms = elapsed.as_millis(),
+                        success = result.is_ok(),
+                        "MatrixOne idle-connection health check was slow"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "astra_core::matrixone_pool",
+                        idle_ms = metadata.idle_for.as_millis(),
+                        elapsed_ms = elapsed.as_millis(),
+                        success = result.is_ok(),
+                        "MatrixOne idle-connection health check completed"
+                    );
+                }
+                result?;
+                Ok(true)
+            })
+        })
+        // SQLx measures the complete checkout path, including semaphore wait,
+        // connection establishment, and the conditional health check above.
+        // Keep that latency independently visible from query execution logs;
+        // SQLx's MySQL QueryLogger already starts before statement-cache lookup
+        // and PREPARE, so those remain part of the statement duration.
+        .acquire_slow_threshold(MATRIXONE_SLOW_POOL_ACQUIRE_AFTER)
         .acquire_timeout(std::time::Duration::from_secs(
             settings.db_pool_acquire_timeout_secs,
         ))
@@ -124,6 +201,25 @@ mod matrixone_statement_tests {
         assert_eq!(
             query.sql(),
             "SELECT requested.value FROM (SELECT CAST(? AS CHAR) AS value UNION ALL SELECT CAST(? AS CHAR) AS value) AS requested"
+        );
+    }
+}
+
+#[cfg(test)]
+mod matrixone_pool_option_tests {
+    use super::*;
+
+    #[test]
+    fn checkout_health_checks_are_idle_aware_and_slow_acquires_are_visible() {
+        let options = matrixone_pool_options(&MatrixOneSettings::default());
+
+        assert!(
+            !options.get_test_before_acquire(),
+            "a hot connection must not incur an unconditional PING"
+        );
+        assert_eq!(
+            options.get_acquire_slow_threshold(),
+            MATRIXONE_SLOW_POOL_ACQUIRE_AFTER
         );
     }
 }

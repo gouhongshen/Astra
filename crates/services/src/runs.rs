@@ -12483,12 +12483,107 @@ impl DatabaseRunStateStore {
         projection_event_idx: i64,
         latest_event_type: &str,
     ) {
+        match Self::patch_run_projection_event_metadata(
+            self.pool.get(),
+            user_id,
+            expected_session_id,
+            run_id,
+            projection_event_idx,
+            latest_event_type,
+        )
+        .await
+        {
+            Ok(rows_affected) if rows_affected > 0 => {}
+            Ok(_) => {
+                self.inspect_or_repair_run_projection_event_metadata_miss(
+                    user_id,
+                    expected_session_id,
+                    run_id,
+                    projection_event_idx,
+                    latest_event_type,
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    projection_event_idx,
+                    latest_event_type,
+                    error = %error,
+                    "action admission committed but display projection event metadata patch failed"
+                );
+            }
+        }
+    }
+
+    async fn inspect_or_repair_run_projection_event_metadata_miss(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        projection_event_idx: i64,
+        latest_event_type: &str,
+    ) {
+        match self
+            .load_run_projection_metadata_for_user(user_id, run_id)
+            .await
+        {
+            Ok(None) => {
+                if let Err(error) = self
+                    .sync_projection_for_user(user_id, expected_session_id, run_id)
+                    .await
+                {
+                    tracing::warn!(
+                        user_id,
+                        run_id,
+                        projection_event_idx,
+                        latest_event_type,
+                        error = %error,
+                        "event commit succeeded but missing display projection repair failed"
+                    );
+                }
+            }
+            Ok(Some(existing)) => {
+                tracing::debug!(
+                    user_id,
+                    run_id,
+                    projection_event_idx,
+                    current_projection_event_idx = existing.projection_event_idx,
+                    latest_event_type,
+                    "ignored stale run display projection event metadata patch"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    user_id,
+                    run_id,
+                    projection_event_idx,
+                    latest_event_type,
+                    error = %error,
+                    "event commit succeeded but display projection state check failed"
+                );
+            }
+        }
+    }
+
+    async fn patch_run_projection_event_metadata<'e, E>(
+        executor: E,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        projection_event_idx: i64,
+        latest_event_type: &str,
+    ) -> Result<u64, sqlx::Error>
+    where
+        E: Executor<'e, Database = MySql>,
+    {
         let projection_hash = event_metadata_projection_patch_hash(
             run_id,
             projection_event_idx,
             Some(latest_event_type),
         );
-        match sqlx::query(
+        sqlx::query(
             "UPDATE run_display_projections
              SET projection_event_idx = ?,
                  latest_event_type = ?,
@@ -12503,63 +12598,9 @@ impl DatabaseRunStateStore {
         .bind(expected_session_id)
         .bind(run_id)
         .bind(projection_event_idx)
-        .execute(self.pool.get())
+        .execute(executor)
         .await
-        {
-            Ok(result) if result.rows_affected() > 0 => {}
-            Ok(_) => {
-                match self
-                    .load_run_projection_metadata_for_user(user_id, run_id)
-                    .await
-                {
-                    Ok(None) => {
-                        if let Err(error) = self
-                            .sync_projection_for_user(user_id, expected_session_id, run_id)
-                            .await
-                        {
-                            tracing::warn!(
-                                user_id,
-                                run_id,
-                                projection_event_idx,
-                                latest_event_type,
-                                error = %error,
-                                "event commit succeeded but missing display projection repair failed"
-                            );
-                        }
-                    }
-                    Ok(Some(existing)) => {
-                        tracing::debug!(
-                            user_id,
-                            run_id,
-                            projection_event_idx,
-                            current_projection_event_idx = existing.projection_event_idx,
-                            latest_event_type,
-                            "ignored stale run display projection event metadata patch"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            user_id,
-                            run_id,
-                            projection_event_idx,
-                            latest_event_type,
-                            error = %error,
-                            "event commit succeeded but display projection state check failed"
-                        );
-                    }
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    user_id,
-                    run_id,
-                    projection_event_idx,
-                    latest_event_type,
-                    error = %error,
-                    "action admission committed but display projection event metadata patch failed"
-                );
-            }
-        }
+        .map(|result| result.rows_affected())
     }
 
     async fn upsert_event_metadata_projection_tx(
@@ -13064,6 +13105,11 @@ impl DatabaseRunStateStore {
                 entity: run_id.to_string(),
                 source: sqlx::Error::Protocol(error),
             })?;
+        let latest_event_type = rows
+            .last()
+            .expect("committed event batch")
+            .event_type
+            .clone();
         #[cfg(test)]
         let inject_missing_commit = self
             .generic_append_commit_ack_loss_missing_once
@@ -13106,6 +13152,51 @@ impl DatabaseRunStateStore {
                 ),
             }
         };
+        if commit_error.is_none() {
+            // The projection is a recoverable read model, so it must not
+            // participate in the authoritative event transaction. Reuse the
+            // now-synchronized physical connection after COMMIT instead: this
+            // removes the second checkout without extending the run-row lock
+            // or making projection availability gate event durability.
+            match Self::patch_run_projection_event_metadata(
+                connection.connection_mut(),
+                user_id,
+                expected_session_id,
+                run_id,
+                last_event_idx,
+                &latest_event_type,
+            )
+            .await
+            {
+                Ok(rows_affected) if rows_affected > 0 => connection.release(),
+                Ok(_) => {
+                    connection.release();
+                    self.inspect_or_repair_run_projection_event_metadata_miss(
+                        user_id,
+                        expected_session_id,
+                        run_id,
+                        last_event_idx,
+                        &latest_event_type,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        user_id,
+                        run_id,
+                        projection_event_idx = last_event_idx,
+                        latest_event_type,
+                        error = %error,
+                        "event commit succeeded but display projection event metadata patch failed"
+                    );
+                    // The failed exchange may have left unread protocol data.
+                    // Drop closes this connection instead of returning it to
+                    // the shared pool; the authoritative commit already won.
+                    drop(connection);
+                }
+            }
+            return Ok(());
+        }
         if connection_reusable {
             connection.release();
         } else {
@@ -13119,15 +13210,15 @@ impl DatabaseRunStateStore {
         {
             rows[0].event_hash.push_str("-conflicting-proof");
         }
-        if let Some(commit_error) = commit_error
-            && !self
-                .exact_run_event_rows_are_durable(&rows, "reconcile_run_events_batch_commit")
-                .await
-                .map_err(|error| DatabaseRunStateStoreError::Database {
-                    operation: "reconcile_run_events_batch_commit",
-                    entity: run_id.to_string(),
-                    source: sqlx::Error::Protocol(format!("{commit_error}; {error}")),
-                })?
+        let commit_error = commit_error.expect("checked non-empty commit error");
+        if !self
+            .exact_run_event_rows_are_durable(&rows, "reconcile_run_events_batch_commit")
+            .await
+            .map_err(|error| DatabaseRunStateStoreError::Database {
+                operation: "reconcile_run_events_batch_commit",
+                entity: run_id.to_string(),
+                source: sqlx::Error::Protocol(format!("{commit_error}; {error}")),
+            })?
         {
             return Err(db_error(
                 "commit_run_events_batch_ambiguous",
@@ -13140,10 +13231,9 @@ impl DatabaseRunStateStore {
             expected_session_id,
             run_id,
             last_event_idx,
-            &rows.last().expect("committed event batch").event_type,
+            &latest_event_type,
         )
         .await;
-
         Ok(())
     }
 }
