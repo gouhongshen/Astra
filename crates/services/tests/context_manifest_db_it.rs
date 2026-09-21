@@ -123,6 +123,56 @@ async fn manifest_replay_and_collision_preserve_original_and_tenant_identity() {
     assert_eq!(deleted, 0);
 }
 
+#[tokio::test]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn manifest_replays_reuse_their_physical_connection() {
+    use astra_services::observation_capture::DurableCaptureOutcome;
+
+    let (_, mut settings) = common::setup_pool_and_settings().await;
+    settings.db_pool_min_connections = 1;
+    settings.db_pool_max_connections = 1;
+    let pool = SharedPool::new(&settings)
+        .await
+        .expect("create one-connection MatrixOne pool");
+    let user_id = id("replay-connection-user");
+    let session_id = id("replay-connection-session");
+    let manifest_id = id("replay-connection-manifest");
+    insert_session(&pool, &user_id, &session_id).await;
+    let store = DatabaseContextManifestStore::new(pool.clone());
+    let header = manifest(&manifest_id, &user_id, &session_id, None);
+    let items = vec![item(&session_id, 0)];
+
+    assert_eq!(
+        store
+            .save_manifest(header.clone(), items.clone())
+            .await
+            .expect("insert manifest"),
+        DurableCaptureOutcome::Inserted
+    );
+    let connection_id_before: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool.get())
+        .await
+        .expect("read connection ID before replay");
+
+    for replay in 1..=2 {
+        assert_eq!(
+            store
+                .save_manifest(header.clone(), items.clone())
+                .await
+                .expect("replay manifest"),
+            DurableCaptureOutcome::Replayed
+        );
+        let connection_id_after: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(pool.get())
+            .await
+            .expect("read connection ID after replay");
+        assert_eq!(
+            connection_id_after, connection_id_before,
+            "successful replay {replay} must return the physical connection to the pool"
+        );
+    }
+}
+
 fn id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
 }

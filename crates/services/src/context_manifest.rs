@@ -930,6 +930,7 @@ impl DatabaseContextManifestStore {
                     entity: manifest.manifest_id.clone(),
                     source,
                 })?;
+            connection.release();
             return Ok(outcome);
         }
         if !known_reason {
