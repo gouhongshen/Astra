@@ -41,15 +41,19 @@ fn scrape_database_pool_metrics(state: &AppState) {
     );
     registry.register_counter(
         "astra_db_pool_health_checks_total",
-        "MatrixOne idle-connection PING health checks by outcome.",
+        "Completed or cancelled MatrixOne idle-connection PING health checks by outcome.",
     );
     registry.register_counter(
         "astra_db_pool_health_check_microseconds_total",
         "Cumulative time spent in MatrixOne idle-connection PING health checks.",
     );
     registry.register_counter(
+        "astra_db_pool_health_check_slow_total",
+        "MatrixOne idle-connection PING health checks exceeding the configured slow threshold.",
+    );
+    registry.register_counter(
         "astra_db_pool_guarded_acquires_total",
-        "Cancellation-safe MatrixOne pool acquisition attempts by outcome.",
+        "Completed or cancelled MatrixOne pool acquisitions by outcome.",
     );
     registry.register_counter(
         "astra_db_pool_guarded_acquire_microseconds_total",
@@ -69,8 +73,7 @@ fn scrape_database_pool_metrics(state: &AppState) {
     registry.set_counter_absolute(
         "astra_db_pool_health_checks_total",
         &[("outcome", "success")],
-        pool.health_checks
-            .saturating_sub(pool.health_check_failures),
+        pool.health_check_successes,
     );
     registry.set_counter_absolute(
         "astra_db_pool_health_checks_total",
@@ -78,16 +81,26 @@ fn scrape_database_pool_metrics(state: &AppState) {
         pool.health_check_failures,
     );
     registry.set_counter_absolute(
+        "astra_db_pool_health_checks_total",
+        &[("outcome", "cancelled")],
+        pool.health_check_cancelled,
+    );
+    registry.set_counter_absolute(
         "astra_db_pool_health_check_microseconds_total",
         &[],
         pool.health_check_micros,
+    );
+    registry.set_counter_absolute(
+        "astra_db_pool_health_check_slow_total",
+        &[],
+        pool.health_check_slow,
     );
 
     let acquire = astra_services::db_pool_acquire_telemetry_snapshot();
     registry.set_counter_absolute(
         "astra_db_pool_guarded_acquires_total",
         &[("outcome", "success")],
-        acquire.attempts.saturating_sub(acquire.failures),
+        acquire.successes,
     );
     registry.set_counter_absolute(
         "astra_db_pool_guarded_acquires_total",
@@ -95,9 +108,14 @@ fn scrape_database_pool_metrics(state: &AppState) {
         acquire.failures,
     );
     registry.set_counter_absolute(
+        "astra_db_pool_guarded_acquires_total",
+        &[("outcome", "cancelled")],
+        acquire.cancelled,
+    );
+    registry.set_counter_absolute(
         "astra_db_pool_guarded_acquire_microseconds_total",
         &[],
-        acquire.wait_micros,
+        acquire.elapsed_micros,
     );
     registry.set_counter_absolute(
         "astra_db_pool_guarded_slow_acquires_total",
@@ -861,7 +879,15 @@ mod tests {
             "{text}"
         );
         assert!(
+            text.contains("astra_db_pool_health_checks_total{outcome=\"cancelled\"}"),
+            "{text}"
+        );
+        assert!(
             text.contains("# TYPE astra_db_pool_guarded_acquires_total counter"),
+            "{text}"
+        );
+        assert!(
+            text.contains("astra_db_pool_guarded_acquires_total{outcome=\"cancelled\"}"),
             "{text}"
         );
         assert!(

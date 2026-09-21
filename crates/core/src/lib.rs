@@ -3,6 +3,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use axum::{
     Json,
@@ -16,31 +17,196 @@ use sqlx::{Connection, MySql, Pool, QueryBuilder, mysql::MySqlPoolOptions};
 /// full network round trip without improving correctness. A long-idle
 /// connection still carries a material stale-socket risk, so it is checked
 /// before reuse.
-const MATRIXONE_IDLE_HEALTH_CHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+const MATRIXONE_IDLE_HEALTH_CHECK_AFTER: Duration = Duration::from_secs(30);
 /// Checkout latency above this boundary is operationally significant for an
 /// interactive turn and is reported separately from statement execution.
-pub const MATRIXONE_SLOW_POOL_ACQUIRE_AFTER: std::time::Duration =
-    std::time::Duration::from_millis(250);
+pub const MATRIXONE_SLOW_POOL_ACQUIRE_AFTER: Duration = Duration::from_millis(250);
 static MATRIXONE_POOL_HOT_CHECKOUTS: AtomicU64 = AtomicU64::new(0);
-static MATRIXONE_POOL_HEALTH_CHECKS: AtomicU64 = AtomicU64::new(0);
-static MATRIXONE_POOL_HEALTH_CHECK_FAILURES: AtomicU64 = AtomicU64::new(0);
-static MATRIXONE_POOL_HEALTH_CHECK_MICROS: AtomicU64 = AtomicU64::new(0);
+static MATRIXONE_POOL_HEALTH_CHECKS: DropSafeOperationTelemetry = DropSafeOperationTelemetry::new();
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DropSafeOperationTelemetrySnapshot {
+    pub attempts: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub cancelled: u64,
+    pub slow: u64,
+    pub elapsed_micros: u64,
+}
+
+/// Monotonic async-operation telemetry that records cancellation when its
+/// observation future is dropped before the wrapped operation completes.
+///
+/// This keeps timeout and task-abort paths from being inferred as successes.
+#[derive(Debug)]
+pub struct DropSafeOperationTelemetry {
+    attempts: AtomicU64,
+    successes: AtomicU64,
+    failures: AtomicU64,
+    cancelled: AtomicU64,
+    slow: AtomicU64,
+    elapsed_micros: AtomicU64,
+}
+
+impl DropSafeOperationTelemetry {
+    pub const fn new() -> Self {
+        Self {
+            attempts: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
+            cancelled: AtomicU64::new(0),
+            slow: AtomicU64::new(0),
+            elapsed_micros: AtomicU64::new(0),
+        }
+    }
+
+    pub fn snapshot(&self) -> DropSafeOperationTelemetrySnapshot {
+        DropSafeOperationTelemetrySnapshot {
+            attempts: self.attempts.load(Ordering::Relaxed),
+            successes: self.successes.load(Ordering::Relaxed),
+            failures: self.failures.load(Ordering::Relaxed),
+            cancelled: self.cancelled.load(Ordering::Relaxed),
+            slow: self.slow.load(Ordering::Relaxed),
+            elapsed_micros: self.elapsed_micros.load(Ordering::Relaxed),
+        }
+    }
+
+    pub async fn observe<F, T, E>(&self, slow_after: Duration, operation: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        let mut observation = DropSafeOperationObservation::new(self, slow_after);
+        let result = operation.await;
+        observation.finish(if result.is_ok() {
+            DropSafeOperationOutcome::Success
+        } else {
+            DropSafeOperationOutcome::Failure
+        });
+        result
+    }
+}
+
+impl Default for DropSafeOperationTelemetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+enum DropSafeOperationOutcome {
+    Success,
+    Failure,
+    Cancelled,
+}
+
+struct DropSafeOperationObservation<'a> {
+    telemetry: &'a DropSafeOperationTelemetry,
+    started: Instant,
+    slow_after: Duration,
+    finished: bool,
+}
+
+impl<'a> DropSafeOperationObservation<'a> {
+    fn new(telemetry: &'a DropSafeOperationTelemetry, slow_after: Duration) -> Self {
+        telemetry.attempts.fetch_add(1, Ordering::Relaxed);
+        Self {
+            telemetry,
+            started: Instant::now(),
+            slow_after,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, outcome: DropSafeOperationOutcome) {
+        self.record(outcome);
+        self.finished = true;
+    }
+
+    fn record(&self, outcome: DropSafeOperationOutcome) {
+        let elapsed = self.started.elapsed();
+        self.telemetry.elapsed_micros.fetch_add(
+            elapsed.as_micros().try_into().unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if elapsed >= self.slow_after {
+            self.telemetry.slow.fetch_add(1, Ordering::Relaxed);
+        }
+        match outcome {
+            DropSafeOperationOutcome::Success => &self.telemetry.successes,
+            DropSafeOperationOutcome::Failure => &self.telemetry.failures,
+            DropSafeOperationOutcome::Cancelled => &self.telemetry.cancelled,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for DropSafeOperationObservation<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.record(DropSafeOperationOutcome::Cancelled);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MatrixOnePoolTelemetrySnapshot {
     pub hot_checkouts: u64,
-    pub health_checks: u64,
+    pub health_check_attempts: u64,
+    pub health_check_successes: u64,
     pub health_check_failures: u64,
+    pub health_check_cancelled: u64,
+    pub health_check_slow: u64,
     pub health_check_micros: u64,
 }
 
 pub fn matrixone_pool_telemetry_snapshot() -> MatrixOnePoolTelemetrySnapshot {
+    let health_checks = MATRIXONE_POOL_HEALTH_CHECKS.snapshot();
     MatrixOnePoolTelemetrySnapshot {
         hot_checkouts: MATRIXONE_POOL_HOT_CHECKOUTS.load(Ordering::Relaxed),
-        health_checks: MATRIXONE_POOL_HEALTH_CHECKS.load(Ordering::Relaxed),
-        health_check_failures: MATRIXONE_POOL_HEALTH_CHECK_FAILURES.load(Ordering::Relaxed),
-        health_check_micros: MATRIXONE_POOL_HEALTH_CHECK_MICROS.load(Ordering::Relaxed),
+        health_check_attempts: health_checks.attempts,
+        health_check_successes: health_checks.successes,
+        health_check_failures: health_checks.failures,
+        health_check_cancelled: health_checks.cancelled,
+        health_check_slow: health_checks.slow,
+        health_check_micros: health_checks.elapsed_micros,
     }
+}
+
+async fn matrixone_connection_is_reusable<F>(
+    idle_for: Duration,
+    ping: F,
+) -> Result<bool, sqlx::Error>
+where
+    F: std::future::Future<Output = Result<(), sqlx::Error>>,
+{
+    if idle_for < MATRIXONE_IDLE_HEALTH_CHECK_AFTER {
+        MATRIXONE_POOL_HOT_CHECKOUTS.fetch_add(1, Ordering::Relaxed);
+        return Ok(true);
+    }
+
+    let started = Instant::now();
+    let result = MATRIXONE_POOL_HEALTH_CHECKS
+        .observe(MATRIXONE_SLOW_POOL_ACQUIRE_AFTER, ping)
+        .await;
+    let elapsed = started.elapsed();
+    if elapsed >= MATRIXONE_SLOW_POOL_ACQUIRE_AFTER {
+        tracing::warn!(
+            target: "astra_core::matrixone_pool",
+            idle_ms = idle_for.as_millis(),
+            elapsed_ms = elapsed.as_millis(),
+            success = result.is_ok(),
+            "MatrixOne idle-connection health check was slow"
+        );
+    } else {
+        tracing::debug!(
+            target: "astra_core::matrixone_pool",
+            idle_ms = idle_for.as_millis(),
+            elapsed_ms = elapsed.as_millis(),
+            success = result.is_ok(),
+            "MatrixOne idle-connection health check completed"
+        );
+    }
+    result?;
+    Ok(true)
 }
 
 fn matrixone_pool_options(settings: &MatrixOneSettings) -> MySqlPoolOptions {
@@ -49,43 +215,10 @@ fn matrixone_pool_options(settings: &MatrixOneSettings) -> MySqlPoolOptions {
         .min_connections(settings.db_pool_min_connections)
         .test_before_acquire(false)
         .before_acquire(|connection, metadata| {
-            Box::pin(async move {
-                if metadata.idle_for < MATRIXONE_IDLE_HEALTH_CHECK_AFTER {
-                    MATRIXONE_POOL_HOT_CHECKOUTS.fetch_add(1, Ordering::Relaxed);
-                    return Ok(true);
-                }
-
-                MATRIXONE_POOL_HEALTH_CHECKS.fetch_add(1, Ordering::Relaxed);
-                let started = std::time::Instant::now();
-                let result = connection.ping().await;
-                let elapsed = started.elapsed();
-                MATRIXONE_POOL_HEALTH_CHECK_MICROS.fetch_add(
-                    elapsed.as_micros().try_into().unwrap_or(u64::MAX),
-                    Ordering::Relaxed,
-                );
-                if result.is_err() {
-                    MATRIXONE_POOL_HEALTH_CHECK_FAILURES.fetch_add(1, Ordering::Relaxed);
-                }
-                if elapsed >= MATRIXONE_SLOW_POOL_ACQUIRE_AFTER {
-                    tracing::warn!(
-                        target: "astra_core::matrixone_pool",
-                        idle_ms = metadata.idle_for.as_millis(),
-                        elapsed_ms = elapsed.as_millis(),
-                        success = result.is_ok(),
-                        "MatrixOne idle-connection health check was slow"
-                    );
-                } else {
-                    tracing::debug!(
-                        target: "astra_core::matrixone_pool",
-                        idle_ms = metadata.idle_for.as_millis(),
-                        elapsed_ms = elapsed.as_millis(),
-                        success = result.is_ok(),
-                        "MatrixOne idle-connection health check completed"
-                    );
-                }
-                result?;
-                Ok(true)
-            })
+            Box::pin(matrixone_connection_is_reusable(
+                metadata.idle_for,
+                connection.ping(),
+            ))
         })
         // SQLx measures the complete checkout path, including semaphore wait,
         // connection establishment, and the conditional health check above.
@@ -208,6 +341,60 @@ mod matrixone_statement_tests {
 #[cfg(test)]
 mod matrixone_pool_option_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn drop_safe_operation_telemetry_records_completed_and_cancelled_outcomes() {
+        let telemetry = DropSafeOperationTelemetry::new();
+
+        telemetry
+            .observe(Duration::MAX, async { Ok::<_, ()>(()) })
+            .await
+            .expect("successful operation");
+        assert!(
+            telemetry
+                .observe(Duration::MAX, async { Err::<(), _>(()) })
+                .await
+                .is_err(),
+            "failed operation"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                telemetry.observe(Duration::ZERO, std::future::pending::<Result<(), ()>>(),),
+            )
+            .await
+            .is_err(),
+            "outer deadline must cancel the observed operation"
+        );
+
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.attempts, 3);
+        assert_eq!(snapshot.successes, 1);
+        assert_eq!(snapshot.failures, 1);
+        assert_eq!(snapshot.cancelled, 1);
+        assert_eq!(snapshot.slow, 1);
+        assert!(snapshot.elapsed_micros > 0);
+    }
+
+    #[tokio::test]
+    async fn hot_connection_skips_ping_but_idle_connection_rejects_ping_failure() {
+        assert!(
+            matrixone_connection_is_reusable(Duration::ZERO, async {
+                panic!("hot connection must not poll PING")
+            })
+            .await
+            .expect("hot connection is accepted")
+        );
+
+        let failure = matrixone_connection_is_reusable(MATRIXONE_IDLE_HEALTH_CHECK_AFTER, async {
+            Err(sqlx::Error::Protocol("stale connection".to_string()))
+        })
+        .await;
+        assert!(
+            failure.is_err(),
+            "failed idle PING must reject the checkout"
+        );
+    }
 
     #[test]
     fn checkout_health_checks_are_idle_aware_and_slow_acquires_are_visible() {
