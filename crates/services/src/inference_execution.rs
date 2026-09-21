@@ -4013,6 +4013,7 @@ pub async fn load_inference_canonical_transitions_for_session(
                 error,
             )
         })?;
+        recovery_connection.release();
         return Ok(Vec::new());
     };
     let head_transition_id: String = head.try_get("head_transition_id").map_err(|error| {

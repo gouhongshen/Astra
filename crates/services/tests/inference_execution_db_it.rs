@@ -249,6 +249,51 @@ async fn assert_independent_query_can_replace_cancelled_checkout(pool: &sqlx::Po
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
+async fn empty_canonical_wal_recovery_reuses_its_physical_connection() {
+    let (bootstrap_pool, mut settings) = common::setup_pool_and_settings().await;
+    drop(bootstrap_pool);
+    settings.db_pool_min_connections = 0;
+    settings.db_pool_max_connections = 1;
+    let shared_pool = astra_core::SharedPool::new(&settings)
+        .await
+        .expect("create one-slot canonical WAL recovery pool");
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("empty-wal-user-{suffix}");
+    let session_id = format!("empty-wal-session-{suffix}");
+    let run_id = format!("empty-wal-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let connection_id_before: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool)
+        .await
+        .expect("read canonical WAL recovery connection id");
+    for _ in 0..2 {
+        let recovered = load_inference_canonical_transitions_for_session(
+            &shared_pool,
+            &user_id,
+            &session_id,
+            0,
+        )
+        .await
+        .expect("load an empty canonical WAL");
+        assert!(recovered.is_empty());
+    }
+    let connection_id_after: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool)
+        .await
+        .expect("read connection id after repeated empty WAL recovery");
+
+    assert_eq!(
+        connection_id_before, connection_id_after,
+        "successful empty WAL recovery must return its healthy connection to the pool"
+    );
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
 async fn cancelled_inference_recovery_and_settlement_close_their_physical_checkouts() {
     let (shared_pool, _) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get();
