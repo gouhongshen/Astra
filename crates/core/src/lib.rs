@@ -71,18 +71,8 @@ impl DropSafeOperationTelemetry {
         }
     }
 
-    pub async fn observe<F, T, E>(&self, slow_after: Duration, operation: F) -> Result<T, E>
-    where
-        F: std::future::Future<Output = Result<T, E>>,
-    {
-        let mut observation = DropSafeOperationObservation::new(self, slow_after);
-        let result = operation.await;
-        observation.finish(if result.is_ok() {
-            DropSafeOperationOutcome::Success
-        } else {
-            DropSafeOperationOutcome::Failure
-        });
-        result
+    pub fn start(&self, slow_after: Duration) -> DropSafeOperationObservation<'_> {
+        DropSafeOperationObservation::new(self, slow_after)
     }
 }
 
@@ -98,7 +88,8 @@ enum DropSafeOperationOutcome {
     Cancelled,
 }
 
-struct DropSafeOperationObservation<'a> {
+#[must_use = "dropping the observation records cancellation"]
+pub struct DropSafeOperationObservation<'a> {
     telemetry: &'a DropSafeOperationTelemetry,
     started: Instant,
     slow_after: Duration,
@@ -116,7 +107,12 @@ impl<'a> DropSafeOperationObservation<'a> {
         }
     }
 
-    fn finish(&mut self, outcome: DropSafeOperationOutcome) {
+    pub fn finish_result<T, E>(&mut self, result: &Result<T, E>) {
+        let outcome = if result.is_ok() {
+            DropSafeOperationOutcome::Success
+        } else {
+            DropSafeOperationOutcome::Failure
+        };
         self.record(outcome);
         self.finished = true;
     }
@@ -184,9 +180,9 @@ where
     }
 
     let started = Instant::now();
-    let result = MATRIXONE_POOL_HEALTH_CHECKS
-        .observe(MATRIXONE_SLOW_POOL_ACQUIRE_AFTER, ping)
-        .await;
+    let mut observation = MATRIXONE_POOL_HEALTH_CHECKS.start(MATRIXONE_SLOW_POOL_ACQUIRE_AFTER);
+    let result = ping.await;
+    observation.finish_result(&result);
     let elapsed = started.elapsed();
     if elapsed >= MATRIXONE_SLOW_POOL_ACQUIRE_AFTER {
         tracing::warn!(
@@ -346,22 +342,16 @@ mod matrixone_pool_option_tests {
     async fn drop_safe_operation_telemetry_records_completed_and_cancelled_outcomes() {
         let telemetry = DropSafeOperationTelemetry::new();
 
-        telemetry
-            .observe(Duration::MAX, async { Ok::<_, ()>(()) })
-            .await
-            .expect("successful operation");
+        let mut success = telemetry.start(Duration::MAX);
+        success.finish_result(&Ok::<_, ()>(()));
+        let mut failure = telemetry.start(Duration::MAX);
+        failure.finish_result(&Err::<(), _>(()));
         assert!(
-            telemetry
-                .observe(Duration::MAX, async { Err::<(), _>(()) })
-                .await
-                .is_err(),
-            "failed operation"
-        );
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(1),
-                telemetry.observe(Duration::ZERO, std::future::pending::<Result<(), ()>>(),),
-            )
+            tokio::time::timeout(Duration::from_millis(1), async {
+                let mut cancelled = telemetry.start(Duration::ZERO);
+                let result = std::future::pending::<Result<(), ()>>().await;
+                cancelled.finish_result(&result);
+            },)
             .await
             .is_err(),
             "outer deadline must cancel the observed operation"

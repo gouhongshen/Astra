@@ -36,12 +36,14 @@ pub fn db_pool_acquire_telemetry_snapshot() -> DbPoolAcquireTelemetrySnapshot {
 async fn acquire_pool_connection(
     pool: &sqlx::Pool<MySql>,
 ) -> Result<PoolConnection<MySql>, sqlx::Error> {
-    POOL_ACQUIRE_TELEMETRY
-        .observe(
-            astra_core::MATRIXONE_SLOW_POOL_ACQUIRE_AFTER,
-            pool.acquire(),
-        )
-        .await
+    // Keep observation synchronous around the original acquire future. An
+    // additional generic async wrapper materially deepens the already-large
+    // runtime continuation future and can exhaust Tokio's worker stack.
+    let mut observation =
+        POOL_ACQUIRE_TELEMETRY.start(astra_core::MATRIXONE_SLOW_POOL_ACQUIRE_AFTER);
+    let result = pool.acquire().await;
+    observation.finish_result(&result);
+    result
 }
 
 /// A checked-out shared-pool connection that is reusable only after its
