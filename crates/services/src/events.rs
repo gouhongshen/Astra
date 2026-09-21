@@ -711,6 +711,7 @@ impl EventService for DatabaseEventService {
                 .await
                 .map_err(internal_error)?;
                 tx.commit().await.map_err(internal_error)?;
+                connection.release();
                 return Err(error_response(
                     StatusCode::CONFLICT,
                     format!("event_id {existing_id} already exists with a different payload hash"),
@@ -824,6 +825,7 @@ impl EventService for DatabaseEventService {
                     .await
                     .map_err(internal_error)?;
                     tx.commit().await.map_err(internal_error)?;
+                    connection.release();
                 }
                 return Err(error_response(
                     StatusCode::CONFLICT,

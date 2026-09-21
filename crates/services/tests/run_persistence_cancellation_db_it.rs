@@ -6,6 +6,7 @@
 
 mod common;
 
+use astra_core::SharedPool;
 use astra_services::runs::{
     AtomicRunInteractionBatchRegistration, AtomicRunInteractionBatchRegistrationRequest,
     AtomicRunInteractionWaitRequest, DatabaseRunStateStore, DurableRunInteractionKind,
@@ -224,6 +225,77 @@ async fn existing_run_start_claim_releases_rollback_checkout_before_reread() {
     );
 
     drop(held);
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn repeated_interaction_registration_reuses_its_physical_connection() {
+    let (_, mut settings) = common::setup_pool_and_settings().await;
+    settings.db_pool_min_connections = 1;
+    settings.db_pool_max_connections = 1;
+    let shared_pool = SharedPool::new(&settings)
+        .await
+        .expect("create one-connection MatrixOne pool");
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("interaction-replay-user-{suffix}");
+    let session_id = format!("interaction-replay-session-{suffix}");
+    let run_id = format!("interaction-replay-run-{suffix}");
+    let request_id = format!("interaction-replay-request-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let store =
+        DatabaseRunStateStore::new(shared_pool.clone()).with_owner_pod_id(TEST_OWNER_POD_ID);
+    let required = serde_json::json!({
+        "event_type": "approval_required",
+        "idempotency_key": format!("approval:{request_id}:required"),
+        "data": {
+            "request_id": request_id,
+            "session_id": session_id,
+            "tool": "bash",
+            "approval_kind": "standard",
+        }
+    });
+    let registration = || AtomicRunInteractionBatchRegistrationRequest {
+        user_id: &user_id,
+        run_id: &run_id,
+        expected_session_id: &session_id,
+        expected_control_epoch: -1,
+        expected_owner_generation: 0,
+        events: std::slice::from_ref(&required),
+    };
+
+    assert_eq!(
+        store
+            .register_guarded_interaction_batch(registration())
+            .await
+            .expect("register interaction batch"),
+        AtomicRunInteractionBatchRegistration::Registered
+    );
+    let connection_id_before: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool)
+        .await
+        .expect("read connection ID before registration replay");
+
+    for replay in 1..=2 {
+        assert_eq!(
+            store
+                .register_guarded_interaction_batch(registration())
+                .await
+                .expect("replay interaction batch"),
+            AtomicRunInteractionBatchRegistration::Registered
+        );
+        let connection_id_after: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(pool)
+            .await
+            .expect("read connection ID after registration replay");
+        assert_eq!(
+            connection_id_after, connection_id_before,
+            "successful registration replay {replay} must reuse the physical connection"
+        );
+    }
+
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 

@@ -16105,6 +16105,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(if run_guidance_event_matches(&existing, request.event) {
                 AtomicRunGuidanceAdmission::Duplicate { event_index }
             } else {
@@ -17253,6 +17254,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentApply::AlreadyApplied {
                 event_indices: existing_applied_indices,
             });
@@ -19985,6 +19987,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunInteractionBatchRegistration::Registered);
         }
         let event_rows = registration_events
@@ -22724,6 +22727,7 @@ impl DatabaseRunStateStore {
             )
             .to_string()
         })?;
+        connection.release();
         Ok(recovery)
     }
 
