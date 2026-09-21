@@ -307,7 +307,10 @@ impl DatabaseRunStateStore {
             if !run_events_have_same_immutable_payload(&existing, &event) {
                 return Err("permission request identity conflict".into());
             }
-            return selection(&existing, idx);
+            let selected = selection(&existing, idx)?;
+            tx.rollback().await.map_err(|e| e.to_string())?;
+            connection.release();
+            return Ok(selected);
         }
         if !matches!(run.status.as_str(), STATUS_RUNNING | STATUS_WAITING) {
             return Err("permission run is inactive".into());
@@ -351,13 +354,19 @@ impl DatabaseRunStateStore {
         .await
         {
             Ok(true) => {}
-            Ok(false) | Err(sqlx::Error::RowNotFound) => return Ok(None),
+            Ok(false) | Err(sqlx::Error::RowNotFound) => {
+                tx.rollback().await.map_err(|e| e.to_string())?;
+                connection.release();
+                return Ok(None);
+            }
             Err(error) => return Err(error.to_string()),
         }
         let root: Option<i32> = sqlx::query_scalar(
             "SELECT 1 FROM agent_runs WHERE user_id=? AND session_id=? AND run_id=? AND depth=0 LIMIT 1",
         ).bind(user_id).bind(session_id).bind(run_id).fetch_optional(&mut *tx).await.map_err(|e|e.to_string())?;
         if root.is_none() {
+            tx.rollback().await.map_err(|e| e.to_string())?;
+            connection.release();
             return Ok(None);
         }
         let snapshot = Self::permission_snapshot_tx(&mut tx, user_id, run_id).await?;
@@ -389,6 +398,8 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|e| e.to_string())?
         else {
+            tx.rollback().await.map_err(|e| e.to_string())?;
+            connection.release();
             return Ok(false);
         };
         if run.depth != 0
@@ -396,27 +407,37 @@ impl DatabaseRunStateStore {
             || run.status != STATUS_RUNNING
             || run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str())
         {
+            tx.rollback().await.map_err(|e| e.to_string())?;
+            connection.release();
             return Ok(false);
         }
         if lock_durable_lineage_cancellation_markers_tx(&mut tx, &run)
             .await?
             .any()
         {
+            tx.rollback().await.map_err(|e| e.to_string())?;
+            connection.release();
             return Ok(false);
         }
         let live:Option<i32>=sqlx::query_scalar("SELECT 1 FROM agent_runs WHERE user_id=? AND run_id=? AND owner_pod_id=? AND run_generation=? AND owner_lease_expires_at>=NOW(6) FOR UPDATE")
             .bind(user_id).bind(run_id).bind(&self.owner_pod_id).bind(i64::try_from(generation).map_err(|e|e.to_string())?).fetch_optional(&mut *tx).await.map_err(|e|e.to_string())?;
         if live.is_none() {
+            tx.rollback().await.map_err(|e| e.to_string())?;
+            connection.release();
             return Ok(false);
         }
         let payload:Option<String>=sqlx::query_scalar("SELECT payload_json FROM agent_run_events WHERE user_id=? AND run_id=? AND event_idx=? AND event_type=? LIMIT 1")
             .bind(user_id).bind(run_id).bind(selected.revision).bind(REQUESTED).fetch_optional(&mut *tx).await.map_err(|e|e.to_string())?;
         let Some(payload) = payload else {
+            tx.rollback().await.map_err(|e| e.to_string())?;
+            connection.release();
             return Ok(false);
         };
         let source: serde_json::Value =
             serde_json::from_str(&payload).map_err(|e| e.to_string())?;
         if selection(&source, selected.revision)? != *selected {
+            tx.rollback().await.map_err(|e| e.to_string())?;
+            connection.release();
             return Ok(false);
         }
         let snapshot = Self::permission_snapshot_tx(&mut tx, user_id, run_id).await?;
@@ -424,12 +445,16 @@ impl DatabaseRunStateStore {
             if applied.selection.revision > selected.revision
                 || (applied.owner_generation == generation && applied.round_index > round)
             {
+                tx.rollback().await.map_err(|e| e.to_string())?;
+                connection.release();
                 return Ok(false);
             }
             if applied.selection == *selected
                 && applied.round_index == round
                 && applied.owner_generation == generation
             {
+                tx.rollback().await.map_err(|e| e.to_string())?;
+                connection.release();
                 return Ok(true);
             }
         }

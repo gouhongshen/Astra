@@ -11,8 +11,12 @@ use astra_services::runs::{
     AtomicRunInteractionBatchRegistration, AtomicRunInteractionBatchRegistrationRequest,
     AtomicRunInteractionWaitRequest, DatabaseRunStateStore, DurableRunInteractionKind,
     DurableRunInteractionResolveOutcome, DurableRunInteractionWaitOutcome, DurableRunStartClaim,
-    RunStateStore,
+    RunPermissionModeRequest, RunStateStore,
 };
+use astra_services::{
+    PromptRequestPersistInput, PromptRequestPlanInput, persist_prompt_request, plan_prompt_request,
+};
+use astra_turn_types::PermissionMode;
 use serial_test::serial;
 use uuid::Uuid;
 
@@ -408,6 +412,205 @@ async fn repeated_interaction_response_reuses_its_physical_connection() {
         );
     }
 
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn repeated_permission_operations_reuse_their_physical_connection() {
+    let (_, mut settings) = common::setup_pool_and_settings().await;
+    settings.db_pool_min_connections = 1;
+    settings.db_pool_max_connections = 1;
+    let shared_pool = SharedPool::new(&settings)
+        .await
+        .expect("create one-connection MatrixOne pool");
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("permission-replay-user-{suffix}");
+    let session_id = format!("permission-replay-session-{suffix}");
+    let run_id = format!("permission-replay-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let store =
+        DatabaseRunStateStore::new(shared_pool.clone()).with_owner_pod_id(TEST_OWNER_POD_ID);
+    let request = RunPermissionModeRequest {
+        expected_session_id: session_id.clone(),
+        request_id: format!("permission-replay-request-{suffix}"),
+        mode: PermissionMode::Plan,
+    };
+
+    let selected = store
+        .request_permission_mode(&user_id, &run_id, &request)
+        .await
+        .expect("persist permission request");
+    let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool)
+        .await
+        .expect("read connection ID before permission replay");
+    for replay in 1..=2 {
+        assert_eq!(
+            store
+                .request_permission_mode(&user_id, &run_id, &request)
+                .await
+                .expect("replay permission request"),
+            selected
+        );
+        let replay_connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(pool)
+            .await
+            .expect("read connection ID after permission replay");
+        assert_eq!(
+            replay_connection_id, connection_id,
+            "permission request replay {replay} must reuse the physical connection"
+        );
+    }
+
+    assert!(
+        store
+            .apply_permission_mode(&user_id, &session_id, &run_id, 0, &selected, 1)
+            .await
+            .expect("apply permission selection")
+    );
+    for replay in 1..=2 {
+        assert!(
+            store
+                .apply_permission_mode(&user_id, &session_id, &run_id, 0, &selected, 1)
+                .await
+                .expect("replay permission application")
+        );
+        let replay_connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(pool)
+            .await
+            .expect("read connection ID after permission application replay");
+        assert_eq!(
+            replay_connection_id, connection_id,
+            "permission application replay {replay} must reuse the physical connection"
+        );
+    }
+
+    assert!(
+        store
+            .permission_mode_snapshot("other-user", &session_id, &run_id)
+            .await
+            .expect("read missing permission snapshot")
+            .is_none()
+    );
+    let snapshot_connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool)
+        .await
+        .expect("read connection ID after missing permission snapshot");
+    assert_eq!(snapshot_connection_id, connection_id);
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn prompt_replay_and_write_recovery_do_not_self_wait_for_pool_capacity() {
+    let (_, mut settings) = common::setup_pool_and_settings().await;
+    settings.db_pool_min_connections = 1;
+    settings.db_pool_max_connections = 1;
+    let shared_pool = SharedPool::new(&settings)
+        .await
+        .expect("create one-connection MatrixOne pool");
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("prompt-replay-user-{suffix}");
+    let session_id = format!("prompt-replay-session-{suffix}");
+    let run_id = format!("prompt-replay-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+    let plan = plan_prompt_request(PromptRequestPlanInput {
+        user_id: &user_id,
+        session_id: &session_id,
+        turn: 1,
+        round: 0,
+        attempt: 0,
+        source: "turn",
+        messages: &messages,
+        tools: &[],
+        max_output_tokens: None,
+    })
+    .expect("plan prompt request");
+    let input = PromptRequestPersistInput {
+        session_id: session_id.clone(),
+        user_id: user_id.clone(),
+        run_id: Some(run_id.clone()),
+        turn: 1,
+        round: 0,
+        attempt: 0,
+        source: "turn".into(),
+        model: "test-model".into(),
+        provider: "test-provider".into(),
+    };
+
+    persist_prompt_request(&shared_pool, &input, &plan)
+        .await
+        .expect("persist prompt request");
+    let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool)
+        .await
+        .expect("read connection ID before prompt replay");
+    for replay in 1..=2 {
+        persist_prompt_request(&shared_pool, &input, &plan)
+            .await
+            .expect("replay prompt request");
+        let replay_connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(pool)
+            .await
+            .expect("read connection ID after prompt replay");
+        assert_eq!(
+            replay_connection_id, connection_id,
+            "prompt replay {replay} must reuse the physical connection"
+        );
+    }
+
+    let invalid_input = PromptRequestPersistInput {
+        turn: 2,
+        model: "x".repeat(1024),
+        ..input.clone()
+    };
+    let invalid_plan = plan_prompt_request(PromptRequestPlanInput {
+        user_id: &user_id,
+        session_id: &session_id,
+        turn: 2,
+        round: 0,
+        attempt: 0,
+        source: "turn",
+        messages: &messages,
+        tools: &[],
+        max_output_tokens: None,
+    })
+    .expect("plan invalid prompt request");
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        persist_prompt_request(&shared_pool, &invalid_input, &invalid_plan),
+    )
+    .await
+    .expect("prompt write recovery must not wait on its own checkout")
+    .expect_err("oversized model must fail prompt request persistence");
+    assert!(
+        !error.to_ascii_lowercase().contains("pool timed out"),
+        "prompt recovery must preserve the statement error instead of replacing it with pool acquisition timeout: {error}"
+    );
+    let recovery_connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(pool)
+        .await
+        .expect("read connection ID after prompt write recovery");
+    assert_eq!(recovery_connection_id, connection_id);
+
+    for statement in [
+        "DELETE FROM prompt_deltas WHERE user_id = ? AND session_id = ?",
+        "DELETE FROM prompt_request_records WHERE user_id = ? AND session_id = ?",
+    ] {
+        sqlx::query(statement)
+            .bind(&user_id)
+            .bind(&session_id)
+            .execute(pool)
+            .await
+            .expect("clean prompt persistence fixture");
+    }
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
