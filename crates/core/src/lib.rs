@@ -1,4 +1,6 @@
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -10,7 +12,10 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{Connection, MySql, Pool, QueryBuilder, mysql::MySqlPoolOptions};
+use sqlx::{
+    Connection, MySql, Pool, QueryBuilder,
+    mysql::{MySqlConnection, MySqlPoolOptions},
+};
 
 /// A recently used MatrixOne connection has just completed a synchronized
 /// protocol exchange, so pinging it again before the next statement adds a
@@ -20,12 +25,12 @@ use sqlx::{Connection, MySql, Pool, QueryBuilder, mysql::MySqlPoolOptions};
 const MATRIXONE_IDLE_HEALTH_CHECK_AFTER: Duration = Duration::from_secs(30);
 /// Checkout latency above this boundary is operationally significant for an
 /// interactive turn and is reported separately from statement execution.
-pub const MATRIXONE_SLOW_POOL_ACQUIRE_AFTER: Duration = Duration::from_millis(250);
+const MATRIXONE_SLOW_POOL_ACQUIRE_AFTER: Duration = Duration::from_millis(250);
 static MATRIXONE_POOL_HOT_CHECKOUTS: AtomicU64 = AtomicU64::new(0);
 static MATRIXONE_POOL_HEALTH_CHECKS: DropSafeOperationTelemetry = DropSafeOperationTelemetry::new();
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DropSafeOperationTelemetrySnapshot {
+struct DropSafeOperationTelemetrySnapshot {
     pub attempts: u64,
     pub successes: u64,
     pub failures: u64,
@@ -39,7 +44,7 @@ pub struct DropSafeOperationTelemetrySnapshot {
 ///
 /// This keeps timeout and task-abort paths from being inferred as successes.
 #[derive(Debug)]
-pub struct DropSafeOperationTelemetry {
+struct DropSafeOperationTelemetry {
     attempts: AtomicU64,
     successes: AtomicU64,
     failures: AtomicU64,
@@ -49,7 +54,7 @@ pub struct DropSafeOperationTelemetry {
 }
 
 impl DropSafeOperationTelemetry {
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             attempts: AtomicU64::new(0),
             successes: AtomicU64::new(0),
@@ -60,7 +65,7 @@ impl DropSafeOperationTelemetry {
         }
     }
 
-    pub fn snapshot(&self) -> DropSafeOperationTelemetrySnapshot {
+    fn snapshot(&self) -> DropSafeOperationTelemetrySnapshot {
         DropSafeOperationTelemetrySnapshot {
             attempts: self.attempts.load(Ordering::Relaxed),
             successes: self.successes.load(Ordering::Relaxed),
@@ -71,7 +76,7 @@ impl DropSafeOperationTelemetry {
         }
     }
 
-    pub fn start(&self, slow_after: Duration) -> DropSafeOperationObservation<'_> {
+    fn start(&self, slow_after: Duration) -> DropSafeOperationObservation<'_> {
         DropSafeOperationObservation::new(self, slow_after)
     }
 }
@@ -89,7 +94,7 @@ enum DropSafeOperationOutcome {
 }
 
 #[must_use = "dropping the observation records cancellation"]
-pub struct DropSafeOperationObservation<'a> {
+struct DropSafeOperationObservation<'a> {
     telemetry: &'a DropSafeOperationTelemetry,
     started: Instant,
     slow_after: Duration,
@@ -107,7 +112,7 @@ impl<'a> DropSafeOperationObservation<'a> {
         }
     }
 
-    pub fn finish_result<T, E>(&mut self, result: &Result<T, E>) {
+    fn finish_result<T, E>(&mut self, result: &Result<T, E>) {
         let outcome = if result.is_ok() {
             DropSafeOperationOutcome::Success
         } else {
@@ -167,18 +172,17 @@ pub fn matrixone_pool_telemetry_snapshot() -> MatrixOnePoolTelemetrySnapshot {
     }
 }
 
-async fn matrixone_connection_is_reusable<F>(
+fn matrixone_connection_requires_health_check(idle_for: Duration) -> bool {
+    idle_for >= MATRIXONE_IDLE_HEALTH_CHECK_AFTER
+}
+
+async fn matrixone_idle_connection_is_reusable<F>(
     idle_for: Duration,
     ping: F,
 ) -> Result<bool, sqlx::Error>
 where
     F: std::future::Future<Output = Result<(), sqlx::Error>>,
 {
-    if idle_for < MATRIXONE_IDLE_HEALTH_CHECK_AFTER {
-        MATRIXONE_POOL_HOT_CHECKOUTS.fetch_add(1, Ordering::Relaxed);
-        return Ok(true);
-    }
-
     let started = Instant::now();
     let mut observation = MATRIXONE_POOL_HEALTH_CHECKS.start(MATRIXONE_SLOW_POOL_ACQUIRE_AFTER);
     let result = ping.await;
@@ -205,16 +209,34 @@ where
     Ok(true)
 }
 
+type MatrixOneConnectionReuseCheck<'a> =
+    Pin<Box<dyn Future<Output = Result<bool, sqlx::Error>> + Send + 'a>>;
+
+fn matrixone_connection_reuse_check<'a>(
+    connection: &'a mut MySqlConnection,
+    idle_for: Duration,
+) -> MatrixOneConnectionReuseCheck<'a> {
+    if !matrixone_connection_requires_health_check(idle_for) {
+        MATRIXONE_POOL_HOT_CHECKOUTS.fetch_add(1, Ordering::Relaxed);
+        // Do not add an async wrapper to the common checkout path. Besides
+        // avoiding an unnecessary network round trip, keeping this future
+        // shallow matters for the runtime's already-large continuation state.
+        return Box::pin(std::future::ready(Ok(true)));
+    }
+
+    Box::pin(matrixone_idle_connection_is_reusable(
+        idle_for,
+        connection.ping(),
+    ))
+}
+
 fn matrixone_pool_options(settings: &MatrixOneSettings) -> MySqlPoolOptions {
     MySqlPoolOptions::new()
         .max_connections(settings.db_pool_max_connections)
         .min_connections(settings.db_pool_min_connections)
         .test_before_acquire(false)
         .before_acquire(|connection, metadata| {
-            Box::pin(matrixone_connection_is_reusable(
-                metadata.idle_for,
-                connection.ping(),
-            ))
+            matrixone_connection_reuse_check(connection, metadata.idle_for)
         })
         // SQLx measures the complete checkout path, including semaphore wait,
         // connection establishment, and the conditional health check above.
@@ -367,19 +389,17 @@ mod matrixone_pool_option_tests {
     }
 
     #[tokio::test]
-    async fn hot_connection_skips_ping_but_idle_connection_rejects_ping_failure() {
-        assert!(
-            matrixone_connection_is_reusable(Duration::ZERO, async {
-                panic!("hot connection must not poll PING")
-            })
-            .await
-            .expect("hot connection is accepted")
-        );
+    async fn hot_connection_skips_health_check_but_idle_connection_rejects_ping_failure() {
+        assert!(!matrixone_connection_requires_health_check(Duration::ZERO));
+        assert!(matrixone_connection_requires_health_check(
+            MATRIXONE_IDLE_HEALTH_CHECK_AFTER
+        ));
 
-        let failure = matrixone_connection_is_reusable(MATRIXONE_IDLE_HEALTH_CHECK_AFTER, async {
-            Err(sqlx::Error::Protocol("stale connection".to_string()))
-        })
-        .await;
+        let failure =
+            matrixone_idle_connection_is_reusable(MATRIXONE_IDLE_HEALTH_CHECK_AFTER, async {
+                Err(sqlx::Error::Protocol("stale connection".to_string()))
+            })
+            .await;
         assert!(
             failure.is_err(),
             "failed idle PING must reject the checkout"

@@ -51,18 +51,6 @@ fn scrape_database_pool_metrics(state: &AppState) {
         "astra_db_pool_health_check_slow_total",
         "MatrixOne idle-connection PING health checks exceeding the configured slow threshold.",
     );
-    registry.register_counter(
-        "astra_db_pool_guarded_acquires_total",
-        "Completed or cancelled MatrixOne pool acquisitions by outcome.",
-    );
-    registry.register_counter(
-        "astra_db_pool_guarded_acquire_microseconds_total",
-        "Cumulative time spent acquiring cancellation-safe MatrixOne connections.",
-    );
-    registry.register_counter(
-        "astra_db_pool_guarded_slow_acquires_total",
-        "Cancellation-safe MatrixOne pool acquisitions exceeding the configured slow threshold.",
-    );
     registry.register_gauge(
         "astra_db_pool_connections",
         "Current MatrixOne pool connections by state.",
@@ -94,33 +82,6 @@ fn scrape_database_pool_metrics(state: &AppState) {
         "astra_db_pool_health_check_slow_total",
         &[],
         pool.health_check_slow,
-    );
-
-    let acquire = astra_services::db_pool_acquire_telemetry_snapshot();
-    registry.set_counter_absolute(
-        "astra_db_pool_guarded_acquires_total",
-        &[("outcome", "success")],
-        acquire.successes,
-    );
-    registry.set_counter_absolute(
-        "astra_db_pool_guarded_acquires_total",
-        &[("outcome", "failure")],
-        acquire.failures,
-    );
-    registry.set_counter_absolute(
-        "astra_db_pool_guarded_acquires_total",
-        &[("outcome", "cancelled")],
-        acquire.cancelled,
-    );
-    registry.set_counter_absolute(
-        "astra_db_pool_guarded_acquire_microseconds_total",
-        &[],
-        acquire.elapsed_micros,
-    );
-    registry.set_counter_absolute(
-        "astra_db_pool_guarded_slow_acquires_total",
-        &[],
-        acquire.slow,
     );
 
     if let Some(shared_pool) = state.shared_pool.as_ref() {
@@ -880,14 +841,6 @@ mod tests {
         );
         assert!(
             text.contains("astra_db_pool_health_checks_total{outcome=\"cancelled\"}"),
-            "{text}"
-        );
-        assert!(
-            text.contains("# TYPE astra_db_pool_guarded_acquires_total counter"),
-            "{text}"
-        );
-        assert!(
-            text.contains("astra_db_pool_guarded_acquires_total{outcome=\"cancelled\"}"),
             "{text}"
         );
         assert!(

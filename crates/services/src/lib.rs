@@ -9,10 +9,7 @@ pub mod branches;
 pub mod byok_endpoint;
 mod cancellation_safe_db;
 pub(crate) use cancellation_safe_db::CancellationSafeTransaction;
-pub use cancellation_safe_db::{
-    CancellationSafePoolConnection, DbPoolAcquireTelemetrySnapshot, TransactionConnection,
-    db_pool_acquire_telemetry_snapshot,
-};
+pub use cancellation_safe_db::{CancellationSafePoolConnection, TransactionConnection};
 pub mod config_version_cloud;
 pub mod context;
 pub mod context_manifest;

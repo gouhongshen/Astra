@@ -24,28 +24,6 @@ pub trait TransactionConnection:
 impl<'a> sealed::TransactionConnection for Transaction<'a, MySql> {}
 impl<'a> TransactionConnection for Transaction<'a, MySql> {}
 
-static POOL_ACQUIRE_TELEMETRY: astra_core::DropSafeOperationTelemetry =
-    astra_core::DropSafeOperationTelemetry::new();
-
-pub type DbPoolAcquireTelemetrySnapshot = astra_core::DropSafeOperationTelemetrySnapshot;
-
-pub fn db_pool_acquire_telemetry_snapshot() -> DbPoolAcquireTelemetrySnapshot {
-    POOL_ACQUIRE_TELEMETRY.snapshot()
-}
-
-async fn acquire_pool_connection(
-    pool: &sqlx::Pool<MySql>,
-) -> Result<PoolConnection<MySql>, sqlx::Error> {
-    // Keep observation synchronous around the original acquire future. An
-    // additional generic async wrapper materially deepens the already-large
-    // runtime continuation future and can exhaust Tokio's worker stack.
-    let mut observation =
-        POOL_ACQUIRE_TELEMETRY.start(astra_core::MATRIXONE_SLOW_POOL_ACQUIRE_AFTER);
-    let result = pool.acquire().await;
-    observation.finish_result(&result);
-    result
-}
-
 /// A checked-out shared-pool connection that is reusable only after its
 /// caller explicitly proves the MySQL protocol is synchronized.
 ///
@@ -59,7 +37,7 @@ pub struct CancellationSafePoolConnection {
 
 impl CancellationSafePoolConnection {
     pub async fn acquire(pool: &sqlx::Pool<MySql>) -> Result<Self, sqlx::Error> {
-        let connection = acquire_pool_connection(pool).await?;
+        let connection = pool.acquire().await?;
         Ok(Self {
             connection: Some(connection),
         })
@@ -122,7 +100,7 @@ impl TransactionConnection for CancellationSafeTransaction {}
 
 impl CancellationSafeTransaction {
     pub(crate) async fn begin(pool: &sqlx::Pool<MySql>) -> Result<Self, sqlx::Error> {
-        let connection = acquire_pool_connection(pool).await?;
+        let connection = pool.acquire().await?;
         let mut transaction = Self {
             connection: Some(connection),
             transaction_open: false,
