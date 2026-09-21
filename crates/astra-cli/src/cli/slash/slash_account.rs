@@ -32,6 +32,21 @@ async fn clear_local_auth_state(profile: Option<&str>, state: &mut SessionState)
     let _ = crate::cli::auth_flow::clear_profile_auth(profile);
 }
 
+async fn report_default_model_after_auth(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    state: &mut SessionState,
+) {
+    match ensure_state_default_model(api, token, state).await {
+        Ok(Some(model)) => {
+            crate::cli::slash::slash_config::set_active_model_for_display(Some(model.clone()));
+            cli_ok!("Default model: {}", model);
+        }
+        Ok(None) => (),
+        Err(error) => cli_warn!("{}", error),
+    }
+}
+
 pub(crate) async fn handle_account_command(
     cmd: &str,
     arg: &str,
@@ -66,12 +81,7 @@ pub(crate) async fn handle_account_command(
                     if let Some(notice) = sync_report.user_notice() {
                         cli_warn!("{}", notice);
                     }
-                    if let Some(model) = ensure_state_default_model(api, &token, state).await {
-                        crate::cli::slash::slash_config::set_active_model_for_display(Some(
-                            model.clone(),
-                        ));
-                        cli_ok!("Default model: {}", model);
-                    }
+                    report_default_model_after_auth(api, &token, state).await;
                 }
                 Err(e) => cli_err!("Register failed: {}", e),
             }
@@ -87,12 +97,7 @@ pub(crate) async fn handle_account_command(
                     if let Some(notice) = sync_report.user_notice() {
                         cli_warn!("{}", notice);
                     }
-                    if let Some(model) = ensure_state_default_model(api, &token, state).await {
-                        crate::cli::slash::slash_config::set_active_model_for_display(Some(
-                            model.clone(),
-                        ));
-                        cli_ok!("Default model: {}", model);
-                    }
+                    report_default_model_after_auth(api, &token, state).await;
                 }
                 Err(e) => cli_err!("Login failed: {}", e),
             }

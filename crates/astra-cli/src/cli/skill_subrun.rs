@@ -62,7 +62,9 @@ pub(crate) async fn resolve_subrun_model_selection(
         crate::cli::session::session_runtime::ServerDefaultModel::NoModels => {
             Err("no active model Offering is available for the sub-run".to_string())
         }
-        crate::cli::session::session_runtime::ServerDefaultModel::Unavailable(error) => Err(error),
+        crate::cli::session::session_runtime::ServerDefaultModel::Unavailable(error) => {
+            Err(error.to_string())
+        }
     }
 }
 

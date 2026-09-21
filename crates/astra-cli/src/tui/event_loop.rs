@@ -2471,9 +2471,21 @@ async fn sync_default_model_after_auth(
     token: &str,
     state: &mut crate::cli::session::session_state::SessionState,
     bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
 ) -> Option<String> {
     let model =
-        crate::cli::session::session_runtime::ensure_state_default_model(api, token, state).await?;
+        match crate::cli::session::session_runtime::ensure_state_default_model(api, token, state)
+            .await
+        {
+            Ok(model) => model?,
+            Err(error) => {
+                // Login has already committed. A catalog failure is a separate,
+                // recoverable warning, not a reason to undo authentication.
+                chat_widget
+                    .commit_system(history_cell::system::SystemCell::warning(error.to_string()));
+                return None;
+            }
+        };
     crate::cli::slash::slash_config::set_active_model_for_display(Some(model.clone()));
     bottom_pane.footer.model = Some(model.clone());
     Some(model)
@@ -7041,7 +7053,7 @@ pub(crate) async fn run_tui_session(
                                 if let Some(notice) = report.user_notice() {
                                     chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
                                 }
-                                if let Some(model) = sync_default_model_after_auth(api, &token, &mut state, &mut bottom_pane).await {
+                                if let Some(model) = sync_default_model_after_auth(api, &token, &mut state, &mut bottom_pane, &mut chat_widget).await {
                                     chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Default model: {model}")));
                                 }
                             }
@@ -10216,6 +10228,7 @@ pub(crate) async fn run_tui_session(
                                                     &token,
                                                     &mut state,
                                                     &mut bottom_pane,
+                                                    &mut chat_widget,
                                                 )
                                                 .await
                                                 {
@@ -10252,6 +10265,7 @@ pub(crate) async fn run_tui_session(
                                                     &token,
                                                     &mut state,
                                                     &mut bottom_pane,
+                                                    &mut chat_widget,
                                                 )
                                                 .await
                                                 {
@@ -18399,6 +18413,39 @@ mod tests {
             response_idx, slash_rows,
             "slash response should start right after the slash card's own breathing room"
         );
+    }
+
+    #[tokio::test]
+    async fn default_model_failure_after_auth_is_a_visible_warning() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/model-access"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let mut pane = BottomPane::new();
+        let mut widget = chat_widget::ChatWidget::new("");
+        widget.commit_system(history_cell::system::SystemCell::response("Logged in."));
+
+        assert!(
+            sync_default_model_after_auth(&api, "token", &mut state, &mut pane, &mut widget)
+                .await
+                .is_none()
+        );
+        assert!(state.model.is_none());
+        assert_eq!(widget.history().len(), 2);
+        assert!(matches!(widget.history()[1].to_persist(),
+            Some(crate::tui::turn_event::TurnEvent::System {
+                level: crate::tui::turn_event::SystemLevel::Warning, text, ..
+            }) if text.contains("503") && !text.contains("missing_model_selection")
+        ));
+        assert_eq!(mock.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]

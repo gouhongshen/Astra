@@ -215,13 +215,10 @@ pub(crate) async fn stream_chat_sse(
             }
             ServerDefaultModel::NoModels => None,
             ServerDefaultModel::Unavailable(error) => {
-                return Err(crate::TurnFailure {
+                return Err(session_runtime::model_catalog_turn_failure(
                     error,
-                    partial: crate::PartialTurnData {
-                        session_id: p.session_id.map(str::to_string),
-                        ..Default::default()
-                    },
-                });
+                    p.session_id,
+                ));
             }
         }
     } else {

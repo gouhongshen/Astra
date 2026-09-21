@@ -4,7 +4,7 @@
 /// default model. It is not a concrete model name and must not be persisted or
 /// sent as a model override.
 pub const MISSING_MODEL_SELECTION_MESSAGE: &str = "\
-Model selection is required. Select a concrete model with `/model set <name>`, \
+Model selection is required. Select a concrete model with `/model <name>`, \
 pass `--model <name>`, or run `astra config set default_model <name>`.";
 
 pub fn normalize_model_override(model: Option<&str>) -> Option<&str> {
@@ -58,5 +58,7 @@ mod tests {
 
         assert_eq!(err.kind, crate::ErrorKind::MissingModelSelection);
         assert!(err.message.contains("default_model"));
+        assert!(err.message.contains("`/model <name>`"));
+        assert!(!err.message.contains("/model set"));
     }
 }

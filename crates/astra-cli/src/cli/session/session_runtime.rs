@@ -328,7 +328,7 @@ pub(crate) struct ServerModelSelection {
 pub(crate) enum ServerDefaultModel {
     Selected(ServerModelSelection),
     NoModels,
-    Unavailable(String),
+    Unavailable(astra_core::ClassifiedError),
 }
 
 fn model_list_entry_is_active(entry: &ModelListItemResponse) -> bool {
@@ -446,10 +446,54 @@ pub(crate) async fn load_server_model_catalog_json(
     .map_err(|error| format!("failed to render complete model catalog: {error}"))
 }
 
+fn model_catalog_http_error(status: reqwest::StatusCode) -> astra_core::ClassifiedError {
+    use astra_core::ErrorKind;
+    let kind = match status.as_u16() {
+        401 | 403 => ErrorKind::Auth,
+        402 => ErrorKind::PaymentRequired,
+        408 => ErrorKind::Network,
+        429 => ErrorKind::RateLimit,
+        400..=499 => ErrorKind::InvalidRequest,
+        _ => ErrorKind::ServerError,
+    };
+    astra_core::ClassifiedError::new(
+        kind,
+        format!("Model catalog request failed with status {status}. Check model service access and try again."),
+    ).with_details_json(serde_json::json!({"http_status": status.as_u16()}).to_string())
+}
+
+fn model_catalog_contract_error(message: impl Into<String>) -> astra_core::ClassifiedError {
+    astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+}
+
+/// Keep the catalog owner and HTTP status through the string-based turn boundary.
+/// Auth also covers forbidden access and provider credentials; only a catalog
+/// session 401 can authorize the existing session refresh retry.
+pub(crate) fn model_catalog_turn_failure(
+    error: astra_core::ClassifiedError,
+    session_id: Option<&str>,
+) -> crate::TurnFailure {
+    let mut metadata = error
+        .details_json
+        .as_deref()
+        .and_then(|details| serde_json::from_str::<serde_json::Value>(details).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    metadata["source"] = serde_json::json!("model_access");
+    crate::TurnFailure {
+        error: error.to_string(),
+        partial: crate::PartialTurnData {
+            session_id: session_id.map(str::to_string),
+            error_code: Some(error.kind.as_str().to_string()),
+            error_metadata: Some(metadata),
+            ..Default::default()
+        },
+    }
+}
+
 async fn load_server_model_access(
     api: &astra_thin_client::ThinClient,
     token: &str,
-) -> Result<ModelAccessProjectionResponse, String> {
+) -> Result<ModelAccessProjectionResponse, astra_core::ClassifiedError> {
     let mut cursor: Option<ModelListCursor> = None;
     let mut first: Option<ModelAccessProjectionResponse> = None;
     let mut expected_revision = None;
@@ -458,7 +502,9 @@ async fn load_server_model_access(
     loop {
         if let Some(current) = &cursor {
             if !seen_cursors.insert(current.clone()) {
-                return Err("Model Access projection cycled its continuation cursor".to_string());
+                return Err(model_catalog_contract_error(
+                    "Model Access projection cycled its continuation cursor",
+                ));
             }
         }
         let cursor_tuple = cursor.as_ref().map(|value| {
@@ -471,44 +517,84 @@ async fn load_server_model_access(
         let response = api
             .get_model_access_page_response_timeout(
                 token,
-                std::time::Duration::from_secs(3),
+                astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT,
                 cursor_tuple,
             )
             .await
-            .map_err(|error| format!("failed to load Model Access projection: {error}"))?;
+            .map_err(|error| {
+                let timed_out = matches!(&error, astra_thin_client::ThinClientError::Http(error) if error.is_timeout());
+                tracing::warn!(
+                    target: "astra_cli::model_selection",
+                    operation = "model_access", stage = "request", timed_out,
+                    error = ?error, "model catalog request failed"
+                );
+                let (kind, message) = match &error {
+                    astra_thin_client::ThinClientError::Api { status, .. } => return model_catalog_http_error(*status),
+                    astra_thin_client::ThinClientError::InvalidAuthHeader => (
+                        astra_core::ErrorKind::Auth,
+                        "Could not authenticate the model catalog request. Sign in again.",
+                    ),
+                    astra_thin_client::ThinClientError::Http(_) => (astra_core::ErrorKind::Network, if timed_out {
+                        "Model catalog request timed out. Try again, or check the model service if this persists."
+                    } else {
+                        "Could not reach the model catalog. Check your connection and try again."
+                    }),
+                    _ => (
+                        astra_core::ClassifiedError::from(error.to_string()).kind,
+                        "Could not prepare the model catalog request. Check your sign-in and client configuration.",
+                    ),
+                };
+                astra_core::ClassifiedError::new(kind, message)
+            })?;
         if !response.status().is_success() {
-            return Err(format!(
-                "Model Access projection request failed with status {}",
-                response.status()
-            ));
+            return Err(model_catalog_http_error(response.status()));
         }
         let page: ModelAccessProjectionResponse = response
             .json()
             .await
-            .map_err(|error| format!("Model Access projection was not valid JSON: {error}"))?;
+            .map_err(|error| {
+                tracing::warn!(
+                    target: "astra_cli::model_selection",
+                    operation = "model_access", stage = "response_body",
+                    error = ?error, "model catalog response could not be decoded"
+                );
+                let (kind, message) = if error.is_timeout() {
+                    (astra_core::ErrorKind::Network, "Model catalog response timed out. Try again.")
+                } else if error.is_decode() {
+                    (astra_core::ErrorKind::ContractViolation, "Model catalog response was not valid JSON. Check the model service and try again.")
+                } else {
+                    (astra_core::ErrorKind::Network, "Model catalog response could not be read. Check your connection and try again.")
+                };
+                astra_core::ClassifiedError::new(kind, message)
+            })?;
         if page.limit == 0 || page.limit > 200 {
-            return Err("Model Access projection returned an invalid page limit".to_string());
+            return Err(model_catalog_contract_error(
+                "Model Access projection returned an invalid page limit",
+            ));
         }
         if expected_total.get_or_insert(page.total) != &page.total {
-            return Err("Model Access projection changed total during pagination".to_string());
+            return Err(model_catalog_contract_error(
+                "Model Access projection changed total during pagination",
+            ));
         }
         if expected_revision.get_or_insert_with(|| page.catalog_revision.clone())
             != &page.catalog_revision
         {
-            return Err(
-                "Model Access projection changed catalog revision during pagination".to_string(),
-            );
+            return Err(model_catalog_contract_error(
+                "Model Access projection changed catalog revision during pagination",
+            ));
         }
         let page_had_offerings = !page.offerings.is_empty();
         if page.next_cursor.is_some() && !page_had_offerings {
-            return Err("Model Access projection returned a cursor without offerings".to_string());
+            return Err(model_catalog_contract_error(
+                "Model Access projection returned a cursor without offerings",
+            ));
         }
         if let Some(existing) = &mut first {
             if existing.accesses != page.accesses {
-                return Err(
-                    "Model Access projection changed access declarations during pagination"
-                        .to_string(),
-                );
+                return Err(model_catalog_contract_error(
+                    "Model Access projection changed access declarations during pagination",
+                ));
             }
             existing.offerings.extend(page.offerings);
             existing.next_cursor = page.next_cursor.clone();
@@ -517,14 +603,15 @@ async fn load_server_model_access(
         }
         let next = first.as_ref().and_then(|page| page.next_cursor.clone());
         let Some(next) = next else {
-            let projection =
-                first.ok_or_else(|| "Model Access projection returned no page".to_string())?;
+            let projection = first.ok_or_else(|| {
+                model_catalog_contract_error("Model Access projection returned no page")
+            })?;
             if projection.offerings.len() != projection.total as usize {
-                return Err(format!(
+                return Err(model_catalog_contract_error(format!(
                     "Model Access projection ended with {} offerings but advertised {}",
                     projection.offerings.len(),
                     projection.total
-                ));
+                )));
             }
             for access in &projection.accesses {
                 let count = projection
@@ -533,16 +620,18 @@ async fn load_server_model_access(
                     .filter(|offering| offering.access_id == access.id)
                     .count() as u32;
                 if count != access.available_model_count {
-                    return Err(format!(
+                    return Err(model_catalog_contract_error(format!(
                         "Model Access count for '{}' advertised {} but drained {}",
                         access.id, access.available_model_count, count
-                    ));
+                    )));
                 }
             }
             return Ok(projection);
         };
         if cursor.as_ref() == Some(&next) {
-            return Err("Model Access projection repeated its continuation cursor".to_string());
+            return Err(model_catalog_contract_error(
+                "Model Access projection repeated its continuation cursor",
+            ));
         }
         cursor = Some(next);
     }
@@ -550,41 +639,44 @@ async fn load_server_model_access(
 
 pub(crate) fn default_model_selection_from_access(
     projection: &ModelAccessProjectionResponse,
-) -> Result<Option<ServerModelSelection>, String> {
+) -> Result<Option<ServerModelSelection>, astra_core::ClassifiedError> {
     match projection.default_resolution.as_ref() {
         Some(ModelDefaultResolution::Invalid { reason }) => {
-            return Err(format!(
+            return Err(model_catalog_contract_error(format!(
                 "Model Access rejected the provider default because {}; choose an available model explicitly",
                 model_default_invalid_reason_message(*reason)
-            ));
+            )));
         }
         Some(ModelDefaultResolution::Missing) => {
             return if projection.offerings.is_empty() {
                 Ok(None)
             } else {
-                Err(
-                    "Model Access has no resolved default for a non-empty effective catalog"
-                        .to_string(),
-                )
+                Err(model_catalog_contract_error(
+                    "Model Access has no resolved default for a non-empty effective catalog",
+                ))
             };
         }
         Some(ModelDefaultResolution::Selected { offering_id, .. })
             if projection.default_offering_id.as_deref() != Some(offering_id) =>
         {
-            return Err(
-                "Model Access default resolution disagrees with default_offering_id".to_string(),
-            );
+            return Err(model_catalog_contract_error(
+                "Model Access default resolution disagrees with default_offering_id",
+            ));
         }
         Some(ModelDefaultResolution::Selected { .. }) => {}
         None => {
-            return Err("Model Access omitted required default_resolution".to_string());
+            return Err(model_catalog_contract_error(
+                "Model Access omitted required default_resolution",
+            ));
         }
     }
     let Some(default_offering_id) = projection.default_offering_id.as_deref() else {
         return if projection.offerings.is_empty() {
             Ok(None)
         } else {
-            Err("Model Access omitted its default for a non-empty effective catalog".to_string())
+            Err(model_catalog_contract_error(
+                "Model Access omitted its default for a non-empty effective catalog",
+            ))
         };
     };
     let entry = projection
@@ -592,14 +684,20 @@ pub(crate) fn default_model_selection_from_access(
         .iter()
         .find(|entry| entry.offering_id == default_offering_id)
         .ok_or_else(|| {
-            "Model Access default does not reference an effective Offering".to_string()
+            model_catalog_contract_error(
+                "Model Access default does not reference an effective Offering",
+            )
         })?;
     if !model_list_entry_is_active(entry) {
-        return Err("Model Access default references an inactive Offering".to_string());
+        return Err(model_catalog_contract_error(
+            "Model Access default references an inactive Offering",
+        ));
     }
     model_selection_from_list_entry(entry)
         .map(Some)
-        .ok_or_else(|| "Model Access default has invalid selection metadata".to_string())
+        .ok_or_else(|| {
+            model_catalog_contract_error("Model Access default has invalid selection metadata")
+        })
 }
 
 fn model_default_invalid_reason_message(reason: ModelDefaultInvalidReason) -> &'static str {
@@ -769,7 +867,7 @@ pub(crate) async fn ensure_state_default_model(
     api: &astra_thin_client::ThinClient,
     token: &str,
     state: &mut SessionState,
-) -> Option<String> {
+) -> Result<Option<String>, astra_core::ClassifiedError> {
     if let Some(model) = normalize_model_override(state.model.as_deref()).map(str::to_string) {
         match resolve_server_model_selection(
             api,
@@ -801,7 +899,7 @@ pub(crate) async fn ensure_state_default_model(
                 eprintln!("warning: {error}; keeping current context budget");
             }
         }
-        return Some(model);
+        return Ok(Some(model));
     }
     match resolve_server_default_model(api, token).await {
         ServerDefaultModel::Selected(selection) => {
@@ -827,13 +925,10 @@ pub(crate) async fn ensure_state_default_model(
                     selection.name
                 );
             }
-            Some(selection.name)
+            Ok(Some(selection.name))
         }
-        ServerDefaultModel::NoModels => None,
-        ServerDefaultModel::Unavailable(error) => {
-            eprintln!("warning: {error}");
-            None
-        }
+        ServerDefaultModel::NoModels => Ok(None),
+        ServerDefaultModel::Unavailable(error) => Err(error),
     }
 }
 
@@ -986,6 +1081,12 @@ pub(crate) async fn attempt_token_refresh(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> bool {
+    if crate::cli::native_auth::active().is_some() {
+        // The native bearer provider rotates UC credentials before dispatch.
+        // A rejected native token must never send a legacy profile's refresh
+        // token to this server; explicit sign-in owns recovery in that case.
+        return false;
+    }
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
     let Some(refresh) = creds
@@ -2423,7 +2524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_default_resolution_uses_model_access_default() {
+    async fn server_default_resolution_accepts_slow_model_access_default() {
         let mock = MockServer::start().await;
         let projection = access_projection(
             vec![
@@ -2434,21 +2535,24 @@ mod tests {
         );
         Mock::given(method("GET"))
             .and(path("/model-access"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(projection))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(projection)
+                    .set_delay(std::time::Duration::from_secs(4)),
+            )
+            .expect(1)
             .mount(&mock)
             .await;
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
 
-        let resolved = resolve_server_default_model(&api, "token").await;
+        let mut state = SessionState::default();
+        let resolved = ensure_state_default_model(&api, "token", &mut state)
+            .await
+            .expect("a healthy catalog may take longer than the old three-second timeout");
 
-        assert_eq!(
-            resolved,
-            ServerDefaultModel::Selected(super::ServerModelSelection {
-                name: "beta-model".to_string(),
-                context_window: Some(128_000),
-                offering_id: "offer-beta".to_string(),
-            })
-        );
+        assert_eq!(resolved, Some("beta-model".to_string()));
+        assert_eq!(state.model.as_deref(), Some("beta-model"));
+        assert_eq!(state.context_budget.model_limit, 128_000);
     }
 
     #[tokio::test]
@@ -2472,7 +2576,11 @@ mod tests {
             .await
             .expect_err("a continuation cursor must accompany progress");
 
-        assert!(error.contains("cursor without offerings"), "{error}");
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert!(
+            error.message.contains("cursor without offerings"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -2496,7 +2604,9 @@ mod tests {
             ..SessionState::default()
         };
 
-        let selected = ensure_state_default_model(&api, "token", &mut state).await;
+        let selected = ensure_state_default_model(&api, "token", &mut state)
+            .await
+            .expect("explicit model resolution");
 
         assert_eq!(
             selected.as_deref(),
@@ -2515,13 +2625,44 @@ mod tests {
             vec![catalog_entry("offer-active", "active-model", true, 8_192)],
             None,
         );
-        assert!(default_model_selection_from_access(&missing_default).is_err());
+        assert_eq!(
+            default_model_selection_from_access(&missing_default)
+                .unwrap_err()
+                .kind,
+            astra_core::ErrorKind::ContractViolation
+        );
 
         let unknown_default = access_projection(
             vec![catalog_entry("offer-active", "active-model", true, 8_192)],
             Some("offer-missing"),
         );
-        assert!(default_model_selection_from_access(&unknown_default).is_err());
+        assert_eq!(
+            default_model_selection_from_access(&unknown_default)
+                .unwrap_err()
+                .kind,
+            astra_core::ErrorKind::ContractViolation
+        );
+
+        let valid = access_projection(
+            vec![catalog_entry("offer-active", "active-model", true, 8_192)],
+            Some("offer-active"),
+        );
+        let mut omitted_resolution = valid.clone();
+        omitted_resolution.default_resolution = None;
+        let mut disagrees = valid.clone();
+        disagrees.default_offering_id = Some("other-offering".into());
+        let mut inactive = valid.clone();
+        inactive.offerings[0].is_active = false;
+        let mut missing_metadata = valid.clone();
+        missing_metadata.offerings[0].name = " ".into();
+        for projection in [omitted_resolution, disagrees, inactive, missing_metadata] {
+            assert_eq!(
+                default_model_selection_from_access(&projection)
+                    .unwrap_err()
+                    .kind,
+                astra_core::ErrorKind::ContractViolation,
+            );
+        }
     }
 
     #[test]
@@ -2569,7 +2710,10 @@ mod tests {
         assert!(
             matches!(
                 resolve_server_default_model(&api, "token").await,
-                ServerDefaultModel::Unavailable(_)
+                ServerDefaultModel::Unavailable(astra_core::ClassifiedError {
+                    kind: astra_core::ErrorKind::ContractViolation,
+                    ..
+                })
             ),
             "an invalid provider default must not silently fall back"
         );

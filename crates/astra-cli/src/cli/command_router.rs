@@ -413,7 +413,9 @@ async fn resolve_one_shot_model(
         match session_runtime::resolve_server_default_model(api, token).await {
             session_runtime::ServerDefaultModel::Selected(selection) => Some(selection.name),
             session_runtime::ServerDefaultModel::NoModels => None,
-            session_runtime::ServerDefaultModel::Unavailable(error) => return Err(error),
+            session_runtime::ServerDefaultModel::Unavailable(error) => {
+                return Err(error.to_string());
+            }
         }
     };
     let Some(model) = model else {

@@ -430,6 +430,47 @@ mod tests {
             Some(session.astra_user_id.clone()),
         )
         .unwrap();
+        // A catalog 401 must not refresh an unrelated legacy profile against
+        // the selected UC server. Reuse this isolated process/binding fixture.
+        {
+            use crate::cli::cli_config::cli_utils::{Profile, credential_store, save_credentials};
+            let mut credentials = credential_store().load().unwrap();
+            credentials.profiles.insert(
+                "legacy-refresh-test".into(),
+                Profile {
+                    access_token: Some("legacy-access".into()),
+                    refresh_token: Some("legacy-refresh".into()),
+                    ..Default::default()
+                },
+            );
+            save_credentials(&credentials).unwrap();
+            assert_eq!(
+                credential_store().load().unwrap().profiles["legacy-refresh-test"]
+                    .refresh_token
+                    .as_deref(),
+                Some("legacy-refresh")
+            );
+            Mock::given(path("/auth/refresh"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "wrong-identity", "access_token": "wrong-access", "refresh_token": "wrong-refresh"
+                })))
+                .expect(0).mount(&selected).await;
+            let api = astra_thin_client::ThinClient::new(&selected.uri(), None).unwrap();
+            assert!(
+                !crate::cli::session::session_runtime::attempt_token_refresh(
+                    &api,
+                    Some("legacy-refresh-test")
+                )
+                .await
+            );
+            assert_eq!(binding.access_token().await.unwrap(), "synthetic-access");
+            assert_eq!(
+                credential_store().load().unwrap().profiles["legacy-refresh-test"]
+                    .refresh_token
+                    .as_deref(),
+                Some("legacy-refresh")
+            );
+        }
         Mock::given(path("/preferences"))
             .and(header("Authorization", "Bearer synthetic-access"))
             .respond_with(
