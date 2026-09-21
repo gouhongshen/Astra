@@ -10605,6 +10605,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(StatusTransitionCommit::default());
         };
         if expected_statuses.contains(&run.status.as_str())
@@ -10618,6 +10619,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Err(error);
         }
         let lineage_markers = lock_durable_lineage_cancellation_markers_tx(&mut tx, &run).await?;
@@ -10630,13 +10632,32 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(StatusTransitionCommit::default());
         }
         let recovery_event = if let Some(claim) = recovery_claim {
             if run.owner_pod_id.as_deref() != Some(self.owner_pod_id.as_str()) {
+                tx.rollback().await.map_err(|source| {
+                    db_error(
+                        "transition_run_status_with_events_rollback_recovery_owner",
+                        run_id,
+                        source,
+                    )
+                    .to_string()
+                })?;
+                connection.release();
                 return Ok(StatusTransitionCommit::default());
             }
             let Some(identity) = execution_handoff_checkpoint_identity(&run)? else {
+                tx.rollback().await.map_err(|source| {
+                    db_error(
+                        "transition_run_status_with_events_rollback_recovery_identity",
+                        run_id,
+                        source,
+                    )
+                    .to_string()
+                })?;
+                connection.release();
                 return Ok(StatusTransitionCommit::default());
             };
             let row = sqlx::query(
@@ -10653,6 +10674,15 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|error| error.to_string())?;
             let Some(row) = row else {
+                tx.rollback().await.map_err(|source| {
+                    db_error(
+                        "transition_run_status_with_events_rollback_recovery_checkpoint",
+                        run_id,
+                        source,
+                    )
+                    .to_string()
+                })?;
+                connection.release();
                 return Ok(StatusTransitionCommit::default());
             };
             let checkpoint =
@@ -10668,6 +10698,15 @@ impl DatabaseRunStateStore {
             let Some(association) =
                 execution_handoff_recovery_association(claim, &run, &checkpoint, event.as_ref())?
             else {
+                tx.rollback().await.map_err(|source| {
+                    db_error(
+                        "transition_run_status_with_events_rollback_recovery_association",
+                        run_id,
+                        source,
+                    )
+                    .to_string()
+                })?;
+                connection.release();
                 return Ok(StatusTransitionCommit::default());
             };
             if !recovery_frontier_matches(claim, &run) {
@@ -10684,6 +10723,15 @@ impl DatabaseRunStateStore {
                 .await
                 .map_err(|error| error.to_string())?;
                 if live.is_none() {
+                    tx.rollback().await.map_err(|source| {
+                        db_error(
+                            "transition_run_status_with_events_rollback_recovery_frontier",
+                            run_id,
+                            source,
+                        )
+                        .to_string()
+                    })?;
+                    connection.release();
                     return Ok(StatusTransitionCommit::default());
                 }
                 let recovery = event
@@ -10745,6 +10793,7 @@ impl DatabaseRunStateStore {
                         )
                         .to_string()
                     })?;
+                    connection.release();
                     return Err(error.to_string());
                 }
             }
@@ -10802,6 +10851,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(StatusTransitionCommit::default());
         }
         if !self
@@ -10817,6 +10867,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(StatusTransitionCommit::default());
         }
         enqueue_work_terminal_event_for_run(&mut tx, &run, status).await?;
@@ -10830,11 +10881,13 @@ impl DatabaseRunStateStore {
             )
             .await;
             if let Err(mut detail) = insert_result {
-                let rollback_error = tx.rollback().await.err();
-                if let Some(rollback_error) = rollback_error {
-                    detail.push_str(&format!(
-                        "; rollback after insert failure also failed: {rollback_error}"
-                    ));
+                match tx.rollback().await {
+                    Ok(()) => connection.release(),
+                    Err(rollback_error) => {
+                        detail.push_str(&format!(
+                            "; rollback after insert failure also failed: {rollback_error}"
+                        ));
+                    }
                 }
                 return Err(detail);
             }
@@ -12737,6 +12790,7 @@ impl DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_sync_run_projection_missing", run_id, source)
             })?;
+            connection.release();
             return Ok(());
         };
         let latest_event_type = sqlx::query_scalar::<_, String>(
@@ -12793,6 +12847,7 @@ impl DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_cross_session_run_projection", run_id, source)
             })?;
+            connection.release();
             return Err(db_error(
                 "sync_run_projection_cross_session_conflict",
                 run_id,
@@ -12808,6 +12863,7 @@ impl DatabaseRunStateStore {
                     tx.rollback().await.map_err(|source| {
                         db_error("rollback_stale_run_projection", run_id, source)
                     })?;
+                    connection.release();
                     return Err(db_error(
                         "sync_run_projection_stale_authority",
                         run_id,
@@ -13459,6 +13515,7 @@ impl DatabaseRunStateStore {
                         db_error("insert_run_rollback_error", &record.run_id, rollback_error)
                             .to_string()
                     })?;
+                    connection.release();
                     return Err(db_error("insert_run", &record.run_id, source).to_string());
                 }
             };
@@ -13475,6 +13532,7 @@ impl DatabaseRunStateStore {
                 tx.rollback().await.map_err(|source| {
                     db_error("insert_run_rollback_slot_blocked", &record.run_id, source).to_string()
                 })?;
+                connection.release();
                 return Err("session already has an active run".to_string());
             }
             result
@@ -13594,6 +13652,7 @@ impl DatabaseRunStateStore {
                         db_error("insert_run_rollback_error", &record.run_id, rollback_error)
                             .to_string()
                     })?;
+                    connection.release();
                     return Err(db_error("insert_run", &record.run_id, source).to_string());
                 }
             }
@@ -13602,6 +13661,7 @@ impl DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("insert_run_rollback_noop", &record.run_id, source).to_string()
             })?;
+            connection.release();
             return Err("session already has an active run".to_string());
         }
         Self::insert_run_event_rows_tx(
@@ -13842,6 +13902,7 @@ impl DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_empty_run_recovery_claim", "active", source).to_string()
             })?;
+            connection.release();
             return Ok(Vec::new());
         }
         // The database clock determines lease expiry only, never which
@@ -13908,6 +13969,7 @@ impl DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_empty_run_recovery_claim", "active", source).to_string()
             })?;
+            connection.release();
             return Ok(Vec::new());
         }
 
@@ -16066,6 +16128,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunGuidanceAdmission::Missing);
         };
 
@@ -16125,6 +16188,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunGuidanceAdmission::Inactive { status: run.status });
         }
 
@@ -16153,6 +16217,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("admit_run_guidance_rollback_fenced", request.run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunGuidanceAdmission::SettlementFenced);
         }
 
@@ -16178,6 +16243,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunGuidanceAdmission::ConsumerNotLive {
                 run: Box::new(run),
                 process_local_recovery_safe: false,
@@ -16226,6 +16292,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunGuidanceAdmission::ConsumerNotLive {
                 run: Box::new(run),
                 process_local_recovery_safe: false,
@@ -16339,6 +16406,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentAdmissionTransition::Missing);
         };
 
@@ -16354,6 +16422,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentAdmissionTransition::Inactive { status: run.status });
         }
         if run.run_generation != request.expected_owner_generation {
@@ -16366,6 +16435,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(
                 AtomicRunUserIntentAdmissionTransition::OwnerGenerationMismatch {
                     actual_owner_generation,
@@ -16382,6 +16452,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentAdmissionTransition::OwnerMismatch {
                 actual_owner_pod_id,
             });
@@ -16412,6 +16483,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentAdmissionTransition::OwnerLeaseExpired);
         }
 
@@ -16450,6 +16522,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             let event_index = latest.map(|gate| gate.event_index);
             return Ok(match request.transition {
                 RunUserIntentAdmissionTransition::Fence => {
@@ -16513,6 +16586,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentAdmissionTransition::OwnerLeaseExpired);
         }
         Self::insert_run_event_rows_tx(
@@ -16668,6 +16742,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunTerminalIntentReturn::Missing);
         };
 
@@ -16769,6 +16844,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(AtomicRunTerminalIntentReturn::IdentityConflict);
             }
         }
@@ -16785,6 +16861,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunTerminalIntentReturn::AlreadyReturned { event_indices });
         }
         if !durable_run_status_is_terminal(&run.status) {
@@ -16797,6 +16874,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunTerminalIntentReturn::NotTerminal { status });
         }
 
@@ -16856,6 +16934,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunTerminalIntentReturn::NotTerminal { status: run.status });
         }
         Self::insert_run_event_rows_tx(
@@ -16973,6 +17052,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_missing_user_intent_apply", request.run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentApply::Missing);
         };
         if run.run_generation != request.expected_owner_generation {
@@ -16985,6 +17065,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentApply::OwnerGenerationMismatch {
                 actual_owner_generation,
             });
@@ -16999,6 +17080,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentApply::OwnerMismatch {
                 actual_owner_pod_id,
             });
@@ -17058,6 +17140,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(AtomicRunUserIntentApply::IdentityConflict);
             }
             let event = decode_run_event_payload(&row, request.run_id)
@@ -17076,6 +17159,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(AtomicRunUserIntentApply::SourceMissing {
                     event_index: *source_index,
                 });
@@ -17107,6 +17191,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentApply::IdentityConflict);
         }
 
@@ -17168,6 +17253,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(AtomicRunUserIntentApply::IdentityConflict);
             }
             let event = decode_run_event_payload(&row, request.run_id)
@@ -17195,6 +17281,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(AtomicRunUserIntentApply::IdentityConflict);
             }
             if let Some((event_index, actual)) = actual_applied {
@@ -17207,6 +17294,7 @@ impl RunStateStore for DatabaseRunStateStore {
                         )
                         .to_string()
                     })?;
+                    connection.release();
                     return Ok(AtomicRunUserIntentApply::IdentityConflict);
                 }
                 existing_applied_indices.push(*event_index);
@@ -17220,6 +17308,7 @@ impl RunStateStore for DatabaseRunStateStore {
                         )
                         .to_string()
                     })?;
+                    connection.release();
                     return Ok(AtomicRunUserIntentApply::IdentityConflict);
                 }
                 returned_count += 1;
@@ -17239,6 +17328,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(if all_returned {
                 AtomicRunUserIntentApply::RunTerminalReturned
             } else {
@@ -17269,6 +17359,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentApply::Inactive { status });
         }
         let lease_live: i64 = sqlx::query_scalar(
@@ -17286,6 +17377,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_expired_user_intent_apply", request.run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentApply::OwnerLeaseExpired);
         }
 
@@ -17315,6 +17407,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_fenced_user_intent_apply", request.run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentApply::SettlementFenced);
         }
 
@@ -17392,6 +17485,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_lost_user_intent_apply", request.run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunUserIntentApply::OwnerLeaseExpired);
         }
         Self::insert_run_event_rows_tx(
@@ -17715,6 +17809,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("update_run_status_rollback_missing", run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(false);
         };
         if let Err(error) = ensure_terminal_status_immutable(&run, status) {
@@ -17726,6 +17821,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Err(error);
         }
         let interaction_closure_rows = self
@@ -17769,6 +17865,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("update_run_status_rollback_conflict", run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(false);
         }
         Self::insert_run_event_rows_tx(
@@ -17786,6 +17883,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("update_run_status_rollback_slot_blocked", run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(false);
         }
         enqueue_work_terminal_event_for_run(&mut tx, &run, status).await?;
@@ -17859,6 +17957,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(false);
         };
         if expected_statuses.contains(&run.status.as_str())
@@ -17872,6 +17971,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Err(error);
         }
         let lineage_markers = lock_durable_lineage_cancellation_markers_tx(&mut tx, &run).await?;
@@ -17884,6 +17984,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(false);
         }
         let interaction_closure_rows = self
@@ -17937,6 +18038,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(false);
         }
         Self::insert_run_event_rows_tx(
@@ -17959,6 +18061,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(false);
         }
         enqueue_work_terminal_event_for_run(&mut tx, &run, status).await?;
@@ -18028,6 +18131,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(false);
         };
         if expected_statuses.contains(&run.status.as_str())
@@ -18041,6 +18145,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Err(error);
         }
         let lineage_markers = lock_durable_lineage_cancellation_markers_tx(&mut tx, &run).await?;
@@ -18053,6 +18158,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(false);
         }
         let session_id = run.session_id.clone();
@@ -18083,6 +18189,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Err(error.to_string());
             }
         };
@@ -18131,6 +18238,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(false);
         }
         if !self
@@ -18146,6 +18254,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(false);
         }
         enqueue_work_terminal_event_for_run(&mut tx, &run, status).await?;
@@ -18166,11 +18275,13 @@ impl RunStateStore for DatabaseRunStateStore {
         )
         .await;
         if let Err(mut detail) = insert_result {
-            let rollback_error = tx.rollback().await.err();
-            if let Some(rollback_error) = rollback_error {
-                detail.push_str(&format!(
-                    "; rollback after insert failure also failed: {rollback_error}"
-                ));
+            match tx.rollback().await {
+                Ok(()) => connection.release(),
+                Err(rollback_error) => {
+                    detail.push_str(&format!(
+                        "; rollback after insert failure also failed: {rollback_error}"
+                    ));
+                }
             }
             return Err(detail);
         }
@@ -18246,6 +18357,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(GuardedRunStatusTransition::StatusConflict);
         };
         if let Some(generation) = forbid_open_settlement_generation {
@@ -18258,6 +18370,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(GuardedRunStatusTransition::StatusConflict);
             }
             let started_key = format!("run-settlement-started:{generation}");
@@ -18304,6 +18417,7 @@ impl RunStateStore for DatabaseRunStateStore {
                         )
                         .to_string()
                     })?;
+                    connection.release();
                     return Ok(GuardedRunStatusTransition::SettlementInProgress);
                 }
             }
@@ -18319,6 +18433,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Err(error);
         }
         let lineage_markers = lock_durable_lineage_cancellation_markers_tx(&mut tx, &run).await?;
@@ -18331,6 +18446,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(GuardedRunStatusTransition::StatusConflict);
         }
         let last_event_idx = run.last_event_idx;
@@ -18359,6 +18475,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Err(error.to_string());
             }
         };
@@ -18414,6 +18531,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(GuardedRunStatusTransition::StatusConflict);
         }
         if !self
@@ -18429,6 +18547,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(GuardedRunStatusTransition::SessionBlocked);
         }
         enqueue_work_terminal_event_for_run(&mut tx, &run, status).await?;
@@ -18449,11 +18568,13 @@ impl RunStateStore for DatabaseRunStateStore {
         )
         .await;
         if let Err(mut detail) = insert_result {
-            let rollback_error = tx.rollback().await.err();
-            if let Some(rollback_error) = rollback_error {
-                detail.push_str(&format!(
-                    "; rollback after insert failure also failed: {rollback_error}"
-                ));
+            match tx.rollback().await {
+                Ok(()) => connection.release(),
+                Err(rollback_error) => {
+                    detail.push_str(&format!(
+                        "; rollback after insert failure also failed: {rollback_error}"
+                    ));
+                }
             }
             return Err(detail);
         }
@@ -18616,6 +18737,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("generation_fenced_append_rollback_missing", run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(false);
         };
         if run.run_generation != expected_generation
@@ -18624,6 +18746,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("generation_fenced_append_rollback_conflict", run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(false);
         }
 
@@ -18670,6 +18793,7 @@ impl RunStateStore for DatabaseRunStateStore {
                             )
                             .to_string()
                         })?;
+                        connection.release();
                         return Err(format!(
                             "immutable run event conflict for idempotency key {key}"
                         ));
@@ -18689,6 +18813,7 @@ impl RunStateStore for DatabaseRunStateStore {
                             )
                             .to_string()
                         })?;
+                        connection.release();
                         return Err(format!(
                             "immutable run event conflict for idempotency key {key}"
                         ));
@@ -18707,6 +18832,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(true);
         }
 
@@ -18752,6 +18878,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("generation_fenced_append_rollback_cas", run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(false);
         }
 
@@ -19032,6 +19159,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_save_checkpoint_missing", run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(None);
         };
         if let CheckpointWriteAuthority::ExecutionOwner {
@@ -19048,6 +19176,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 tx.rollback().await.map_err(|source| {
                     db_error("rollback_checkpoint_owner_conflict", run_id, source).to_string()
                 })?;
+                connection.release();
                 return Ok(None);
             }
         }
@@ -19090,6 +19219,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_checkpoint_authority", run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(None);
         }
         let insert_sql = if checkpoint_kind == "execution_handoff" {
@@ -19152,6 +19282,7 @@ impl RunStateStore for DatabaseRunStateStore {
             tx.rollback().await.map_err(|source| {
                 db_error("rollback_save_checkpoint", run_id, source).to_string()
             })?;
+            connection.release();
             return Ok(None);
         }
         tx.commit()
@@ -19374,6 +19505,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(AtomicRunToolRequestCommitOutcome::AlreadyCommitted(
                     expected_receipt,
                 ));
@@ -19389,6 +19521,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(AtomicRunToolRequestCommitOutcome::Superseded {
                     user_intent_event_index,
                 });
@@ -19402,6 +19535,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(AtomicRunToolRequestCommitOutcome::Inactive { status });
             }
             TransactionalRunActionAdmission::OwnerGenerationMismatch {
@@ -19416,6 +19550,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(AtomicRunToolRequestCommitOutcome::OwnerGenerationMismatch {
                     actual_owner_generation,
                 });
@@ -19431,6 +19566,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(AtomicRunToolRequestCommitOutcome::OwnerMismatch {
                     actual_owner_pod_id,
                 });
@@ -19444,6 +19580,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(AtomicRunToolRequestCommitOutcome::Missing);
             }
         };
@@ -19710,6 +19847,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunInteractionBatchRegistration::Missing);
         };
         let (registration_batch_id, registration_events) =
@@ -19723,6 +19861,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(
                 AtomicRunInteractionBatchRegistration::OwnerGenerationMismatch {
                     actual_owner_generation: run.run_generation,
@@ -19739,6 +19878,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunInteractionBatchRegistration::OwnerMismatch {
                 actual_owner_pod_id,
             });
@@ -19753,6 +19893,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunInteractionBatchRegistration::Inactive { status });
         }
         let lease_active: i64 = sqlx::query_scalar(
@@ -19782,6 +19923,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunInteractionBatchRegistration::OwnerLeaseExpired);
         }
         if request.expected_control_epoch > run.last_event_idx {
@@ -19793,6 +19935,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Err(format!(
                 "control epoch {} is ahead of durable run {} event index {}",
                 request.expected_control_epoch, request.run_id, run.last_event_idx
@@ -19825,6 +19968,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunInteractionBatchRegistration::Superseded {
                 user_intent_event_index,
             });
@@ -19866,6 +20010,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Err(format!(
                     "interaction registration identity {request_id} has duplicate durable facts"
                 ));
@@ -19897,6 +20042,7 @@ impl RunStateStore for DatabaseRunStateStore {
                         )
                         .to_string()
                     })?;
+                    connection.release();
                     return Err(format!(
                         "immutable interaction registration conflict for request {request_id}"
                     ));
@@ -19940,6 +20086,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Err(format!(
                 "interaction registration batch {registration_batch_id} has an unexpected durable fact set"
             ));
@@ -19953,6 +20100,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Err(format!(
                 "partial interaction registration is invalid: {} of {} facts exist",
                 existing_indices.len(),
@@ -19974,6 +20122,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Err(
                     "durable interaction registration facts are not one contiguous ordered batch"
                         .to_string(),
@@ -20045,6 +20194,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(AtomicRunInteractionBatchRegistration::OwnerLeaseExpired);
         }
         Self::insert_run_event_rows_tx(
@@ -20290,6 +20440,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::MissingRequest);
             };
             if let Some(queued_response_event_type) = queued_response_event_type {
@@ -20331,6 +20482,7 @@ impl RunStateStore for DatabaseRunStateStore {
                             )
                             .to_string()
                         })?;
+                        connection.release();
                         return Ok(DurableRunInteractionWaitOutcome::AlreadyResolved(event));
                     } else if event_type == queued_response_event_type {
                         queued = Some(event);
@@ -20478,6 +20630,7 @@ impl RunStateStore for DatabaseRunStateStore {
                                 )
                                 .to_string()
                             })?;
+                            connection.release();
                             tokio::task::yield_now().await;
                             continue;
                         }
@@ -20509,6 +20662,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 tx.rollback().await.map_err(|source| {
                     db_error("rollback_run_interaction_wait_generation", run_id, source).to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::OwnerGenerationMismatch {
                     actual_owner_generation: run.run_generation,
                 });
@@ -20518,6 +20672,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 tx.rollback().await.map_err(|source| {
                     db_error("rollback_run_interaction_wait_owner", run_id, source).to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::OwnerMismatch {
                     actual_owner_pod_id,
                 });
@@ -20527,6 +20682,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     db_error("rollback_run_interaction_wait_future_epoch", run_id, source)
                         .to_string()
                 })?;
+                connection.release();
                 return Err(format!(
                     "control epoch {} is ahead of durable run {} event index {}",
                     request.expected_control_epoch, request.run_id, run.last_event_idx
@@ -20546,6 +20702,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 tx.rollback().await.map_err(|source| {
                     db_error("rollback_run_interaction_wait_lease", run_id, source).to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::OwnerLeaseExpired);
             }
             let newer_intent: Option<i64> = sqlx::query_scalar(
@@ -20565,6 +20722,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 tx.rollback().await.map_err(|source| {
                     db_error("rollback_run_interaction_wait_superseded", run_id, source).to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::Superseded {
                     user_intent_event_index,
                 });
@@ -20622,6 +20780,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::AlreadyResolved(resolved));
             }
             let Some(required) = required else {
@@ -20633,6 +20792,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::MissingRequest);
             };
             if kind == DurableRunInteractionKind::Approval {
@@ -20662,6 +20822,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     tx.rollback().await.map_err(|source| {
                         db_error("rollback_missing_approval_frontier", run_id, source).to_string()
                     })?;
+                    connection.release();
                     return Ok(DurableRunInteractionWaitOutcome::MissingRequest);
                 };
                 if earliest != request_id {
@@ -20669,6 +20830,7 @@ impl RunStateStore for DatabaseRunStateStore {
                         db_error("rollback_out_of_order_approval_frontier", run_id, source)
                             .to_string()
                     })?;
+                    connection.release();
                     return Err(format!(
                         "approval {request_id} is not the earliest unresolved frontier; {earliest} must settle first"
                     ));
@@ -20701,6 +20863,7 @@ impl RunStateStore for DatabaseRunStateStore {
                         )
                         .to_string()
                     })?;
+                    connection.release();
                     return Ok(DurableRunInteractionWaitOutcome::NoLongerActive);
                 }
                 let wait_event = interaction_wait_started_event(
@@ -20875,6 +21038,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(
                     if run.waiting_for.as_deref() == Some(kind.waiting_for())
                         && exact_wait_exists
@@ -20895,6 +21059,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::NoLongerActive);
             }
             if exact_wait_exists {
@@ -20906,6 +21071,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::NoLongerActive);
             }
 
@@ -20960,6 +21126,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::NoLongerActive);
             }
             if !self
@@ -20975,6 +21142,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 tx.rollback().await.map_err(|source| {
                     db_error("begin_run_interaction_wait_rollback_slot", run_id, source).to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionWaitOutcome::NoLongerActive);
             }
             Self::insert_run_event_rows_tx(
@@ -21111,6 +21279,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 tx.rollback().await.map_err(|source| {
                     db_error("resolve_run_interaction_rollback_missing", run_id, source).to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
             };
             let rows = sqlx::query(
@@ -21164,6 +21333,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     db_error("resolve_run_interaction_rollback_existing", run_id, source)
                         .to_string()
                 })?;
+                connection.release();
                 return Ok(existing_interaction_resolution_outcome(
                     existing,
                     &response_data,
@@ -21181,6 +21351,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
             };
             if let Some(existing) = queued_response.as_ref()
@@ -21194,6 +21365,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionResolveOutcome::Conflict(
                     existing.clone(),
                 ));
@@ -21364,6 +21536,7 @@ impl RunStateStore for DatabaseRunStateStore {
                         db_error("resolve_queued_interaction_rollback_replay", run_id, source)
                             .to_string()
                     })?;
+                    connection.release();
                     return Ok(DurableRunInteractionResolveOutcome::Queued(existing));
                 }
                 let event =
@@ -21410,6 +21583,7 @@ impl RunStateStore for DatabaseRunStateStore {
                         )
                         .to_string()
                     })?;
+                    connection.release();
                     tokio::task::yield_now().await;
                     continue;
                 }
@@ -21560,6 +21734,7 @@ impl RunStateStore for DatabaseRunStateStore {
                     db_error("resolve_run_interaction_rollback_conflict", run_id, source)
                         .to_string()
                 })?;
+                connection.release();
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -21577,6 +21752,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 tx.rollback().await.map_err(|source| {
                     db_error("resolve_run_interaction_rollback_slot", run_id, source).to_string()
                 })?;
+                connection.release();
                 return Ok(DurableRunInteractionResolveOutcome::NoLongerWaiting);
             }
             Self::insert_run_event_rows_tx(
@@ -22634,6 +22810,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(UserIntentAdmissionTransitionRecovery::Missing);
         };
         if run.run_generation != request.expected_owner_generation {
@@ -22646,6 +22823,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(
                 UserIntentAdmissionTransitionRecovery::OwnerGenerationMismatch {
                     actual_owner_generation,
@@ -22662,6 +22840,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(UserIntentAdmissionTransitionRecovery::OwnerMismatch {
                 actual_owner_pod_id,
             });
@@ -22676,6 +22855,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(UserIntentAdmissionTransitionRecovery::Inactive { status });
         }
         let lease_live: i64 = sqlx::query_scalar(
@@ -22703,6 +22883,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(UserIntentAdmissionTransitionRecovery::OwnerLeaseExpired);
         }
         let recovered = self
@@ -22825,6 +23006,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(UserIntentApplyRecovery::Missing);
         };
         if run.run_generation != request.expected_owner_generation {
@@ -22837,6 +23019,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(UserIntentApplyRecovery::OwnerGenerationMismatch {
                 actual_owner_generation,
             });
@@ -22851,6 +23034,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(UserIntentApplyRecovery::OwnerMismatch {
                 actual_owner_pod_id,
             });
@@ -22873,6 +23057,7 @@ impl DatabaseRunStateStore {
                 )
                 .to_string()
             })?;
+            connection.release();
             return Ok(UserIntentApplyRecovery::NotCommitted);
         }
         let by_key = recovered
@@ -22890,6 +23075,7 @@ impl DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(UserIntentApplyRecovery::NotCommitted);
             };
             if !recovered_run_control_event_is_equivalent(actual, expected_event, key) {
@@ -22901,6 +23087,7 @@ impl DatabaseRunStateStore {
                     )
                     .to_string()
                 })?;
+                connection.release();
                 return Ok(UserIntentApplyRecovery::Conflict);
             }
             event_indices.push(actual.event_idx);
@@ -22921,6 +23108,7 @@ impl DatabaseRunStateStore {
             )
             .to_string()
         })?;
+        connection.release();
         Ok(if this_attempt {
             UserIntentApplyRecovery::ThisAttempt(event_indices)
         } else {
