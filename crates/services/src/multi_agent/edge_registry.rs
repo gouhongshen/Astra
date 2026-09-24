@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::metrics::SharedMultiAgentMetrics;
+use crate::cancellation_safe_db::CancellationSafeTransaction;
 use crate::db_row::RowExt as EdgeRegistryDbRow;
 
 const CURRENT_READ_MAX_ATTEMPTS: u32 = 6;
@@ -334,7 +335,7 @@ fn registration_before_mutation_decision(
 }
 
 async fn transition_error_with_rollback(
-    transaction: sqlx::Transaction<'_, sqlx::MySql>,
+    mut transaction: CancellationSafeTransaction,
     operation: &str,
     registry_id: &str,
     error: impl std::fmt::Display,
@@ -644,7 +645,7 @@ impl DatabaseEdgeRegistryService {
     }
 
     async fn load_registration_state_for_update(
-        transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        transaction: &mut CancellationSafeTransaction,
         user_id: &str,
         registry_id: &str,
     ) -> Result<Option<RegistrationState>, sqlx::Error> {
@@ -672,7 +673,7 @@ impl DatabaseEdgeRegistryService {
     /// row lock for `SELECT ... FOR UPDATE`, while a no-op UPDATE participates
     /// in commit-time conflict detection.
     async fn establish_registry_current_read(
-        transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        transaction: &mut CancellationSafeTransaction,
         user_id: &str,
         registry_id: &str,
     ) -> Result<(), sqlx::Error> {
@@ -688,7 +689,7 @@ impl DatabaseEdgeRegistryService {
     }
 
     async fn establish_generation_current_read(
-        transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        transaction: &mut CancellationSafeTransaction,
         user_id: &str,
         edge_agent_id: &str,
     ) -> Result<(), sqlx::Error> {
@@ -704,7 +705,7 @@ impl DatabaseEdgeRegistryService {
     }
 
     async fn load_generation_state(
-        transaction: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        transaction: &mut CancellationSafeTransaction,
         user_id: &str,
         edge_agent_id: &str,
     ) -> Result<Option<RegistrationGenerationState>, sqlx::Error> {
@@ -749,9 +750,13 @@ impl DatabaseEdgeRegistryService {
                 .await;
             }
 
-            let mut transaction = self.pool.begin().await.map_err(|error| {
-                format!("edge_registry {operation} verification begin (attempt {attempt}): {error}")
-            })?;
+            let mut transaction = CancellationSafeTransaction::begin(&self.pool)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "edge_registry {operation} verification begin (attempt {attempt}): {error}"
+                    )
+                })?;
             if let Err(error) =
                 Self::establish_generation_current_read(&mut transaction, user_id, edge_agent_id)
                     .await
@@ -885,7 +890,12 @@ impl DatabaseEdgeRegistryService {
                 .await;
             }
 
-            let mut transaction = self.pool.begin().await.map_err(|error| {
+            // Publication/cleanup attempts can be cancelled by their caller.
+            // Guard the checkout before BEGIN is sent: SQLx constructs its
+            // Transaction only after the BEGIN response, so cancellation in
+            // that window otherwise has no transaction Drop to roll back.
+            // The same guard covers statements, COMMIT, and explicit ROLLBACK.
+            let mut transaction = CancellationSafeTransaction::begin(&self.pool).await.map_err(|error| {
                 format!(
                     "edge_registry {operation} registration {registry_id} begin (attempt {attempt}): {error}"
                 )
@@ -1163,9 +1173,7 @@ impl DatabaseEdgeRegistryService {
                     .await;
             }
 
-            let mut transaction = self
-                .pool
-                .begin()
+            let mut transaction = CancellationSafeTransaction::begin(&self.pool)
                 .await
                 .map_err(|e| format!("edge_registry lease begin (attempt {attempt}): {e}"))?;
             let lookup_sql = format!(
@@ -1436,9 +1444,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                 ))
                 .await;
             }
-            let mut transaction = self
-                .pool
-                .begin()
+            let mut transaction = CancellationSafeTransaction::begin(&self.pool)
                 .await
                 .map_err(|e| format!("edge_registry begin (attempt {attempt}): {e}"))?;
             // Fetch registry_id + registered_at in one query; construct the
