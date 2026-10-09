@@ -1,11 +1,10 @@
 //! REPL state management.
 //!
 //! This module defines `SessionState`, the central struct that holds all session state
-//! for the CLI REPL. It also includes helper types like `ExplainMode` and `SkillDevState`.
+//! for the CLI REPL. It also includes helper types like `ExplainMode`.
 
 use crate::cli::cli_config::cli_context::CliContext;
 use crate::cli::permission_manager::PermissionManager;
-use crate::cli::slash::slash_team;
 use crate::mcp_client;
 use astra_config::runtime_config::ExplainReportFormat;
 use astra_runtime::plan as runtime_plan;
@@ -168,13 +167,6 @@ pub(crate) struct ExplainSlashCommand {
     pub(crate) report_format: Option<ExplainReportFormat>,
 }
 
-/// Active `/skill dev` session — name and directory are always set together.
-#[derive(Clone, Debug)]
-pub(crate) struct SkillDevState {
-    pub name: String,
-    pub dir: std::path::PathBuf,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ContinuationAnchor {
     pub text: String,
@@ -234,17 +226,47 @@ impl std::fmt::Display for ContinuationAnchor {
     }
 }
 
-/// Adaptive engine state persisted between sessions.
-/// Holds anti-flap dampening, experiment enrollment, and tuned config so the
-/// adaptive engine doesn't oscillate or lose progress on session restart.
-#[derive(Debug, Default, Clone)]
-pub(crate) struct PersistedAdaptiveState {
-    pub last_scenario_change_turn: Option<u32>,
-    pub last_token_budget_direction: i8,
-    pub last_token_budget_change_turn: Option<u32>,
-    pub active_experiment_id: Option<String>,
-    pub active_variant: Option<String>,
-    pub tuned_config_json: Option<String>,
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SessionModelChoice {
+    Requested(String),
+    Selected(super::session_runtime::ServerModelSelection),
+}
+
+impl From<&str> for SessionModelChoice {
+    fn from(name: &str) -> Self {
+        Self::Requested(name.to_string())
+    }
+}
+
+impl From<String> for SessionModelChoice {
+    fn from(name: String) -> Self {
+        Self::Requested(name)
+    }
+}
+
+impl std::ops::Deref for SessionModelChoice {
+    type Target = str;
+    fn deref(&self) -> &str {
+        match self {
+            Self::Requested(name) => name,
+            Self::Selected(selection) => &selection.name,
+        }
+    }
+}
+
+impl SessionModelChoice {
+    pub(crate) fn offering_id(&self) -> Option<&str> {
+        match self {
+            Self::Selected(selection) => Some(&selection.offering_id),
+            Self::Requested(_) => None,
+        }
+    }
+    pub(crate) fn pricing(&self) -> Option<&astra_services::models::PricingData> {
+        match self {
+            Self::Selected(selection) => selection.pricing.as_ref(),
+            Self::Requested(_) => None,
+        }
+    }
 }
 
 // NOTE: SessionState is per-session and NOT shared across sessions. In future
@@ -258,8 +280,10 @@ pub(crate) struct SessionState {
     pub run_id: Option<String>,
     /// Display name for this session (set via --name flag).
     pub session_name: Option<String>,
+    /// Session-owned caller intent (including model policy/profile selection),
+    /// independent of `model`, which may be populated by default resolution.
     pub cli_context: CliContext,
-    pub model: Option<String>,
+    pub model: Option<SessionModelChoice>,
     pub turn: u32,
     pub last_response: Option<String>,
     /// Session-scoped file edit journal — shared with ToolExecutors for undo.
@@ -323,10 +347,6 @@ pub(crate) struct SessionState {
     pub total_cache_creation_tokens: u64,
     /// Complete attributed estimate, or unknown. Current-rate scenarios are separate.
     pub total_session_cost: Option<f64>,
-    /// Cached pricing data for the active model (used by /cost).
-    pub cached_pricing: astra_services::models::PricingData,
-    pub skill_dev: Option<SkillDevState>,
-    pub active_system_skills: Vec<prompts::SystemSkill>,
     /// Runtime configuration loaded from config files + env vars (M3).
     pub runtime_config: astra_config::runtime_config::RuntimeConfig,
     /// Explicit `/explain --format …` choice for this running CLI session.
@@ -342,8 +362,8 @@ pub(crate) struct SessionState {
     /// and ConfigChange journal events so post-hoc audit can answer
     /// "what config did this session/turn run under".
     ///
-    /// `None` only for legacy code paths that don't walk through the
-    /// version front door yet (covered by follow-up commits).
+    /// The id may be computed without storing a configuration blob.
+    /// `None` means the session configuration has not yet been versioned.
     pub config_version_id: Option<String>,
     pub context_budget: prompts::ContextBudget,
     pub journal: Option<session_journal::JournalWriter>,
@@ -403,46 +423,18 @@ pub(crate) struct SessionState {
     /// Tool replay guard rebuilt from step events on resume.
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
-    /// Session-scoped skill quality tracker for learning loop.
-    pub skill_quality_tracker: astra_skills::quality::SkillQualityTracker,
-    /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
-    pub skill_improvement_tracker: astra_skills::improvement::ImprovementTracker,
-    /// Skills surfaced by `discover_skills` during this CLI session.
-    pub discovered_skills: std::collections::HashSet<String>,
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
-    /// Delegation engine for multi-agent coordination.
-    /// Constructed at REPL startup with a real `CliDelegateSubRunExecutor` when
-    /// the user is authenticated. Falls back to stub creation during plan execution
-    /// if not already initialized.
-    pub delegation_engine:
-        Option<std::sync::Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
-    /// Team coordination registry for multi-agent team patterns.
-    pub team_registry: slash_team::TeamRegistry,
-    /// Shared team persistence service (in-memory or API-backed).
-    /// Used for execution history and snapshot persistence.
-    pub team_store: std::sync::Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
     /// Project-level instructions loaded from `.astra/instructions.md`.
     /// Injected into every turn's effective message as `<project_instructions>`.
     pub project_instructions: Option<String>,
-    /// Shared messaging metrics (populated when delegation is active).
-    pub messaging_metrics: Option<std::sync::Arc<astra_messaging::MessagingMetrics>>,
-    /// Shared dead letter queue (populated when delegation is active).
-    pub dead_letter_queue: Option<std::sync::Arc<astra_messaging::dead_letter::DeadLetterQueue>>,
-    /// Dynamic agent spawner for runtime agent creation.
+    /// Session-local recovery and observation projection for child runs.
     pub agent_spawner: Option<std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Session-scoped typed authority for every asynchronous work kind. Model
     /// boundaries consume this registry instead of querying UI projections or
     /// one producer-specific cache.
     pub active_work_registry: std::sync::Arc<astra_core::work_unit::ActiveWorkRegistry>,
-    /// Persistent top-level mailbox so spawned agents can reply across turns.
-    pub root_mailbox: Option<astra_messaging::router::AgentMailbox>,
-    /// Replies received while the REPL is idle at the prompt. Flushed only at safe redraw points.
 
     // ── Drift tracking ──
-    /// Redo stack — stores undone turns for `/redo` recovery.
-    /// Each entry is (user_msg, assistant_msg, turn_number).
-    pub redo_stack: Vec<(String, String, u32)>,
-
     /// Resume guidance message from a previously interrupted checkpoint.
     /// One-shot: consumed and cleared after the first turn that uses it.
     pub resume_guidance: Option<String>,
@@ -450,10 +442,6 @@ pub(crate) struct SessionState {
     /// cannot immediately repeat the exploratory path that just tripped a guard.
     pub resume_restricted_tools: Vec<String>,
 
-    /// Turns where history compaction occurred (for drift detection).
-    pub drift_compressed_turns: Vec<u32>,
-    /// Turns where user provided correction/redirection (for drift detection).
-    pub drift_user_corrections: Vec<u32>,
     /// Original user query at session start (for drift baseline comparison).
     pub drift_original_query: Option<String>,
 
@@ -477,38 +465,13 @@ pub(crate) struct SessionState {
     pub memory_inference_offering: super::session_memory_inference::MemoryJudgmentOffering,
     /// Background session-memory.md extraction coordinator. `None` means
     /// the current CLI path has no API-backed extraction service.
-    pub session_memory_extractor:
-        Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>>,
-
-    /// P8: persistent auto-invoke handler. Owns the per-cause cooldowns
-    /// across turns of this session. Created lazily on first turn so
-    /// sessions that never trigger anything pay no cost. The REPL is
-    /// single-threaded per session so no Arc/Mutex needed.
-    pub auto_invoke_handler: Option<astra_runtime::auto_invoke_handler::AutoInvokeHandler>,
-
-    /// P8: most recent auto-invoke diagnosis, produced at the end of the
-    /// previous turn. Passed through to the next turn's ToolExecutor so
-    /// the LLM sees "the system already noticed X" in the prompt.
-    /// Cleared when no diagnosis is produced.
-    pub latest_skill_diagnosis: Option<astra_skills::auto_invoke::SkillDiagnosis>,
+    pub session_memory_port:
+        Option<std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>>,
 
     /// P3/P4: evaluator-derived feedback from the previous turn. Passed to
     /// the next turn's ToolExecutor so the prompt can correct tool behavior
     /// such as sequential read churn, repeated calls, and stalls.
     pub latest_turn_quality_feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
-
-    /// R1: tracks active diagnosis postconditions across turns. When a
-    /// diagnosis fires, its success_criteria are registered here. On each
-    /// subsequent turn, evaluate_turn checks whether the criteria are met.
-    /// Session cleanup reads the accumulated met/failed counts for the
-    /// DiagnosisOutcomeTracker.
-    pub diagnosis_outcome_tracker: astra_runtime::auto_invoke_handler::DiagnosisOutcomeTracker,
-
-    /// R1: cumulative met/failed diagnosis criteria for the session.
-    /// Incremented by `maybe_run_auto_invoke` when tracker completes a
-    /// diagnosis evaluation. Written to DiagnosisOutcomeTracker for observability.
-    pub diagnosis_criteria_met: u32,
-    pub diagnosis_criteria_failed: u32,
 
     // ── Observability ──
     /// Global observability hub for profiles, traces, and feedback signals.
@@ -519,8 +482,8 @@ pub(crate) struct SessionState {
     pub observability_session: Option<
         std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
     >,
-    /// Adaptive state restored from workspace, applied when ObservabilitySession is created.
-    pub pending_adaptive_state: Option<PersistedAdaptiveState>,
+    /// The observability projection needs the current authoritative runtime configuration.
+    pub observability_config_pending: bool,
 
     // ── User Profile (M5) ──
     /// User profile manager for preferences and scenario detection.
@@ -584,8 +547,6 @@ pub(crate) struct SessionState {
     // ── Harness (observation + verification layer) ──
     #[cfg(feature = "harness")]
     pub harness_sink: std::sync::Arc<astra_harness::InMemorySnapshotSink>,
-    #[cfg(feature = "harness")]
-    pub harness_trace: std::sync::Arc<std::sync::RwLock<astra_harness::SessionTrace>>,
 }
 
 impl Default for SessionState {
@@ -633,9 +594,6 @@ impl Default for SessionState {
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             total_session_cost: Some(0.0),
-            cached_pricing: Default::default(),
-            skill_dev: None,
-            active_system_skills: Vec::new(),
             // Load RuntimeConfig from config files + env vars, then create
             // ContextBudget using the loaded config (M3 wiring).
             runtime_config: { astra_config::runtime_config::RuntimeConfig::load() },
@@ -669,33 +627,16 @@ impl Default for SessionState {
             runtime_consecutive_context_window_errors: 0,
             workspace_observation_quarantine: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
-            skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
-            discovered_skills: std::collections::HashSet::new(),
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),
             )),
-            delegation_engine: None,
-            team_registry: slash_team::TeamRegistry::new(),
-            team_store: std::sync::Arc::new(
-                astra_services::team_persistence::InMemoryTeamStore::new(),
-            ),
             project_instructions: None,
-            // Create shared messaging infrastructure eagerly so /messaging always has data
-            messaging_metrics: Some(std::sync::Arc::new(astra_messaging::MessagingMetrics::new())),
-            dead_letter_queue: Some(std::sync::Arc::new(
-                astra_messaging::dead_letter::DeadLetterQueue::new(),
-            )),
-            agent_spawner: None, // Created lazily when agent spawning is first used
+            agent_spawner: None, // Installed by session projection initialization
             active_work_registry: std::sync::Arc::new(
                 astra_core::work_unit::ActiveWorkRegistry::default(),
             ),
-            root_mailbox: None,
-            redo_stack: Vec::new(),
             resume_guidance: None,
             resume_restricted_tools: Vec::new(),
-            drift_compressed_turns: Vec::new(),
-            drift_user_corrections: Vec::new(),
             drift_original_query: None,
             session_lessons: Vec::new(),
             memory_selection_reports: Vec::new(),
@@ -703,18 +644,13 @@ impl Default for SessionState {
             lesson_checkpointer: astra_runtime::learning::checkpoint::LessonCheckpointer::new(),
             memory_inference_offering:
                 super::session_memory_inference::MemoryJudgmentOffering::Unresolved,
-            session_memory_extractor: None,
-            auto_invoke_handler: None,
-            latest_skill_diagnosis: None,
+            session_memory_port: None,
+
             latest_turn_quality_feedback: None,
-            diagnosis_outcome_tracker:
-                astra_runtime::auto_invoke_handler::DiagnosisOutcomeTracker::new(),
-            diagnosis_criteria_met: 0,
-            diagnosis_criteria_failed: 0,
             // Observability: hub is created at REPL startup, session on first turn
             observability_hub: None,
             observability_session: None,
-            pending_adaptive_state: None,
+            observability_config_pending: false,
             user_profile_manager: {
                 let store =
                     std::sync::Arc::new(astra_config::user_profile::UserProfileStore::new());
@@ -735,10 +671,6 @@ impl Default for SessionState {
             bash_detach_slot: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "harness")]
             harness_sink: astra_harness::InMemorySnapshotSink::arc(),
-            #[cfg(feature = "harness")]
-            harness_trace: std::sync::Arc::new(std::sync::RwLock::new(
-                astra_harness::SessionTrace::new(None),
-            )),
         }
     }
 }
@@ -761,17 +693,6 @@ impl SessionState {
     pub(crate) fn set_explain_report_format_override(&mut self, format: ExplainReportFormat) {
         self.explain_report_format_override = Some(format);
         self.runtime_config.explain.report_format = Some(format);
-    }
-
-    /// Reload file-backed configuration while retaining an explicit session
-    /// format choice. This is used after a successful `/config` save; callers
-    /// that only inspect configuration should not reload at all.
-    pub(crate) fn reload_runtime_config(&mut self) {
-        let format_override = self.explain_report_format_override;
-        self.runtime_config = astra_config::runtime_config::RuntimeConfig::load();
-        if let Some(format) = format_override {
-            self.runtime_config.explain.report_format = Some(format);
-        }
     }
 
     fn advance_session_attachment(&mut self) {
@@ -829,11 +750,12 @@ impl SessionState {
     /// Reset session-scoped runtime state after starting a new session.
     ///
     /// Intentionally preserves user preferences, model selection, project
-    /// instructions, runtime config, and long-lived registries/services.
+    /// instructions, and long-lived registries/services. This mechanical reset
+    /// does not select configuration: new-session boundaries must prepare and
+    /// install process/profile settings, while restore installs its snapshot.
     ///
     /// Call `prepare_for_session_rebind().await` before using this at a
-    /// session boundary; this synchronous reset does not tear down the
-    /// asynchronously registered root mailbox.
+    /// session boundary to clear the asynchronously shared background-task view.
     pub fn reset_for_new_session(&mut self) {
         self.advance_session_attachment();
         // A registry generation belongs to exactly one session. Old producers
@@ -865,10 +787,7 @@ impl SessionState {
         self.session_persistence_error = None;
         self.latest_context_assembly_trace = None;
         self.clear_runtime_recovery_state();
-        self.redo_stack.clear();
         self.clear_resume_recovery_state();
-        self.drift_compressed_turns.clear();
-        self.drift_user_corrections.clear();
         self.drift_original_query = None;
         self.session_lessons.clear();
         self.memory_selection_reports.clear();
@@ -876,11 +795,10 @@ impl SessionState {
         self.lesson_checkpointer = Default::default();
         self.memory_inference_offering =
             super::session_memory_inference::MemoryJudgmentOffering::Unresolved;
-        self.latest_skill_diagnosis = None;
         self.latest_turn_quality_feedback = None;
         self.cloud_plan_mirror = None;
         self.observability_session = None;
-        self.pending_adaptive_state = None;
+        self.observability_config_pending = false;
         self.csl_manager = None;
         self.perm_manager.clear_session_overrides();
         self.pending_bg_notifications.clear();
@@ -889,37 +807,18 @@ impl SessionState {
     /// Reset live state before restoring a different session into this REPL.
     ///
     /// Stronger than `reset_for_new_session()`: resume must also drop the
-    /// current session binding and any workspace-derived skill/adaptive state
+    /// current session binding and any workspace-derived skills and configuration
     /// so the next restore cannot inherit stale values from the previous
-    /// session. Call `prepare_for_session_rebind().await` first so any
-    /// root mailbox tied to the old session is unregistered before the
-    /// next session binds.
+    /// session. Call `prepare_for_session_rebind().await` first to clear
+    /// the previous session's background-task view.
     pub fn reset_for_session_restore(&mut self) {
         self.reset_for_new_session();
         self.clear_session_id();
-        self.discovered_skills.clear();
     }
 
-    /// Tear down session-bound routing before this REPL is rebound to a
-    /// different session id.
+    /// Clear the shared background-task projection before rebinding the session.
     pub async fn prepare_for_session_rebind(&mut self) {
-        self.unregister_root_mailbox().await;
         self.bg_task_list_cache.write().await.clear();
-    }
-
-    /// Unregister and drop the root mailbox so a subsequent turn can
-    /// re-register without agent_id collision.
-    pub async fn unregister_root_mailbox(&mut self) {
-        if let Some(mailbox) = self.root_mailbox.take() {
-            let addr = mailbox.address.clone();
-            let router = mailbox.router();
-            if let Err(e) = router.unregister(&addr).await {
-                eprintln!(
-                    "astra: failed to unregister root mailbox run_id={} agent_id={}: {e}",
-                    addr.run_id, addr.agent_id
-                );
-            }
-        }
     }
 
     /// Single source of truth for "is the CLI session currently in
@@ -954,7 +853,6 @@ pub(crate) fn apply_initial_explain_mode(
 mod default_tests {
     use super::{ContinuationAnchor, ExplainMode, SessionState, apply_initial_explain_mode};
     use crate::cli::permission_manager::PermissionManager;
-    use astra_config::runtime_config::ExplainReportFormat;
 
     #[test]
     fn explain_slash_parser_is_explicit_and_idempotent() {
@@ -1035,23 +933,6 @@ mod default_tests {
     }
 
     #[test]
-    fn explicit_report_format_override_survives_runtime_config_reload() {
-        let mut state = SessionState::default();
-        state.set_explain_report_format_override(ExplainReportFormat::Text);
-
-        state.reload_runtime_config();
-
-        assert_eq!(
-            state.explain_report_format_override,
-            Some(ExplainReportFormat::Text)
-        );
-        assert_eq!(
-            state.runtime_config.explain.effective_report_format(),
-            ExplainReportFormat::Text
-        );
-    }
-
-    #[test]
     fn default_auto_approve_reads_env_flag() {
         unsafe { std::env::set_var("ASTRA_CLI_AUTO_APPROVE", "1") };
         let state = SessionState::default();
@@ -1084,20 +965,10 @@ mod default_tests {
                 schema_digest: "sha256:write-file".into(),
                 descriptor: None,
             }],
-            redo_stack: vec![("u".into(), "a".into(), 1)],
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
-            drift_compressed_turns: vec![2],
-            drift_user_corrections: vec![3],
             drift_original_query: Some("orig".into()),
             session_lessons_loaded: true,
-            latest_skill_diagnosis: Some(astra_skills::auto_invoke::SkillDiagnosis::new(
-                "diag",
-                &astra_skills::auto_invoke::AutoInvokeCause::SessionStalls { count: 5 },
-                "headline",
-                vec!["finding".to_string()],
-                None,
-            )),
             latest_turn_quality_feedback: Some(astra_runtime::self_model::TurnQualityFeedback {
                 turn: 1,
                 findings: vec!["finding".into()],
@@ -1128,15 +999,11 @@ mod default_tests {
         assert_eq!(state.total_session_cost, Some(0.0));
         assert!(state.recent_tools.is_empty());
         assert!(state.deferred_tool_activations.is_empty());
-        assert!(state.redo_stack.is_empty());
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());
-        assert!(state.drift_compressed_turns.is_empty());
-        assert!(state.drift_user_corrections.is_empty());
         assert!(state.drift_original_query.is_none());
         assert!(state.session_lessons.is_empty());
         assert!(!state.session_lessons_loaded);
-        assert!(state.latest_skill_diagnosis.is_none());
         assert!(state.latest_turn_quality_feedback.is_none());
         assert!(!state.last_turn_interrupted);
         assert!(state.plan_mode_sync_error.is_none());
@@ -1303,13 +1170,6 @@ mod default_tests {
     }
 
     #[test]
-    fn state_default_values() {
-        let state = SessionState::default();
-        assert_eq!(state.diagnosis_criteria_met, 0);
-        assert_eq!(state.diagnosis_criteria_failed, 0);
-    }
-
-    #[test]
     fn reset_for_session_restore_clears_resume_specific_state() {
         let mut state = SessionState {
             session_id: Some("sess-restore".into()),
@@ -1320,7 +1180,6 @@ mod default_tests {
                 schema_digest: "sha256:write-file".into(),
                 descriptor: None,
             }],
-            discovered_skills: ["skill-b".to_string()].into_iter().collect(),
             plan_mode_sync_error: Some("sync".into()),
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
@@ -1335,7 +1194,6 @@ mod default_tests {
         assert!(state.history.is_empty());
         assert!(state.recent_tools.is_empty());
         assert!(state.deferred_tool_activations.is_empty());
-        assert!(state.discovered_skills.is_empty());
         assert!(state.plan_mode_sync_error.is_none());
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());
@@ -1344,28 +1202,13 @@ mod default_tests {
     }
 
     #[tokio::test]
-    async fn prepare_for_session_rebind_unregisters_root_mailbox() {
-        let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
-        let tracker = std::sync::Arc::new(
-            astra_runtime::server::delegation::engine::DelegationTracker::new(),
-        );
-        let router =
-            std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
-        let root_addr = astra_messaging::AgentAddress::new("old-session", "main");
-
+    async fn prepare_for_session_rebind_clears_background_task_projection() {
         let mut state = SessionState::default();
-        state.root_mailbox = Some(router.register(root_addr.clone(), None).await.unwrap());
         *state.bg_task_list_cache.write().await =
             "<background_tasks count=\"1\"><task id=\"old\" /></background_tasks>".into();
 
         state.prepare_for_session_rebind().await;
-
-        assert!(state.root_mailbox.is_none());
         assert!(state.bg_task_list_cache.read().await.is_empty());
-        router
-            .register(root_addr, None)
-            .await
-            .expect("old root mailbox address should be reusable after unregister");
     }
 }
 

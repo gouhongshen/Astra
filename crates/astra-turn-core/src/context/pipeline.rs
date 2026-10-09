@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::compaction_types::CompactionTier;
 use crate::context_binder::{ContextBound, bind_sections};
-use crate::context_optimizer::{ContextOptimized, optimize_with_spill};
+use crate::context_optimizer::{ContextOptimized, optimize};
 use crate::context_planner::{ContextPlan, PlanInput, plan_turn};
 use crate::context_pressure::ContextPressure;
 use crate::context_serializer::{SerializedProviderRequest, serialize_provider_request};
@@ -20,7 +20,6 @@ use crate::pipeline_config::PipelineConfig;
 use crate::recovery_state::RecoveryState;
 use crate::section_types::estimate_text_tokens;
 use crate::session_latches::SessionLatches;
-use crate::spill_backend::SpillBackend;
 use crate::token_accounting::TokenAccounting;
 
 enum LimitPolicy<'a> {
@@ -240,16 +239,13 @@ impl ContextPipeline {
         };
 
         let started = Instant::now();
-        let spill_backend: Option<&dyn SpillBackend> =
-            input.sources.external.spill_backend.as_deref();
-        let optimized = optimize_with_spill(
+        let optimized = optimize(
             &plan,
             bound,
             input.latches,
             provider_policy,
             optimize_limits,
             input.sources.turn.turn_index,
-            spill_backend,
         );
         timings.push(PipelinePhaseTiming::elapsed("optimize", started));
 

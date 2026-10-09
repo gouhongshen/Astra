@@ -25,8 +25,66 @@ use astra_turn_core::context_feedback::{
     RuntimePolicySignal, RuntimePolicyStage, RuntimePolicySubject, RuntimeRecoveryEvidence,
 };
 
-pub fn configured_evaluation_thresholds() -> astra_turn_core::evaluation::EvaluationThresholds {
-    let policy = astra_config::RuntimeConfig::load().tool_policy;
+/// Resolve the admitted tool policy for the shared execution circuit breaker.
+pub fn circuit_breaker_config_from_tool_policy(
+    config: &astra_config::runtime_config::ToolPolicyConfig,
+) -> astra_turn_core::loop_circuit_breaker::BreakerConfig {
+    // Resolve each threshold and warn when a user-supplied value was clamped
+    // to its floor so operators can diagnose unexpected behaviour.
+    macro_rules! resolve_and_warn {
+        ($raw:expr, $effective:expr, $name:literal) => {{
+            let raw = $raw;
+            let effective = $effective;
+            if raw > 0 && effective != raw {
+                tracing::warn!(
+                    config_field = $name,
+                    user_value = raw,
+                    applied_value = effective,
+                    "circuit breaker config value below floor — clamped to minimum"
+                );
+            }
+            effective as usize
+        }};
+    }
+
+    astra_turn_core::loop_circuit_breaker::BreakerConfig {
+        stall_threshold: resolve_and_warn!(
+            config.circuit_breaker_stall_threshold,
+            config.effective_circuit_breaker_stall_threshold(),
+            "circuit_breaker_stall_threshold"
+        ),
+        repetition_threshold: resolve_and_warn!(
+            config.circuit_breaker_repetition_threshold,
+            config.effective_circuit_breaker_repetition_threshold(),
+            "circuit_breaker_repetition_threshold"
+        ),
+        read_only_stall_threshold: resolve_and_warn!(
+            config.circuit_breaker_read_only_stall_threshold,
+            config.effective_circuit_breaker_read_only_stall_threshold(),
+            "circuit_breaker_read_only_stall_threshold"
+        ),
+        max_introspect_emissions: resolve_and_warn!(
+            config.circuit_breaker_max_introspect_emissions,
+            config.effective_circuit_breaker_max_introspect_emissions(),
+            "circuit_breaker_max_introspect_emissions"
+        ),
+        half_open_patience: resolve_and_warn!(
+            config.circuit_breaker_half_open_patience,
+            config.effective_circuit_breaker_half_open_patience(),
+            "circuit_breaker_half_open_patience"
+        ),
+        absolute_max_rounds: resolve_and_warn!(
+            config.circuit_breaker_absolute_max_rounds,
+            config.effective_circuit_breaker_absolute_max_rounds(),
+            "circuit_breaker_absolute_max_rounds"
+        ),
+    }
+}
+
+/// Resolve once at execution admission; tool boundaries consume the frozen value.
+pub fn evaluation_thresholds_from_policy(
+    policy: &astra_config::runtime_config::ToolPolicyConfig,
+) -> astra_turn_core::evaluation::EvaluationThresholds {
     astra_turn_core::evaluation::EvaluationThresholds {
         redundant_overlapping_reads: policy.effective_redundant_reads_eval_threshold() as usize,
         search_fanout: policy.effective_search_fanout_eval_threshold() as usize,
@@ -265,10 +323,9 @@ pub struct RuntimePolicyEvaluationState {
 }
 
 impl RuntimePolicyEvaluationState {
-    const TASK_RESOLUTION_HINT_EVIDENCE_LIMIT: usize = 32;
-
     /// Use the same bounded evidence window and reducer as policy feedback.
     /// This is coverage evidence, not authority to erase execution failures.
+    #[cfg(test)]
     pub(crate) fn unresolved_tool_outcomes(
         &self,
     ) -> BTreeMap<
@@ -278,190 +335,6 @@ impl RuntimePolicyEvaluationState {
         astra_turn_core::evaluation::unresolved_tool_outcome_facts(
             &self.record_window.iter().cloned().collect::<Vec<_>>(),
         )
-    }
-
-    /// Candidate evidence opens one terminal assessment, never clears failures
-    /// or increases scheduling pressure. Same-round siblings are not later.
-    pub(crate) fn has_task_resolution_candidate(&self) -> bool {
-        let failures = self.unresolved_tool_outcomes();
-        self.has_task_resolution_candidate_for(&failures)
-    }
-
-    /// Return whether any of the supplied unresolved outcomes has a later
-    /// observation candidate.  Completion settlement supplies a semantically
-    /// filtered failure projection here: advisory probes remain in the raw
-    /// policy window, but cannot open a terminal reconciliation on their own.
-    pub(crate) fn has_task_resolution_candidate_for(
-        &self,
-        failures: &BTreeMap<
-            astra_turn_core::evaluation::EvaluationOutcomeKey,
-            astra_turn_core::evaluation::UnresolvedToolOutcome,
-        >,
-    ) -> bool {
-        failures.values().any(|failure| {
-            let Some(failed_round) = self
-                .record_window
-                .get(failure.fact_index)
-                .and_then(|fact| fact.round)
-            else {
-                return false;
-            };
-            failure.invocation.is_some()
-                && self
-                    .record_window
-                    .iter()
-                    .skip(failure.fact_index + 1)
-                    .any(|fact| Self::is_later_task_resolution_evidence(fact, failed_round))
-        })
-    }
-
-    fn is_later_task_resolution_evidence(
-        fact: &astra_turn_core::evaluation::ToolEvaluationFact,
-        failed_round: u32,
-    ) -> bool {
-        fact.execution_completion().is_some()
-            && fact.round.is_some_and(|round| round > failed_round)
-            && fact.is_assessment_observation_candidate()
-    }
-
-    /// Bounded labels for the terminal assessment prompt. These are hints to
-    /// select existing execution references; the assessment validator remains
-    /// the authority for relevance, chronology, and terminal integrity.
-    #[cfg(test)]
-    pub(crate) fn task_resolution_hint_evidence(&self) -> serde_json::Value {
-        let failures = self.unresolved_tool_outcomes();
-        self.task_resolution_hint_evidence_for(&failures)
-    }
-
-    /// Render task-resolution evidence for an explicit failure projection.
-    /// The full policy window remains available to diagnostics; this method
-    /// only controls which outcomes are presented as completion obligations.
-    pub(crate) fn task_resolution_hint_evidence_for(
-        &self,
-        unresolved: &BTreeMap<
-            astra_turn_core::evaluation::EvaluationOutcomeKey,
-            astra_turn_core::evaluation::UnresolvedToolOutcome,
-        >,
-    ) -> serde_json::Value {
-        let mut failures = unresolved
-            .values()
-            .filter(|failure| failure.invocation.is_some())
-            .cloned()
-            .collect::<Vec<_>>();
-        failures.sort_by_key(|failure| failure.fact_index);
-
-        let failed_executions = failures
-            .iter()
-            .take(Self::TASK_RESOLUTION_HINT_EVIDENCE_LIMIT)
-            .filter_map(|failure| {
-                let fact = self.record_window.get(failure.fact_index)?;
-                let reference = failure.invocation.as_ref()?;
-                Some(serde_json::json!({
-                    "call_id": reference.identity().invocation_id.as_str(),
-                    "tool": fact.tool_name(),
-                    "round": fact.round,
-                    "ok": fact.ok,
-                    "disposition": fact.disposition,
-                }))
-            })
-            .collect::<Vec<_>>();
-
-        let mut evidence_candidates = Vec::new();
-        for (candidate_index, fact) in self.record_window.iter().enumerate() {
-            if evidence_candidates.len() == Self::TASK_RESOLUTION_HINT_EVIDENCE_LIMIT {
-                break;
-            }
-            let is_later = failures.iter().any(|failure| {
-                let Some(failed_round) = self
-                    .record_window
-                    .get(failure.fact_index)
-                    .and_then(|failed| failed.round)
-                else {
-                    return false;
-                };
-                candidate_index > failure.fact_index
-                    && Self::is_later_task_resolution_evidence(fact, failed_round)
-            });
-            if !is_later {
-                continue;
-            }
-            let Some(reference) = fact.execution_completion() else {
-                continue;
-            };
-            evidence_candidates.push(serde_json::json!({
-                "call_id": reference.identity().invocation_id.as_str(),
-                "tool": fact.tool_name(),
-                "round": fact.round,
-                "ok": fact.ok,
-                "disposition": fact.disposition,
-            }));
-        }
-
-        serde_json::json!({
-            "failed_executions": failed_executions,
-            "evidence_candidates": evidence_candidates,
-        })
-    }
-
-    /// Recover bounded invocation references from a retained prefix, then use
-    /// the current journal suffix. This projection carries identity/order only;
-    /// the ledger resolver must rebuild outcomes from their original digests.
-    pub(crate) fn task_resolution_evidence(
-        &self,
-        assessment: &astra_turn_types::task_resolution::TaskResolutionAssessment,
-        records: &[ToolCallRecord],
-    ) -> Vec<ToolCallRecord> {
-        let requested: BTreeSet<_> = assessment
-            .failed_call_ids
-            .iter()
-            .chain(&assessment.evidence_call_ids)
-            .map(String::as_str)
-            .collect();
-        let mut evidence: Vec<_> = self
-            .record_window
-            .iter()
-            .filter_map(|fact| {
-                let reference = fact.execution_completion()?;
-                if !requested.contains(reference.identity().invocation_id.as_str())
-                    || records
-                        .iter()
-                        .any(|record| record.execution_completion.as_ref() == Some(reference))
-                {
-                    return None;
-                }
-                Some(ToolCallRecord {
-                    tool_call_id: Some(reference.identity().invocation_id.clone()),
-                    execution_completion: Some(reference.clone()),
-                    round: fact.round,
-                    ..Default::default()
-                })
-            })
-            .collect();
-        evidence.extend(
-            records
-                .iter()
-                .filter(|record| {
-                    record
-                        .tool_call_id
-                        .as_deref()
-                        .is_some_and(|id| requested.contains(id))
-                })
-                .cloned(),
-        );
-        evidence
-    }
-
-    pub(crate) fn task_resolution_workspace_evidence(
-        &self,
-        evidence_call_ids: &[String],
-    ) -> Vec<astra_turn_types::task_resolution::ToolExecutionEvidenceRef> {
-        self.record_window
-            .iter()
-            .filter(|fact| fact.is_workspace_observation_candidate())
-            .filter_map(|fact| fact.execution_completion())
-            .filter(|reference| evidence_call_ids.contains(&reference.identity().invocation_id))
-            .cloned()
-            .collect()
     }
 
     pub fn preflight_history(
@@ -630,12 +503,7 @@ fn evaluate_policy_boundary(
         .map(|record| {
             (
                 record,
-                astra_turn_core::evaluation::ToolEvaluationFact::from_record(record)
-                    .with_workspace_observation_candidate(
-                        super::agentic_loop::lifecycle::record_can_observe_bound_workspace(
-                            None, record,
-                        ),
-                    ),
+                astra_turn_core::evaluation::ToolEvaluationFact::from_record(record),
             )
         })
         .collect::<Vec<_>>();
@@ -894,7 +762,13 @@ fn evaluate_policy_boundary(
             ),
             observed_at_round: completed_rounds,
             evidence_count: saturating_u32(rejected_requests),
-            recommendation: RuntimePolicyRecommendation::RepairToolRequest,
+            recommendation: if astra_turn_core::evaluation::has_active_non_retryable_rejection(
+                &run_window,
+            ) {
+                RuntimePolicyRecommendation::DiagnoseToolOutcomes
+            } else {
+                RuntimePolicyRecommendation::RepairToolRequest
+            },
         });
     }
     if validation_retries >= thresholds.redundant_validation_retries
@@ -1284,24 +1158,6 @@ fn feedback_has_persistent_round_activity(set: &RuntimePolicyFeedbackSet) -> boo
     })
 }
 
-/// Whether a terminal answer deserves one bounded evidence-reconciliation
-/// pass before it becomes user-visible.
-///
-/// A single failed command is often the evidence the user asked for, so it
-/// must not force another model call.  This boundary is intentionally narrower:
-/// the same unresolved-outcome fact must survive long enough to reach the
-/// evaluator's `Converge` stage.  Recovered failures disappear from the active
-/// projection and therefore never satisfy this predicate.
-pub fn feedback_requires_outcome_reconciliation(set: &RuntimePolicyFeedbackSet) -> bool {
-    let RuntimePolicyFeedbackSet::Evaluated { entries, .. } = set else {
-        return false;
-    };
-    entries.iter().any(|entry| {
-        entry.signal == RuntimePolicySignal::UnresolvedToolOutcomes
-            && entry.stage == RuntimePolicyStage::Converge
-    })
-}
-
 /// Stable Context Pipeline projection. It contains typed subject/evidence and
 /// recommendations, never an execution command.
 pub fn policy_advisory_payload(set: &RuntimePolicyFeedbackSet) -> Option<serde_json::Value> {
@@ -1644,106 +1500,6 @@ mod tests {
             ok: false,
             result_class: Some(result_class.to_string()),
             ..Default::default()
-        }
-    }
-
-    fn with_completion(mut record: ToolCallRecord, call_id: &str) -> ToolCallRecord {
-        record.tool_call_id = Some(call_id.to_string());
-        record.execution_completion = Some(
-            astra_turn_types::task_resolution::ToolExecutionEvidenceRef::EdgeDispatch(
-                astra_turn_types::task_resolution::EdgeDispatchCompletionRef {
-                    identity: astra_turn_types::ToolInvocationIdentity::new(
-                        "user", "session", "run", "chain", call_id,
-                    )
-                    .unwrap(),
-                    edge_agent_id: "edge-1".to_string(),
-                    result_hash: format!("hash-{call_id}"),
-                },
-            ),
-        );
-        record
-    }
-
-    #[test]
-    fn task_resolution_hint_projects_real_later_evidence_and_survives_restore() {
-        let records = vec![
-            with_completion(
-                failed("bash", r#"{"command":"cargo test"}"#, 1, "test_failure"),
-                "failed-check",
-            ),
-            with_completion(
-                executed("read_file", r#"{"path":"report.txt"}"#, 2),
-                "read-report",
-            ),
-        ];
-        let mut state = RuntimePolicyEvaluationState::default();
-        evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &records, 2).unwrap();
-
-        let hint = state.task_resolution_hint_evidence();
-        assert_eq!(hint["failed_executions"][0]["call_id"], "failed-check");
-        assert_eq!(hint["failed_executions"][0]["tool"], "bash");
-        assert_eq!(hint["failed_executions"][0]["round"], 1);
-        assert_eq!(hint["failed_executions"][0]["ok"], false);
-        assert_eq!(hint["failed_executions"][0]["disposition"], "executed");
-        assert_eq!(hint["evidence_candidates"][0]["call_id"], "read-report");
-        assert_eq!(hint["evidence_candidates"][0]["tool"], "read_file");
-        assert_eq!(hint["evidence_candidates"][0]["round"], 2);
-        assert_eq!(hint["evidence_candidates"][0]["ok"], true);
-        assert_eq!(hint["evidence_candidates"][0]["disposition"], "executed");
-
-        let wire = state
-            .serialize_continuation(serde_json::value::Serializer)
-            .unwrap();
-        let restored = RuntimePolicyEvaluationState::deserialize_continuation(wire).unwrap();
-        assert_eq!(restored.task_resolution_hint_evidence(), hint);
-    }
-
-    #[test]
-    fn task_resolution_hint_excludes_same_round_and_missing_references() {
-        for (records, expected_failures) in [
-            (
-                vec![
-                    with_completion(
-                        failed("bash", r#"{"command":"check"}"#, 1, "test_failure"),
-                        "failed-same-round",
-                    ),
-                    with_completion(
-                        executed("read_file", r#"{"path":"same.txt"}"#, 1),
-                        "read-same-round",
-                    ),
-                ],
-                1,
-            ),
-            (
-                vec![
-                    failed("bash", r#"{"command":"check"}"#, 1, "test_failure"),
-                    with_completion(
-                        executed("read_file", r#"{"path":"later.txt"}"#, 2),
-                        "read-after-unreferenced-failure",
-                    ),
-                ],
-                0,
-            ),
-            (
-                vec![
-                    with_completion(
-                        failed("bash", r#"{"command":"check"}"#, 1, "test_failure"),
-                        "failed-before-unreferenced-read",
-                    ),
-                    executed("read_file", r#"{"path":"later.txt"}"#, 2),
-                ],
-                1,
-            ),
-        ] {
-            let mut state = RuntimePolicyEvaluationState::default();
-            evaluate_tool_boundary(&mut state, RuntimePolicySubject::Run, &records, 2).unwrap();
-            assert!(!state.has_task_resolution_candidate());
-            let hint = state.task_resolution_hint_evidence();
-            assert_eq!(
-                hint["failed_executions"].as_array().unwrap().len(),
-                expected_failures
-            );
-            assert_eq!(hint["evidence_candidates"], serde_json::json!([]));
         }
     }
 
@@ -2130,6 +1886,98 @@ mod tests {
                 .iter()
                 .any(|entry| entry.signal == RuntimePolicySignal::UnresolvedToolOutcomes)
         );
+    }
+
+    #[test]
+    fn invalid_arguments_require_repair_not_terminal_rejection_diagnosis() {
+        let mut state = RuntimePolicyEvaluationState::default();
+        let record = ToolCallRecord {
+            name: "agent".into(),
+            args_full: Some(r#"{"action":"spawn","requested_model_policy":"{}"}"#.into()),
+            round: Some(1),
+            disposition: Some(ToolCallDisposition::Rejected),
+            error_kind: Some(astra_core::ErrorKind::ToolInvalidArgs),
+            result_full: Some(
+                serde_json::json!({"error_kind":"tool_invalid_args","retryable":false}).to_string(),
+            ),
+            ..Default::default()
+        };
+        let feedback = evaluate_tool_boundary(&mut state, work_subject("item-1"), &[record], 1)
+            .unwrap()
+            .unwrap();
+        assert!(entries(&feedback).iter().any(|entry| entry.signal
+            == RuntimePolicySignal::RejectedToolRequests
+            && entry.recommendation == RuntimePolicyRecommendation::RepairToolRequest));
+        let restored: RuntimePolicyEvaluationState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert!(
+            !astra_turn_core::evaluation::has_active_non_retryable_rejection(
+                &restored.record_window.into_iter().collect::<Vec<_>>()
+            )
+        );
+    }
+
+    #[test]
+    fn non_retryable_rejection_guidance_survives_recovery_until_exact_success() {
+        for retryable in [None, Some(true), Some(false)] {
+            let mut state = RuntimePolicyEvaluationState::default();
+            let record = ToolCallRecord {
+                name: "agent".into(),
+                args_full: Some(r#"{"action":"spawn","prompt":"compute a value"}"#.into()),
+                round: Some(1),
+                disposition: Some(ToolCallDisposition::Rejected),
+                result_class: Some("rejected".into()),
+                runtime_model_result_full: Some(
+                    serde_json::json!({"retryable": retryable}).to_string(),
+                ),
+                // The model-bound result, not an older executor payload, owns recovery advice.
+                result_full: Some(r#"{"retryable":true}"#.into()),
+                ..Default::default()
+            };
+            let feedback = evaluate_tool_boundary(
+                &mut state,
+                work_subject("item-1"),
+                std::slice::from_ref(&record),
+                1,
+            )
+            .unwrap()
+            .unwrap();
+            let entry = entries(&feedback)
+                .iter()
+                .find(|entry| entry.signal == RuntimePolicySignal::RejectedToolRequests)
+                .unwrap();
+            assert_eq!(
+                entry.recommendation,
+                if retryable == Some(false) {
+                    RuntimePolicyRecommendation::DiagnoseToolOutcomes
+                } else {
+                    RuntimePolicyRecommendation::RepairToolRequest
+                }
+            );
+            let restored: RuntimePolicyEvaluationState =
+                serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+            let mut facts = restored.record_window.into_iter().collect::<Vec<_>>();
+            let blocked = |facts: &[_]| {
+                astra_turn_core::evaluation::has_active_non_retryable_rejection(facts)
+            };
+            assert_eq!(blocked(&facts), retryable == Some(false));
+            facts.push(
+                astra_turn_core::evaluation::ToolEvaluationFact::from_record(&executed(
+                    "agent",
+                    r#"{"action":"status"}"#,
+                    2,
+                )),
+            );
+            assert_eq!(blocked(&facts), retryable == Some(false));
+            facts.push(
+                astra_turn_core::evaluation::ToolEvaluationFact::from_record(&executed(
+                    "agent",
+                    record.args_full.as_deref().unwrap(),
+                    3,
+                )),
+            );
+            assert!(!blocked(&facts));
+        }
     }
 
     #[test]
@@ -3637,7 +3485,6 @@ mod tests {
         let first = evaluate_tool_boundary(&mut state, subject.clone(), &records, 2)
             .unwrap()
             .expect("first typed diagnosis");
-        assert!(!feedback_requires_outcome_reconciliation(&first));
         assert_eq!(
             entries(&first)
                 .iter()
@@ -3656,7 +3503,6 @@ mod tests {
             .unwrap()
             .expect("persistent failure must advance its policy stage");
         let payload = policy_advisory_payload(&converged).expect("model advisory");
-        assert!(feedback_requires_outcome_reconciliation(&converged));
         let entry = payload["entries"]
             .as_array()
             .unwrap()
@@ -4237,5 +4083,58 @@ mod tests {
             policy.truncation_marker(Some("length")).is_none(),
             "disabled policy must not emit marker"
         );
+    }
+    #[test]
+    fn circuit_breaker_config_uses_runtime_config_defaults() {
+        let cfg = super::circuit_breaker_config_from_tool_policy(
+            &astra_config::runtime_config::ToolPolicyConfig::default(),
+        );
+
+        assert_eq!(cfg.stall_threshold, 6);
+        assert_eq!(cfg.repetition_threshold, 3);
+        assert_eq!(cfg.read_only_stall_threshold, 12);
+        // `0` in user config means "use default", NOT the BreakerConfig sentinel "unbounded".
+        assert_eq!(cfg.max_introspect_emissions, 3);
+        assert_eq!(cfg.half_open_patience, 2);
+        assert_eq!(cfg.absolute_max_rounds, 1000);
+    }
+
+    #[test]
+    fn circuit_breaker_config_uses_runtime_config_overrides_with_floors() {
+        let tool_policy = astra_config::runtime_config::ToolPolicyConfig {
+            circuit_breaker_stall_threshold: 1,
+            circuit_breaker_repetition_threshold: 7,
+            circuit_breaker_read_only_stall_threshold: 2,
+            // user=0 → effective_*() returns default (3); floor is 1
+            circuit_breaker_max_introspect_emissions: 0,
+            circuit_breaker_half_open_patience: 5,
+            circuit_breaker_absolute_max_rounds: 10,
+            ..Default::default()
+        };
+
+        let cfg = super::circuit_breaker_config_from_tool_policy(&tool_policy);
+
+        // stall: resolve(1, 6, 3) = max(1, 3) = 3 (floored)
+        assert_eq!(cfg.stall_threshold, 3);
+        // repetition: resolve(7, 3, 2) = max(7, 2) = 7
+        assert_eq!(cfg.repetition_threshold, 7);
+        // read_only: resolve(2, 12, 4) = max(2, 4) = 4 (floored)
+        assert_eq!(cfg.read_only_stall_threshold, 4);
+        // introspect: resolve(0, 3, 1) = 3 (default)
+        assert_eq!(cfg.max_introspect_emissions, 3);
+        assert_eq!(cfg.half_open_patience, 5);
+        // absolute: resolve(10, 200, 20) = max(10, 20) = 20 (floored)
+        assert_eq!(cfg.absolute_max_rounds, 20);
+    }
+
+    #[test]
+    fn circuit_breaker_config_introspect_floor_is_one() {
+        // user supplies explicit value=1 (at the floor) — should pass through unchanged
+        let tool_policy = astra_config::runtime_config::ToolPolicyConfig {
+            circuit_breaker_max_introspect_emissions: 1,
+            ..Default::default()
+        };
+        let cfg = super::circuit_breaker_config_from_tool_policy(&tool_policy);
+        assert_eq!(cfg.max_introspect_emissions, 1);
     }
 }

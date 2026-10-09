@@ -397,7 +397,7 @@ impl OutputTransportFailure {
     }
 }
 
-/// Partial data rescued from `AgenticLoopState` when a turn fails.
+/// Partial stream and local callback facts retained when a turn fails.
 /// Enables enriched error logging, failure learning, and post-mortem analysis.
 #[derive(Debug, Default)]
 pub(crate) struct PartialTurnData {
@@ -679,6 +679,7 @@ pub(crate) fn root_run_transcript_events(
         return Vec::new();
     }
 
+    let mut evidence_keys = BTreeSet::new();
     messages
         .iter()
         .filter(|message| {
@@ -686,6 +687,17 @@ pub(crate) fn root_run_transcript_events(
                 message.get("role").and_then(serde_json::Value::as_str),
                 Some("system") | None
             )
+        })
+        .filter(|message| {
+            message
+                .get("evidence")
+                .and_then(|value| {
+                    serde_json::from_value::<astra_turn_types::AgentTranscriptEvidence>(
+                        value.clone(),
+                    )
+                    .ok()
+                })
+                .is_none_or(|evidence| evidence_keys.insert(evidence.stable_key()))
         })
         .enumerate()
         .filter_map(|(index, message)| {
@@ -738,8 +750,6 @@ pub(crate) struct StreamResult {
     /// advisory threshold, error pressure, and health telemetry). Only
     /// non-Healthy verdicts.
     pub(crate) verdict_events: Vec<VerdictEvent>,
-    /// Step Protocol recorder summary for debugging and audit.
-    pub(crate) step_recorder_summary: Option<astra_pipeline::step_recorder::RecorderSummary>,
     /// Exported tool health entries from this turn's TurnGuard (for cross-session persistence).
     pub(crate) tool_health_export: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     /// Last heavy checkpoint built during the agentic loop (for cloud persistence).
@@ -759,6 +769,7 @@ pub(crate) struct StreamResult {
     pub(crate) pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
     /// Collected turn observability events (llm_round, tool timing) for batch flush.
     pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
+    pub(crate) turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
     /// Aggregated LLM round count for this turn.
     pub(crate) llm_rounds: Option<u32>,
     /// Provider-reported token usage coverage. Token totals are lower bounds
@@ -802,9 +813,6 @@ pub(crate) struct StreamResult {
     /// This is the durable fact source for active-run guidance; `final_messages`
     /// is only a prompt projection fallback.
     pub(crate) applied_user_intents: Vec<AppliedStreamUserIntent>,
-    /// Results from background-spawned agents collected after the agentic
-    /// loop ended. Each entry is (agent_id, result_text).
-    pub(crate) background_agent_results: Vec<(String, String)>,
 }
 
 impl StreamResult {
@@ -844,22 +852,6 @@ impl StreamResult {
         event.tool_outcomes = Some(outcomes);
     }
 
-    /// Merge terminal background-agent outputs into the user-facing aggregate
-    /// response used by one-shot CLI and server surfaces.
-    ///
-    /// Interactive turns reconcile the same facts through the root mailbox on
-    /// a later model step. One-shot surfaces have no later step, so leaving the
-    /// drain results only in an internal field would make completed work
-    /// invisible to text consumers.
-    pub(crate) fn integrate_background_agent_results(&mut self) -> Option<String> {
-        let section = format_background_agent_results(&self.background_agent_results)?;
-        if !self.full_text.is_empty() {
-            self.full_text.push_str("\n\n");
-        }
-        self.full_text.push_str(&section);
-        Some(section)
-    }
-
     /// User input that should represent this committed turn in durable history.
     ///
     /// The runtime can apply user guidance while a turn is executing.
@@ -884,21 +876,6 @@ impl StreamResult {
         }
         latest_user_input_from_messages(primary_line, &self.final_messages)
     }
-}
-
-pub(crate) fn format_background_agent_results(results: &[(String, String)]) -> Option<String> {
-    if results.is_empty() {
-        return None;
-    }
-
-    let mut section = String::from("## Background agent results");
-    for (agent_id, result) in results {
-        section.push_str("\n\n### Agent `");
-        section.push_str(agent_id);
-        section.push_str("`\n\n");
-        section.push_str(result.trim());
-    }
-    Some(section)
 }
 
 fn effective_user_input_from_applied_user_intents(
@@ -1144,6 +1121,7 @@ mod usage_attribution_tests {
             start_elapsed_ms: Some(0),
             duration_ms: Some(10),
             outcome: Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Succeeded),
+            decision_detail: None,
             usage,
             auxiliary_usage: None,
             context: None,
@@ -1204,6 +1182,7 @@ mod usage_attribution_tests {
             start_elapsed_ms: Some(0),
             duration_ms: Some(20),
             outcome: Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Completed),
+            decision_detail: None,
             usage: None,
             auxiliary_usage: Some(Box::new(astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
                 available,
@@ -1247,6 +1226,7 @@ mod usage_attribution_tests {
             start_elapsed_ms: Some(0),
             duration_ms: Some(20),
             outcome: Some(astra_turn_types::ExplainAnalyzeOutcomeV1::Completed),
+            decision_detail: None,
             usage: None,
             auxiliary_usage: Some(Box::new(astra_turn_types::ExplainAnalyzeAuxiliaryUsageV1 {
                 available: true,
@@ -1579,6 +1559,7 @@ mod usage_attribution_tests {
 impl Default for StreamResult {
     fn default() -> Self {
         Self {
+            turn_evaluation: None,
             session_id: None,
             run_id: None,
             session_persistence_error: None,
@@ -1599,7 +1580,6 @@ impl Default for StreamResult {
             budget_pressure: 0.0,
             stall_events: vec![],
             verdict_events: vec![],
-            step_recorder_summary: None,
             tool_health_export: vec![],
             last_heavy_checkpoint: None,
             ttft_ms: None,
@@ -1621,7 +1601,6 @@ impl Default for StreamResult {
             deferred_tool_activations: Vec::new(),
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
-            background_agent_results: Vec::new(),
         }
     }
 }

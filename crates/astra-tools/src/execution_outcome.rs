@@ -83,3 +83,56 @@ impl ToolExecutionOutcome {
         self
     }
 }
+
+/// Carry a producer-owned control execution fact through a tool
+/// boundary.  Control tools may reject a request after inspecting durable
+/// state (for example, a duplicate fanout start) while returning a structured
+/// error that still contains the existing group.  The JSON fact must reach the
+/// journal as `Rejected`; otherwise the record fallback promotes the request
+/// to `Executed` and completion policy treats a request that never ran as a
+/// failed execution.
+pub fn insert_producer_execution_fact(
+    parsed: Option<&Value>,
+    metadata: &mut serde_json::Map<String, Value>,
+) {
+    let Some(executed) = parsed.and_then(|value| {
+        value
+            .get("executed")
+            .or_else(|| value.pointer("/advisory/executed"))
+    }) else {
+        return;
+    };
+    match executed {
+        Value::Bool(false) => insert_not_executed_fact(metadata),
+        Value::Bool(true) => {
+            metadata.insert("execution_started".to_string(), Value::Bool(true));
+            metadata.insert(
+                "execution_fact".to_string(),
+                Value::String("executed".to_string()),
+            );
+        }
+        Value::Null => {
+            // `null` is an explicit outcome-unknown fact. Do not turn it into
+            // `execution_started=false`: the operation may already have had
+            // side effects and must remain fail-closed for settlement.
+            metadata.insert(
+                "execution_fact".to_string(),
+                Value::String("unknown".to_string()),
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Record non-execution only at a producer boundary that has not started work.
+pub fn insert_not_executed_fact(metadata: &mut serde_json::Map<String, Value>) {
+    metadata.insert("execution_started".to_string(), Value::Bool(false));
+    metadata.insert(
+        "disposition".to_string(),
+        Value::String("rejected".to_string()),
+    );
+    metadata.insert(
+        "execution_fact".to_string(),
+        Value::String("not_executed".to_string()),
+    );
+}

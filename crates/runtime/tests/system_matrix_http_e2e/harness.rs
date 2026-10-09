@@ -11,7 +11,10 @@ use std::sync::Arc;
 
 use astra_core::SharedPool;
 use astra_core::config::AppSettings;
-use astra_runtime::{DatabaseEvaluationService, MemoriaForwarder, build_app, build_server_state};
+pub use astra_runtime::server::provider_test_support::{
+    ProviderGateway, ProviderResponse, ProviderScript,
+};
+use astra_runtime::{MemoriaForwarder, build_app, build_server_state};
 use astra_services::runs::{
     AtomicRunInteractionBatchRegistrationRequest, AtomicRunInteractionWaitRequest,
     DurableRunInteractionKind, DurableRunInteractionWaitOutcome,
@@ -173,9 +176,13 @@ pub fn build_e2e_access_token(user_id: &str, username: &str, exp_unix: u64) -> S
 async fn build_state(
     memoria: Arc<E2eMemoriaStub>,
     memoria_base_url: String,
+    database: Option<&str>,
 ) -> (astra_runtime::AppState, String, String) {
     let mut settings =
         AppSettings::from_env().expect("AppSettings::from_env (see astra-server env)");
+    if let Some(database) = database {
+        settings.matrixone.database = database.to_string();
+    }
     // Runtime memory/observer clients are constructed by build_server_state,
     // independently of the forwarder replaced below. Bind every client to
     // the fixture before construction; never let this mock-provider suite
@@ -422,53 +429,6 @@ pub async fn post_empty(app: &Router, path: &str, auth: Option<&str>) -> (Status
         .expect("body");
     let json: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
     (status, json)
-}
-
-/// POST JSON and collect the response body as UTF-8 (for small buffered SSE bodies).
-pub async fn collect_sse_body_text(
-    app: &Router,
-    req: Request<Body>,
-    max_bytes: usize,
-) -> (StatusCode, String) {
-    let response = app.clone().oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    if !status.is_success() {
-        let bytes = body::to_bytes(response.into_body(), 4 * 1024 * 1024)
-            .await
-            .unwrap_or_default();
-        return (status, String::from_utf8_lossy(&bytes).into_owned());
-    }
-    let mut stream = response.into_body().into_data_stream();
-    let mut acc = Vec::new();
-    let mut matched = false;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, stream.next()).await {
-        let chunk = chunk.expect("body chunk");
-        acc.extend_from_slice(&chunk);
-        if acc.len() >= max_bytes {
-            matched = true;
-            break;
-        }
-        let preview = String::from_utf8_lossy(&acc);
-        if preview.contains("\"run_id\"") && preview.contains("session_info") {
-            matched = true;
-            break;
-        }
-        if preview.contains("\"type\":\"error\"") {
-            matched = true;
-            break;
-        }
-    }
-    if !matched {
-        let preview = String::from_utf8_lossy(&acc);
-        panic!(
-            "SSE stream timed out (5s) without expected events (run_id/session_info/error). \
-             Collected {} bytes, preview: {}",
-            acc.len(),
-            &preview[..preview.len().min(500)]
-        );
-    }
-    (status, String::from_utf8_lossy(&acc).into_owned())
 }
 
 /// Parse SSE `data: {...}` blocks; return the first JSON object whose `type` matches.
@@ -728,11 +688,88 @@ pub struct MatrixE2eCtx {
     pub edge_agent_id: String,
     pub model_offering_id: String,
     pub suffix: String,
+    isolated_database: Option<String>,
     fixture_heartbeat: Mutex<Option<tokio::task::JoinHandle<()>>>,
     fixture_heartbeat_error: Arc<Mutex<Option<String>>>,
+    native_providers: Mutex<Vec<ProviderGateway>>,
 }
 
 impl MatrixE2eCtx {
+    /// Rebuild production wiring after the caller has drained/stopped its
+    /// producer and observed writer release. Keep auth, session and Offering
+    /// identities, assertion pool, heartbeat and provider scripts alive.
+    pub async fn restart_after_execution_handoff(&mut self) {
+        assert!(
+            self.isolated_database.is_some(),
+            "startup recovery scans the catalog"
+        );
+        self.app_state.close_database_pools().await;
+        let (state, database, _) = build_state(
+            self.memoria.clone(),
+            start_mock_memoria().await,
+            self.isolated_database.as_deref(),
+        )
+        .await;
+        assert_eq!(database, self.matrixone_database);
+        let _ = state
+            .refresh_memoria_health_if_stale(std::time::Duration::ZERO)
+            .await;
+        self.shared_pool = state
+            .shared_pool
+            .as_ref()
+            .expect("restarted shared pool")
+            .clone();
+        self.app_state = state.clone();
+        self.app = build_app(state);
+    }
+
+    /// Configure the fixture Offering through the public model API. Scripts
+    /// respond at the provider boundary; they never enter request context.
+    /// Background extraction may skip or resolve another deployment Offering.
+    /// This primary fixture does not own extraction cardinality. Strictly
+    /// matched background snapshots receive empty updates; owner tests need
+    /// their own extraction oracle.
+    pub async fn install_native_provider(&self, auth: &str, mut scripts: Vec<ProviderScript>) {
+        let fixture_model = format!("mock-{}", self.suffix);
+        let extraction_system=astra_turn_core::cloud::session_memory_extract::build_extraction_prompt("",&[])[0]["content"].clone();
+        scripts.push(ProviderScript::optional_background_json("sparse memory extraction for the live session",move |request|
+            request.path=="/v1/chat/completions" && request.body["model"]==fixture_model
+            && request.body["stream"]==false && request.body["temperature"]==0.0
+            && request.body["max_completion_tokens"]==2048 && request.body.get("tools").is_none()
+            && request.body["messages"].as_array().is_some_and(|messages| messages.len()==2
+                && messages[0]["role"]=="system" && messages[0]["content"]==extraction_system
+                && messages[1]["role"]=="user" && messages[1]["content"].as_str().is_some_and(|text|
+                    text.starts_with("## Current session memory:") && text.contains("## Recent conversation:") && text.ends_with("Output the sparse JSON update:"))),
+            json!({"choices":[{"index":0,"message":{"role":"assistant","content":"{}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":13,"completion_tokens":2,"total_tokens":15}})));
+        let gateway = ProviderGateway::start(scripts).await;
+        let (status, body) = put_json(
+            &self.app,
+            &format!("/models/mock-{}", self.suffix),
+            Some(auth),
+            json!({
+                "provider":"openai","base_url":format!("{}/v1",gateway.base_url)
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "configure native fixture Offering: {body}"
+        );
+        self.native_providers.lock().await.push(gateway);
+    }
+
+    pub async fn native_provider_requests(
+        &self,
+    ) -> Vec<astra_runtime::server::provider_test_support::ProviderRequest> {
+        let providers = self.native_providers.lock().await;
+        let mut requests = Vec::new();
+        for provider in providers.iter() {
+            requests.extend(provider.requests.lock().await.iter().cloned());
+        }
+        requests
+    }
+
     async fn stop_fixture_heartbeat(&self) {
         if let Some(heartbeat) = self.fixture_heartbeat.lock().await.take() {
             heartbeat.abort();
@@ -791,7 +828,10 @@ impl MatrixE2eCtx {
         astra_services::models::invalidate_active_llm_model_resolution_cache();
         self.pool.close().await;
         self.app_state.close_database_pools().await;
-        offering_cleanup.expect("remove Matrix E2E mock Offering");
+        offering_cleanup.expect("remove Matrix E2E fixture Offering");
+        for gateway in self.native_providers.lock().await.iter() {
+            gateway.assert_complete();
+        }
         if let Some(error) = self.fixture_heartbeat_error.lock().await.take() {
             panic!("Matrix E2E fixture heartbeat failed before cleanup: {error}");
         }
@@ -841,7 +881,7 @@ pub async fn seed_pending_approval(
             checkpoint_json: None,
             error_code: None,
             error_message: None,
-            retry_count: 0,
+
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,
@@ -981,12 +1021,33 @@ pub async fn revoke_astra_admin_role(pool: &sqlx::MySqlPool, user_id: &str) {
     .expect("revoke_astra_admin_role delete");
 }
 
-/// Build app, connect pool, register user, refresh token, create session (with cleanup of stale rows).
 pub async fn bootstrap() -> BootstrapResult {
+    bootstrap_in_database(None).await
+}
+
+/// Recovery discovery is catalog-wide, so restart tests cannot share the
+/// catalog of concurrent journeys. Bootstrap still uses the production schema
+/// owner and the existing public auth/session/model fixture. The caller owns
+/// this exact name and its independent cleanup connection before bootstrap.
+pub async fn bootstrap_isolated_execution_handoff(database: String) -> BootstrapResult {
+    assert!(database.starts_with("astra_test_http_handoff_"));
+    assert!(
+        database
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    );
+    bootstrap_in_database(Some(database)).await
+}
+
+async fn bootstrap_in_database(database: Option<String>) -> BootstrapResult {
     let memoria = Arc::new(E2eMemoriaStub::default());
     let memoria_base_url = start_mock_memoria().await;
-    let (state, matrixone_database, url) =
-        build_state(memoria.clone(), memoria_base_url.clone()).await;
+    let (state, matrixone_database, url) = build_state(
+        memoria.clone(),
+        memoria_base_url.clone(),
+        database.as_deref(),
+    )
+    .await;
 
     let pool = sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(4)
@@ -996,23 +1057,12 @@ pub async fn bootstrap() -> BootstrapResult {
 
     cleanup_interrupted_matrix_e2e_sessions(&state).await;
 
-    // Reuse the server's database pool. A separate 80-connection evaluation
-    // pool per in-process app made a serial journey suite reserve twice the
-    // production capacity and obscured genuine leaks behind the global cap.
+    // Reuse the server's database pool for session lifecycle assertions.
     let session_lifecycle_pool = state
         .shared_pool
         .as_ref()
         .expect("build_server_state wires a shared MatrixOne pool")
         .clone();
-    let matrixone_settings = session_lifecycle_pool.settings().clone();
-    let state = state.with_evaluation_service(Arc::new(
-        DatabaseEvaluationService::new(matrixone_settings)
-            .with_pool(session_lifecycle_pool.clone())
-            .with_memoria_config(
-                memoria_base_url,
-                Some("system-e2e-mock-master-key".to_string()),
-            ),
-    ));
 
     // `build_app` is used in-process here, so the real server startup hook that
     // primes capability health does not run. Mirror that production boundary
@@ -1103,7 +1153,9 @@ pub async fn bootstrap() -> BootstrapResult {
         &app,
         "/sessions",
         Some(&auth_header),
-        json!({ "title": "product matrix session", "metadata": { "suite": "matrix" } }),
+        json!({ "title": "product matrix session", "metadata": {
+            "suite": "matrix", "full_llm_capture": false
+        } }),
     )
     .await;
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
@@ -1149,7 +1201,7 @@ pub async fn bootstrap() -> BootstrapResult {
         "Matrix E2E Edge registration must have one materialized row"
     );
 
-    // Register a mock model so run-lifecycle tests don't need a real LLM.
+    // No live LLM: opt-in delegation fixtures use the loopback judgment provider.
     grant_astra_admin_role(&pool, &user_id).await;
     let mock_model = format!("mock-{suffix}");
     let (st_mdl, model) = post_json(
@@ -1218,8 +1270,10 @@ pub async fn bootstrap() -> BootstrapResult {
             edge_agent_id,
             model_offering_id,
             suffix,
+            isolated_database: database,
             fixture_heartbeat: Mutex::new(Some(fixture_heartbeat)),
             fixture_heartbeat_error,
+            native_providers: Mutex::new(Vec::new()),
         },
         auth_header,
         refresh_token,

@@ -1,0 +1,47 @@
+name: flash_discover_then_delegate_glm
+description: |
+  The parent uses its supplied authorized Chat catalog or queries it before
+  using an available GLM child, without reading workspace configuration.
+  Exact child output and parent adoption remain independently verified.
+prompt: |
+  Check which Chat models are currently available for you to delegate to.
+  If GLM 5.2 is available, ask a GLM 5.2 subagent to reply exactly
+  ASTRA-CATALOG-GLM-OK, then tell me its reply and which model it used.
+  Do not inspect local configuration or workspace files to find models.
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: execution_tool_count
+    name: model_catalog
+    min: 0
+    max: 3
+  - type: execution_tool_count
+    name: model_catalog
+    ok: false
+    min: 0
+    max: 0
+  - type: execution_child_results_adopted
+    children:
+      - expected_result: {text: ASTRA-CATALOG-GLM-OK}
+        model: glm-5.2
+  - type: text_contains
+    needle: ASTRA-CATALOG-GLM-OK
+  - type: execution_tool_count
+    name: bash
+    min: 0
+    max: 0
+  - type: execution_tool_count
+    name: grep
+    min: 0
+    max: 0
+  - type: execution_tool_count
+    name: read_file
+    min: 0
+    max: 0
+  - type: execution_tool_count
+    name: reflect
+    min: 0
+    max: 0

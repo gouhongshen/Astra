@@ -429,7 +429,7 @@ pub(crate) const RESERVED_CLI_ARGS: &[&str] = &[
     // Session ID — the harness manages --session-id for multi-turn
     // steps; a case overriding it would break session continuation.
     "--session-id",
-    // Required to archive primary/auxiliary usage before session cleanup.
+    // Defaults to on; only a validated on/off observation override is allowed.
     "--explain",
     // Cases may opt into an earlier CLI deadline via
     // `cli_wall_time_seconds`; the harness retains the outer watchdog.
@@ -441,8 +441,20 @@ pub(crate) const RESERVED_CLI_ARGS: &[&str] = &[
 /// exact form (`--model`) and `=` syntax (`--model=gpt-4`) so the
 /// denylist cannot be bypassed by appending `=value`.
 pub(crate) fn validate_extra_cli_args(args: &[String]) -> Result<(), String> {
-    for a in args {
+    let mut explain_seen = false;
+    for (index, a) in args.iter().enumerate() {
         let flag_part = a.split('=').next().unwrap_or(a);
+        if flag_part == "--explain" {
+            let value = a
+                .split_once('=')
+                .map(|(_, value)| value)
+                .or_else(|| args.get(index + 1).map(String::as_str));
+            if explain_seen || !matches!(value, Some("on" | "off")) {
+                return Err("--explain requires exactly one on/off observation mode".into());
+            }
+            explain_seen = true;
+            continue;
+        }
         for r in RESERVED_CLI_ARGS {
             if flag_part == *r {
                 return Err(format!(
@@ -680,6 +692,18 @@ impl Case {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn shipped_subagent_model_cases_parse_with_strict_criteria() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/subagent_model_selection");
+        let cases = Case::load_dir(&dir).expect("shipped DeepSeek Flash cases");
+        assert!(cases.iter().all(|case| !case.criteria.is_empty()));
+        assert!(
+            cases
+                .iter()
+                .any(|case| case.name == "flash_semantic_model_reference_glm")
+        );
+    }
 
     #[test]
     fn loads_minimal_case() {
@@ -1089,25 +1113,25 @@ criteria:
                         && producer_filters.iter().any(|filter| {
                             filter.document == crate::criteria::JournalToolDocument::Arguments
                                 && filter.path == "/action"
-                                && filter.equals == serde_json::json!("remember")
+                                && filter.equals == Some(serde_json::json!("remember"))
                         })
                         && producer_filters.iter().any(|filter| {
                             filter.document == crate::criteria::JournalToolDocument::Arguments
                                 && filter.path == "/memory_type"
-                                && filter.equals == serde_json::json!("working")
+                                && filter.equals == Some(serde_json::json!("working"))
                         })
                     && *actual_consumer_document == consumer_document
                     && *actual_consumer_paths == consumer_paths
                         && consumer_filters.iter().any(|filter| {
                             filter.document == crate::criteria::JournalToolDocument::Arguments
                                 && filter.path == "/action"
-                                && filter.equals == serde_json::json!(action)
+                                && filter.equals == Some(serde_json::json!(action))
                         })
                         && (action != "recall"
                             || consumer_filters.iter().any(|filter| {
                                 filter.document == crate::criteria::JournalToolDocument::Arguments
                                     && filter.path == "/scope"
-                                    && filter.equals == serde_json::json!("session")
+                                    && filter.equals == Some(serde_json::json!("session"))
                             }))
                 )
             })
@@ -1409,17 +1433,17 @@ steps:
         let path = dir.path().join("c.yaml");
         std::fs::write(
             &path,
-            "name: c\nprompt: p\ncriteria:\n  - type: fork_cache_class\n    expect: [hit]\n",
+            "name: c\nprompt: p\ncriteria:\n  - type: fork_cache_outcome\n    expect: [hit]\n",
         )
         .unwrap();
-        let err = Case::from_path(&path).expect_err("old type name must fail");
+        let err = Case::from_path(&path).expect_err("retired criterion must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("unknown variant"),
             "serde's well-shaped error is preserved: {msg}"
         );
         assert!(
-            msg.contains("fork_cache_class"),
+            msg.contains("fork_cache_outcome"),
             "offending name must appear: {msg}"
         );
         assert!(
@@ -1496,7 +1520,6 @@ steps:
             "--permission-mode=auto",
             "--system-prompt=override",
             "--session-id=hijack",
-            "--explain=off",
         ] {
             let err = validate_extra_cli_args(&[bypass.into()]);
             assert!(
@@ -1509,7 +1532,17 @@ steps:
     #[test]
     fn non_reserved_flag_with_equals_accepted() {
         assert!(validate_extra_cli_args(&["--verbose=true".into()]).is_ok());
-        assert!(validate_extra_cli_args(&["--explain=yes".into()]).is_err());
+        for args in [
+            vec!["--explain=yes"],
+            vec!["--explain"],
+            vec!["--explain=off", "--explain=on"],
+            vec!["--explain", "--model=other"],
+        ] {
+            assert!(
+                validate_extra_cli_args(&args.into_iter().map(str::to_owned).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
     }
 
     #[test]

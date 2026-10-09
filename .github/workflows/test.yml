@@ -40,17 +40,10 @@ jobs:
         id: scope
         run: python3 scripts/ci/ci_scope.py
 
-  # All shards start immediately. A previous compile-only job added a ~20 minute
-  # barrier, but rust-cache intentionally removes workspace binaries before
-  # saving, so the shards still had to compile and link their own test targets.
-  # Package-scoped compilation keeps each small runner bounded while sccache and
-  # the shared dependency cache avoid repeating dependency code generation.
-  #
-  # Shard balance (test counts):
-  #   shard-a: astra-cli (split by edge_tools group) — shell tests need process isolation
-  #   shard-b: astra-runtime (3151) + contracts (19)
-  #   shard-c: astra-turn-core (2167) + astra-services (1186) + plan/prompts
-  #   shard-d: remaining core crates + server e2e-hooks (3176, mostly overlaps runtime)
+  # Package groups remain parallel. CLI builds and executes its full inventory
+  # once; stable protected labels require that same completed test result.
+  # Short CLI partitions are not the workflow critical path, so separate
+  # artifact consumers only repeat setup, download and extraction work.
   #
   # Runtime profile guardrails are intentionally covered across these shards
   # instead of running `make test-runtime-profiles` as a separate CI job. That
@@ -60,70 +53,55 @@ jobs:
   # static-checks.yml covers the web Vitest files. This keeps the invariant
   # protected without repeating the same Rust/Web tests in an extra job.
 
+  cli-test-build:
+    name: "Test: shared CLI executables"
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: ci-test
+          save-cache: ${{ github.event_name == 'push' }}
+      - name: Prebuild mock MCP server
+        run: cargo build --locked -p astra-cli --bin mock_mcp_server
+      - name: Test complete CLI inventory
+        run: cargo nextest run --locked -p astra-cli --lib --bins --profile ci
+      - name: Retain CLI test timings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cli-timings-${{ github.run_attempt }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 3
+
   shard-a:
     name: "Test: astra-cli (${{ matrix.segment }})"
-    needs: scope
+    needs: [scope, cli-test-build]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 5
     env:
       RUN_TESTS: ${{ needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - segment: non-edge
-            filter: "not test(/edge_tools::/)"
-            command_timeout: 25m
-          - segment: edge-shell
-            filter: "test(/edge_tools::shell::/)"
-            command_timeout: 30m
-          - segment: edge-fs-tools
-            filter: "test(/edge_tools::fs_tools::/)"
-            command_timeout: 25m
-          # Required branch-protection context; the retired Git tool shard
-          # now exercises the session worktree lifecycle.
-          - segment: edge-git-gix
-            filter: "test(/edge_tools::worktree::/) or test(/edge_tools::tests::worktree_tests::/)"
-            command_timeout: 25m
-          - segment: edge-rest
-            filter: "test(/edge_tools::/) and not test(/edge_tools::shell::/) and not test(/edge_tools::fs_tools::/) and not test(/edge_tools::worktree::/) and not test(/edge_tools::tests::worktree_tests::/)"
-            command_timeout: 25m
+        segment: [non-edge, edge-shell, edge-fs-tools, edge-git-gix, edge-rest]
 
     steps:
       - name: Skip unaffected test segment
         if: env.RUN_TESTS != 'true'
         run: echo "No astra-cli test impact detected."
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        if: env.RUN_TESTS == 'true'
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/rust-setup
-        if: env.RUN_TESTS == 'true'
-        with:
-          shared-key: ci-test
-          save-cache: ${{ github.event_name == 'push' && matrix.segment == 'non-edge' }}
-      - name: Prebuild mock MCP server
-        if: env.RUN_TESTS == 'true' && matrix.segment == 'non-edge'
-        run: cargo build --manifest-path Cargo.toml -p astra-cli --bin mock_mcp_server
-      - name: "Test astra-cli (${{ matrix.segment }})"
+      - name: Require complete CLI test result
         if: env.RUN_TESTS == 'true'
         env:
-          NEXTEST_FILTER: ${{ matrix.filter }}
-        run: >-
-          timeout ${{ matrix.command_timeout }} cargo nextest run
-          --manifest-path Cargo.toml -p astra-cli
-          --profile ci --lib --bins -E "$NEXTEST_FILTER"
-      - name: Test astra-cli runtime profile guardrail
-        if: env.RUN_TESTS == 'true' && matrix.segment == 'non-edge'
-        run: >-
-          timeout ${{ matrix.command_timeout }} cargo nextest run
-          --manifest-path Cargo.toml -p astra-cli
-          --profile ci --lib
-          -E 'test(/local_cli_catalog_exposes_the_root_work_lifecycle/)'
-      - name: Dump processes on failure
-        if: failure() && env.RUN_TESTS == 'true'
-        run: pgrep -af 'cargo|nextest|astra|bash|sleep' || true
+          TEST_RESULT: ${{ needs.cli-test-build.result }}
+        run: test "$TEST_RESULT" = success
 
   shard-b:
     name: "Test: astra-runtime"
@@ -142,19 +120,8 @@ jobs:
         run: >-
           cargo nextest run --manifest-path Cargo.toml -p astra-runtime
           --profile ci
-      - name: Test contract (http + admin + settings)
-        run: |
-          cargo nextest run --manifest-path Cargo.toml -p astra-runtime --profile ci --test http_contract --test admin_contract
-          cargo nextest run --manifest-path Cargo.toml -p astra-core --profile ci --lib -E 'test(/settings_contract/)'
-      - name: Summarize contract failure
-        if: failure()
-        shell: bash
-        run: |
-          {
-            echo "## Regression gate"
-            echo
-            echo "Contract tests failed. Inspect the preceding shard-b steps for the failing contract."
-          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Measure history compaction work (offline)
+        run: make test-history-work NEXTEST_OFFLINE_PROFILE=ci
 
   shard-c:
     name: "Test: turn-core + services + plan"
@@ -207,7 +174,7 @@ jobs:
         run: >-
           cargo nextest run --manifest-path Cargo.toml -p astra-runtime
           --features e2e-hooks --profile ci
-          -E 'test(/bridge/) or test(/e2e/) or test(/phase_r5/) or test(/phase_r6/) or test(/phase_r7/) or test(/phase_j/) or test(/web_agent/) or test(/mock_llm/) or test(/cache_provider/)'
+          -E 'test(/bridge/) or test(/e2e/) or binary(phase_r5_mock_lifecycle_e2e) or binary(phase_r6_unhappy_lifecycle) or binary(phase_r7_context_design_invariants) or binary(phase_j_prompt_cache_gaps) or binary(cache_provider_matrix_e2e) or test(/web_agent/) or test(/mock_llm/)'
 
   vendored-terminal:
     name: "Test: vendored terminal (${{ matrix.os }})"
@@ -232,8 +199,34 @@ jobs:
           cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features event-stream
           cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib --features event-stream,use-dev-tty
 
+  # Preserve required check names while three builds run on separate runners.
+  # Both aggregate checks require the entire terminal matrix.
   terminal-pty:
     name: "Test: terminal PTY (${{ matrix.os }})"
+    needs: [scope, terminal-pty-shards]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - name: Require terminal PTY shards
+        shell: bash
+        env:
+          SHARDS_RESULT: ${{ needs.terminal-pty-shards.result }}
+          SHARDS_REQUIRED: ${{ needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true' }}
+        run: |
+          set -euo pipefail
+          if [ "$SHARDS_REQUIRED" = true ]; then
+            test "$SHARDS_RESULT" = success
+          else
+            case "$SHARDS_RESULT" in success|skipped) ;; *) exit 1 ;; esac
+          fi
+
+  terminal-pty-shards:
+    name: "Terminal: ${{ matrix.segment }} (${{ matrix.os }})"
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' || needs.scope.outputs.test_core == 'true') }}
     runs-on: ${{ matrix.os }}
@@ -242,6 +235,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-15]
+        segment: [default-reader, dev-tty-reader, reflow]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -249,17 +243,40 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           shared-key: ci-terminal-pty
+          # One writer per OS populates the shared dependency cache on pushes.
+          save-cache: ${{ github.event_name == 'push' && matrix.segment == 'default-reader' }}
           install-nextest: false
-      # Separate Cargo invocations prevent feature unification from silently
-      # selecting dev-tty for the nominal default-reader test run.
-      - name: Test real terminal readers through PTYs
+      # Separate runners keep dev-tty feature unification out of the default
+      # reader and avoid serializing two lib builds and the reflow binary build.
+      - name: Test default terminal reader through PTYs
+        if: matrix.segment == 'default-reader'
         run: |
           cargo test --locked -p astra-cli --lib tui::terminal_startup -- --test-threads=2
+      - name: Initialize system Git for macOS CLI observation
+        if: matrix.os == 'macos-15' && matrix.segment == 'default-reader'
+        timeout-minutes: 1
+        run: |
+          time /usr/bin/env -i PATH=/usr/bin:/bin HOME=/nonexistent LANG=C LC_ALL=C \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 \
+            /usr/bin/git -C "$GITHUB_WORKSPACE" -c core.fsmonitor=false \
+            -c core.untrackedCache=false rev-parse --show-toplevel
+      - name: Test macOS CLI Bash execution
+        if: matrix.os == 'macos-15' && matrix.segment == 'default-reader'
+        # Reuse the default-feature CLI test executable already built above.
+        run: >-
+          cargo test --locked --manifest-path Cargo.toml -p astra-cli
+          --lib edge_tools::shell::tests::bash_echo_returns_output -- --exact
+      - name: Test dev-tty terminal reader through PTYs
+        if: matrix.segment == 'dev-tty-reader'
+        run: |
           cargo test --locked -p astra-cli --lib --features crossterm/use-dev-tty tui::terminal_startup -- --test-threads=2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        if: matrix.segment == 'reflow'
         with:
           node-version-file: .nvmrc
       - name: Test inline terminal resize with xterm reflow
+        if: matrix.segment == 'reflow'
         run: |
           cargo build --locked -p astra-cli --bin astra
           npm ci --ignore-scripts --prefix scripts/tui-reflow
@@ -267,6 +284,29 @@ jobs:
 
   macos-workspace-coordination:
     name: "Test: macOS workspace coordination"
+    needs: [scope, macos-workspace-coordination-tests, terminal-pty-shards]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require macOS coordination and CLI execution
+        shell: bash
+        env:
+          COORDINATION_RESULT: ${{ needs.macos-workspace-coordination-tests.result }}
+          TERMINAL_RESULT: ${{ needs.terminal-pty-shards.result }}
+          SHARDS_REQUIRED: ${{ needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true' || needs.scope.outputs.test_cli == 'true' }}
+        run: |
+          set -euo pipefail
+          for result in "$COORDINATION_RESULT" "$TERMINAL_RESULT"; do
+            if [ "$SHARDS_REQUIRED" = true ]; then
+              test "$result" = success
+            else
+              case "$result" in success|skipped) ;; *) exit 1 ;; esac
+            fi
+          done
+
+  macos-workspace-coordination-tests:
+    name: "macOS workspace coordination contracts"
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true' || needs.scope.outputs.test_cli == 'true') }}
     runs-on: macos-15
@@ -277,7 +317,10 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/rust-setup
         with:
-          shared-key: ci-test-macos-workspace-coordination
+          # Reuse the CLI dependency cache; default-reader is its only writer.
+          shared-key: ci-terminal-pty
+          save-cache: "false"
+          install-nextest: "false"
       - name: Lint macOS workspace coordination
         run: >-
           cargo clippy --locked --manifest-path Cargo.toml -p astra-tools
@@ -302,15 +345,26 @@ jobs:
         run: >-
           cargo test --locked --manifest-path Cargo.toml -p astra-tools
           workspace_observation::tests:: -- --test-threads=1
-      - name: Test macOS CLI Bash execution
-        run: >-
-          cargo test --locked --manifest-path Cargo.toml -p astra-cli
-          --lib edge_tools::shell::tests::bash_echo_returns_output -- --exact
 
-  # Online tests run beside the offline shards instead of waiting for an
-  # unrelated compile-only job. CI keeps each live-DB lane serial; the
-  # Makefile assigns services to core and runtime/plan to integration so the
-  # two jobs share test-binary link and live-DB work more evenly.
+  # Preserve the required core check while its package groups run separately.
+  # The aggregate requires all selected online jobs, including integration.
+  test-online-core:
+    name: "Test: online (core)"
+    needs: test-online
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require online shards
+        shell: bash
+        env:
+          SHARDS_RESULT: ${{ needs.test-online.result }}
+        run: |
+          set -euo pipefail
+          test "$SHARDS_RESULT" = success
+
+  # Each online job owns a separate MatrixOne/Memoria stack. Keep tests serial
+  # within that stack; parallelism comes from isolated runners, not DB pressure.
   test-online:
     name: "Test: online (${{ matrix.lane }})"
     needs: scope
@@ -320,11 +374,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [core, integration]
+        lane: [core-runtime, core-turn-core, core-services, integration]
     env:
       RUN_TESTS: >-
         ${{ needs.scope.result != 'success' ||
-            (matrix.lane == 'core' && needs.scope.outputs.online_core == 'true') ||
+            (matrix.lane != 'integration' && needs.scope.outputs.online_core == 'true') ||
             (matrix.lane == 'integration' && needs.scope.outputs.online_integration == 'true') }}
       MATRIXONE_HOST: localhost
       MATRIXONE_PORT: "6001"

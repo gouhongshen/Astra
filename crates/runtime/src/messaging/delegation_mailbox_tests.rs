@@ -19,12 +19,14 @@ mod tests {
     use astra_services::runs::InMemoryRunStateStore;
 
     use crate::server::delegation::engine::{
-        DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutor,
+        DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutionResult, SubRunExecutor,
     };
     use crate::server::run::engine::RunEngine;
     use astra_messaging::in_process::InProcessTransport;
     use astra_messaging::router::AgentMailboxRouter;
     use astra_messaging::types::*;
+
+    const DELEGATION_ID: &str = "del-mailbox-test";
 
     // ── Custom executor that uses mailbox to communicate ────────────────────
 
@@ -35,7 +37,7 @@ mod tests {
 
     #[async_trait]
     impl SubRunExecutor for MailboxTestExecutor {
-        async fn execute(&self, mut config: SubRunConfig) -> Result<AgentResult, String> {
+        async fn execute(&self, mut config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
             let agent_id = config.agent_profile.agent_id.clone();
             let run_id = config.run_id.clone();
 
@@ -52,10 +54,11 @@ mod tests {
                 let _ = mailbox.send(hello_msg).await;
 
                 // 2. Broadcast to all peers in the delegation group.
-                let did = mailbox.delegation_id.clone().unwrap_or_default();
                 let broadcast_msg = AgentMessage::new(
                     mailbox.address.clone(),
-                    MessageTarget::Broadcast { delegation_id: did },
+                    MessageTarget::Broadcast {
+                        delegation_id: DELEGATION_ID.into(),
+                    },
                     MessagePayload::Text {
                         content: format!("{agent_id} reporting in"),
                         summary: None,
@@ -79,26 +82,34 @@ mod tests {
                     .send_progress(0, 0, "completed", Some(format!("{agent_id} done")))
                     .await;
 
-                Ok(AgentResult {
-                    agent_id,
-                    run_id,
-                    status: "completed".to_string(),
-                    output: Some(format!("mailbox=true, sent=2, received={}", received.len())),
-                    error: None,
-                    prompt_tokens: 10,
-                    completion_tokens: 5,
-                    tool_calls: 0,
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
+                        agent_id,
+                        run_id,
+                        status: "completed".to_string(),
+                        output: Some(format!("mailbox=true, sent=2, received={}", received.len())),
+                        error: None,
+                        prompt_tokens: 10,
+                        completion_tokens: 5,
+                        tool_calls: 0,
+                    },
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
                 })
             } else {
-                Ok(AgentResult {
-                    agent_id,
-                    run_id,
-                    status: "completed".to_string(),
-                    output: Some("mailbox=false".to_string()),
-                    error: None,
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
+                Ok(SubRunExecutionResult {
+                    result: AgentResult {
+                        agent_id,
+                        run_id,
+                        status: "completed".to_string(),
+                        output: Some("mailbox=false".to_string()),
+                        error: None,
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    },
+                    committed_frontier: None,
+                    applied_user_intents: Vec::new(),
                 })
             }
         }
@@ -126,7 +137,7 @@ mod tests {
     fn fan_out_request(agents: Vec<&str>) -> DelegationRequest {
         DelegationRequest {
             session_id: "test-session".into(),
-            delegation_id: "del-mailbox-test".into(),
+            delegation_id: DELEGATION_ID.into(),
             parent_run_id: "parent-run".into(),
             task: "test task with mailbox".into(),
             pattern: CoordinationPattern::FanOut {
@@ -159,8 +170,14 @@ mod tests {
                 &request.user_id,
                 &request.session_id,
             )
-            .await
-            .map(|_| ())
+            .await?;
+        crate::server::provider_test_support::append_control_plane_contract(
+            run_engine,
+            &request.user_id,
+            &request.session_id,
+            &request.parent_run_id,
+        )
+        .await
     }
 
     // ── Tests ───────────────────────────────────────────────────────────────
@@ -180,7 +197,10 @@ mod tests {
             tracker.clone(),
             Arc::new(MailboxTestExecutor),
         )
-        .with_mailbox_router(router.clone());
+        .with_mailbox_router(router.clone())
+        .for_execution(Arc::new(crate::orchestration::DynamicAgentSpawner::new(
+            router.clone(),
+        )));
 
         let request = fan_out_request(vec!["coder", "reviewer"]);
         persist_request_parent(&run_engine, &request).await.unwrap();
@@ -222,7 +242,10 @@ mod tests {
             tracker.clone(),
             Arc::new(MailboxTestExecutor),
         )
-        .with_mailbox_router(router.clone());
+        .with_mailbox_router(router.clone())
+        .for_execution(Arc::new(crate::orchestration::DynamicAgentSpawner::new(
+            router.clone(),
+        )));
 
         let request = fan_out_request(vec!["coder", "reviewer"]);
         persist_request_parent(&run_engine, &request).await.unwrap();
@@ -284,7 +307,10 @@ mod tests {
             tracker.clone(),
             Arc::new(MailboxTestExecutor),
         )
-        .with_mailbox_router(router.clone());
+        .with_mailbox_router(router.clone())
+        .for_execution(Arc::new(crate::orchestration::DynamicAgentSpawner::new(
+            router.clone(),
+        )));
 
         let request = fan_out_request(vec!["coder", "reviewer", "tester"]);
         persist_request_parent(&run_engine, &request).await.unwrap();
@@ -329,12 +355,19 @@ mod tests {
         let tracker = Arc::new(DelegationTracker::new());
 
         // No mailbox_router → agents should get mailbox=None.
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker.clone(),
+        ));
         let engine = DelegationEngine::with_executor(
             profiles,
             run_engine.clone(),
             tracker,
             Arc::new(MailboxTestExecutor),
-        );
+        )
+        .for_execution(Arc::new(crate::orchestration::DynamicAgentSpawner::new(
+            router,
+        )));
         // Intentionally NOT calling .with_mailbox_router()
 
         let request = fan_out_request(vec!["coder"]);
@@ -368,7 +401,10 @@ mod tests {
             tracker.clone(),
             Arc::new(MailboxTestExecutor),
         )
-        .with_mailbox_router(router);
+        .with_mailbox_router(router.clone())
+        .for_execution(Arc::new(crate::orchestration::DynamicAgentSpawner::new(
+            router,
+        )));
 
         let request = fan_out_request(vec!["coder", "reviewer"]);
         persist_request_parent(&run_engine, &request).await.unwrap();

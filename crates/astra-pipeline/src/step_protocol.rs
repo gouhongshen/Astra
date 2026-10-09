@@ -1,37 +1,34 @@
-//! Step Protocol v2: Slot-based execution, tiered checkpoints, DB-first events.
+//! Step Protocol v2: Slot-based execution, recovery checkpoints, DB-first events.
 //!
 //! # Architecture: 3 Concerns, 3 Types
 //!
 //! ```text
-//! ┌─ StepDescriptor ──────────────┐  Scheduling layer (who/when/retry)
-//! │  step_id, task_id, action,    │  Immutable after creation
-//! │  scheduling, retry_policy     │
+//! ┌─ StepDescriptor ──────────────┐  Identity and timeout metadata
+//! │  step_id, task_id, action,    │  Rebound on session adoption
+//! │  scheduling                  │
 //! ├─ StepExecution ───────────────┤  Runtime layer (cursor/progress)
 //! │  cursor, execution_slots,     │  Mutable during execution
 //! │  result, memory_context       │
-//! ├─ StepCheckpoint ──────────────┤  Persistence layer (2-tier)
-//! │  Light: cursor + metadata     │  Frequent, cheap
-//! │  Heavy: + messages + results  │  Infrequent, full recovery
+//! ├─ StepCheckpoint ──────────────┤  Persistence layer
+//! │  Light: cursor + metadata     │  Embedded cursor
+//! │  Heavy: + messages + results  │  Durable, full recovery
 //! └───────────────────────────────┘
 //! ```
 //!
 //! # Key properties
 //!
-//! - **Versioned**: compound encoding `major*1000+minor`. `VersionPolicy` with negotiation chain.
+//! - **Versioned**: checkpoints must match the current protocol exactly.
 //! - **Slot-based cursor**: `ExecutionSlot` per tool (state machine), not sequential index.
-//! - **Tiered checkpoints**: `LightCheckpoint` (frequent) + `HeavyCheckpoint` (full recovery).
-//! - **Checkpoint strategy**: `CheckpointTrigger` maps events to Light/Heavy tier.
+//! - **Recovery checkpoints**: `HeavyCheckpoint` embeds the `LightCheckpoint` cursor.
 //! - **Semantic idempotency**: Keys optionally include `workspace_version` + `memory_snapshot_id`.
 //! - **IdempotencyCache trait**: pluggable backends (InMemory, MatrixOne).
 //! - **Wait triggers**: `WaitTrigger` (User/Webhook/Timer) with `continuation_token`.
 //! - **DB-first events**: `StepEventStore` trait (in-memory or MatrixOne).
-//! - **Tool-level retry**: `ToolRetryPolicy` per tool classification.
 //! - **Memory governance**: `MemoryGovernanceAction` for retrieval/promotion/purge tracking.
 //! # Hardening additions
 //!
 //! - **Memory governance**: `MemoryGovernanceAction` enum carried in `MemoryContext` for lifecycle tracking.
 //! - **IdempotencyCache trait**: Abstraction over in-memory and MatrixOne-backed caches.
-//! - **Checkpoint triggers**: `CheckpointTrigger` / `CheckpointTier` for strategy-driven checkpointing.
 //! - **Canonical idempotency keys**: `compute_idempotency_key` uses `canonical_json` for determinism.
 
 use serde::{Deserialize, Serialize};
@@ -46,78 +43,21 @@ pub const PROTOCOL_VERSION_MAJOR: u32 = 2;
 pub const PROTOCOL_VERSION_MINOR: u32 = 0;
 pub const PROTOCOL_VERSION: u32 = PROTOCOL_VERSION_MAJOR * 1000 + PROTOCOL_VERSION_MINOR;
 
-/// How to handle version mismatches on checkpoint restore.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum VersionPolicy {
-    /// Reject any mismatch (safe default for production)
-    #[default]
-    Strict,
-    /// Accept if major version matches (same major = version / 1000).
-    /// E.g., v1.0 (1000) and v1.1 (1001) are compatible.
-    Compatible,
-}
-
-/// Result of version negotiation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VersionVerdict {
-    /// Exact match — proceed normally
-    ExactMatch,
-    /// Compatible (same major, different minor) — proceed with caution
-    CompatibleDecode { found: u32 },
-}
-
-pub fn check_protocol_version_with_policy(
-    version: u32,
-    policy: VersionPolicy,
-) -> Result<VersionVerdict, ProtocolError> {
-    // Version 0 is always invalid regardless of policy
-    if version == 0 {
-        return Err(ProtocolError::VersionMismatch {
-            expected: PROTOCOL_VERSION,
-            found: 0,
-            policy,
-        });
-    }
-
-    // Exact match — always OK
+/// Reject checkpoints not written with the current protocol.
+pub fn check_protocol_version(version: u32) -> Result<(), ProtocolError> {
     if version == PROTOCOL_VERSION {
-        return Ok(VersionVerdict::ExactMatch);
-    }
-
-    match policy {
-        VersionPolicy::Strict => Err(ProtocolError::VersionMismatch {
+        Ok(())
+    } else {
+        Err(ProtocolError::VersionMismatch {
             expected: PROTOCOL_VERSION,
             found: version,
-            policy,
-        }),
-        VersionPolicy::Compatible => {
-            let expected_major = PROTOCOL_VERSION / 1000;
-            let found_major = version / 1000;
-            if expected_major == found_major {
-                Ok(VersionVerdict::CompatibleDecode { found: version })
-            } else {
-                Err(ProtocolError::VersionMismatch {
-                    expected: PROTOCOL_VERSION,
-                    found: version,
-                    policy,
-                })
-            }
-        }
+        })
     }
-}
-
-/// Convenience: strict check (returns Ok(()) for exact match)
-pub fn check_protocol_version(version: u32) -> Result<(), ProtocolError> {
-    check_protocol_version_with_policy(version, VersionPolicy::Strict).map(|_| ())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProtocolError {
-    VersionMismatch {
-        expected: u32,
-        found: u32,
-        policy: VersionPolicy,
-    },
+    VersionMismatch { expected: u32, found: u32 },
     InvalidCursor(String),
     CheckpointCorrupt(String),
 }
@@ -125,21 +65,10 @@ pub enum ProtocolError {
 impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::VersionMismatch {
-                expected,
-                found,
-                policy,
-            } => {
-                let action = match policy {
-                    VersionPolicy::Strict => "Discard checkpoint and restart",
-                    VersionPolicy::Compatible => "Incompatible major version, discarding",
-                };
-                write!(
-                    f,
-                    "Protocol version mismatch: expected v{expected}, found v{found} \
-                     (policy: {policy:?}). {action}."
-                )
-            }
+            Self::VersionMismatch { expected, found } => write!(
+                f,
+                "Protocol version mismatch: expected v{expected}, found v{found}. Discard checkpoint and restart."
+            ),
             Self::InvalidCursor(msg) => write!(f, "Invalid execution cursor: {msg}"),
             Self::CheckpointCorrupt(msg) => write!(f, "Corrupt checkpoint: {msg}"),
         }
@@ -150,61 +79,22 @@ impl std::error::Error for ProtocolError {}
 
 // ─── Step: Layered Structure ─────────────────────────────────────────────────
 
-/// Scheduling contract — immutable policy governing a step's execution.
-/// Attached to StepDescriptor at creation, enforced by the runtime.
+/// Headless tool-round budget, attached to the descriptor and checked between batches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulingContract {
-    /// Execution priority (0=background, 5=normal, 10=urgent).
-    /// Higher priority steps execute first when multiple are queued.
-    pub priority: u32,
-    /// Maximum wall-clock time for the entire step (all tools combined).
+    /// Wall-clock budget checked before admitting another tool batch.
     pub timeout_ms: u64,
-    /// Per-tool timeout (0 = inherit from step timeout / tool_count).
-    pub per_tool_timeout_ms: u64,
-    /// Maximum retry attempts for transient failures.
-    pub max_retries: u32,
-    /// Initial backoff delay for retries (exponential: base * 2^attempt).
-    pub backoff_base_ms: u64,
-    /// Maximum backoff delay cap.
-    pub backoff_max_ms: u64,
 }
 
 impl Default for SchedulingContract {
     fn default() -> Self {
         Self {
-            priority: 5,
             timeout_ms: 300_000,
-            per_tool_timeout_ms: 0,
-            max_retries: 2,
-            backoff_base_ms: 500,
-            backoff_max_ms: 5_000,
         }
     }
 }
 
-impl SchedulingContract {
-    /// Compute backoff delay for retry attempt N (exponential with cap).
-    pub fn backoff_ms(&self, attempt: u32) -> u64 {
-        let delay = self.backoff_base_ms.saturating_mul(1u64 << attempt.min(10));
-        delay.min(self.backoff_max_ms)
-    }
-
-    /// Effective per-tool timeout: explicit value, or step timeout / tool_count.
-    /// Floor: never less than 30s (30_000ms) to avoid starving individual tools
-    /// when many tools share a step budget.
-    pub fn effective_tool_timeout_ms(&self, tool_count: usize) -> u64 {
-        const MIN_TOOL_TIMEOUT_MS: u64 = 30_000;
-        if self.per_tool_timeout_ms > 0 {
-            self.per_tool_timeout_ms
-        } else if tool_count > 0 {
-            (self.timeout_ms / tool_count as u64).max(MIN_TOOL_TIMEOUT_MS)
-        } else {
-            self.timeout_ms
-        }
-    }
-}
-
-/// Scheduling descriptor (immutable after creation, owned by Scheduler).
+/// Step identity and timeout; session adoption may rebind identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepDescriptor {
     pub step_id: String,
@@ -213,7 +103,7 @@ pub struct StepDescriptor {
     pub parent_step_id: Option<String>,
     pub action: StepAction,
     pub agent_id: Option<String>,
-    /// Scheduling contract governing this step's execution policy.
+    /// Execution timeout consumed by the headless step deadline.
     pub scheduling: SchedulingContract,
     pub protocol_version: u32,
     pub created_at: u64,
@@ -226,8 +116,6 @@ pub struct StepExecution {
     pub payload: StepPayload,
     pub result: Option<StepResult>,
     pub status: StepStatus,
-    pub attempt: u32,
-    pub max_attempts: u32,
     /// Memory context flowing through step lifecycle
     pub memory_context: Option<MemoryContext>,
     pub started_at: Option<u64>,
@@ -273,7 +161,7 @@ pub enum MemoryGovernanceAction {
 }
 
 /// Composite Step = descriptor + execution + idempotency key.
-/// This is the full Step passed between Scheduler and Agent.
+/// The recorder updates execution progress and captures recovery state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     pub descriptor: StepDescriptor,
@@ -308,8 +196,6 @@ impl Step {
                 payload,
                 result: None,
                 status: StepStatus::Pending,
-                attempt: 1,
-                max_attempts: 3,
                 memory_context: None,
                 started_at: None,
                 completed_at: None,
@@ -342,14 +228,6 @@ impl Step {
             self.execution.status,
             StepStatus::Completed | StepStatus::Failed | StepStatus::Cancelled
         )
-    }
-
-    pub fn is_retriable(&self) -> bool {
-        self.execution.attempt < self.execution.max_attempts
-            && !matches!(
-                self.execution.status,
-                StepStatus::Completed | StepStatus::Cancelled
-            )
     }
 
     pub fn mark_started(&mut self, agent_id: &str) {
@@ -675,7 +553,7 @@ impl ExecutionCursor {
 // ─── Checkpoint (Tiered: Light / Heavy) ──────────────────────────────────────
 
 /// Light checkpoint: cursor + metadata only.
-/// Written frequently (every tool completion), cheap to serialize.
+/// Embedded in heavy recovery checkpoints; not persisted as a standalone file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LightCheckpoint {
     pub protocol_version: u32,
@@ -718,13 +596,32 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "version", deny_unknown_fields)]
 pub enum RunExecutionControl {
-    #[serde(rename = "2")]
-    V2 {
+    #[serde(rename = "4")]
+    V4 {
         completion_settlement: astra_turn_types::CompletionSettlementState,
         hook_obligations: astra_turn_types::StopHookObligations,
+        reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1,
         budget_wrapup_injected: bool,
         budget_wrapup_ignored_rounds: u32,
     },
+}
+
+impl RunExecutionControl {
+    pub fn validate_budget(&self, budget: &RunExecutionBudget) -> Result<(), &'static str> {
+        let Self::V4 {
+            reply_obligations,
+            hook_obligations,
+            ..
+        } = self;
+        let RunExecutionBudget::V1 {
+            run_id,
+            producer_owner_generation,
+            ..
+        } = budget;
+        astra_turn_types::validate_completion_check_declarations(&hook_obligations.declarations)
+            .map_err(|_| "invalid completion check declarations")?;
+        reply_obligations.validate_owner(run_id, *producer_owner_generation)
+    }
 }
 
 /// Heavy checkpoint: conversation and execution facts at one frontier.
@@ -913,7 +810,6 @@ pub struct BreakpointIndex {
 
 pub use astra_core::composite_snapshot::{
     CompositeSnapshot, CompositeSnapshotIndex, DataSnapshotRef, MemorySnapshotRef, SnapshotRef,
-    SnapshotSpec,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1064,6 +960,19 @@ impl StepCheckpoint {
             ));
         }
 
+        if let Self::Heavy(h) = self
+            && let Some(control) = &h.run_execution_control
+        {
+            let Some(budget) = &h.run_execution_budget else {
+                return Err(ProtocolError::CheckpointCorrupt(
+                    "execution control has no paired run budget".into(),
+                ));
+            };
+            control
+                .validate_budget(budget)
+                .map_err(|error| ProtocolError::CheckpointCorrupt(error.into()))?;
+        }
+
         Ok(())
     }
 
@@ -1073,32 +982,7 @@ impl StepCheckpoint {
     }
 }
 
-// ─── Checkpoint Trigger Strategy ─────────────────────────────────────────────
-
-/// When to write checkpoints. Enforced by the execution engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CheckpointTrigger {
-    /// After every slot completion → LightCheckpoint
-    SlotCompleted,
-    /// On phase transition (Perceive→Plan→Act→Evaluate) → HeavyCheckpoint
-    PhaseTransition,
-    /// Before expensive operations (LLM call, bash) → LightCheckpoint
-    BeforeExpensiveOp,
-    /// Explicit user/system request → HeavyCheckpoint
-    Explicit,
-}
-
-impl CheckpointTrigger {
-    /// What tier of checkpoint should this trigger produce?
-    pub fn checkpoint_tier(&self) -> CheckpointTier {
-        match self {
-            Self::SlotCompleted | Self::BeforeExpensiveOp => CheckpointTier::Light,
-            Self::PhaseTransition | Self::Explicit => CheckpointTier::Heavy,
-        }
-    }
-}
-
-/// Tier of checkpoint produced by a trigger.
+/// Tier of a persisted checkpoint artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheckpointTier {
     Light,
@@ -1174,128 +1058,6 @@ pub enum StepVerdict {
     Complete,
     Failed,
     BudgetExhausted,
-}
-
-// ─── Retry Policy ────────────────────────────────────────────────────────────
-
-/// Default absolute ceiling for automatic retries (step + tool policies, serde default).
-pub const DEFAULT_RETRY_MAX_ATTEMPTS_CEILING: u32 = 5;
-
-/// Step-level retry policy (fallback when tool-level not specified).
-fn default_retry_max_retries() -> u32 {
-    DEFAULT_RETRY_MAX_ATTEMPTS_CEILING
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryPolicy {
-    pub max_attempts: u32,
-    /// Absolute ceiling on step-level retry attempts (defense in depth vs misconfigured `max_attempts`).
-    #[serde(default = "default_retry_max_retries")]
-    pub max_retries: u32,
-    pub backoff_base_ms: u64,
-    pub backoff_max_ms: u64,
-    pub retry_on: Vec<ErrorCategory>,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            max_retries: default_retry_max_retries(),
-            backoff_base_ms: 500,
-            backoff_max_ms: 30_000,
-            retry_on: vec![ErrorCategory::Transient, ErrorCategory::Timeout],
-        }
-    }
-}
-
-impl RetryPolicy {
-    /// Compute backoff delay for attempt N (exponential with jitter cap)
-    pub fn backoff_ms(&self, attempt: u32) -> u64 {
-        let delay = self.backoff_base_ms.saturating_mul(1u64 << attempt.min(10));
-        delay.min(self.backoff_max_ms)
-    }
-
-    pub fn should_retry(&self, attempt: u32, category: &ErrorCategory) -> bool {
-        let limit = self.max_attempts.min(self.max_retries.max(1));
-        attempt < limit && self.retry_on.contains(category)
-    }
-}
-
-/// Tool-level retry policy (more granular than step-level).
-/// A single tool failure doesn't force whole-step retry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolRetryPolicy {
-    pub max_attempts: u32,
-    #[serde(default = "default_retry_max_retries")]
-    pub max_retries: u32,
-    pub backoff_base_ms: u64,
-    pub backoff_max_ms: u64,
-}
-
-impl Default for ToolRetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 2,
-            max_retries: default_retry_max_retries(),
-            backoff_base_ms: 300,
-            backoff_max_ms: 5_000,
-        }
-    }
-}
-
-impl ToolRetryPolicy {
-    pub fn backoff_ms(&self, attempt: u32) -> u64 {
-        self.backoff_base_ms
-            .saturating_mul(1u64 << attempt.min(10))
-            .min(self.backoff_max_ms)
-    }
-
-    pub fn should_retry(&self, attempt: u32) -> bool {
-        let limit = self.max_attempts.min(self.max_retries.max(1));
-        attempt < limit
-    }
-}
-
-/// Get tool-level retry policy based on idempotency classification.
-///
-/// `args` is optional because most tools dispatch on name alone; action-sensitive
-/// tools (e.g. `memory`) inspect `args["action"]` to distinguish read vs write.
-pub fn tool_retry_policy(tool_name: &str, args: Option<&serde_json::Value>) -> ToolRetryPolicy {
-    match classify_tool_idempotency(tool_name, args) {
-        // Pure reads: retry aggressively (no side effects)
-        ToolIdempotency::PureRead => ToolRetryPolicy {
-            max_attempts: 3,
-            max_retries: default_retry_max_retries(),
-            backoff_base_ms: 200,
-            backoff_max_ms: 2_000,
-        },
-        // Idempotent writes: retry cautiously
-        ToolIdempotency::IdempotentWrite => ToolRetryPolicy {
-            max_attempts: 2,
-            max_retries: default_retry_max_retries(),
-            backoff_base_ms: 500,
-            backoff_max_ms: 5_000,
-        },
-        // Non-idempotent: do NOT auto-retry (let LLM decide)
-        ToolIdempotency::NonIdempotent => ToolRetryPolicy {
-            max_attempts: 1, // no retry
-            max_retries: 1,
-            backoff_base_ms: 0,
-            backoff_max_ms: 0,
-        },
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ErrorCategory {
-    Transient,
-    Timeout,
-    RateLimit,
-    AuthFailure,
-    InvalidInput,
-    ToolNotFound,
-    InternalError,
 }
 
 // ─── Idempotency ─────────────────────────────────────────────────────────────
@@ -1736,9 +1498,14 @@ mod tests {
 
     #[test]
     fn run_execution_control_requires_complete_known_contract() {
-        let snapshot = RunExecutionControl::V2 {
+        let snapshot = RunExecutionControl::V4 {
             completion_settlement: astra_turn_types::CompletionSettlementState::default(),
             hook_obligations: astra_turn_types::StopHookObligations::default(),
+            reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
+                run_id: "control-run".into(),
+                producer_owner_generation: 3,
+                pending: Vec::new(),
+            },
             budget_wrapup_injected: true,
             budget_wrapup_ignored_rounds: 1,
         };
@@ -1755,63 +1522,117 @@ mod tests {
                 "missing {field}"
             );
         }
-        let mut unknown = wire;
-        unknown["version"] = serde_json::json!("future");
-        assert!(serde_json::from_value::<RunExecutionControl>(unknown).is_err());
+        for version in ["1", "2", "3", "future"] {
+            let mut unknown = wire.clone();
+            unknown["version"] = serde_json::json!(version);
+            assert!(serde_json::from_value::<RunExecutionControl>(unknown).is_err());
+        }
+    }
+
+    #[test]
+    fn checkpoint_control_requires_exact_paired_question_owner() {
+        let mut checkpoint = StepCheckpoint::heavy(
+            "step".into(),
+            "task".into(),
+            "worker".into(),
+            ExecutionCursor::default(),
+        );
+        let StepCheckpoint::Heavy(heavy) = &mut checkpoint else {
+            unreachable!()
+        };
+        heavy.run_execution_control = Some(RunExecutionControl::V4 {
+            completion_settlement: Default::default(),
+            hook_obligations: Default::default(),
+            reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
+                run_id: "questioner".into(),
+                producer_owner_generation: 3,
+                pending: vec![astra_turn_types::PendingReply {
+                    request_id: "q1".into(),
+                    expected_responder: astra_turn_types::AgentCommunicationParty {
+                        run_id: "parent-mailbox".into(),
+                        agent_id: "orchestrator".into(),
+                    },
+                }],
+            },
+            budget_wrapup_injected: false,
+            budget_wrapup_ignored_rounds: 0,
+        });
+        assert!(
+            checkpoint.validate().is_err(),
+            "unpaired control cannot restore"
+        );
+        for (run_id, generation, valid) in [
+            ("other-run", 3, false),
+            ("questioner", 4, false),
+            ("questioner", 3, true),
+        ] {
+            let StepCheckpoint::Heavy(heavy) = &mut checkpoint else {
+                unreachable!()
+            };
+            heavy.run_execution_budget = Some(RunExecutionBudget::V1 {
+                run_id: run_id.into(),
+                producer_owner_generation: generation,
+                charged_iterations: 1,
+                granted_iteration_boundary: 10,
+                remaining_iterations: 9,
+                effective_hard_turn_limit: None,
+            });
+            let decoded: StepCheckpoint =
+                serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+            assert_eq!(decoded.validate().is_ok(), valid);
+        }
+        let StepCheckpoint::Heavy(heavy) = &mut checkpoint else {
+            unreachable!()
+        };
+        let Some(RunExecutionControl::V4 {
+            hook_obligations, ..
+        }) = &mut heavy.run_execution_control
+        else {
+            unreachable!()
+        };
+        // Even a phase not selected by this execution must remain a valid
+        // declaration contract for its descendants.
+        hook_obligations
+            .declarations
+            .task_completed
+            .push(astra_turn_types::StopHook {
+                label: "child-check".into(),
+                command: "make check".into(),
+                working_dir: None,
+                depends_on: vec!["missing".into()],
+                timeout_secs: None,
+
+                authoritative: true,
+            });
+        let decoded: StepCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        assert!(
+            decoded.validate().is_err(),
+            "unselected malformed declarations cannot restore"
+        );
     }
 
     // ── Protocol Version ──
 
     #[test]
     fn protocol_version_checks() {
-        // Exact match succeeds for both policies
-        for policy in [VersionPolicy::Strict, VersionPolicy::Compatible] {
-            let result = check_protocol_version_with_policy(PROTOCOL_VERSION, policy);
-            assert!(result.is_ok());
-            assert_eq!(result.unwrap(), VersionVerdict::ExactMatch);
-        }
-
-        // Default check uses strict and succeeds for current version
         assert!(check_protocol_version(PROTOCOL_VERSION).is_ok());
-
-        // Mismatched version with strict → error with Discard message
-        let err = check_protocol_version(PROTOCOL_VERSION + 1).unwrap_err();
-        assert!(matches!(err, ProtocolError::VersionMismatch { .. }));
-        assert!(err.to_string().contains("Discard"));
-
-        // Strict rejects mismatch, zero version rejected by both
-        let cases: Vec<(u32, VersionPolicy, bool, &str)> = vec![
-            (999, VersionPolicy::Strict, false, "strict rejects mismatch"),
-            (0, VersionPolicy::Strict, false, "strict rejects zero"),
-            (
-                0,
-                VersionPolicy::Compatible,
-                false,
-                "compatible rejects zero",
-            ),
-            (
-                1000,
-                VersionPolicy::Compatible,
-                false,
-                "compatible rejects diff major",
-            ),
-            (
-                2050,
-                VersionPolicy::Compatible,
-                true,
-                "compatible accepts same major",
-            ),
-        ];
-        for (ver, policy, expect_ok, desc) in cases {
-            let result = check_protocol_version_with_policy(ver, policy);
-            assert_eq!(result.is_ok(), expect_ok, "{desc} (ver={ver})");
-            if !expect_ok {
-                if let Err(ProtocolError::VersionMismatch { policy: p, .. }) = result {
-                    assert_eq!(p, policy);
-                } else {
-                    panic!("expected VersionMismatch for {desc}");
-                }
-            }
+        for version in [
+            0,
+            500,
+            999,
+            1000,
+            PROTOCOL_VERSION - 1,
+            PROTOCOL_VERSION + 1,
+            2050,
+        ] {
+            assert_eq!(
+                check_protocol_version(version),
+                Err(ProtocolError::VersionMismatch {
+                    expected: PROTOCOL_VERSION,
+                    found: version,
+                })
+            );
         }
     }
 
@@ -1831,11 +1652,8 @@ mod tests {
         );
         assert_eq!(step.status(), StepStatus::Pending);
         assert_eq!(step.descriptor.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(step.execution.attempt, 1);
-        assert_eq!(step.execution.max_attempts, 3);
         assert!(!step.idempotency_key.is_empty());
         assert!(!step.is_terminal());
-        assert!(step.is_retriable());
         assert!(step.descriptor.agent_id.is_none());
         assert!(step.execution.result.is_none());
         assert!(step.checkpoint.is_none());
@@ -1893,12 +1711,11 @@ mod tests {
             tokens_out: 50,
         });
         assert!(step.is_terminal());
-        assert!(!step.is_retriable());
         assert!(step.execution.completed_at.is_some());
     }
 
     #[test]
-    fn step_lifecycle_failed_retriable() {
+    fn step_lifecycle_failed() {
         let mut step = Step::new(
             "s1".into(),
             "t1".into(),
@@ -1911,8 +1728,11 @@ mod tests {
         );
         step.mark_started("agent-01");
         step.mark_failed("timeout");
+        assert_eq!(step.status(), StepStatus::Failed);
         assert!(step.is_terminal());
-        assert!(step.is_retriable()); // attempt=1, max=3, scheduler decides
+        assert!(
+            matches!(&step.execution.result, Some(StepResult::Error { message }) if message == "timeout")
+        );
     }
 
     // ── Execution Slots (Cursor v3) ──
@@ -2364,74 +2184,6 @@ mod tests {
                 "Expected NonIdempotent for {tool}"
             );
         }
-    }
-
-    // ── Retry Policy ──
-
-    #[test]
-    fn retry_policy() {
-        let policy = RetryPolicy::default();
-
-        // Exponential backoff
-        let backoff_expected = [(0, 500), (1, 1000), (2, 2000), (3, 4000)];
-        for (attempt, expected_ms) in backoff_expected {
-            assert_eq!(
-                policy.backoff_ms(attempt),
-                expected_ms,
-                "backoff at attempt {attempt}"
-            );
-        }
-
-        // Capped backoff
-        let capped = RetryPolicy {
-            backoff_max_ms: 5000,
-            ..RetryPolicy::default()
-        };
-        assert_eq!(capped.backoff_ms(10), 5000, "backoff capped at max");
-
-        // Should retry logic
-        assert!(policy.should_retry(1, &ErrorCategory::Transient));
-        assert!(policy.should_retry(2, &ErrorCategory::Timeout));
-        assert!(
-            !policy.should_retry(3, &ErrorCategory::Transient),
-            "max_attempts=3"
-        );
-        assert!(
-            !policy.should_retry(1, &ErrorCategory::AuthFailure),
-            "not in retry_on"
-        );
-
-        // max_retries caps retries
-        let limited = RetryPolicy {
-            max_attempts: 100,
-            max_retries: 5,
-            ..RetryPolicy::default()
-        };
-        assert!(limited.should_retry(0, &ErrorCategory::Transient));
-        assert!(limited.should_retry(4, &ErrorCategory::Transient));
-        assert!(
-            !limited.should_retry(5, &ErrorCategory::Transient),
-            "max_retries=5"
-        );
-    }
-
-    // ── Tool Retry Policy ──
-
-    #[test]
-    fn tool_retry_policy_by_tool_type() {
-        // PureRead tools get 3 retries with 200ms base
-        let policy = tool_retry_policy("grep", None);
-        assert_eq!(policy.max_attempts, 3);
-        assert_eq!(policy.backoff_base_ms, 200);
-
-        // IdempotentWrite gets 2 retries with 500ms base
-        let policy = tool_retry_policy("write_file", None);
-        assert_eq!(policy.max_attempts, 2);
-        assert_eq!(policy.backoff_base_ms, 500);
-
-        // NonIdempotent gets 1 attempt (no retry)
-        let policy = tool_retry_policy("bash", None);
-        assert_eq!(policy.max_attempts, 1);
     }
 
     // ── Canonical JSON ──
@@ -2922,43 +2674,6 @@ mod tests {
         assert_eq!(cache.check(&new).unwrap().output, "new");
     }
 
-    // ── Checkpoint Trigger Strategy ──
-
-    #[test]
-    fn checkpoint_trigger_tier_mapping() {
-        assert_eq!(
-            CheckpointTrigger::SlotCompleted.checkpoint_tier(),
-            CheckpointTier::Light
-        );
-        assert_eq!(
-            CheckpointTrigger::BeforeExpensiveOp.checkpoint_tier(),
-            CheckpointTier::Light
-        );
-        assert_eq!(
-            CheckpointTrigger::PhaseTransition.checkpoint_tier(),
-            CheckpointTier::Heavy
-        );
-        assert_eq!(
-            CheckpointTrigger::Explicit.checkpoint_tier(),
-            CheckpointTier::Heavy
-        );
-    }
-
-    #[test]
-    fn checkpoint_trigger_serde_roundtrip() {
-        let triggers = [
-            CheckpointTrigger::SlotCompleted,
-            CheckpointTrigger::PhaseTransition,
-            CheckpointTrigger::BeforeExpensiveOp,
-            CheckpointTrigger::Explicit,
-        ];
-        for t in &triggers {
-            let json = serde_json::to_string(t).unwrap();
-            let restored: CheckpointTrigger = serde_json::from_str(&json).unwrap();
-            assert_eq!(&restored, t);
-        }
-    }
-
     // ── Canonical JSON Consistency ──
 
     #[test]
@@ -2986,26 +2701,15 @@ mod tests {
         assert_eq!(key1, key2);
     }
 
-    // ── Version Display per Policy ──
+    // ── Version mismatch guidance ──
 
     #[test]
     fn version_display_strict_says_discard() {
         let err = ProtocolError::VersionMismatch {
             expected: 1000,
             found: 999,
-            policy: VersionPolicy::Strict,
         };
         assert!(err.to_string().contains("Discard checkpoint and restart"));
-    }
-
-    #[test]
-    fn version_display_compatible_says_incompatible() {
-        let err = ProtocolError::VersionMismatch {
-            expected: 1000,
-            found: 2000,
-            policy: VersionPolicy::Compatible,
-        };
-        assert!(err.to_string().contains("Incompatible major version"));
     }
 
     // ── Recovery Boundary: validate() hardened ──
@@ -3338,13 +3042,6 @@ mod tests {
         assert_eq!(PROTOCOL_VERSION % 1000, PROTOCOL_VERSION_MINOR);
     }
 
-    #[test]
-    fn version_compatible_rejects_old_versions() {
-        // Old version in major 0 range, current is major 1
-        let result = check_protocol_version_with_policy(500, VersionPolicy::Compatible);
-        assert!(result.is_err()); // major 0 != major 1
-    }
-
     // ── Wait Trigger Validation ──
 
     #[test]
@@ -3377,70 +3074,15 @@ mod tests {
     #[test]
     fn scheduling_contract_defaults() {
         let c = SchedulingContract::default();
-        assert_eq!(c.priority, 5);
         assert_eq!(c.timeout_ms, 300_000);
-        assert_eq!(c.per_tool_timeout_ms, 0);
-        assert_eq!(c.max_retries, 2);
-        assert_eq!(c.backoff_base_ms, 500);
-        assert_eq!(c.backoff_max_ms, 5_000);
-    }
-
-    #[test]
-    fn scheduling_contract_backoff_exponential() {
-        let c = SchedulingContract::default();
-        assert_eq!(c.backoff_ms(0), 500); // 500 * 2^0
-        assert_eq!(c.backoff_ms(1), 1000); // 500 * 2^1
-        assert_eq!(c.backoff_ms(2), 2000); // 500 * 2^2
-        assert_eq!(c.backoff_ms(3), 4000); // 500 * 2^3
-        assert_eq!(c.backoff_ms(4), 5000); // capped at max
-    }
-
-    #[test]
-    fn scheduling_contract_effective_tool_timeout() {
-        let c = SchedulingContract::default(); // 300s step, 0 per-tool
-        // With 3 tools: 300_000 / 3 = 100_000ms per tool (above 30s floor)
-        assert_eq!(c.effective_tool_timeout_ms(3), 100_000);
-        // With 1 tool: full step timeout
-        assert_eq!(c.effective_tool_timeout_ms(1), 300_000);
-        // With 0 tools: full step timeout (edge case)
-        assert_eq!(c.effective_tool_timeout_ms(0), 300_000);
-
-        // Explicit per-tool timeout overrides
-        let c2 = SchedulingContract {
-            per_tool_timeout_ms: 30_000,
-            ..Default::default()
-        };
-        assert_eq!(c2.effective_tool_timeout_ms(3), 30_000);
-        assert_eq!(c2.effective_tool_timeout_ms(1), 30_000);
-
-        // Floor: many tools should not starve individual tools below 30s
-        let c3 = SchedulingContract {
-            timeout_ms: 60_000, // 60s step
-            ..Default::default()
-        };
-        // 60_000 / 5 = 12_000 which is below floor → clamp to 30_000
-        assert_eq!(c3.effective_tool_timeout_ms(5), 30_000);
-        // 60_000 / 2 = 30_000 which equals floor → OK
-        assert_eq!(c3.effective_tool_timeout_ms(2), 30_000);
-        // 60_000 / 1 = 60_000 which is above floor → unchanged
-        assert_eq!(c3.effective_tool_timeout_ms(1), 60_000);
     }
 
     #[test]
     fn scheduling_contract_serde_roundtrip() {
-        let c = SchedulingContract {
-            priority: 8,
-            timeout_ms: 60_000,
-            per_tool_timeout_ms: 10_000,
-            max_retries: 5,
-            backoff_base_ms: 200,
-            backoff_max_ms: 10_000,
-        };
+        let c = SchedulingContract { timeout_ms: 60_000 };
         let json = serde_json::to_string(&c).unwrap();
         let c2: SchedulingContract = serde_json::from_str(&json).unwrap();
-        assert_eq!(c2.priority, 8);
         assert_eq!(c2.timeout_ms, 60_000);
-        assert_eq!(c2.max_retries, 5);
     }
 
     #[test]
@@ -3455,19 +3097,12 @@ mod tests {
                 tool_calls: vec![],
             },
         )
-        .with_scheduling(SchedulingContract {
-            priority: 10,
-            timeout_ms: 60_000,
-            ..Default::default()
-        });
-        assert_eq!(step.descriptor.scheduling.priority, 10);
+        .with_scheduling(SchedulingContract { timeout_ms: 60_000 });
         assert_eq!(step.descriptor.scheduling.timeout_ms, 60_000);
-        assert_eq!(step.descriptor.scheduling.max_retries, 2); // default
     }
 
     #[test]
-    fn step_backward_compat_with_timeout() {
-        // with_timeout_ms still works (sets scheduling.timeout_ms)
+    fn step_timeout_override() {
         let step = Step::new(
             "step-1".into(),
             "task-1".into(),

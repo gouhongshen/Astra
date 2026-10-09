@@ -1,6 +1,8 @@
 #![cfg(test)]
 
-use super::{BottomPane, UserIntentRejectReason};
+use super::{
+    BottomPane, PendingUserIntentCustody, PendingUserIntentTarget, UserIntentRejectReason,
+};
 use crate::tui::task_status::TaskStatus;
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::time::Instant;
@@ -219,7 +221,10 @@ fn next_turn_queue_confirms_visibility_and_preserves_fifo() {
         pane.take_queued_next_turn_submissions()
             .into_iter()
             .collect::<Vec<_>>(),
-        vec!["summarize the findings", "then prepare the patch"],
+        vec![
+            super::NextTurnSubmission::Interactive("summarize the findings".into()),
+            super::NextTurnSubmission::Interactive("then prepare the patch".into())
+        ],
         "the next-turn lane must retain the user's submission order"
     );
 }
@@ -379,26 +384,84 @@ fn locally_accepted_intent_does_not_claim_remote_delivery() {
 
 #[test]
 fn agent_guidance_uses_its_named_target_and_never_drains_into_root_chat() {
-    let mut pane = BottomPane::new();
-    assert!(pane.accept_agent_guide(
-        "intent-agent-1".into(),
-        "internal-run-id".into(),
-        "Reviewer".into(),
-        "inspect the failing test".into(),
-    ));
+    for accepted in [false, true] {
+        let mut pane = BottomPane::new();
+        let guide = crate::tui::event_loop::AgentGuideTarget::capture(
+            "Reviewer".into(),
+            "internal-run-id".into(),
+            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                run_id: "internal-run-id".into(),
+            },
+            astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            None,
+            7,
+        );
+        assert!(pane.accept_agent_guide(
+            "intent-agent-1".into(),
+            guide.clone(),
+            "inspect the failing test".into(),
+        ));
 
-    let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
-    assert!(rendered.contains("Sending guidance to Reviewer"));
-    assert!(!rendered.contains("internal-run-id"));
-    assert!(pane.take_client_recoverable_user_intents().is_empty());
-    assert!(pane.promote_agent_guide_accepted("intent-agent-1"));
-    let pending = pane
-        .remove_agent_guide("intent-agent-1")
-        .expect("targeted guidance remains owned by the agent lane");
-    assert_eq!(
-        pending.status,
-        astra_turn_types::UserIntentStatus::AcceptedRemote
-    );
+        let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
+        assert!(rendered.contains("Sending guidance to Reviewer"));
+        assert!(!rendered.contains("internal-run-id"));
+        assert!(pane.take_client_recoverable_user_intents().is_empty());
+        if accepted {
+            assert!(pane.promote_agent_guide_accepted("intent-agent-1"));
+        }
+        assert!(pane.mark_user_intent_unconfirmed("intent-agent-1"));
+        assert!(!pane.mark_user_intent_unconfirmed("intent-agent-1"));
+        let rendered = render_text(&pane, Rect::new(0, 0, 100, 8));
+        assert!(rendered.contains("unknown"), "{rendered}");
+        assert!(!rendered.contains("Sending"), "{rendered}");
+        assert!(!rendered.contains("sending"), "{rendered}");
+        assert!(pane.take_client_recoverable_user_intents().is_empty());
+        assert!(pane.composer.text().is_empty());
+        assert!(pane.take_queued_next_turn_submissions().is_empty());
+        assert!(!pane.has_pending_composer_queue());
+        pane.composer.set_text("ordinary lead input");
+        assert!(matches!(
+            pane.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            super::BottomPaneAction::SubmitInput(text) if text == "ordinary lead input"
+        ));
+        assert_eq!(pane.pending_user_intent_count(), 1);
+        assert!(
+            pane.apply_user_intent(
+                "intent-agent-1",
+                astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                astra_turn_types::UserIntentStatus::Applied,
+                "member-only instruction",
+            )
+            .is_none()
+        );
+        assert!(!pane.return_user_intent(
+            "intent-agent-1",
+            astra_turn_types::UserIntentStatus::Returned,
+            "member-only instruction",
+        ));
+        assert_eq!(pane.pending_user_intent_count(), 1);
+        let pending = pane
+            .remove_agent_guide("intent-agent-1", None, 7, Some("internal-run-id"))
+            .expect("uncertain guidance remains owned by the member lane");
+        assert_eq!(pending.intent_id, "intent-agent-1");
+        assert_eq!(pending.text, "inspect the failing test");
+        assert_eq!(pending.custody, PendingUserIntentCustody::Unconfirmed);
+        assert_eq!(
+            pending.target,
+            PendingUserIntentTarget::AgentRun { target: guide }
+        );
+        assert_eq!(
+            pending.status,
+            if accepted {
+                astra_turn_types::UserIntentStatus::AcceptedRemote
+            } else {
+                astra_turn_types::UserIntentStatus::AcceptedLocal
+            }
+        );
+    }
 }
 
 #[test]

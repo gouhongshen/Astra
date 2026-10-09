@@ -8,7 +8,6 @@ description: |
 prompt: |
   Call `agent` exactly once with:
     action: "spawn"
-    name: "small-budget-child"
     description: "Verify bounded child output"
     prompt: "Reply with the exact text: small-budget-ok. Do not use tools."
     max_output_tokens: 256
@@ -30,11 +29,27 @@ criteria:
     name: agent
     document: result
     path: /status
-    equals: completed
+    equals: launched
   - type: journal_tool_json
     name: agent
     document: result
-    path: /result
-    equals: small-budget-ok
+    path: /result_family
+    equals: control_receipt
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/status
+      equals: completed
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: session_child_result_adopted
+    expected_result: "small-budget-ok"
   - type: text_contains
     needle: small-budget-ok

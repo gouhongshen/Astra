@@ -12,6 +12,19 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use crate::ToolResult;
+
+/// Selected by the execution owner, never by tool arguments. A user-owned
+/// proxy is a trusted network boundary and may resolve destinations itself;
+/// Server traffic must retain direct, pinned connections instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchTransport {
+    #[default]
+    DirectPinned,
+    LocalEnvironment,
+}
+
 pub use convert::{to_markdown, to_text};
 pub use extract::{ExtractedLink, PageMetadata, extract_links, extract_metadata};
 
@@ -132,6 +145,7 @@ impl FetchConfig {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
     scope: String,
+    transport: FetchTransport,
     url: String,
     format: OutputFormat,
     max_links: usize,
@@ -220,24 +234,70 @@ const MAX_WALK_DEPTH: usize = 256;
 
 // ─── Entry Point ─────────────────────────────────────────────────────────────
 
-/// Tool dispatcher entry point. Returns JSON on success, `"Error: ..."` on failure.
-/// HTTP 4xx/5xx responses are returned as error strings so the caller marks them as errors.
-pub async fn fetch(args: &Value) -> String {
-    fetch_with_cache_scope(args, "").await
+/// One result contract for CLI, Server, User Runner and search. The total
+/// deadline covers DNS, redirects and body reads, not just individual sends.
+pub async fn fetch_with_cache_scope(
+    args: &Value,
+    cache_scope: &str,
+    transport: FetchTransport,
+) -> ToolResult {
+    let timeout = Duration::from_secs(args.get("timeout").and_then(Value::as_u64).unwrap_or(30));
+    let result = tokio::time::timeout(timeout, fetch_inner(args, cache_scope, transport))
+        .await
+        .unwrap_or_else(|_| Err(FetchError::Timeout("Total fetch deadline exceeded".into())));
+    render_fetch_result(result, transport)
 }
 
-/// Same as [`fetch`], but isolates the URL cache by caller-provided session/workspace scope.
-pub async fn fetch_with_cache_scope(args: &Value, cache_scope: &str) -> String {
-    match fetch_inner(args, cache_scope).await {
-        Ok(result) if result.status >= 400 => {
-            format!("Error: HTTP {} — {}", result.status, result.content)
+fn render_fetch_result(
+    result: Result<Arc<FetchResult>, FetchError>,
+    transport: FetchTransport,
+) -> ToolResult {
+    use astra_core::{ErrorKind, ToolFailureEvidence};
+    let (kind, detail, response) = match result {
+        Ok(result) if result.status < 400 => {
+            return ToolResult::text(
+                serde_json::to_string(&*result).expect("serializable fetch result"),
+            );
         }
-        Ok(result) => serde_json::to_string(&*result).unwrap_or_else(|e| format!("Error: {e}")),
-        Err(e) => format!("Error: {e}"),
-    }
+        Ok(result) => {
+            let kind = match result.status {
+                401 | 403 => ErrorKind::Auth,
+                404 | 410 => ErrorKind::ToolNotFound,
+                429 => ErrorKind::RateLimit,
+                500..=599 => ErrorKind::ServerError,
+                _ => ErrorKind::InvalidRequest,
+            };
+            (
+                kind,
+                format!("HTTP {}", result.status),
+                serde_json::to_value(&*result).ok(),
+            )
+        }
+        Err(error) => {
+            let kind = match &error {
+                FetchError::Validation(_) => ErrorKind::ToolInvalidArgs,
+                FetchError::Network(_) => ErrorKind::Network,
+                FetchError::Timeout(_) => ErrorKind::ToolTimeout,
+                FetchError::SsrfBlocked(_) => ErrorKind::PolicyDenied,
+            };
+            (kind, error.to_string(), None)
+        }
+    };
+    ToolResult::error(
+        serde_json::json!({
+            "error": detail, "error_kind": kind.as_str(),
+            "transport": transport, "response": response,
+        })
+        .to_string(),
+    )
+    .with_failure_evidence(ToolFailureEvidence::from_error_kind(kind))
 }
 
-async fn fetch_inner(args: &Value, cache_scope: &str) -> Result<Arc<FetchResult>, FetchError> {
+async fn fetch_inner(
+    args: &Value,
+    cache_scope: &str,
+    transport: FetchTransport,
+) -> Result<Arc<FetchResult>, FetchError> {
     let (raw_url, config) = FetchConfig::from_args(args)?;
     let url = if config.allow_http {
         raw_url.clone()
@@ -252,6 +312,7 @@ async fn fetch_inner(args: &Value, cache_scope: &str) -> Result<Arc<FetchResult>
 
     let cache_key = CacheKey {
         scope: cache_scope.to_string(),
+        transport,
         url: url.clone(),
         format: config.format,
         max_links: config.max_links,
@@ -268,7 +329,8 @@ async fn fetch_inner(args: &Value, cache_scope: &str) -> Result<Arc<FetchResult>
     }
 
     let start = Instant::now();
-    let (status, final_url, content_type, body) = do_fetch(&url, config.timeout).await?;
+    let (status, final_url, content_type, body) =
+        fetch_reqwest(&url, config.timeout, transport).await?;
     // Store one bounded representation independent of the caller's requested
     // slice. A later model round asking for 8k after an initial 3k read can
     // reuse the same network response; only the returned projection changes.
@@ -515,20 +577,10 @@ fn is_private_ipv4(v4: Ipv4Addr) -> bool {
 
 // ─── HTTP Fetch ──────────────────────────────────────────────────────────────
 
-async fn do_fetch(
-    url: &str,
-    timeout: Duration,
-) -> Result<(u16, Option<String>, String, String), FetchError> {
-    // The transport must be self-contained. In particular, the CLI/edge path
-    // deliberately has no shared HTTP client, and it must not silently fall
-    // back to a task image's `curl` binary. Both entry points use the same
-    // pinned, SSRF-checked Rust transport.
-    fetch_reqwest(url, timeout).await
-}
-
 async fn fetch_reqwest(
     url: &str,
     timeout: Duration,
+    transport: FetchTransport,
 ) -> Result<(u16, Option<String>, String, String), FetchError> {
     let mut current = url.to_string();
     let mut final_url = None;
@@ -543,12 +595,17 @@ async fn fetch_reqwest(
 
         // Build a per-hop client that pins the DNS resolution to prevent rebinding.
         // reqwest's `resolve()` overrides its internal DNS for this host.
-        let mut builder = reqwest::Client::builder()
+        let builder = match transport {
+            FetchTransport::DirectPinned => reqwest::Client::builder().no_proxy(),
+            FetchTransport::LocalEnvironment => {
+                astra_core::net::client_builder_for_target(&current)
+            }
+        };
+        let mut builder = builder
             .timeout(timeout)
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(USER_AGENT)
-            .no_proxy();
+            .user_agent(USER_AGENT);
 
         // Pin the complete validated address set in one override. Calling
         // `resolve()` repeatedly would replace the previous override, leaving
@@ -572,7 +629,7 @@ async fn fetch_reqwest(
         })
         .await
         .map_err(|_| FetchError::Timeout(format!("Request timed out after {timeout:?}")))?
-        .map_err(|e| FetchError::Network(format!("HTTP request failed: {e}")))?;
+        .map_err(|e| transport_error(e, "HTTP request"))?;
 
         let status = resp.status();
         if status.is_redirection()
@@ -616,12 +673,21 @@ async fn fetch_reqwest(
     )))
 }
 
+fn transport_error(error: reqwest::Error, stage: &str) -> FetchError {
+    if error.is_timeout() {
+        FetchError::Timeout(format!("{stage} timed out"))
+    } else {
+        // Preserve typed cause without retaining query-bearing error URLs.
+        FetchError::Network(format!("{stage} failed: {}", error.without_url()))
+    }
+}
+
 async fn read_limited_body(resp: &mut reqwest::Response) -> Result<String, FetchError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| FetchError::Network(format!("Failed to read body: {e}")))?
+        .map_err(|e| transport_error(e, "HTTP body read"))?
     {
         let remaining = MAX_DOWNLOAD_BYTES.saturating_sub(bytes.len());
         if remaining == 0 {
@@ -1549,6 +1615,7 @@ mod tests {
     fn cache_key(scope: &str, url: &str, format: OutputFormat) -> CacheKey {
         CacheKey {
             scope: scope.into(),
+            transport: FetchTransport::DirectPinned,
             url: url.into(),
             format,
             max_links: 25,
@@ -1946,22 +2013,40 @@ mod tests {
 
     #[tokio::test]
     async fn error_on_missing_url() {
-        let r = fetch(&serde_json::json!({})).await;
-        assert!(r.starts_with("Error:"), "got: {r}");
-        assert!(r.contains("Missing 'url'"));
+        let r =
+            fetch_with_cache_scope(&serde_json::json!({}), "", FetchTransport::DirectPinned).await;
+        assert!(r.is_error);
+        assert!(r.output.contains("Missing 'url'"));
+        assert_eq!(r.metadata.unwrap()["error_kind"], "tool_invalid_args");
     }
 
     #[tokio::test]
     async fn error_on_private_ip() {
-        let r = fetch(&serde_json::json!({"url": "http://127.0.0.1/admin"})).await;
-        assert!(r.starts_with("Error:"), "got: {r}");
-        assert!(r.contains("SSRF"), "got: {r}");
+        for transport in [
+            FetchTransport::DirectPinned,
+            FetchTransport::LocalEnvironment,
+        ] {
+            let r = fetch_with_cache_scope(
+                &serde_json::json!({"url": "http://127.0.0.1/admin"}),
+                "",
+                transport,
+            )
+            .await;
+            assert!(r.is_error);
+            assert!(r.output.contains("SSRF"));
+            assert_eq!(r.metadata.unwrap()["error_kind"], "policy_denied");
+        }
     }
 
     #[tokio::test]
     async fn error_on_bad_format() {
-        let r = fetch(&serde_json::json!({"url": "https://x.com", "format": "raw"})).await;
-        assert!(r.starts_with("Error:"), "got: {r}");
+        let r = fetch_with_cache_scope(
+            &serde_json::json!({"url": "https://x.com", "format": "raw"}),
+            "",
+            FetchTransport::DirectPinned,
+        )
+        .await;
+        assert!(r.is_error);
     }
 
     // ── Performance ───────────────────────────────────────────────────
@@ -1998,10 +2083,8 @@ mod tests {
         assert!(r.content.contains("Not Found"), "got: {}", r.content);
     }
 
-    #[tokio::test]
-    async fn http_4xx_returns_error_string() {
-        // Simulate what happens when fetch_inner returns a 404
-        // We test the fetch() wrapper's error signaling by calling transform + checking output
+    #[test]
+    fn http_4xx_preserves_response_and_typed_failure() {
         let config = FetchConfig::default();
         let result = transform(
             "https://x.com/gone",
@@ -2013,14 +2096,12 @@ mod tests {
             Duration::ZERO,
         );
         assert_eq!(result.status, 410);
-        // The fetch() function wraps this as an error
-        let result = Arc::new(result);
-        let output = if result.status >= 400 {
-            format!("Error: HTTP {} — {}", result.status, result.content)
-        } else {
-            serde_json::to_string(&*result).unwrap()
-        };
-        assert!(output.starts_with("Error: HTTP 410"), "got: {output}");
+        let result = render_fetch_result(Ok(Arc::new(result)), FetchTransport::DirectPinned);
+        assert!(result.is_error);
+        assert_eq!(result.metadata.unwrap()["error_kind"], "tool_not_found");
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["response"]["status"], 410);
+        assert_eq!(output["response"]["content"], "Gone");
     }
 
     // ── Empty Body Handling ───────────────────────────────────────────

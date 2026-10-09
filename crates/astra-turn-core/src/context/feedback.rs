@@ -380,7 +380,9 @@ impl RuntimeFeedbackFrame {
 
     #[must_use]
     pub fn cache_hit_ratio(&self) -> Option<f64> {
-        self.request_usage.map(|usage| usage.cache_hit_ratio())
+        self.request_usage
+            .filter(|usage| usage.total_input() > 0)
+            .map(|usage| usage.cache_hit_ratio())
     }
 
     /// Compare provider-reported cache reads with the estimated stable prefix.
@@ -394,17 +396,6 @@ impl RuntimeFeedbackFrame {
             return None;
         }
         Some(cache_read as f64 / eligible as f64)
-    }
-
-    pub fn detect_cache_break(&mut self, turn: u32, min_creation_threshold: u64) {
-        if turn > 1
-            && self.request_usage.is_some_and(|usage| {
-                usage.cache_read == 0 && usage.cache_creation >= min_creation_threshold
-            })
-            && self.cache_break_detected.is_none()
-        {
-            self.cache_break_detected = Some(CacheBreakReason::UnknownColdStart);
-        }
     }
 
     pub fn attribute_cache_break(&mut self, reason: CacheBreakReason) {
@@ -468,19 +459,6 @@ impl ContextFeedback {
             cache_hit_ratio,
             was_truncated,
             cache_break_detected: None,
-        }
-    }
-
-    /// Detect a cache break from cold creation (no cache reads, significant creation).
-    /// Call this with the turn number to determine if a break occurred.
-    pub fn detect_cache_break(&mut self, turn: u32, min_creation_threshold: u64) {
-        if turn > 1
-            && self.tokens.cache_read == 0
-            && self.tokens.cache_creation >= min_creation_threshold
-        {
-            if self.cache_break_detected.is_none() {
-                self.cache_break_detected = Some(CacheBreakReason::UnknownColdStart);
-            }
         }
     }
 
@@ -554,6 +532,11 @@ mod tests {
             policy_feedback: RuntimePolicyFeedbackSet::NotEvaluated,
         };
         frame.context.estimated_cache_eligible_tokens = Some(100);
+        assert_eq!(frame.cache_hit_ratio(), None);
+        frame.request_usage = Some(TokenAccounting::default());
+        assert_eq!(frame.cache_hit_ratio(), None);
+        frame.request_usage = Some(TokenAccounting::from_fields(20, 0, 0, 5));
+        assert_eq!(frame.cache_hit_ratio(), Some(0.0));
         frame.request_usage = Some(TokenAccounting::from_fields(20, 80, 0, 0));
 
         assert_eq!(frame.cache_read_vs_eligible_ratio(), Some(0.8));
@@ -572,26 +555,9 @@ mod tests {
     }
 
     #[test]
-    fn detects_cache_break_from_cold_creation() {
-        let mut f = ContextFeedback::from_usage(0, 0, 5000, 100, false);
-        f.detect_cache_break(2, 1000);
-        assert_eq!(
-            f.cache_break_detected,
-            Some(CacheBreakReason::UnknownColdStart)
-        );
-    }
-
-    #[test]
-    fn no_cache_break_on_turn_1() {
-        let mut f = ContextFeedback::from_usage(0, 0, 5000, 100, false);
-        f.detect_cache_break(1, 1000);
-        assert!(f.cache_break_detected.is_none());
-    }
-
-    #[test]
     fn attribute_replaces_unknown() {
         let mut f = ContextFeedback::from_usage(0, 0, 5000, 100, false);
-        f.detect_cache_break(2, 1000);
+        f.attribute_cache_break(CacheBreakReason::UnknownColdStart);
         f.attribute_cache_break(CacheBreakReason::ToolSchemasChanged {
             added: vec!["bash".to_string()],
             removed: Vec::new(),

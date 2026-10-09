@@ -30,6 +30,7 @@ pub(crate) struct StartupTerminal {
     raw_output_flags: Option<OutputFlags>,
     #[cfg(unix)]
     raw_local_flags: Option<LocalFlags>,
+    keyboard_enhancement_supported: bool,
 }
 
 fn should_query_colors(profile: Option<&str>, no_color: bool, background_override: bool) -> bool {
@@ -62,6 +63,7 @@ impl StartupTerminal {
                 interrupt: Some(interrupt),
                 raw_output_flags: None,
                 raw_local_flags: None,
+                keyboard_enhancement_supported: false,
             };
             match crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
                 execute!(stdout, EnableBracketedPaste)
@@ -104,6 +106,14 @@ impl StartupTerminal {
                     sixel = response
                         .device_attributes
                         .map(|params| params.iter().skip(1).any(|&param| param == 4));
+                    // `CSI ?u` shares this same DA1-anchored round trip
+                    // (see startup_query.rs); a missing reply here means
+                    // unsupported, not "ask again" -- a second query would
+                    // race this one, exactly the class of bug the PTY
+                    // regression `pty_late_da1_is_unknown_until_reply` guards
+                    // against for the sibling DA1/sixel query.
+                    guard.keyboard_enhancement_supported =
+                        response.keyboard_enhancement_flags.is_some();
                 }
                 Err(error) => tracing::debug!(%error, "terminal startup query unavailable"),
             }
@@ -151,6 +161,13 @@ impl StartupTerminal {
         {
             self.owns_raw_mode = false;
         }
+    }
+
+    /// Whether the terminal answered the startup query for progressive
+    /// keyboard enhancement (Kitty protocol). `false` on non-unix targets,
+    /// where the startup query above never runs.
+    pub(crate) fn keyboard_enhancement_supported(&self) -> bool {
+        self.keyboard_enhancement_supported
     }
 }
 

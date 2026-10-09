@@ -103,7 +103,6 @@ impl MockLoopState {
     fn build_external(&self) -> ExternalSources {
         ExternalSources {
             memory_entries: self.memory_entries.clone(),
-            spill_dir: None,
             ..Default::default()
         }
     }

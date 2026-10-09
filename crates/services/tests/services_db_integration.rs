@@ -17,7 +17,6 @@ use astra_services::event_ingestion::{EventIngestionWorker, IngestionConfig, Ing
 use astra_services::introspection::{
     IntentDriftAssessmentStatus, IntentDriftLevel, IntentDriftVerdict,
 };
-use astra_services::replay::ReplaySessionRequestData;
 use astra_services::session_audit::TurnListParams;
 use astra_services::session_audit::{
     AuditSessionListParams, CrossSessionRuntimePromotionListParams, CrossSessionStatsParams,
@@ -39,16 +38,15 @@ use astra_services::{
     DatabaseAdminAuditReader, DatabaseContextManifestStore, DatabaseContextService,
     DatabaseDecisionService, DatabaseEventService, DatabaseIntrospectionService,
     DatabaseMarketplaceService, DatabaseMarketplaceStatsService, DatabasePersonalSkillStore,
-    DatabaseReflectService, DatabaseReplayService, DatabaseSessionArtifactStore,
-    DatabaseSessionContextCoordinator, DatabaseSessionService, DatabaseSkillService,
-    DatabaseStateProjectionStore, DecisionCreateRequestData, DecisionListFilter, DecisionService,
-    EventCreateRequestData, EventListFilter, EventService, IntrospectionService,
-    MAX_API_LIST_LIMIT, MarketplaceService, MarketplaceStatsService, MatrixOneSyncService,
-    ReflectService, ReplayService, ReserveTurnOutcome, RetrievalStage, SessionArtifactJsonStore,
-    SessionArtifactReference, SessionArtifactReferenceKind, SessionArtifactStore,
-    SessionArtifactStoreError, SessionContextCoordinator, SessionContextCoordinatorError,
-    SessionListFilter, SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData,
-    SnapshotListFilter, SubmitUserSkillVersion,
+    DatabaseReflectService, DatabaseSessionArtifactStore, DatabaseSessionContextCoordinator,
+    DatabaseSessionService, DatabaseSkillService, DatabaseStateProjectionStore,
+    DecisionCreateRequestData, DecisionListFilter, DecisionService, EventCreateRequestData,
+    EventListFilter, EventService, IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService,
+    MarketplaceStatsService, ReflectService, ReserveTurnOutcome, RetrievalStage,
+    SessionArtifactJsonStore, SessionArtifactReference, SessionArtifactReferenceKind,
+    SessionArtifactStore, SessionArtifactStoreError, SessionContextCoordinator,
+    SessionContextCoordinatorError, SessionListFilter, SessionService, SkillSearchQuery,
+    SkillService, SnapshotCreateRequestData, SnapshotListFilter, SubmitUserSkillVersion,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, SessionKeyV1, SessionSurfaceV1,
@@ -61,11 +59,172 @@ use uuid::Uuid;
 
 mod common;
 
+// Historical rows are read-side inputs, not a substitute checkpoint upload API.
+async fn seed_restore_session_fixture(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    metadata: serde_json::Value,
+) {
+    sqlx::query("INSERT INTO agent_sessions (session_id, user_id, title, status, event_count, metadata) VALUES (?, ?, 'restore fixture', 'active', 0, CAST(? AS JSON))")
+        .bind(session_id).bind(user_id).bind(metadata.to_string())
+        .execute(pool).await.expect("seed historical session");
+}
+
+async fn seed_restore_checkpoint_fixture(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    checkpoint: &astra_services::session_checkpoint::Checkpoint,
+    state_json: Option<&str>,
+) {
+    sqlx::query("INSERT INTO session_checkpoints (checkpoint_id, session_id, user_id, number, turn, title, summary, tools_json, total_tokens, had_stalls, error_count, state_json) VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?, CAST(? AS JSON))")
+        .bind(Uuid::new_v4().to_string()).bind(session_id).bind(user_id)
+        .bind(checkpoint.number).bind(checkpoint.turn).bind(&checkpoint.title)
+        .bind(&checkpoint.summary).bind(serde_json::to_string(&checkpoint.tools_used).unwrap())
+        .bind(checkpoint.total_tokens).bind(checkpoint.had_stalls).bind(checkpoint.error_count)
+        .bind(state_json).execute(pool).await.expect("seed historical checkpoint");
+}
+
+fn context_trace_request_fixture(
+    session_id: &str,
+    signal: &ContextTraceSignal,
+) -> EventCreateRequestData {
+    EventCreateRequestData {
+        ingestion_source: astra_services::events::EventIngestionSource::Client,
+        event_id: None,
+        session_id: session_id.into(),
+        event_type: "context_trace_signal".into(),
+        content: signal.preview(),
+        agent_id: Some("fixture-agent".into()),
+        agent_version: Some(env!("CARGO_PKG_VERSION").into()),
+        parent_event_id: None,
+        parent_event_ids: Some(Vec::new()),
+        causal_chain_id: Some(format!("{session_id}:context-trace:{}", signal.turn_id)),
+        metadata: Some(serde_json::to_value(signal).unwrap()),
+    }
+}
+
 fn agent_event_fixture_payload_hash(payload: serde_json::Value) -> String {
     astra_services::observation_capture::canonical_observation_payload_hash(
         astra_services::observation_capture::ObservationPayloadDomain::AgentEvent,
         &payload,
     )
+}
+
+fn model_request_fixture_accepted_event(
+    user_id: &str,
+    session_id: &str,
+    request_id: &str,
+    run_id: &str,
+    parent_run_id: Option<&str>,
+    agent_id: &str,
+) -> astra_services::ModelRequestContextEvent {
+    use astra_services::{
+        ModelRequestContextEvent, ModelRequestEventStage, ModelRequestIdentity,
+        ModelRequestTopology,
+    };
+
+    ModelRequestContextEvent {
+        schema: astra_services::MODEL_REQUEST_CONTEXT_SCHEMA.into(),
+        stage: ModelRequestEventStage::Accepted,
+        identity: ModelRequestIdentity {
+            request_id: request_id.into(),
+            provider_response_id: None,
+            owner_scope: user_id.into(),
+            session_id: Some(session_id.into()),
+            run_id: Some(run_id.into()),
+            turn: Some(1),
+            round: Some(0),
+            logical_attempt: 0,
+            physical_attempt: 0,
+            actor_id: Some("fixture-actor".into()),
+            execution_principal: Some("server".into()),
+            billing_scope: Some(user_id.into()),
+            auth_session_id: None,
+            device_instance_id: None,
+            agent_id: Some(agent_id.into()),
+            parent_run_id: parent_run_id.map(str::to_owned),
+            topology: ModelRequestTopology::ServerOnly,
+            interaction_owner: "server".into(),
+            loop_owner: "server".into(),
+            execution_binding: "server".into(),
+            provider: "fixture-provider".into(),
+            model: "glm-5.2".into(),
+            offering_id: "glm-5.2-offering".into(),
+            inference_purpose: "agent_turn".into(),
+            operation_id: "agent_turn".into(),
+            provider_protocol: "openai_compatible".into(),
+            provider_wire_hash: "fixture-wire-hash".into(),
+            provider_wire_bytes: 100,
+        },
+        route: None,
+        lineage: Default::default(),
+        budget: Default::default(),
+        usage: None,
+        composition: Default::default(),
+        wire_composition: Default::default(),
+        cache: Default::default(),
+        compaction: Default::default(),
+        terminal_status: None,
+        usage_status: None,
+        error_kind: None,
+    }
+}
+
+async fn insert_model_request_fixture(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    attempt_id: &str,
+    event: &astra_services::ModelRequestContextEvent,
+    created_at: &str,
+) {
+    let usage = event.usage.as_ref();
+    sqlx::query(
+        "INSERT INTO model_request_context_events \
+         (user_id, session_id, event_id, attempt_id, invocation_id, event_stage, \
+          terminal_status, topology, provider, model_family, purpose, input_tokens, \
+          output_tokens, cache_read_tokens, cache_creation_tokens, event_json, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(Uuid::new_v4().to_string())
+    .bind(attempt_id)
+    .bind(format!("invocation-{attempt_id}"))
+    .bind(event.stage.as_str())
+    .bind(event.terminal_status.as_deref())
+    .bind(event.identity.topology.as_str())
+    .bind(&event.identity.provider)
+    .bind(&event.identity.model)
+    .bind(&event.identity.inference_purpose)
+    .bind(usage.map(|usage| usage.input.total_input_tokens() as i64))
+    .bind(usage.map(|usage| usage.output_tokens as i64))
+    .bind(usage.map(|usage| usage.input.cache_read_tokens as i64))
+    .bind(usage.map(|usage| usage.input.cache_creation_tokens as i64))
+    .bind(serde_json::to_string(event).expect("serialize model request fixture"))
+    .bind(created_at)
+    .execute(pool)
+    .await
+    .expect("insert model request context fixture");
+}
+
+async fn cleanup_model_request_fixtures(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    attempt_ids: &[String],
+) {
+    for attempt_id in attempt_ids {
+        sqlx::query(
+            "DELETE FROM model_request_context_events WHERE user_id = ? AND attempt_id = ?",
+        )
+        .bind(user_id)
+        .bind(attempt_id)
+        .execute(pool)
+        .await
+        .expect("delete model request context fixture");
+    }
 }
 
 async fn setup_pool_and_settings() -> (SharedPool, MatrixOneSettings) {
@@ -1772,11 +1931,6 @@ fn deleted_rows_for_table(details: &serde_json::Value, label: &str) -> u64 {
         .unwrap_or_else(|| panic!("database_tables_deleted.{label}.rows_deleted must be u64"))
 }
 
-fn config_version_fixture_id() -> String {
-    let uuid_hex = Uuid::new_v4().simple().to_string();
-    format!("cfg_{}", &uuid_hex[..20])
-}
-
 async fn cleanup_session_delete_fixture_for_owner(
     pool: &sqlx::Pool<sqlx::MySql>,
     user_id: &str,
@@ -1804,34 +1958,12 @@ async fn cleanup_session_delete_fixture_for_owner(
     .await;
 
     for table in [
-        "harness_citations",
-        "harness_skill_rules",
-        "harness_skill_drafts",
-        "harness_items",
-    ] {
-        let sql = format!(
-            "DELETE FROM {table} \
-             WHERE harness_run_id IN (
-                 SELECT harness_run_id FROM harness_runs
-                 WHERE session_id = ? AND user_id = ?
-             )"
-        );
-        let _ = sqlx::query(&sql)
-            .bind(session_id)
-            .bind(user_id)
-            .execute(pool)
-            .await;
-    }
-
-    for table in [
         "ctx_decision_audits",
         "ctx_snapshots",
         "session_artifacts",
-        "eval_calibration_assessments",
         "conversation_log",
         "agent_event_edges",
         "agent_events",
-        "harness_runs",
         "agent_session_execution_slots",
         "agent_runs",
         "agent_sessions",
@@ -1852,82 +1984,6 @@ async fn cleanup_session_delete_fixture_for_owner(
             .execute(pool)
             .await;
     }
-}
-
-async fn insert_harness_run_fixture(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    user_id: &str,
-    session_id: &str,
-    harness_run_id: &str,
-    marker: &str,
-) {
-    let item_id = format!("{harness_run_id}-item");
-    let draft_id = format!("{harness_run_id}-draft");
-    let rule_id = format!("{harness_run_id}-rule");
-    let citation_id = format!("{harness_run_id}-citation");
-
-    sqlx::query(
-        "INSERT INTO harness_runs \
-         (harness_run_id, harness_id, version_id, user_id, session_id, status, input_json, output_json) \
-         VALUES (?, ?, 'v1', ?, ?, 'running', '{}', '{}')",
-    )
-    .bind(harness_run_id)
-    .bind(format!("harness-{marker}"))
-    .bind(user_id)
-    .bind(session_id)
-    .execute(pool)
-    .await
-    .expect("insert harness run");
-
-    sqlx::query(
-        "INSERT INTO harness_items \
-         (item_id, harness_run_id, item_type, locator_json, input_json, proposed_output_json, final_output_json, status) \
-         VALUES (?, ?, 'case', '{}', '{}', '{}', '{}', 'pending')",
-    )
-    .bind(&item_id)
-    .bind(harness_run_id)
-    .execute(pool)
-    .await
-    .expect("insert harness item");
-
-    sqlx::query(
-        "INSERT INTO harness_skill_drafts \
-         (skill_draft_id, harness_run_id, candidate_name, description, target_scope, publish_visibility, content_markdown, source_summary_json, status) \
-         VALUES (?, ?, ?, 'session delete fixture', 'user', 'private', '# fixture', '{}', 'proposed')",
-    )
-    .bind(&draft_id)
-    .bind(harness_run_id)
-    .bind(format!("fixture-{marker}"))
-    .execute(pool)
-    .await
-    .expect("insert harness skill draft");
-
-    sqlx::query(
-        "INSERT INTO harness_skill_rules \
-         (skill_rule_id, skill_draft_id, harness_run_id, rule_type, statement, rationale, status) \
-         VALUES (?, ?, ?, 'requirement', 'delete session-owned harness children', 'fixture', 'proposed')",
-    )
-    .bind(&rule_id)
-    .bind(&draft_id)
-    .bind(harness_run_id)
-    .execute(pool)
-    .await
-    .expect("insert harness skill rule");
-
-    sqlx::query(
-        "INSERT INTO harness_citations \
-         (citation_id, harness_run_id, item_id, skill_draft_id, skill_rule_id, source_locator_json, source_content_hash) \
-         VALUES (?, ?, ?, ?, ?, '{}', ?)",
-    )
-    .bind(&citation_id)
-    .bind(harness_run_id)
-    .bind(&item_id)
-    .bind(&draft_id)
-    .bind(&rule_id)
-    .bind(format!("hash-{marker}"))
-    .execute(pool)
-    .await
-    .expect("insert harness citation");
 }
 
 fn create_owner_local_session_files(
@@ -2235,426 +2291,6 @@ async fn add_agent_session_event_count_or_create_is_owner_bound_delta_upsert() {
         &[&owner_user_id, &other_user_id],
     )
     .await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn replay_routes_fail_closed_without_durable_reconstruction() {
-    let (shared, settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let session_id = Uuid::new_v4().to_string();
-    let owner_user_id = Uuid::new_v4().to_string();
-    let foreign_user_id = Uuid::new_v4().to_string();
-    let original_event_id = Uuid::new_v4().to_string();
-    cleanup_restore_fixture_for_owner(&pool, &owner_user_id, std::slice::from_ref(&session_id))
-        .await;
-    cleanup_restore_fixture_for_owner(&pool, &foreign_user_id, std::slice::from_ref(&session_id))
-        .await;
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'replay-summary-count', 'active', 7)",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .execute(&pool)
-    .await
-    .expect("insert session root");
-    let causal_chain_id = Uuid::new_v4().to_string();
-    sqlx::query(
-        "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
-         causal_chain_id, payload_hash, ingestion_write_id) \
-         VALUES (?, ?, ?, 'raw_event', 'original event must remain unchanged', ?, ?, ?)",
-    )
-    .bind(&original_event_id)
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .bind(&causal_chain_id)
-    .bind(agent_event_fixture_payload_hash(serde_json::json!({
-        "event_id": &original_event_id,
-        "session_id": &session_id,
-        "user_id": &owner_user_id,
-        "event_type": "raw_event",
-        "content": "original event must remain unchanged",
-        "causal_chain_id": &causal_chain_id,
-    })))
-    .bind(Uuid::new_v4().to_string())
-    .execute(&pool)
-    .await
-    .expect("insert raw event row");
-
-    let session_before =
-        sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-            .bind(&session_id)
-            .bind(&owner_user_id)
-            .fetch_one(&pool)
-            .await
-            .expect("session before replay guardrail");
-    let event_before = sqlx::query(
-        "SELECT event_id, event_type, content FROM agent_events \
-         WHERE event_id = ? AND session_id = ? AND user_id = ?",
-    )
-    .bind(&original_event_id)
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("original event before replay guardrail");
-    let replay_rows_before: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND event_type = 'replay'",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("replay rows before guardrail");
-    assert_eq!(replay_rows_before, 0);
-
-    let replay_service = DatabaseReplayService::new(settings).with_pool(shared);
-    for mock_mode in [true, false] {
-        let (status, body) = replay_service
-            .replay_session(
-                owner_user_id.clone(),
-                session_id.clone(),
-                ReplaySessionRequestData {
-                    sandbox_name: Some("must-not-run".into()),
-                    mock_mode,
-                },
-            )
-            .await
-            .expect_err("owned replay must fail closed");
-        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
-        assert!(
-            body.0.detail.contains("replay") && body.0.detail.contains("unavailable"),
-            "owned replay detail should explain the unavailable capability: {:?}",
-            body.0.detail
-        );
-    }
-
-    for _ in 0..2 {
-        let (status, body) = replay_service
-            .compare_replay(owner_user_id.clone(), session_id.clone())
-            .await
-            .expect_err("owned replay comparison must fail closed");
-        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
-        assert!(
-            body.0.detail.contains("replay") && body.0.detail.contains("unavailable"),
-            "owned comparison detail should explain the unavailable capability: {:?}",
-            body.0.detail
-        );
-    }
-
-    let missing_session_id = Uuid::new_v4().to_string();
-    for result in [
-        replay_service
-            .replay_session(
-                owner_user_id.clone(),
-                missing_session_id.clone(),
-                ReplaySessionRequestData {
-                    sandbox_name: None,
-                    mock_mode: true,
-                },
-            )
-            .await
-            .map(|_| ()),
-        replay_service
-            .compare_replay(owner_user_id.clone(), missing_session_id)
-            .await
-            .map(|_| ()),
-        replay_service
-            .replay_session(
-                foreign_user_id.clone(),
-                session_id.clone(),
-                ReplaySessionRequestData {
-                    sandbox_name: None,
-                    mock_mode: false,
-                },
-            )
-            .await
-            .map(|_| ()),
-        replay_service
-            .compare_replay(foreign_user_id, session_id.clone())
-            .await
-            .map(|_| ()),
-    ] {
-        assert_eq!(
-            result
-                .expect_err("missing or foreign replay must be owner-oblivious")
-                .0,
-            axum::http::StatusCode::NOT_FOUND
-        );
-    }
-
-    let session_after =
-        sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-            .bind(&session_id)
-            .bind(&owner_user_id)
-            .fetch_one(&pool)
-            .await
-            .expect("session after replay guardrail");
-    let event_after = sqlx::query(
-        "SELECT event_id, event_type, content FROM agent_events \
-         WHERE event_id = ? AND session_id = ? AND user_id = ?",
-    )
-    .bind(&original_event_id)
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("original event after replay guardrail");
-    let replay_rows_after: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND event_type = 'replay'",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("replay rows after guardrail");
-
-    assert_eq!(
-        session_before.try_get::<i64, _>("event_count").unwrap(),
-        session_after.try_get::<i64, _>("event_count").unwrap(),
-        "owned replay guardrails must not mutate agent_sessions.event_count"
-    );
-    for column in ["event_id", "event_type", "content"] {
-        assert_eq!(
-            event_before.try_get::<String, _>(column).unwrap(),
-            event_after.try_get::<String, _>(column).unwrap(),
-            "owned replay guardrails must not mutate original event column {column}"
-        );
-    }
-    assert_eq!(
-        replay_rows_after, 0,
-        "replay guardrails must not write replay rows"
-    );
-
-    cleanup_restore_fixture_for_owner(&pool, &owner_user_id, &[session_id]).await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn replay_session_missing_or_foreign_remains_owner_oblivious() {
-    let (shared, settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let session_id = Uuid::new_v4().to_string();
-    let owner_user_id = Uuid::new_v4().to_string();
-    let foreign_user_id = Uuid::new_v4().to_string();
-    cleanup_restore_fixture_for_owner(&pool, &owner_user_id, std::slice::from_ref(&session_id))
-        .await;
-    sqlx::query(
-        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'replay-owner-oblivious', 'active', 0)",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .execute(&pool)
-    .await
-    .expect("insert owner session");
-
-    let replay_service = DatabaseReplayService::new(settings).with_pool(shared);
-    let empty_owner_replay = replay_service
-        .replay_session(
-            owner_user_id.clone(),
-            session_id.clone(),
-            ReplaySessionRequestData {
-                sandbox_name: Some("must-not-run-empty".into()),
-                mock_mode: true,
-            },
-        )
-        .await
-        .expect_err("owned empty replay must fail closed");
-    assert_eq!(
-        empty_owner_replay.0,
-        axum::http::StatusCode::NOT_IMPLEMENTED
-    );
-    assert!(
-        empty_owner_replay
-            .1
-            .0
-            .detail
-            .contains("replay is unavailable"),
-        "owned empty replay should explain the unavailable capability: {:?}",
-        empty_owner_replay.1.0.detail
-    );
-    let empty_owner_compare = replay_service
-        .compare_replay(owner_user_id.clone(), session_id.clone())
-        .await
-        .expect_err("owned empty comparison must fail closed");
-    assert_eq!(
-        empty_owner_compare.0,
-        axum::http::StatusCode::NOT_IMPLEMENTED
-    );
-    assert!(
-        empty_owner_compare
-            .1
-            .0
-            .detail
-            .contains("replay is unavailable"),
-        "owned empty comparison should explain the unavailable capability: {:?}",
-        empty_owner_compare.1.0.detail
-    );
-
-    let replay_result = replay_service
-        .replay_session(
-            foreign_user_id.clone(),
-            session_id.clone(),
-            ReplaySessionRequestData {
-                sandbox_name: None,
-                mock_mode: true,
-            },
-        )
-        .await
-        .expect_err("foreign replay must be hidden");
-    assert_eq!(replay_result.0, axum::http::StatusCode::NOT_FOUND);
-    let compare_result = replay_service
-        .compare_replay(foreign_user_id, session_id.clone())
-        .await
-        .expect_err("foreign comparison must be hidden");
-    assert_eq!(compare_result.0, axum::http::StatusCode::NOT_FOUND);
-
-    let missing_session_id = Uuid::new_v4().to_string();
-    let missing_replay_result = replay_service
-        .replay_session(
-            owner_user_id.clone(),
-            missing_session_id.clone(),
-            ReplaySessionRequestData {
-                sandbox_name: None,
-                mock_mode: false,
-            },
-        )
-        .await
-        .expect_err("missing replay must be hidden");
-    assert_eq!(missing_replay_result.0, axum::http::StatusCode::NOT_FOUND);
-    let missing_compare_result = replay_service
-        .compare_replay(owner_user_id.clone(), missing_session_id)
-        .await
-        .expect_err("missing comparison must be hidden");
-    assert_eq!(missing_compare_result.0, axum::http::StatusCode::NOT_FOUND);
-
-    cleanup_restore_fixture_for_owner(&pool, &owner_user_id, &[session_id]).await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn concurrent_push_session_state_preserves_single_owner_metadata() {
-    let (shared, _settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-
-    let session_id = Uuid::new_v4().to_string();
-    let user_a = format!("state-owner-a-{}", Uuid::new_v4());
-    let user_b = format!("state-owner-b-{}", Uuid::new_v4());
-    cleanup_restore_fixture_for_owners(
-        &pool,
-        std::slice::from_ref(&session_id),
-        &[&user_a, &user_b],
-    )
-    .await;
-
-    let barrier = Arc::new(tokio::sync::Barrier::new(3));
-    let task_a = {
-        let pool = pool.clone();
-        let audit = flusher.writer.clone();
-        let barrier = Arc::clone(&barrier);
-        let session_id = session_id.clone();
-        let user_a = user_a.clone();
-        tokio::spawn(async move {
-            let service = MatrixOneSyncService::new(pool, audit);
-            barrier.wait().await;
-            service
-                .push_session_state(
-                    &session_id,
-                    &user_a,
-                    Some("owner-a-branch"),
-                    Some("gpt-5.4-owner-a"),
-                )
-                .await
-                .map(|_| (user_a, "owner-a-branch".to_string()))
-        })
-    };
-    let task_b = {
-        let pool = pool.clone();
-        let audit = flusher.writer.clone();
-        let barrier = Arc::clone(&barrier);
-        let session_id = session_id.clone();
-        let user_b = user_b.clone();
-        tokio::spawn(async move {
-            let service = MatrixOneSyncService::new(pool, audit);
-            barrier.wait().await;
-            service
-                .push_session_state(
-                    &session_id,
-                    &user_b,
-                    Some("owner-b-branch"),
-                    Some("gpt-5.4-owner-b"),
-                )
-                .await
-                .map(|_| (user_b, "owner-b-branch".to_string()))
-        })
-    };
-
-    barrier.wait().await;
-    let (result_a, result_b) = tokio::join!(task_a, task_b);
-    let outcomes = [result_a.unwrap(), result_b.unwrap()];
-    let successes: Vec<_> = outcomes
-        .iter()
-        .filter_map(|result| result.as_ref().ok())
-        .collect();
-    assert_eq!(
-        successes.len(),
-        2,
-        "owner-bound sessions allow different users to persist the same logical session_id independently; outcomes: {outcomes:?}"
-    );
-
-    let rows = sqlx::query(
-        "SELECT user_id, CAST(metadata AS CHAR) AS metadata_json \
-         FROM agent_sessions WHERE session_id = ? AND user_id IN (?, ?) ORDER BY user_id",
-    )
-    .bind(&session_id)
-    .bind(&user_a)
-    .bind(&user_b)
-    .fetch_all(&pool)
-    .await
-    .expect("load owner session states");
-    assert_eq!(
-        rows.len(),
-        2,
-        "both owners should get isolated session restore metadata rows"
-    );
-    for row in rows {
-        let stored_user = row.try_get::<String, _>("user_id").unwrap();
-        let metadata = row
-            .try_get::<Option<String>, _>("metadata_json")
-            .unwrap()
-            .unwrap_or_default();
-        let expected_branch = if stored_user == user_a {
-            "owner-a-branch"
-        } else if stored_user == user_b {
-            "owner-b-branch"
-        } else {
-            panic!("unexpected owner row: {stored_user}");
-        };
-        assert!(
-            metadata.contains(expected_branch),
-            "owner branch must be retained in that owner's metadata: {metadata}"
-        );
-        let forbidden_branch = if expected_branch == "owner-a-branch" {
-            "owner-b-branch"
-        } else {
-            "owner-a-branch"
-        };
-        assert!(
-            !metadata.contains(forbidden_branch),
-            "owner metadata must not contain another owner's branch: {metadata}"
-        );
-    }
-
-    cleanup_restore_fixture_for_owners(&pool, &[session_id], &[&user_a, &user_b]).await;
-    flusher.shutdown.cancel();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), flusher.join_handle).await;
 }
 
 async fn force_session_artifacts_created_at(
@@ -3528,6 +3164,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     let first_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
+        run_id: Some("first-root-run"),
         turn: 1,
         round: 0,
         attempt: 0,
@@ -3542,7 +3179,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
         &astra_services::PromptRequestPersistInput {
             session_id: session_id.clone(),
             user_id: owner_user_id.clone(),
-            run_id: None,
+            run_id: Some("first-root-run".into()),
             turn: 1,
             round: 0,
             attempt: 0,
@@ -3582,6 +3219,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     let second_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
+        run_id: Some("second-root-run"),
         turn: 2,
         round: 0,
         attempt: 0,
@@ -3596,7 +3234,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
         &astra_services::PromptRequestPersistInput {
             session_id: session_id.clone(),
             user_id: owner_user_id.clone(),
-            run_id: None,
+            run_id: Some("second-root-run".into()),
             turn: 2,
             round: 0,
             attempt: 0,
@@ -3649,6 +3287,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     let third_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
+        run_id: None,
         turn: 3,
         round: 0,
         attempt: 0,
@@ -3686,6 +3325,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
         let plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
             user_id: &owner_user_id,
             session_id: &session_id,
+            run_id: None,
             turn,
             round: 0,
             attempt: 0,
@@ -3725,6 +3365,7 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     let tail_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
+        run_id: None,
         turn: 101,
         round: 0,
         attempt: 0,
@@ -4754,7 +4395,7 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_audit_does_not_price_unattributed_turn_usage() {
+async fn session_audit_prices_historical_physical_attempts_without_catalog_repricing() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -4777,7 +4418,7 @@ async fn session_audit_does_not_price_unattributed_turn_usage() {
     .bind(r#"["text"]"#)
     .bind("[]")
     .bind(
-        r#"{"prompt":0.000002,"completion":0.000008,"cache_read":0.0000005,"cache_write":0.0000015}"#,
+        r#"{"currency":"USD","unit":"per_token","prompt":0.000002,"completion":0.000008,"cache_read":0.0000005,"cache_write":0.0000015}"#,
     )
     .bind("[]")
     .bind("{}")
@@ -4834,15 +4475,250 @@ async fn session_audit_does_not_price_unattributed_turn_usage() {
     .await
     .expect("insert priced audit event");
 
+    let historical_price_snapshot = r#"{"calculation_version":1,"currency":"USD","unit":"per_token","source":"configured","prompt":0.000002,"completion":0.000008,"cache_read":0.0000005,"cache_write":0.0000015,"configuration_updated_at":"2026-09-30"}"#;
+    let route_ids = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
+    let invocation_ids = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
+    for (route_id, invocation_id, run_id, operation_id) in [
+        (
+            &route_ids[0],
+            &invocation_ids[0],
+            "audit-root-run",
+            "audit_root_request",
+        ),
+        (
+            &route_ids[1],
+            &invocation_ids[1],
+            "audit-child-run",
+            "audit_child_request",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO inference_routes \
+             (route_id, user_id, session_id, scope_kind, run_id, offering_id, \
+              resolved_model_name, upstream_model_name, provider, execution_placement, \
+              access_kind, purpose, price_snapshot_json, created_at) \
+             VALUES (?, ?, ?, 'run', ?, 'audit-offering', ?, ?, 'mock', 'server', \
+                     'self_hosted', 'primary_agent', CAST(? AS JSON), NOW(6))",
+        )
+        .bind(route_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(run_id)
+        .bind(&model_name)
+        .bind(&model_name)
+        .bind(historical_price_snapshot)
+        .execute(&pool)
+        .await
+        .expect("insert historical priced route");
+
+        sqlx::query(
+            "INSERT INTO inference_invocations \
+             (invocation_id, route_id, user_id, session_id, scope_kind, run_id, \
+              admission_token, owner_token, owner_generation, owner_lease_expires_at, \
+              turn_index, round_index, operation_id, logical_attempt, purpose, status, \
+              terminal_fingerprint, usage_status, provider_delivery_state, created_at, terminal_at) \
+             VALUES (?, ?, ?, ?, 'run', ?, ?, ?, 1, DATE_ADD(NOW(6), INTERVAL 60 SECOND), \
+                     1, 0, ?, 0, 'primary_agent', 'succeeded', NULL, \
+                     'provider_exact', 'delivery_authorized', NOW(6), NOW(6))",
+        )
+        .bind(invocation_id)
+        .bind(route_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(run_id)
+        .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .bind("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .bind(operation_id)
+        .execute(&pool)
+        .await
+        .expect("insert historical priced invocation");
+    }
+
+    let other_user = Uuid::new_v4().to_string();
+    let attempt_ids = [
+        Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
+        Uuid::new_v4().to_string(),
+    ];
+    let foreign_invocation_id = Uuid::new_v4().to_string();
+    for (attempt_id, invocation_id, owner, run_id, attempt_index, status, coverage, counts) in [
+        (
+            &attempt_ids[0],
+            &invocation_ids[0],
+            &user_id,
+            "audit-root-run",
+            0_i64,
+            "succeeded",
+            "provider_exact",
+            [1_000_000, 500_000, 2_000_000, 1_000_000],
+        ),
+        (
+            &attempt_ids[1],
+            &invocation_ids[1],
+            &user_id,
+            "audit-child-run",
+            0_i64,
+            "failed",
+            "provider_exact",
+            [30_000, 4_000, 100, 20],
+        ),
+        (
+            &attempt_ids[2],
+            &invocation_ids[1],
+            &user_id,
+            "audit-child-run",
+            1_i64,
+            "succeeded",
+            "provider_exact",
+            [10_000, 2_000, 10, 5],
+        ),
+        (
+            &attempt_ids[3],
+            &foreign_invocation_id,
+            &other_user,
+            "foreign-run",
+            0_i64,
+            "succeeded",
+            "provider_exact",
+            [99_000_000, 0, 0, 0],
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO inference_provider_attempts \
+             (attempt_id, invocation_id, user_id, session_id, run_id, attempt_index, provider, \
+              admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes, \
+              status, usage_status, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) \
+             VALUES (?, ?, ?, ?, ?, ?, 'mock', ?, 'openai_compatible', ?, 1, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(attempt_id)
+        .bind(invocation_id)
+        .bind(owner)
+        .bind(&session_id)
+        .bind(run_id)
+        .bind(attempt_index)
+        .bind("00000000000000000000000000000000")
+        .bind("0".repeat(64))
+        .bind(status)
+        .bind(coverage)
+        .bind(counts[0])
+        .bind(counts[1])
+        .bind(counts[2])
+        .bind(counts[3])
+        .execute(&pool)
+        .await
+        .expect("insert physical attempt");
+    }
+
     let audit = DatabaseSessionAuditService::new(settings).with_pool(shared);
     let summary = audit
         .get_summary(&user_id, &session_id)
         .await
-        .expect("get priced session summary");
-    assert_eq!(summary.cost.priced_turn_count, 0);
-    assert_eq!(summary.cost.unpriced_turn_count, 1);
-    assert_eq!(summary.cost.estimated_cost_usd, None);
-    assert!(summary.cost.per_model_cost_usd.is_empty());
+        .expect("get session summary");
+    assert_eq!(summary.request_usage.request_count, 3);
+    assert_eq!(
+        summary.request_usage.fresh_input_tokens.known_tokens,
+        Some(1_040_000)
+    );
+    assert_eq!(
+        summary.request_usage.fresh_input_tokens.observed_attempts,
+        3
+    );
+    assert_eq!(
+        summary.request_usage.output_tokens.known_tokens,
+        Some(506_000)
+    );
+    assert_eq!(summary.request_usage.output_tokens.observed_attempts, 3);
+    assert_eq!(
+        summary.request_usage.cache_read_tokens.known_tokens,
+        Some(2_000_110)
+    );
+    assert_eq!(summary.request_usage.cache_read_tokens.observed_attempts, 3);
+    assert_eq!(
+        summary.request_usage.cache_creation_tokens.known_tokens,
+        Some(1_000_025)
+    );
+    assert_eq!(
+        summary
+            .request_usage
+            .cache_creation_tokens
+            .observed_attempts,
+        3
+    );
+    assert!((summary.cost.estimated_cost_usd.unwrap() - 8.6280925).abs() < 1e-10);
+    assert_eq!(summary.cost.unavailable_reason, None);
+
+    sqlx::query("UPDATE infra_llm_models SET pricing = CAST(? AS JSON) WHERE model_id = ?")
+        .bind(
+            r#"{"currency":"USD","unit":"per_token","prompt":0.2,"completion":0.8,"cache_read":0.05,"cache_write":0.15}"#,
+        )
+        .bind(&model_id)
+        .execute(&pool)
+        .await
+        .expect("change current catalog price");
+    let after_catalog_change = audit
+        .get_summary(&user_id, &session_id)
+        .await
+        .expect("get summary after catalog change");
+    assert!((after_catalog_change.cost.estimated_cost_usd.unwrap() - 8.6280925).abs() < 1e-10);
+
+    sqlx::query(
+        "INSERT INTO inference_provider_attempts \
+         (attempt_id, invocation_id, user_id, session_id, run_id, attempt_index, provider, \
+          admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes, \
+          status, usage_status, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens) \
+         VALUES (?, ?, ?, ?, ?, 0, 'mock', ?, 'openai_compatible', ?, 1, \
+                 'succeeded', 'provider_exact', 99, 99, 99, 99)",
+    )
+    .bind(&attempt_ids[4])
+    .bind(Uuid::new_v4().to_string())
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind("orphan-run")
+    .bind("00000000000000000000000000000000")
+    .bind("0".repeat(64))
+    .execute(&pool)
+    .await
+    .expect("insert orphan physical attempt");
+    let with_orphan = audit
+        .get_summary(&user_id, &session_id)
+        .await
+        .expect("get summary with orphan attempt");
+    assert_eq!(with_orphan.request_usage.request_count, 4);
+    assert_eq!(with_orphan.cost.estimated_cost_usd, None);
+    assert_eq!(
+        with_orphan.cost.unavailable_reason,
+        Some(
+            astra_services::session_audit::SessionCostUnavailableReason::HistoricalAttemptCoverageIncomplete
+        )
+    );
+
+    sqlx::query(
+        "DELETE FROM inference_provider_attempts WHERE session_id = ? AND attempt_id IN (?, ?, ?, ?, ?)",
+    )
+    .bind(&session_id)
+    .bind(&attempt_ids[0])
+    .bind(&attempt_ids[1])
+    .bind(&attempt_ids[2])
+    .bind(&attempt_ids[3])
+    .bind(&attempt_ids[4])
+    .execute(&pool)
+    .await
+    .expect("delete physical attempts");
+
+    sqlx::query("DELETE FROM inference_invocations WHERE user_id = ? AND session_id = ?")
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .expect("delete audit invocations");
+    sqlx::query("DELETE FROM inference_routes WHERE user_id = ? AND session_id = ?")
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .expect("delete audit routes");
 
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
@@ -4862,17 +4738,16 @@ async fn session_audit_does_not_price_unattributed_turn_usage() {
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_metadata() {
-    let (shared, _settings) = setup_pool_and_settings().await;
+    let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
-    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
+    let event_service = DatabaseEventService::new(settings).with_pool(shared.clone());
 
     let user_id = Uuid::new_v4().to_string();
     let session_a = Uuid::new_v4().to_string();
     let session_b = Uuid::new_v4().to_string();
     let checkpoint_id = Uuid::new_v4().to_string();
     let existing_metadata_a =
-        serde_json::json!({"agent_id":"astra-server","note":"keep me"}).to_string();
+        serde_json::json!({"agent_id":"astra-server","note":"keep me","git_branch":"feature/cloud-sync","model":"gpt-5.4"}).to_string();
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_a.clone(), session_b.clone()])
         .await;
@@ -4889,66 +4764,13 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
     .await
     .expect("insert existing session A");
 
-    svc.push_session_state(
-        &session_a,
+    seed_restore_session_fixture(
+        &pool,
         &user_id,
-        Some("feature/cloud-sync"),
-        Some("gpt-5.4"),
+        &session_b,
+        serde_json::json!({"git_branch": Some("legacy-fallback"), "model": null}),
     )
-    .await
-    .expect("push session state A");
-    svc.push_session_state(&session_b, &user_id, Some("legacy-fallback"), None)
-        .await
-        .expect("push session state B");
-    svc.push_session_state(
-        &session_a,
-        &user_id,
-        Some("feature/cloud-sync"),
-        Some("gpt-5.4"),
-    )
-    .await
-    .expect("clear session state A plan fields");
-
-    let metadata_a_json: Option<String> = sqlx::query(
-        "SELECT CAST(metadata AS CHAR) AS metadata_json FROM agent_sessions WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(&session_a)
-    .bind(&user_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load session A metadata")
-    .try_get("metadata_json")
-    .expect("session A metadata json");
-    let metadata_a: serde_json::Value = serde_json::from_str(
-        metadata_a_json
-            .as_deref()
-            .expect("session A metadata should exist"),
-    )
-    .expect("parse session A metadata");
-    assert_eq!(
-        metadata_a
-            .get("agent_id")
-            .and_then(serde_json::Value::as_str),
-        Some("astra-server")
-    );
-    assert_eq!(
-        metadata_a.get("note").and_then(serde_json::Value::as_str),
-        Some("keep me")
-    );
-    assert!(metadata_a.get("executing_plan").is_none());
-    assert!(metadata_a.get("plan_goal").is_none());
-    assert!(metadata_a.get("plan_config").is_none());
-    assert!(metadata_a.get("plan_execution_rounds").is_none());
-    assert_eq!(
-        metadata_a
-            .get("git_branch")
-            .and_then(serde_json::Value::as_str),
-        Some("feature/cloud-sync")
-    );
-    assert_eq!(
-        metadata_a.get("model").and_then(serde_json::Value::as_str),
-        Some("gpt-5.4")
-    );
+    .await;
 
     for (session_id, title) in [
         (&session_a, "Cloud restore A"),
@@ -5099,12 +4921,20 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         explanations: vec!["trace-b".into()],
     };
 
-    svc.push_context_trace_signal(&session_a, &user_id, &trace_a)
+    event_service
+        .create_event(
+            user_id.clone(),
+            context_trace_request_fixture(&session_a, &trace_a),
+        )
         .await
-        .expect("push trace A");
-    svc.push_context_trace_signal(&session_b, &user_id, &trace_b)
+        .expect("canonical Client trace write");
+    event_service
+        .create_event(
+            user_id.clone(),
+            context_trace_request_fixture(&session_b, &trace_b),
+        )
         .await
-        .expect("push trace B");
+        .expect("canonical Client trace write");
 
     let session_a_event_count: i64 =
         sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")
@@ -5209,9 +5039,6 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
     assert_eq!(listed_b.model.as_deref(), Some("claude-sonnet-4.5"));
     assert_eq!(listed_b.git_branch.as_deref(), Some("legacy-fallback"));
 
-    flusher.shutdown.cancel();
-    let _ = flusher.join_handle.await;
-
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_a, session_b]).await;
 }
 
@@ -5220,8 +5047,6 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
 async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
-    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let sync = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
@@ -5230,14 +5055,13 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, std::slice::from_ref(&session_id)).await;
 
-    sync.push_session_state(
-        &session_id,
+    seed_restore_session_fixture(
+        &pool,
         &user_id,
-        Some("feature/sparse-turns"),
-        Some("gpt-5.4"),
+        &session_id,
+        serde_json::json!({"git_branch": Some("feature/sparse-turns"), "model": Some("gpt-5.4")}),
     )
-    .await
-    .expect("push sparse-turn session state");
+    .await;
 
     sqlx::query(
         "UPDATE agent_sessions SET title = 'sparse-turn-restore', event_count = 2 \
@@ -5327,48 +5151,28 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
         "list_resumable_sessions must use the same turn high watermark as restore_session"
     );
 
-    flusher.shutdown.cancel();
-    let _ = flusher.join_handle.await;
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
 }
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn sync_audit_no_longer_persists_session_sync_log_on_live_matrixone() {
-    let (shared, _settings) = setup_pool_and_settings().await;
+    let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
-    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
+    let event_service = DatabaseEventService::new(settings).with_pool(shared.clone());
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, std::slice::from_ref(&session_id)).await;
 
-    svc.push_session_state(
-        &session_id,
+    seed_restore_session_fixture(
+        &pool,
         &user_id,
-        Some("feature/prune"),
-        Some("gpt-5.4"),
-    )
-    .await
-    .expect("push session state");
-    svc.push_checkpoint(
         &session_id,
-        &user_id,
-        &astra_services::session_checkpoint::Checkpoint {
-            number: 1,
-            turn: 1,
-            title: "session-ckpt".into(),
-            summary: "ordinary checkpoint".into(),
-            tools_used: vec!["bash".into()],
-            total_tokens: 50,
-            had_stalls: false,
-            error_count: 0,
-        },
+        serde_json::json!({"git_branch":"feature/prune","model":"gpt-5.4"}),
     )
-    .await
-    .expect("push checkpoint");
+    .await;
 
     for idx in 0..6 {
         let trace = ContextTraceSignal {
@@ -5386,13 +5190,14 @@ async fn sync_audit_no_longer_persists_session_sync_log_on_live_matrixone() {
             timing: None,
             explanations: vec![format!("trace-{idx}")],
         };
-        svc.push_context_trace_signal(&session_id, &user_id, &trace)
+        event_service
+            .create_event(
+                user_id.clone(),
+                context_trace_request_fixture(&session_id, &trace),
+            )
             .await
-            .expect("push context trace");
+            .expect("canonical Client trace write");
     }
-
-    flusher.shutdown.cancel();
-    let _ = flusher.join_handle.await;
 
     let sync_log_query = sqlx::query("SELECT COUNT(*) AS c FROM session_sync_log")
         .fetch_one(&pool)
@@ -5402,17 +5207,6 @@ async fn sync_audit_no_longer_persists_session_sync_log_on_live_matrixone() {
         "session_sync_log must not be part of the current schema"
     );
 
-    let checkpoint_count: i64 = sqlx::query(
-        "SELECT COUNT(*) AS c FROM session_checkpoints \
-         WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load checkpoint fact count")
-    .try_get("c")
-    .expect("checkpoint fact count");
     let context_trace_count: i64 = sqlx::query(
         "SELECT COUNT(*) AS c FROM agent_events \
          WHERE user_id = ? AND session_id = ? AND event_type = 'context_trace_signal'",
@@ -5425,10 +5219,6 @@ async fn sync_audit_no_longer_persists_session_sync_log_on_live_matrixone() {
     .try_get("c")
     .expect("context trace fact count");
 
-    assert_eq!(
-        checkpoint_count, 1,
-        "push_checkpoint writes the domain fact"
-    );
     assert_eq!(
         context_trace_count, 6,
         "context trace pushes write durable agent_events facts"
@@ -5584,8 +5374,6 @@ async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_
 {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
-    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
@@ -5597,20 +5385,14 @@ async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_
         .expect("composite snapshot index path");
     assert!(
         !local_index_path.exists(),
-        "fixture should prove remote composite snapshot restore without local composite_snapshots.json"
+        "fixture should prove remote composite snapshot persistence without local composite_snapshots.json"
     );
 
-    svc.push_session_state(
-        &session_id,
+    seed_restore_session_fixture(&pool, &user_id, &session_id, serde_json::json!({"git_branch": Some("feature/remote-composite"), "model": Some("gpt-5.4")})).await;
+    seed_restore_checkpoint_fixture(
+        &pool,
         &user_id,
-        Some("feature/remote-composite"),
-        Some("gpt-5.4"),
-    )
-    .await
-    .expect("push session state");
-    svc.push_checkpoint(
         &session_id,
-        &user_id,
         &astra_services::session_checkpoint::Checkpoint {
             number: 3,
             turn: 7,
@@ -5621,9 +5403,9 @@ async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_
             had_stalls: false,
             error_count: 0,
         },
+        None,
     )
-    .await
-    .expect("push checkpoint");
+    .await;
 
     let build_index = |label: &str, branch: &str, git_commit: &str, created_at: &str| {
         let data_snapshot = astra_services::DataSnapshotRef {
@@ -5718,11 +5500,8 @@ async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_
         .expect("remote composite snapshot artifact exists");
     assert_eq!(latest_artifact.artifact_id, expected_artifact.artifact_id);
 
-    let restore = HybridRestoreService::new(pool.clone());
-    let listed = restore
-        .list_composite_snapshots(&user_id, &session_id)
-        .await
-        .expect("list composite snapshots");
+    let listed: astra_services::CompositeSnapshotIndex =
+        serde_json::from_value(latest_artifact.content).expect("decode persisted composite index");
     assert_eq!(listed.snapshots.len(), expected_index.snapshots.len());
     assert_eq!(listed.current_version(), expected_index.current_version());
     let listed_snapshot = listed
@@ -5737,41 +5516,31 @@ async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_
     );
     assert_eq!(listed_snapshot.turn, expected_snapshot.turn);
 
-    let restored = restore
-        .restore_to_composite_snapshot(
-            &user_id,
-            &session_id,
-            &expected_snapshot.snapshot_id,
-            &astra_core::composite_snapshot::RestoreSelector::default(),
-        )
-        .await
-        .expect("restore composite snapshot")
-        .expect("composite snapshot restored");
-
-    assert_eq!(restored.snapshot.snapshot_id, expected_snapshot.snapshot_id);
-    assert!(
-        restored
-            .restored_dimensions
-            .iter()
-            .any(|dim| dim == "session"),
-        "remote composite snapshot restore should recover the session-state dimension"
-    );
+    assert_eq!(listed_snapshot.git_commit(), Some(expected_git));
     assert_eq!(
-        restored.git_commit_to_checkout.as_deref(),
-        Some(expected_git)
-    );
-    assert_eq!(
-        restored.data_snapshot_to_restore.as_ref(),
+        listed_snapshot.data_snapshot(),
         Some(expected_data_snapshot)
     );
 
-    let session = restored.session.expect("session restored from checkpoint");
-    assert_eq!(session.turn_count, 7);
-    assert_eq!(session.total_tokens_in, 321);
-    assert_eq!(session.checkpoint_count, 3);
+    let restore = HybridRestoreService::new(pool.clone());
+    let checkpoints = restore
+        .list_checkpoints(&user_id, &session_id)
+        .await
+        .expect("list ordinary remote checkpoint");
+    assert_eq!(checkpoints.len(), 1);
+    let checkpoint = &checkpoints[0];
+    assert_eq!(checkpoint.number, 3);
+    assert_eq!(checkpoint.turn, 7);
+    assert_eq!(checkpoint.total_tokens, 321);
+    assert_eq!(checkpoint.title, "remote composite checkpoint");
+    assert_eq!(checkpoint.summary, "checkpoint only exists in MatrixOne");
     assert!(
-        session.resume_bundle.is_none(),
-        "the fixture has no complete causal conversation from which to build a resume bundle"
+        restore
+            .list_checkpoints(&Uuid::new_v4().to_string(), &session_id)
+            .await
+            .expect("foreign owner checkpoint query")
+            .is_empty(),
+        "checkpoint listing must not expose another owner's records"
     );
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
@@ -5782,22 +5551,13 @@ async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_
 async fn restore_recent_tools_ignores_agent_events_turn_complete_metadata_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
-    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, std::slice::from_ref(&session_id)).await;
 
-    svc.push_session_state(
-        &session_id,
-        &user_id,
-        Some("feature/checkpoint-tools"),
-        Some("gpt-5.4"),
-    )
-    .await
-    .expect("push session state");
+    seed_restore_session_fixture(&pool, &user_id, &session_id, serde_json::json!({"git_branch": Some("feature/checkpoint-tools"), "model": Some("gpt-5.4")})).await;
 
     let query_event_id = Uuid::new_v4().to_string();
     let query_token_usage = serde_json::json!({
@@ -5897,11 +5657,10 @@ async fn restore_recent_tools_ignores_agent_events_turn_complete_metadata_on_liv
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
-    let (shared, _settings) = setup_pool_and_settings().await;
+async fn client_context_trace_requires_owned_session_on_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
-    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
+    let event_service = DatabaseEventService::new(settings).with_pool(shared.clone());
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
@@ -5924,9 +5683,33 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
         explanations: vec!["missing row".into()],
     };
 
-    svc.push_context_trace_signal(&session_id, &user_id, &trace)
+    let rejected = event_service
+        .create_event(
+            user_id.clone(),
+            context_trace_request_fixture(&session_id, &trace),
+        )
         .await
-        .expect("push context trace");
+        .expect_err("Client cannot create a missing session");
+    assert_eq!(rejected.0, axum::http::StatusCode::NOT_FOUND);
+    for table in ["agent_sessions", "agent_events"] {
+        let (rows,): (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE user_id = ? AND session_id = ?"
+        ))
+        .bind(&user_id)
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, 0, "rejection must not create session or event rows");
+    }
+    seed_restore_session_fixture(&pool, &user_id, &session_id, serde_json::json!({})).await;
+    event_service
+        .create_event(
+            user_id.clone(),
+            context_trace_request_fixture(&session_id, &trace),
+        )
+        .await
+        .expect("canonical Client trace write");
 
     let session_row = sqlx::query(
         "SELECT user_id, event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?",
@@ -5935,7 +5718,7 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
     .bind(&user_id)
     .fetch_one(&pool)
     .await
-    .expect("load lazily created session row");
+    .expect("load admitted session row");
     assert_eq!(
         session_row
             .try_get::<String, _>("user_id")
@@ -5947,7 +5730,7 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
             .try_get::<i64, _>("event_count")
             .expect("session event_count"),
         1,
-        "context trace delta update should create the missing session row with the correct event count"
+        "canonical trace write must update the admitted session event count"
     );
     let trace_row = sqlx::query(
         "SELECT event_type, CAST(metadata AS CHAR) AS metadata_json \
@@ -5998,19 +5781,14 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
         "cursorless diagnostic events must not be projected into a causal resume bundle"
     );
 
-    flusher.shutdown.cancel();
-    let _ = flusher.join_handle.await;
-
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
 }
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live_matrixone() {
+async fn historical_checkpoint_readers_keep_session_and_step_rows_separate_on_live_matrixone() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
-    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let svc = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
 
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
@@ -6158,9 +5936,10 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     .await
     .expect("insert heavy-only user_query");
 
-    svc.push_checkpoint(
-        &session_id,
+    seed_restore_checkpoint_fixture(
+        &pool,
         &user_id,
+        &session_id,
         &astra_services::session_checkpoint::Checkpoint {
             number: 1,
             turn: 1,
@@ -6171,32 +5950,10 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             had_stalls: false,
             error_count: 0,
         },
+        None,
     )
-    .await
-    .expect("push ordinary checkpoint");
+    .await;
 
-    svc.push_step_checkpoint(
-        &session_id,
-        &user_id,
-        1,
-        2,
-        "heavy",
-        "step-heavy-v1",
-        &serde_json::json!(["step-one"]).to_string(),
-        &heavy_state_json(
-            &user_id,
-            &session_id,
-            2,
-            serde_json::json!([{"role":"user","content":"first"}]),
-            serde_json::json!(["dangerous_tool"]),
-            serde_json::json!(["step-one"]),
-            serde_json::json!(null),
-            serde_json::json!({"kind":"rate_limited","resumable":true}),
-            serde_json::json!({"attempt_count":1,"cumulative_tokens_freed":50,"last_was_insufficient":false}),
-        ),
-    )
-    .await
-    .expect("push first step checkpoint");
     let approval_overrides = serde_json::json!({
         "rules": [[{
             "tool_name": "bash",
@@ -6205,15 +5962,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             "side_effect": "execute"
         }, true]]
     });
-    svc.push_step_checkpoint(
-        &session_id,
-        &user_id,
-        1,
-        3,
-        "heavy",
-        "step-heavy-v2",
-        &serde_json::json!(["step-two"]).to_string(),
-        &heavy_state_json(
+    seed_restore_checkpoint_fixture(&pool, &user_id, &session_id, &astra_services::session_checkpoint::Checkpoint {number: 1_000_000_001, turn: 3, title: "step-heavy-v2".into(), summary: "heavy".into(), tools_used: vec!["step-two".into()], total_tokens: 0, had_stalls: false, error_count: 0}, Some(&heavy_state_json(
             &user_id,
             &session_id,
             3,
@@ -6228,19 +5977,8 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             approval_overrides.clone(),
             serde_json::json!({"kind":"rate_limited","resumable":true}),
             serde_json::json!({"attempt_count":2,"cumulative_tokens_freed":120,"last_was_insufficient":false}),
-        ),
-    )
-    .await
-    .expect("update step checkpoint");
-    svc.push_step_checkpoint(
-        &heavy_only_session,
-        &user_id,
-        1,
-        1,
-        "heavy",
-        "heavy-only-v1",
-        &serde_json::json!(["heavy-only-tool"]).to_string(),
-        &heavy_state_json(
+        ))).await;
+    seed_restore_checkpoint_fixture(&pool, &user_id, &heavy_only_session, &astra_services::session_checkpoint::Checkpoint {number: 1_000_000_001, turn: 1, title: "heavy-only-v1".into(), summary: "heavy".into(), tools_used: vec!["heavy-only-tool".into()], total_tokens: 0, had_stalls: false, error_count: 0}, Some(&heavy_state_json(
             &user_id,
             &heavy_only_session,
             1,
@@ -6253,10 +5991,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             serde_json::json!(null),
             serde_json::json!({"kind":"context_window","resumable":true}),
             serde_json::json!({"attempt_count":1,"cumulative_tokens_freed":80,"last_was_insufficient":true}),
-        ),
-    )
-    .await
-    .expect("push heavy-only step checkpoint");
+        ))).await;
 
     let rows = sqlx::query(
         "SELECT number, title, summary, CAST(tools_json AS CHAR) AS tools_json, state_json \
@@ -6423,9 +6158,6 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             .and_then(serde_json::Value::as_str),
         Some("context_window")
     );
-
-    flusher.shutdown.cancel();
-    let _ = flusher.join_handle.await;
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id, heavy_only_session]).await;
 }
@@ -6618,25 +6350,23 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         ..Default::default()
     };
     let (sender, shutdown, stats, join) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender
-        .enqueue_async(IngestionEvent {
-            event_id: non_owner_session_end_event_id.clone(),
-            session_id: session_id.clone(),
-            user_id: other_user_id.clone(),
-            event_type: "session_end".into(),
-            content: Some("non-owner close attempt".into()),
-            token_usage: None,
-            llm_model_used: None,
-            skill_name: None,
-            metadata: None,
-            created_at: "2026-09-03T08:30:00Z".into(),
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: None,
-            history_work_queue_reservation: None,
-            ingestion_enqueued_at: None,
-        })
-        .await;
+    sender.enqueue(IngestionEvent {
+        event_id: non_owner_session_end_event_id.clone(),
+        session_id: session_id.clone(),
+        user_id: other_user_id.clone(),
+        event_type: "session_end".into(),
+        content: Some("non-owner close attempt".into()),
+        token_usage: None,
+        llm_model_used: None,
+        skill_name: None,
+        metadata: None,
+        created_at: "2026-09-03T08:30:00Z".into(),
+        parent_event_id: None,
+        parent_event_ids: Vec::new(),
+        causal_chain_id: None,
+        history_work_queue_reservation: None,
+        ingestion_enqueued_at: None,
+    });
     shutdown.signal();
     sender.shutdown();
     tokio::time::timeout(std::time::Duration::from_secs(10), join)
@@ -6778,62 +6508,31 @@ async fn session_owned_services_isolate_same_session_id_across_owners_on_live_ma
     assert_eq!(error.0, axum::http::StatusCode::NOT_FOUND);
     assert_eq!(error.1.0.detail, format!("Session {session_id} not found"));
 
-    let replay_service = DatabaseReplayService::new(settings).with_pool(shared);
-    let replay_result = replay_service
-        .replay_session(
-            other_user_id.clone(),
-            session_id.clone(),
-            ReplaySessionRequestData {
-                sandbox_name: None,
-                mock_mode: true,
-            },
-        )
-        .await;
-    assert_eq!(
-        replay_result
-            .expect_err("non-owner cannot replay session")
-            .0,
-        axum::http::StatusCode::NOT_FOUND
-    );
-    let compare_result = replay_service
-        .compare_replay(other_user_id.clone(), session_id.clone())
-        .await;
-    assert_eq!(
-        compare_result
-            .expect_err("non-owner cannot compare replay")
-            .0,
-        axum::http::StatusCode::NOT_FOUND
-    );
+    seed_restore_session_fixture(
+        &pool,
+        &other_user_id,
+        &session_id,
+        serde_json::json!({"git_branch": Some("other-owner-branch"), "model": Some("gpt-5.4")}),
+    )
+    .await;
 
-    let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
-    let sync_service = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
-    sync_service
-        .push_session_state(
-            &session_id,
-            &other_user_id,
-            Some("other-owner-branch"),
-            Some("gpt-5.4"),
-        )
-        .await
-        .expect("the other owner creates independent restore metadata");
-
-    sync_service
-        .push_checkpoint(
-            &session_id,
-            &owner_user_id,
-            &astra_services::session_checkpoint::Checkpoint {
-                number: 1,
-                turn: 1,
-                title: "owner-checkpoint".into(),
-                summary: "owner checkpoint must survive".into(),
-                tools_used: vec!["owner_tool".into()],
-                total_tokens: 10,
-                had_stalls: false,
-                error_count: 0,
-            },
-        )
-        .await
-        .expect("owner can push checkpoint");
+    seed_restore_checkpoint_fixture(
+        &pool,
+        &owner_user_id,
+        &session_id,
+        &astra_services::session_checkpoint::Checkpoint {
+            number: 1,
+            turn: 1,
+            title: "owner-checkpoint".into(),
+            summary: "owner checkpoint must survive".into(),
+            tools_used: vec!["owner_tool".into()],
+            total_tokens: 10,
+            had_stalls: false,
+            error_count: 0,
+        },
+        None,
+    )
+    .await;
     let restore = HybridRestoreService::new(pool.clone());
     assert!(
         restore
@@ -6859,61 +6558,36 @@ async fn session_owned_services_isolate_same_session_id_across_owners_on_live_ma
             .len(),
         1
     );
-    sync_service
-        .push_checkpoint(
-            &session_id,
-            &other_user_id,
-            &astra_services::session_checkpoint::Checkpoint {
-                number: 1,
-                turn: 99,
-                title: "other-owner-checkpoint".into(),
-                summary: "must remain owner isolated".into(),
-                tools_used: vec!["other_tool".into()],
-                total_tokens: 999,
-                had_stalls: true,
-                error_count: 9,
-            },
-        )
-        .await
-        .expect("the other owner writes an independent same-numbered checkpoint");
-    let checkpoint_row = sqlx::query(
-        "SELECT user_id, title, total_tokens FROM session_checkpoints \
-         WHERE user_id = ? AND session_id = ? AND number = 1",
+    seed_restore_checkpoint_fixture(
+        &pool,
+        &other_user_id,
+        &session_id,
+        &astra_services::session_checkpoint::Checkpoint {
+            number: 1,
+            turn: 99,
+            title: "other-owner-checkpoint".into(),
+            summary: "must remain owner isolated".into(),
+            tools_used: vec!["other_tool".into()],
+            total_tokens: 999,
+            had_stalls: true,
+            error_count: 9,
+        },
+        None,
     )
-    .bind(&owner_user_id)
-    .bind(&session_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load checkpoint after non-owner overwrite attempt");
-    assert_eq!(
-        checkpoint_row
-            .try_get::<String, _>("user_id")
-            .expect("checkpoint user"),
-        owner_user_id
-    );
-    assert_eq!(
-        checkpoint_row
-            .try_get::<Option<String>, _>("title")
-            .expect("checkpoint title")
-            .as_deref(),
-        Some("owner-checkpoint")
-    );
-    assert_eq!(
-        checkpoint_row
-            .try_get::<i64, _>("total_tokens")
-            .expect("checkpoint tokens"),
-        10
-    );
-    let other_checkpoint_owner: String = sqlx::query_scalar(
-        "SELECT user_id FROM session_checkpoints \
-         WHERE user_id = ? AND session_id = ? AND number = 1",
-    )
-    .bind(&other_user_id)
-    .bind(&session_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load other owner's isolated checkpoint");
-    assert_eq!(other_checkpoint_owner, other_user_id);
+    .await;
+    for (user_id, title, tokens) in [
+        (&owner_user_id, "owner-checkpoint", 10),
+        (&other_user_id, "other-owner-checkpoint", 999),
+    ] {
+        let checkpoints = restore
+            .list_checkpoints(user_id, &session_id)
+            .await
+            .expect("read owner-bound checkpoints");
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].number, 1);
+        assert_eq!(checkpoints[0].title, title);
+        assert_eq!(checkpoints[0].total_tokens, tokens);
+    }
 
     let snapshot_count =
         sqlx::query("SELECT COUNT(*) AS c FROM ctx_snapshots WHERE session_id = ? AND user_id = ?")
@@ -7313,6 +6987,9 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     let owner_user_id = Uuid::new_v4().to_string();
     let other_user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
+    let owner_root_attempt = Uuid::new_v4().to_string();
+    let owner_child_attempt = Uuid::new_v4().to_string();
+    let other_attempt = Uuid::new_v4().to_string();
     let owner_query_event_id = Uuid::new_v4().to_string();
     let owner_llm_event_id = Uuid::new_v4().to_string();
     let owner_drift_assessment_event_id = Uuid::new_v4().to_string();
@@ -7324,6 +7001,8 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     let other_context_id = Uuid::new_v4().to_string();
     let owner_decision_id = Uuid::new_v4().to_string();
     let other_decision_id = Uuid::new_v4().to_string();
+    let owner_tool_event_id = Uuid::new_v4().to_string();
+    let owner_boundary_event_id = Uuid::new_v4().to_string();
 
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
@@ -7334,6 +7013,8 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             owner_llm_event_id.clone(),
             owner_drift_assessment_event_id.clone(),
             owner_legacy_drift_event_id.clone(),
+            owner_tool_event_id.clone(),
+            owner_boundary_event_id.clone(),
         ],
         std::slice::from_ref(&owner_decision_id),
     )
@@ -7350,16 +7031,107 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         std::slice::from_ref(&other_decision_id),
     )
     .await;
+    cleanup_model_request_fixtures(
+        &pool,
+        &owner_user_id,
+        &[owner_root_attempt.clone(), owner_child_attempt.clone()],
+    )
+    .await;
+    cleanup_model_request_fixtures(&pool, &other_user_id, std::slice::from_ref(&other_attempt))
+        .await;
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'mixed-owner-derived-it', 'active', 4)",
+         VALUES (?, ?, 'mixed-owner-derived-it', 'active', 6)",
     )
     .bind(&session_id)
     .bind(&owner_user_id)
     .execute(&pool)
     .await
     .expect("insert owner session");
+
+    for (
+        user_id,
+        attempt_id,
+        run_id,
+        parent_run_id,
+        agent_id,
+        include_accepted,
+        status,
+        response_id,
+        created_at,
+    ) in [
+        (
+            &owner_user_id,
+            &owner_root_attempt,
+            "root-run",
+            None,
+            "parent-agent",
+            false,
+            Some("succeeded"),
+            Some("root-provider-response"),
+            "2026-06-01 10:00:10.000000",
+        ),
+        (
+            &owner_user_id,
+            &owner_child_attempt,
+            "child-run",
+            Some("root-run"),
+            "child-agent",
+            true,
+            Some("delivery_unknown"),
+            None,
+            "2026-06-01 10:00:20.000000",
+        ),
+        (
+            &other_user_id,
+            &other_attempt,
+            "foreign-run",
+            None,
+            "foreign-agent",
+            false,
+            Some("succeeded"),
+            Some("foreign-provider-response"),
+            "2026-06-01 10:00:30.000000",
+        ),
+    ] {
+        let mut event = model_request_fixture_accepted_event(
+            user_id,
+            &session_id,
+            attempt_id,
+            run_id,
+            parent_run_id,
+            agent_id,
+        );
+        if include_accepted {
+            insert_model_request_fixture(
+                &pool,
+                user_id,
+                &session_id,
+                attempt_id,
+                &event,
+                "2026-06-01 10:00:19.000000",
+            )
+            .await;
+        }
+        if let Some(status) = status {
+            event.stage = astra_services::ModelRequestEventStage::Terminal;
+            event.terminal_status = Some(status.into());
+            event.usage_status = Some(if status == "delivery_unknown" {
+                "unavailable".into()
+            } else {
+                "provider_exact".into()
+            });
+            event.usage =
+                (status != "delivery_unknown").then(|| astra_services::ModelRequestUsage {
+                    input: astra_turn_types::NormalizedPromptCacheUsage::new(8, 32, 0),
+                    output_tokens: 4,
+                });
+        }
+        event.identity.provider_response_id = response_id.map(str::to_owned);
+        insert_model_request_fixture(&pool, user_id, &session_id, attempt_id, &event, created_at)
+            .await;
+    }
 
     for (event_id, user_id, event_type, content, skill_name, token_usage, created_at) in [
         (
@@ -7525,6 +7297,91 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         .expect("insert mixed owner drift assessment");
     }
 
+    let private_args = "PRIVATE-TOOL-ARGS";
+    let private_result = "PRIVATE-TOOL-RESULT";
+    let tool_metadata = serde_json::json!({
+        "ok": true,
+        "disposition": "executed",
+        "result_class": "success",
+        "exit_semantics": "success",
+        "args_preview": private_args,
+        "result_preview": private_result,
+    });
+    let tool_content = "command completed successfully";
+    let tool_created_at = "2026-06-01 10:01:30.000000";
+    sqlx::query(
+        "INSERT INTO agent_events \
+         (event_id, session_id, user_id, agent_id, event_type, content, run_id, parent_run_id, \
+          tool_call_id, meta_tool_name, metadata, payload_hash, ingestion_write_id, created_at) \
+         VALUES (?, ?, ?, ?, 'tool_call_completed', ?, ?, ?, ?, 'shell', CAST(? AS JSON), ?, ?, ?)",
+    )
+    .bind(&owner_tool_event_id)
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .bind("child-agent")
+    .bind(tool_content)
+    .bind("child-run")
+    .bind("root-run")
+    .bind("child-shell-call")
+    .bind(tool_metadata.to_string())
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &owner_tool_event_id,
+        "session_id": &session_id,
+        "user_id": &owner_user_id,
+        "agent_id": "child-agent",
+        "event_type": "tool_call_completed",
+        "content": tool_content,
+        "run_id": "child-run",
+        "parent_run_id": "root-run",
+        "tool_call_id": "child-shell-call",
+        "meta_tool_name": "shell",
+        "metadata": &tool_metadata,
+        "created_at": tool_created_at,
+    })))
+    .bind(Uuid::new_v4().to_string())
+    .bind(tool_created_at)
+    .execute(&pool)
+    .await
+    .expect("insert scoped tool terminal fixture");
+
+    let boundary_metadata = serde_json::json!({
+        "span_id": "dependency-boundary",
+        "name": "agent_dependency_boundary",
+        "trace_id": "root-run",
+        "attrs": {
+            "parent_run_id": "root-run",
+            "outcome": "results_adopted",
+            "tool_call_id": "wait-for-child",
+            "children": "[{\"agent_id\":\"child-agent\",\"run_id\":\"child-run\",\"status\":\"completed\"}]"
+        }
+    });
+    let boundary_created_at = "2026-06-01 10:01:35.000000";
+    sqlx::query(
+        "INSERT INTO agent_events \
+         (event_id, session_id, user_id, event_type, run_id, metadata, payload_hash, \
+          ingestion_write_id, created_at) \
+         VALUES (?, ?, ?, 'trace_span', ?, CAST(? AS JSON), ?, ?, ?)",
+    )
+    .bind(&owner_boundary_event_id)
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .bind("root-run")
+    .bind(boundary_metadata.to_string())
+    .bind(agent_event_fixture_payload_hash(serde_json::json!({
+        "event_id": &owner_boundary_event_id,
+        "session_id": &session_id,
+        "user_id": &owner_user_id,
+        "event_type": "trace_span",
+        "run_id": "root-run",
+        "metadata": &boundary_metadata,
+        "created_at": boundary_created_at,
+    })))
+    .bind(Uuid::new_v4().to_string())
+    .bind(boundary_created_at)
+    .execute(&pool)
+    .await
+    .expect("insert canonical dependency boundary fixture");
+
     for (
         context_id,
         user_id,
@@ -7632,12 +7489,38 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         )
         .await
         .expect("owner reflect report");
-    assert_eq!(report.data_coverage.events, 4);
+    assert_eq!(report.data_coverage.events, 6);
     assert_eq!(report.data_coverage.decisions, 1);
+    assert_eq!(report.model_requests.records_observed, 3);
+    assert_eq!(report.model_requests.accepted_records_observed, 1);
+    assert_eq!(
+        report.model_requests.coverage,
+        astra_services::reflect::ModelRequestCaptureCoverage::WindowObserved
+    );
+    let model_requests = report
+        .model_requests
+        .terminal
+        .as_ref()
+        .expect("owner terminal request evidence");
+    assert_eq!(model_requests.terminal_requests, 2);
+    assert_eq!(model_requests.terminal_statuses.succeeded, 1);
+    assert_eq!(model_requests.terminal_statuses.delivery_unknown, 1);
+    assert_eq!(model_requests.usage_coverage.exact, 1);
+    assert_eq!(model_requests.usage_coverage.unavailable, 1);
+    assert_eq!(model_requests.provider_response_id_observations, 1);
+    let child_request = model_requests
+        .groups
+        .iter()
+        .find(|group| group.run_id.as_deref() == Some("child-run"))
+        .expect("child request group");
+    assert_eq!(child_request.parent_run_id.as_deref(), Some("root-run"));
+    assert_eq!(child_request.agent_id.as_deref(), Some("child-agent"));
+    assert_eq!(child_request.terminal_statuses.delivery_unknown, 1);
+    assert_eq!(child_request.provider_response_id_observations, 0);
     let view = report.view.as_ref().expect("reflect report includes view");
     assert_eq!(view.topic, "overview");
     assert_eq!(view.facet, "overview");
-    assert_eq!(view.data_coverage.events, 4);
+    assert_eq!(view.data_coverage.events, 6);
     assert_eq!(view.data_coverage.decisions, 1);
     assert!(!report.summary.is_empty());
     assert!(
@@ -7683,7 +7566,35 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             .iter()
             .any(|evidence| evidence.summary.contains("other secret"))
     );
-    assert!(report.graph_slice.nodes.is_empty());
+    let execution_spine = report
+        .graph_slice
+        .nodes
+        .iter()
+        .find(|node| node.label == "execution_spine")
+        .expect("scoped tool event is visible in execution trace");
+    let facts = execution_spine.metadata.as_ref().unwrap()["execution_spine"]["facts"]
+        .as_array()
+        .expect("execution facts");
+    let tool_fact = facts
+        .iter()
+        .find(|fact| fact["event_id"] == owner_tool_event_id)
+        .expect("tool event fact");
+    assert_eq!(tool_fact["run_id"], "child-run");
+    assert_eq!(tool_fact["parent_run_id"], "root-run");
+    assert_eq!(tool_fact["tool_outcome"]["tool_name"], "shell");
+    assert_eq!(tool_fact["tool_outcome"]["disposition"], "executed");
+    assert_eq!(tool_fact["tool_outcome"]["result_class"], "success");
+    assert_eq!(tool_fact["tool_outcome"]["exit_semantics"], "success");
+    let boundary_fact = facts
+        .iter()
+        .find(|fact| fact["event_id"] == owner_boundary_event_id)
+        .expect("dependency boundary event fact");
+    assert_eq!(boundary_fact["kind"], "agent_dependency_boundary");
+    assert_eq!(boundary_fact["tool_call_id"], "wait-for-child");
+    let report_json = serde_json::to_string(&report).unwrap();
+    assert!(!report_json.contains(private_args));
+    assert!(!report_json.contains(private_result));
+    assert!(report.graph_slice.edges.is_empty());
     assert!(report.graph_slice.edges.is_empty());
 
     let introspection =
@@ -7762,6 +7673,8 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
             owner_llm_event_id,
             owner_drift_assessment_event_id,
             owner_legacy_drift_event_id,
+            owner_tool_event_id,
+            owner_boundary_event_id,
         ],
         &[owner_decision_id],
     )
@@ -7778,6 +7691,13 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         &[other_decision_id],
     )
     .await;
+    cleanup_model_request_fixtures(
+        &pool,
+        &owner_user_id,
+        &[owner_root_attempt, owner_child_attempt],
+    )
+    .await;
+    cleanup_model_request_fixtures(&pool, &other_user_id, &[other_attempt]).await;
 }
 
 #[tokio::test]
@@ -7795,10 +7715,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     let foreign_context_capture_id = Uuid::new_v4().to_string();
     let owner_decision_id = Uuid::new_v4().to_string();
     let foreign_decision_id = Uuid::new_v4().to_string();
-    let owner_harness_run_id = Uuid::new_v4().to_string();
-    let foreign_harness_run_id = Uuid::new_v4().to_string();
-    let owner_calibration_id = Uuid::new_v4().to_string();
-    let foreign_calibration_id = Uuid::new_v4().to_string();
     let owner_run_id = Uuid::new_v4().to_string();
     let foreign_run_id = Uuid::new_v4().to_string();
     let owner_skill_eval_id = Uuid::new_v4().to_string();
@@ -7809,21 +7725,9 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     let owner_workspace_without_debt_id = format!("workspace-{}", Uuid::new_v4());
     let foreign_workspace_id = format!("workspace-{}", Uuid::new_v4());
     let owner_cleanup_debt_id = format!("debt-{}", Uuid::new_v4());
-    let owner_config_version_id = config_version_fixture_id();
-    let foreign_config_version_id = config_version_fixture_id();
 
     cleanup_session_delete_fixture_for_owner(&pool, &owner_user_id, &session_id).await;
     cleanup_session_delete_fixture_for_owner(&pool, &other_user_id, &session_id).await;
-    for (user_id, version_id) in [
-        (&owner_user_id, &owner_config_version_id),
-        (&other_user_id, &foreign_config_version_id),
-    ] {
-        let _ = sqlx::query("DELETE FROM config_versions WHERE user_id = ? AND version_id = ?")
-            .bind(user_id)
-            .bind(version_id)
-            .execute(&pool)
-            .await;
-    }
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
@@ -7899,41 +7803,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .await
         .expect("insert conversation log");
     }
-
-    for (user_id, calibration_id, marker) in [
-        (&owner_user_id, &owner_calibration_id, "owner"),
-        (&other_user_id, &foreign_calibration_id, "foreign"),
-    ] {
-        sqlx::query(
-            "INSERT INTO eval_calibration_assessments \
-             (calibration_id, user_id, agent_id, session_id, confidence, quality_score) \
-             VALUES (?, ?, ?, ?, 0.5000, 0.8000)",
-        )
-        .bind(calibration_id)
-        .bind(user_id)
-        .bind(format!("agent-{marker}"))
-        .bind(&session_id)
-        .execute(&pool)
-        .await
-        .expect("insert eval calibration assessment");
-    }
-
-    insert_harness_run_fixture(
-        &pool,
-        &owner_user_id,
-        &session_id,
-        &owner_harness_run_id,
-        "owner",
-    )
-    .await;
-    insert_harness_run_fixture(
-        &pool,
-        &other_user_id,
-        &session_id,
-        &foreign_harness_run_id,
-        "foreign",
-    )
-    .await;
 
     for (user_id, run_id, evaluation_id, marker) in [
         (&owner_user_id, &owner_run_id, &owner_skill_eval_id, "owner"),
@@ -8139,24 +8008,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     .await
     .expect("insert unresolved cleanup debt");
 
-    for (user_id, version_id, marker) in [
-        (&owner_user_id, &owner_config_version_id, "owner"),
-        (&other_user_id, &foreign_config_version_id, "foreign"),
-    ] {
-        sqlx::query(
-            "INSERT INTO config_versions \
-             (version_id, user_id, toml_body, created_at, first_seen_session) \
-             VALUES (?, ?, ?, NOW(6), ?)",
-        )
-        .bind(version_id)
-        .bind(user_id)
-        .bind(format!("model = \"{marker}\""))
-        .bind(&session_id)
-        .execute(&pool)
-        .await
-        .expect("insert config version provenance");
-    }
-
     let decision_service = DatabaseDecisionService::new(settings.clone()).with_pool(shared.clone());
     let retained_request = DecisionCreateRequestData {
         session_id: session_id.clone(),
@@ -8185,13 +8036,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     let delete_audit = load_session_delete_audit_details(&pool, &owner_user_id, &session_id).await;
     assert_eq!(
         delete_audit
-            .get("session_references_cleared")
-            .and_then(serde_json::Value::as_u64),
-        Some(1),
-        "session delete audit must report live config_versions provenance cleanup"
-    );
-    assert_eq!(
-        delete_audit
             .get("workspace_cleanup_debts_enqueued")
             .and_then(serde_json::Value::as_u64),
         Some(1),
@@ -8214,7 +8058,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         1
     );
     assert_eq!(deleted_rows_for_table(&delete_audit, "agent_sessions"), 1);
-    assert_eq!(deleted_rows_for_table(&delete_audit, "harness_items"), 1);
     assert_eq!(
         deleted_rows_for_table(&delete_audit, "session_artifacts"),
         1
@@ -8237,11 +8080,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         ),
         ("conversation_log", "conversation_log"),
         ("session_artifacts", "session_artifacts"),
-        (
-            "eval_calibration_assessments",
-            "eval_calibration_assessments",
-        ),
-        ("harness_runs", "harness_runs"),
         ("ctx_snapshots", "ctx_snapshots"),
         ("ctx_decision_audits", "ctx_decision_audits"),
     ] {
@@ -8394,84 +8232,8 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         "session delete must enqueue cleanup debt before deleting cloud workspace records"
     );
 
-    let owner_first_seen_session: Option<String> = sqlx::query(
-        "SELECT first_seen_session FROM config_versions WHERE user_id = ? AND version_id = ?",
-    )
-    .bind(&owner_user_id)
-    .bind(&owner_config_version_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load owner config version")
-    .try_get("first_seen_session")
-    .expect("decode owner first_seen_session");
-    assert!(
-        owner_first_seen_session.is_none(),
-        "session delete must clear owner config version session provenance"
-    );
-
-    let foreign_first_seen_session: Option<String> = sqlx::query(
-        "SELECT first_seen_session FROM config_versions WHERE user_id = ? AND version_id = ?",
-    )
-    .bind(&other_user_id)
-    .bind(&foreign_config_version_id)
-    .fetch_one(&pool)
-    .await
-    .expect("load foreign config version")
-    .try_get("first_seen_session")
-    .expect("decode foreign first_seen_session");
-    assert_eq!(
-        foreign_first_seen_session.as_deref(),
-        Some(session_id.as_str()),
-        "owner delete must not clear foreign config version provenance"
-    );
-
-    for table in [
-        "harness_citations",
-        "harness_skill_rules",
-        "harness_skill_drafts",
-        "harness_items",
-    ] {
-        let owner_remaining = sqlx::query(&format!(
-            "SELECT COUNT(*) AS c FROM {table} WHERE harness_run_id = ?"
-        ))
-        .bind(&owner_harness_run_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap_or_else(|error| panic!("count owner {table}: {error}"))
-        .try_get::<i64, _>("c")
-        .expect("decode owner harness child count");
-        assert_eq!(
-            owner_remaining, 0,
-            "{table} owner harness children must be deleted"
-        );
-
-        let foreign_remaining = sqlx::query(&format!(
-            "SELECT COUNT(*) AS c FROM {table} WHERE harness_run_id = ?"
-        ))
-        .bind(&foreign_harness_run_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap_or_else(|error| panic!("count foreign {table}: {error}"))
-        .try_get::<i64, _>("c")
-        .expect("decode foreign harness child count");
-        assert_eq!(
-            foreign_remaining, 1,
-            "{table} foreign harness children must not be touched by owner delete"
-        );
-    }
-
     cleanup_session_delete_fixture_for_owner(&pool, &other_user_id, &session_id).await;
     cleanup_session_delete_fixture_for_owner(&pool, &owner_user_id, &session_id).await;
-    for (user_id, version_id) in [
-        (&owner_user_id, &owner_config_version_id),
-        (&other_user_id, &foreign_config_version_id),
-    ] {
-        let _ = sqlx::query("DELETE FROM config_versions WHERE user_id = ? AND version_id = ?")
-            .bind(user_id)
-            .bind(version_id)
-            .execute(&pool)
-            .await;
-    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -9334,4 +9096,115 @@ async fn database_expired_reservation_fences_refreshed_writer() {
     .bind(&key.branch_id)
     .execute(&pool)
     .await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn preferences_preserve_owner_values_and_observable_write_failures_on_live_matrixone() {
+    let (shared, _settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let service = astra_services::MatrixOneSyncService::new(pool.clone());
+    let owner = Uuid::new_v4().to_string();
+    let other = Uuid::new_v4().to_string();
+
+    assert!(
+        service
+            .pull_all_preferences(&owner)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    service
+        .push_preference(&owner, "explain_mode", "true")
+        .await
+        .unwrap();
+    service
+        .push_preference(&other, "explain_mode", "false")
+        .await
+        .unwrap();
+    for (user_id, value) in [(&owner, "true"), (&other, "false")] {
+        assert_eq!(
+            service.pull_all_preferences(user_id).await.unwrap(),
+            vec![("explain_mode".into(), value.into())]
+        );
+    }
+    service
+        .push_preference(&owner, "explain_mode", "true")
+        .await
+        .unwrap();
+    let version: i32 = sqlx::query_scalar(
+        "SELECT version FROM user_preferences WHERE user_id = ? AND pref_key = 'explain_mode'",
+    )
+    .bind(&owner)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        version, 1,
+        "an unchanged value must not write a new version"
+    );
+    service
+        .push_preference(&owner, "explain_mode", "verbose")
+        .await
+        .unwrap();
+    let version: i32 = sqlx::query_scalar(
+        "SELECT version FROM user_preferences WHERE user_id = ? AND pref_key = 'explain_mode'",
+    )
+    .bind(&owner)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(version, 2);
+    service
+        .push_preference(&owner, "blocked_tools", "[]")
+        .await
+        .unwrap();
+    assert_eq!(
+        service.pull_all_preferences(&owner).await.unwrap(),
+        vec![
+            ("blocked_tools".into(), "[]".into()),
+            ("explain_mode".into(), "verbose".into()),
+        ]
+    );
+    assert_eq!(
+        service.pull_all_preferences(&other).await.unwrap(),
+        vec![("explain_mode".into(), "false".into()),]
+    );
+
+    sqlx::query(
+        "UPDATE user_preferences SET version = ? WHERE user_id = ? AND pref_key = 'explain_mode'",
+    )
+    .bind(i32::MAX)
+    .bind(&owner)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let error = service
+        .push_preference(&owner, "explain_mode", "true")
+        .await
+        .unwrap_err();
+    assert!(error.contains("preference version overflow"));
+    assert_eq!(
+        service.pull_all_preferences(&owner).await.unwrap()[1].1,
+        "verbose"
+    );
+    let version: i32 = sqlx::query_scalar(
+        "SELECT version FROM user_preferences WHERE user_id = ? AND pref_key = 'explain_mode'",
+    )
+    .bind(&owner)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        version,
+        i32::MAX,
+        "a rejected write must leave the row unchanged"
+    );
+
+    sqlx::query("DELETE FROM user_preferences WHERE user_id IN (?, ?)")
+        .bind(&owner)
+        .bind(&other)
+        .execute(&pool)
+        .await
+        .unwrap();
 }

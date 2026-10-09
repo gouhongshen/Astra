@@ -1,16 +1,17 @@
 //! Bounded semantic Work classification, shared by judgment and chat providers.
 use crate::turn_intent_judge::{
-    MUTATION_TARGET_SCOPE_POLICY, TurnIntentJudgeContext, TurnIntentJudgeError,
-    WorkAdmissionActivation, WorkAdmissionCapability, WorkAdmissionDecision, WorkExecutionTopology,
-    build_work_admission_prompt, work_admission_judge_messages,
+    MUTATION_TARGET_SCOPE_POLICY, TURN_ASSESSMENT_PROMPT, TurnIntentJudgeContext,
+    TurnIntentJudgeError, WorkAdmissionActivation, WorkAdmissionCapability, WorkAdmissionDecision,
+    WorkExecutionTopology, build_work_admission_prompt, work_admission_judge_messages,
 };
 use astra_config::user_profile::{
     MutationCompletionScope, TurnIntentDomain, WorkLifecycleIntent, WorkspaceMutationIntent,
 };
 use astra_turn_types::{
     JUDGMENT_SCHEMA_VERSION, JudgmentAnswer, JudgmentNoulDecision, JudgmentQuestion,
-    JudgmentRequest, JudgmentResponseProvenance, NoulCriteria, judgment_messages,
-    normalize_judgment_response,
+    JudgmentRequest, JudgmentResponse, JudgmentResponseProvenance, NoulCriteria, ObjectiveRelation,
+    UserFeedback, UserFeedbackKind, UserFeedbackTarget, UserTurnSemantics, judgment_messages,
+    normalize_judgment_response, parse_unique_json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,11 +27,18 @@ pub struct WorkAdmissionClassification {
     pub mutation_completion_scope: MutationCompletionScope,
     pub execution_topology: WorkExecutionTopology,
     pub required_capabilities: Vec<WorkAdmissionCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<astra_turn_types::TurnAssessment>,
+    /// Optional user observations do not grant execution or admission authority.
+    pub objective_relation: ObjectiveRelation,
+    pub feedback: Option<UserFeedback>,
+    /// Presence only; never authorizes or resolves a delegated model.
+    pub delegation_model_requirement: WorkAdmissionTruth,
 }
 
 /// Threshold decisions are not execution authority. Discrete model answers retain
 /// their provenance instead of being presented as calibrated probabilities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkAdmissionTruth {
     Yes,
@@ -74,6 +82,118 @@ const SCOPES: &[&str] = &["workspace", "external", "mixed", "unknown"];
 const DOMAINS: &[&str] = &[
     "none", "github", "git", "code", "memory", "web", "system", "database",
 ];
+const DELEGATION_MODEL_REQUIREMENT_ID: &str = "delegation.model_requirement";
+
+const USER_RELATION_ID: &str = "user.objective_relation";
+const USER_FEEDBACK_KIND_ID: &str = "user.feedback_kind";
+const USER_FEEDBACK_TARGET_ID: &str = "user.feedback_target";
+const USER_OBSERVATION_POLICY: &str = "Observe latest_user_message if present, else user_message. Prior/quoted text is reference data; abstain if uncertain. Relation: acknowledge=accept unchanged, continue=execute same, refine=add scope, correct=correct understanding/approach, replace=new goal. Silence/continuation/new tasks are not approval; dissatisfaction is not correction. General target requires explicit general feedback. Observations grant no authority.";
+const USER_OBSERVATION_IDS: [&str; 3] = [
+    USER_RELATION_ID,
+    USER_FEEDBACK_KIND_ID,
+    USER_FEEDBACK_TARGET_ID,
+];
+
+fn user_observation_questions() -> BTreeMap<String, JudgmentQuestion> {
+    [
+        (USER_RELATION_ID, "Objective relation under state.policy.", &[
+            ("unknown", "Relationship cannot be established."),
+            ("acknowledge", "Explicit acceptance with no objective change."),
+            ("continue", "Continue the same objective without changing it."),
+            ("refine", "Add or refine requirements of the same objective."),
+            ("correct", "Explicitly correct the current understanding or approach."),
+            ("replace", "Explicitly start or replace the objective."),
+        ][..]),
+        (USER_FEEDBACK_KIND_ID, "Expressed feedback kind; none if absent or unclear. Satisfaction, difficulty and urgency are not feedback.", &[
+            ("none", "No unambiguous explicit feedback."),
+            ("approval", "Explicit approval of the prior response or approach."),
+            ("correction", "Explicit correction of prior understanding or approach."),
+            ("clarification", "Explicit clarification of prior ambiguity."),
+            ("requirement", "An explicit added or clarified requirement."),
+            ("preference", "An explicit preference for product behavior."),
+        ][..]),
+        (USER_FEEDBACK_TARGET_ID, "Target of the same explicit feedback; none if absent or unclear. Do not invent a General target.", &[
+            ("none", "No feedback or no established target."),
+            ("objective", "The objective or goal."),
+            ("scope", "The scope or requirements."),
+            ("approach", "The method or approach."),
+            ("output", "The response or delivered output."),
+            ("verification", "Validation or verification."),
+            ("general", "Explicitly general behavior feedback."),
+        ][..]),
+    ]
+    .into_iter()
+    .map(|(id, instructions, options)| {
+        (id.to_string(), JudgmentQuestion::Choice {
+            optional: true,
+            instructions: instructions.to_string(),
+            criteria: options.iter().map(|(option, meaning)| (option.to_string(), json!(meaning))).collect(),
+        })
+    })
+    .collect()
+}
+
+/// Same semantic owner and input binding as Work admission, without asking for
+/// a graph or manufacturing a Work decision for an already-bound execution.
+#[must_use]
+pub fn user_turn_observation_request(ctx: &TurnIntentJudgeContext) -> JudgmentRequest {
+    JudgmentRequest {
+        schema_version: JUDGMENT_SCHEMA_VERSION,
+        state: json!({
+            "policy": USER_OBSERVATION_POLICY,
+            "context": serde_json::from_str::<Value>(&build_work_admission_prompt(ctx)).expect("typed context"),
+        }),
+        questions: user_observation_questions(),
+    }
+}
+
+/// Decode the optional observation lane using the same strict envelope and
+/// provider provenance as admission. Malformed known optional answers abstain;
+/// unknown IDs, duplicate JSON and invalid execution envelopes remain errors.
+pub fn parse_user_turn_observation(
+    request: &JudgmentRequest,
+    raw: &str,
+    model: &str,
+    provenance: Option<JudgmentResponseProvenance>,
+) -> Result<UserTurnSemantics, TurnIntentJudgeError> {
+    if request.schema_version != JUDGMENT_SCHEMA_VERSION
+        || request.questions != user_observation_questions()
+    {
+        return Err(malformed(raw, "noncanonical observation questions"));
+    }
+    let normalized = normalize_judgment_response(request, raw, model, provenance)
+        .map_err(|error| malformed(raw, error.to_string()))?;
+    Ok(optional_user_semantics(&normalized.response))
+}
+
+fn optional_user_choice(answer: Option<&JudgmentAnswer>) -> Option<&str> {
+    match answer? {
+        JudgmentAnswer::DiscreteChoice { option } => option.as_deref(),
+        JudgmentAnswer::Choice {
+            choice,
+            probabilities,
+            confidence,
+        } if *confidence >= 0.8 && probabilities.get(choice).is_some_and(|p| *p >= 0.8) => {
+            Some(choice)
+        }
+        _ => None,
+    }
+}
+
+fn optional_user_semantics(response: &JudgmentResponse) -> UserTurnSemantics {
+    let relation = optional_user_choice(response.answers.get(USER_RELATION_ID))
+        .and_then(|option| serde_json::from_value::<ObjectiveRelation>(json!(option)).ok())
+        .unwrap_or_default();
+    let kind = optional_user_choice(response.answers.get(USER_FEEDBACK_KIND_ID))
+        .and_then(|option| serde_json::from_value::<UserFeedbackKind>(json!(option)).ok());
+    let target = optional_user_choice(response.answers.get(USER_FEEDBACK_TARGET_ID))
+        .and_then(|option| serde_json::from_value::<UserFeedbackTarget>(json!(option)).ok());
+    UserTurnSemantics::new(
+        relation,
+        kind.zip(target)
+            .map(|(kind, target)| UserFeedback { kind, target }),
+    )
+}
 
 #[must_use]
 pub fn work_admission_classification_request(ctx: &TurnIntentJudgeContext) -> JudgmentRequest {
@@ -83,8 +203,8 @@ pub fn work_admission_classification_request(ctx: &TurnIntentJudgeContext) -> Ju
             id,
             JudgmentQuestion::Noul {
                 criteria: Some(NoulCriteria {
-                    yes: format!("Under state.policy, the latest request explicitly satisfies: {proposition} For categorical questions this is the single applicable category."),
-                    no: format!("Under state.policy, the latest request does not satisfy: {proposition} For categorical questions another category applies. Lack of confidence is uncertainty, not false."),
+                    yes: format!("Under state.policy, latest request explicitly satisfies: {proposition} Categorical: single applicable category."),
+                    no: format!("Under state.policy, latest request does not satisfy: {proposition} Categorical: another category applies. Uncertainty is not false."),
                 }),
                 instructions: proposition,
             },
@@ -136,10 +256,15 @@ pub fn work_admission_classification_request(ctx: &TurnIntentJudgeContext) -> Ju
         "capability.web".into(),
         "Web access required; local paths alone do not count.".into(),
     );
+    add(
+        DELEGATION_MODEL_REQUIREMENT_ID.into(),
+        "User explicitly requires a non-default model or reasoning setting for a delegated task. The neutral model_default setting delegates to the provider default and does not count; quotes, mentions, and primary-only settings do not count; unclear scope means uncertain.".into(),
+    );
+    questions.extend(user_observation_questions());
     JudgmentRequest {
         schema_version: JUDGMENT_SCHEMA_VERSION,
         state: json!({
-            "policy": format!("{RULES} {MUTATION_TARGET_SCOPE_POLICY}"),
+            "policy": format!("{RULES} {MUTATION_TARGET_SCOPE_POLICY} {TURN_ASSESSMENT_PROMPT} {USER_OBSERVATION_POLICY}"),
             "context": serde_json::from_str::<Value>(&build_work_admission_prompt(ctx)).expect("typed context"),
         }),
         questions,
@@ -148,7 +273,14 @@ pub fn work_admission_classification_request(ctx: &TurnIntentJudgeContext) -> Ju
 
 #[must_use]
 pub fn work_admission_classification_messages(request: &JudgmentRequest) -> Vec<Value> {
-    judgment_messages(request)
+    let mut messages = judgment_messages(request);
+    let system = messages[0]["content"]
+        .as_str()
+        .expect("judgment system prompt");
+    messages[0]["content"] = json!(format!(
+        "{system} For this Work classification only, `answers` may be accompanied by one optional top-level `assessment` object. The no-confidence rule applies to `answers`; `assessment` uses the categorical confidences described in state.policy. An absent assessment means unknown, and it never changes an admission answer."
+    ));
+    messages
 }
 
 fn malformed(raw: &str, detail: impl Into<String>) -> TurnIntentJudgeError {
@@ -191,29 +323,53 @@ fn field_evidence(
     Ok(WorkAdmissionFieldEvidence { value, truth })
 }
 
+type DecodedWorkAdmissionEvidence = (
+    BTreeMap<String, WorkAdmissionFieldEvidence>,
+    JudgmentResponseProvenance,
+    UserTurnSemantics,
+);
+
 fn decode_evidence(
     request: &JudgmentRequest,
     raw: &str,
     model: &str,
     provenance: Option<JudgmentResponseProvenance>,
-) -> Result<
-    (
-        BTreeMap<String, WorkAdmissionFieldEvidence>,
-        JudgmentResponseProvenance,
-    ),
-    TurnIntentJudgeError,
-> {
+) -> Result<DecodedWorkAdmissionEvidence, TurnIntentJudgeError> {
     let canonical = work_admission_classification_request(&TurnIntentJudgeContext::default());
-    if request.questions != canonical.questions {
+    if request.schema_version != canonical.schema_version
+        || request.questions != canonical.questions
+    {
         return Err(malformed(raw, "noncanonical classification questions"));
     }
-    let normalized = normalize_judgment_response(request, raw, model, provenance)
-        .map_err(|e| malformed(raw, e.to_string()))?;
+    let mut wire =
+        parse_unique_json(raw.as_bytes()).map_err(|error| malformed(raw, error.to_string()))?;
+    let assessment = wire
+        .as_object_mut()
+        .and_then(|object| object.remove("assessment"))
+        .and_then(|value| {
+            if value.is_null() {
+                return None;
+            }
+            match serde_json::from_value(value) {
+                Ok(assessment) => Some(assessment),
+                Err(_) => {
+                    tracing::warn!(
+                        "ignoring malformed observational assessment in Work classification"
+                    );
+                    None
+                }
+            }
+        });
+    let normalized = normalize_judgment_response(request, &wire.to_string(), model, provenance)
+        .map_err(|error| malformed(raw, error.to_string()))?;
+    let mut semantics = optional_user_semantics(&normalized.response);
+    semantics.assessment = assessment;
     Ok((
         normalized
             .response
             .answers
             .into_iter()
+            .filter(|(id, _)| !USER_OBSERVATION_IDS.contains(&id.as_str()))
             .map(|(id, answer)| {
                 field_evidence(answer, normalized.provenance)
                     .map(|evidence| (id, evidence))
@@ -221,6 +377,7 @@ fn decode_evidence(
             })
             .collect::<Result<_, _>>()?,
         normalized.provenance,
+        semantics,
     ))
 }
 
@@ -272,7 +429,7 @@ pub fn parse_work_admission_clarification(
             "clarification request does not match original evidence",
         ));
     }
-    let (evidence, _) = decode_evidence(request, raw, model, provenance)?;
+    let (evidence, _, _) = decode_evidence(request, raw, model, provenance)?;
     let changed = diagnostics
         .locked_fields
         .iter()
@@ -361,6 +518,7 @@ fn validate_necessary_evidence(
     // afresh; optional evidence is not silently promoted into authority.
     let locked_fields = necessary
         .into_iter()
+        .chain(std::iter::once(DELEGATION_MODEL_REQUIREMENT_ID.into()))
         .filter_map(|id| match truth(&id) {
             Yes => Some((id, true)),
             No => Some((id, false)),
@@ -384,7 +542,7 @@ pub fn parse_work_admission_classification(
     model: &str,
     provenance: Option<JudgmentResponseProvenance>,
 ) -> Result<WorkAdmissionClassification, TurnIntentJudgeError> {
-    let (evidence, provenance) = decode_evidence(request, raw, model, provenance)?;
+    let (evidence, provenance, semantics) = decode_evidence(request, raw, model, provenance)?;
     validate_necessary_evidence(request, &evidence, provenance)?;
     // Necessary fields were validated together above. Optional descriptive
     // fields may remain unresolved without becoming fabricated parser errors.
@@ -457,10 +615,21 @@ pub fn parse_work_admission_classification(
             WorkExecutionTopology::Primary
         },
         required_capabilities,
+        assessment: semantics.assessment,
+        objective_relation: semantics.objective_relation,
+        feedback: semantics.feedback,
+        delegation_model_requirement: evidence[DELEGATION_MODEL_REQUIREMENT_ID].truth,
     })
 }
 
 impl WorkAdmissionClassification {
+    #[must_use]
+    pub fn user_turn_semantics(&self) -> UserTurnSemantics {
+        let mut semantics = UserTurnSemantics::new(self.objective_relation, self.feedback);
+        semantics.assessment = self.assessment;
+        semantics
+    }
+
     pub fn into_not_required(self) -> Result<WorkAdmissionDecision, TurnIntentJudgeError> {
         if self.work_lifecycle != WorkLifecycleIntent::NotRequired {
             return Err(malformed(
@@ -470,6 +639,7 @@ impl WorkAdmissionClassification {
         }
         Ok(WorkAdmissionDecision::NotRequired {
             domain: self.domain,
+            assessment: self.assessment,
             workspace_mutation: self.workspace_mutation,
             mutation_completion_scope: self.mutation_completion_scope,
             execution_topology: self.execution_topology,
@@ -505,7 +675,17 @@ pub fn work_admission_plan_messages(
     classification: &WorkAdmissionClassification,
 ) -> Vec<Value> {
     let mut messages = work_admission_judge_messages(ctx);
-    messages.push(json!({"role":"system", "content":format!("Generate the Required graph using the existing graph schema. The following classification is locked; preserve lifecycle, activation, domain, mutation, completion scope and capabilities exactly. Required topology remains runtime-owned and must be omitted from the graph response. Never downgrade to not_required. Locked classification: {}", serde_json::to_string(classification).expect("typed classification"))}));
+    let mut controls = serde_json::to_value(classification).expect("typed classification");
+    // User observations remain with the original classification owner. The
+    // graph planner only consumes the Work control contract and cannot judge
+    // or replace feedback on the same human input a second time.
+    for field in ["objective_relation", "feedback", "assessment"] {
+        controls
+            .as_object_mut()
+            .expect("classification object")
+            .remove(field);
+    }
+    messages.push(json!({"role":"system", "content":format!("Generate the Required graph using the existing graph schema. The following classification is locked; preserve lifecycle, activation, domain, mutation, completion scope and capabilities exactly. Required topology remains runtime-owned and must be omitted from the graph response. Never downgrade to not_required. Do not emit or reinterpret user observations. Locked classification: {controls}" )}));
     messages
 }
 
@@ -589,8 +769,11 @@ mod tests {
         }
         let answers = request
             .questions
-            .keys()
-            .map(|id| {
+            .iter()
+            .map(|(id, question)| {
+                if matches!(question, JudgmentQuestion::Choice { .. }) {
+                    return (id.clone(), json!({"type":"discrete_choice", "option":null}));
+                }
                 let decision = if yes.contains(&id.as_str()) {
                     "yes"
                 } else if uncertain.contains(&id.as_str()) {
@@ -613,14 +796,32 @@ mod tests {
             model: "offline".into(),
             answers: request
                 .questions
-                .keys()
-                .map(|id| {
-                    (
-                        id.clone(),
-                        JudgmentAnswer::Noul {
+                .iter()
+                .map(|(id, question)| {
+                    let answer = match question {
+                        JudgmentQuestion::Noul { .. } => JudgmentAnswer::Noul {
                             noul: if yes.contains(&id.as_str()) { 1.0 } else { 0.0 },
                         },
-                    )
+                        JudgmentQuestion::Choice { criteria, .. } => {
+                            let neutral = if criteria.contains_key("unknown") {
+                                "unknown"
+                            } else {
+                                "none"
+                            };
+                            JudgmentAnswer::Choice {
+                                choice: neutral.to_string(),
+                                probabilities: criteria
+                                    .keys()
+                                    .map(|option| {
+                                        (option.clone(), if option == neutral { 1.0 } else { 0.0 })
+                                    })
+                                    .collect(),
+                                confidence: 1.0,
+                            }
+                        }
+                        _ => unreachable!("Work fixture only uses Noul and Choice"),
+                    };
+                    (id.clone(), answer)
                 })
                 .collect(),
         }
@@ -637,6 +838,324 @@ mod tests {
         )
     }
 
+    fn observation_wire(
+        request: &JudgmentRequest,
+        provenance: JudgmentResponseProvenance,
+        choices: &[(&str, &str)],
+    ) -> Value {
+        let mut wire = match provenance {
+            JudgmentResponseProvenance::ProviderProbability => serde_json::to_value(response(request, &["mutation.read_only", "scope.unknown", "domain.none"])).unwrap(),
+            JudgmentResponseProvenance::DiscreteDecision => serde_json::from_str(&discrete_fixture(request, r#"{"true":["mutation.read_only","scope.unknown","domain.none"],"uncertain":[]}"#)).unwrap(),
+        };
+        for (id, option) in choices {
+            wire["answers"][*id] = match provenance {
+                JudgmentResponseProvenance::DiscreteDecision => {
+                    json!({"type":"discrete_choice","option":option})
+                }
+                JudgmentResponseProvenance::ProviderProbability => {
+                    let JudgmentQuestion::Choice { criteria, .. } = &request.questions[*id] else {
+                        unreachable!()
+                    };
+                    json!({"type":"choice", "choice":option, "confidence":1.0, "probabilities":criteria.keys().map(|key| (key.clone(), if key == option { 1.0 } else { 0.0 })).collect::<BTreeMap<_,_>>()})
+                }
+            };
+        }
+        wire
+    }
+
+    #[test]
+    fn user_observations_share_both_provider_boundaries_without_granting_admission() {
+        let request = work_admission_classification_request(&Default::default());
+        let observation_request = user_turn_observation_request(&Default::default());
+        assert_eq!(request.questions.len(), 23);
+        assert_eq!(observation_request.questions.len(), 3);
+        assert!(
+            request.output_token_budget() > {
+                let mut controls = request.clone();
+                controls
+                    .questions
+                    .retain(|id, _| !USER_OBSERVATION_IDS.contains(&id.as_str()));
+                controls.output_token_budget()
+            }
+        );
+        assert!(
+            !request.output_budget_fits_completion_cap(Some(
+                (request.output_token_budget() - 1) as u32
+            ))
+        );
+        assert!(
+            request.output_budget_fits_completion_cap(Some(request.output_token_budget() as u32))
+        );
+        for provenance in [
+            JudgmentResponseProvenance::ProviderProbability,
+            JudgmentResponseProvenance::DiscreteDecision,
+        ] {
+            let mut wire = observation_wire(
+                &request,
+                provenance,
+                &[
+                    (USER_RELATION_ID, "correct"),
+                    (USER_FEEDBACK_KIND_ID, "correction"),
+                    (USER_FEEDBACK_TARGET_ID, "approach"),
+                ],
+            );
+            let parsed = parse_work_admission_classification(
+                &request,
+                &wire.to_string(),
+                "actual-model",
+                Some(provenance),
+            )
+            .unwrap();
+            assert_eq!(parsed.objective_relation, ObjectiveRelation::Correct);
+            assert_eq!(
+                parsed.feedback,
+                Some(UserFeedback {
+                    kind: UserFeedbackKind::Correction,
+                    target: UserFeedbackTarget::Approach
+                })
+            );
+            let control = parsed.clone().into_not_required().unwrap();
+            // The observation-only consumer uses the same answers and execution
+            // provenance, without accepting or synthesizing any Work decision.
+            wire["answers"]
+                .as_object_mut()
+                .unwrap()
+                .retain(|id, _| USER_OBSERVATION_IDS.contains(&id.as_str()));
+            let semantics = parse_user_turn_observation(
+                &observation_request,
+                &wire.to_string(),
+                "actual-model",
+                Some(provenance),
+            )
+            .unwrap();
+            assert_eq!(semantics, parsed.user_turn_semantics());
+            let mut baseline = observation_wire(&request, provenance, &[]);
+            let baseline_control = parse_work_admission_classification(
+                &request,
+                &baseline.to_string(),
+                "actual-model",
+                Some(provenance),
+            )
+            .unwrap()
+            .into_not_required()
+            .unwrap();
+            assert_eq!(control, baseline_control);
+            // Known optional answers may be absent or malformed. None may be
+            // upgraded to a fabricated General feedback target.
+            for malformed in [
+                Value::Null,
+                json!({"type":"discrete_noul","decision":"yes"}),
+                json!({"type":"discrete_choice","option":"invented"}),
+                json!({"type":"choice","choice":"correct","probabilities":{},"confidence":1.0}),
+            ] {
+                for id in USER_OBSERVATION_IDS {
+                    baseline["answers"][id] = malformed.clone();
+                }
+                let abstained = parse_work_admission_classification(
+                    &request,
+                    &baseline.to_string(),
+                    "actual-model",
+                    Some(provenance),
+                )
+                .unwrap();
+                assert_eq!(abstained.objective_relation, ObjectiveRelation::Unknown);
+                assert_eq!(abstained.feedback, None);
+                assert_eq!(abstained.into_not_required().unwrap(), baseline_control);
+                let mut optional_only = baseline.clone();
+                optional_only["answers"]
+                    .as_object_mut()
+                    .unwrap()
+                    .retain(|id, _| USER_OBSERVATION_IDS.contains(&id.as_str()));
+                assert_eq!(
+                    parse_user_turn_observation(
+                        &observation_request,
+                        &optional_only.to_string(),
+                        "actual-model",
+                        Some(provenance)
+                    )
+                    .unwrap(),
+                    UserTurnSemantics::new(ObjectiveRelation::Unknown, None),
+                );
+            }
+            for id in USER_OBSERVATION_IDS {
+                baseline["answers"].as_object_mut().unwrap().remove(id);
+            }
+            let missing = parse_work_admission_classification(
+                &request,
+                &baseline.to_string(),
+                "actual-model",
+                Some(provenance),
+            )
+            .unwrap();
+            assert_eq!(missing.objective_relation, ObjectiveRelation::Unknown);
+            assert_eq!(missing.feedback, None);
+            let mut optional_only = baseline.clone();
+            optional_only["answers"] = json!({});
+            assert_eq!(
+                parse_user_turn_observation(
+                    &observation_request,
+                    &optional_only.to_string(),
+                    "actual-model",
+                    Some(provenance)
+                )
+                .unwrap(),
+                UserTurnSemantics::new(ObjectiveRelation::Unknown, None)
+            );
+            assert!(
+                parse_user_turn_observation(
+                    &observation_request,
+                    &optional_only.to_string(),
+                    "",
+                    Some(provenance)
+                )
+                .is_err()
+            );
+            assert!(
+                parse_user_turn_observation(
+                    &observation_request,
+                    &optional_only.to_string(),
+                    "actual-model",
+                    None
+                )
+                .is_err()
+            );
+            match provenance {
+                JudgmentResponseProvenance::ProviderProbability => {
+                    optional_only["schema_version"] = json!(999)
+                }
+                JudgmentResponseProvenance::DiscreteDecision => {
+                    optional_only["unexpected"] = json!(true)
+                }
+            }
+            assert!(
+                parse_user_turn_observation(
+                    &observation_request,
+                    &optional_only.to_string(),
+                    "actual-model",
+                    Some(provenance)
+                )
+                .is_err()
+            );
+            baseline["answers"]["unexpected"] = json!({"type":"discrete_choice","option":null});
+            assert!(
+                parse_work_admission_classification(
+                    &request,
+                    &baseline.to_string(),
+                    "actual-model",
+                    Some(provenance)
+                )
+                .is_err()
+            );
+            wire["answers"]["unexpected"] = json!({"type":"discrete_choice","option":null});
+            assert!(
+                parse_user_turn_observation(
+                    &observation_request,
+                    &wire.to_string(),
+                    "actual-model",
+                    Some(provenance)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn native_user_choice_requires_valid_confident_distribution_and_both_feedback_dimensions() {
+        let request = work_admission_classification_request(&Default::default());
+        let mut wire = observation_wire(
+            &request,
+            JudgmentResponseProvenance::ProviderProbability,
+            &[
+                (USER_RELATION_ID, "replace"),
+                (USER_FEEDBACK_KIND_ID, "preference"),
+                (USER_FEEDBACK_TARGET_ID, "output"),
+            ],
+        );
+        for (probability, confidence) in [(0.79, 1.0), (1.0, 0.79)] {
+            wire["answers"][USER_RELATION_ID]["probabilities"]["replace"] = json!(probability);
+            wire["answers"][USER_RELATION_ID]["probabilities"]["unknown"] =
+                json!(1.0 - probability);
+            wire["answers"][USER_RELATION_ID]["confidence"] = json!(confidence);
+            let parsed = parse_work_admission_classification(
+                &request,
+                &wire.to_string(),
+                "model",
+                Some(JudgmentResponseProvenance::ProviderProbability),
+            )
+            .unwrap();
+            assert_eq!(parsed.objective_relation, ObjectiveRelation::Unknown);
+            assert_eq!(parsed.feedback.unwrap().target, UserFeedbackTarget::Output);
+        }
+        wire["answers"][USER_FEEDBACK_TARGET_ID] =
+            json!({"type":"discrete_choice","option":"output"});
+        let parsed = parse_work_admission_classification(
+            &request,
+            &wire.to_string(),
+            "model",
+            Some(JudgmentResponseProvenance::ProviderProbability),
+        )
+        .unwrap();
+        assert_eq!(parsed.feedback, None, "wrong provenance is not a target");
+        let duplicates = r#"{"answers":{"user.objective_relation":{"type":"discrete_choice","option":"correct"},"user.objective_relation":{"type":"discrete_choice","option":"replace"}}}"#;
+        assert!(
+            parse_user_turn_observation(
+                &user_turn_observation_request(&Default::default()),
+                duplicates,
+                "model",
+                Some(JudgmentResponseProvenance::DiscreteDecision)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn classification_carries_optional_assessment_without_changing_admission() {
+        let request = work_admission_classification_request(&Default::default());
+        let mut wire = serde_json::to_value(response(
+            &request,
+            &["mutation.read_only", "scope.unknown", "domain.none"],
+        ))
+        .unwrap();
+        wire["assessment"] = json!({
+            "satisfaction": "dissatisfied",
+            "feedback_relation": "previous_response",
+            "difficulty": "easy",
+            "difficulty_confidence": "high"
+        });
+        let parsed = parse_work_admission_classification(
+            &request,
+            &wire.to_string(),
+            "native-fixture",
+            Some(JudgmentResponseProvenance::ProviderProbability),
+        )
+        .unwrap();
+        assert_eq!(parsed.work_lifecycle, WorkLifecycleIntent::NotRequired);
+        assert_eq!(
+            parsed.assessment.unwrap().difficulty,
+            astra_turn_types::TaskDifficulty::Easy
+        );
+        assert_eq!(
+            parsed
+                .into_not_required()
+                .unwrap()
+                .assessment()
+                .unwrap()
+                .feedback_relation,
+            astra_turn_types::FeedbackResponseRelation::PreviousResponse
+        );
+
+        wire["assessment"] = json!({"difficulty": "invented"});
+        let invalid = parse_work_admission_classification(
+            &request,
+            &wire.to_string(),
+            "native-fixture",
+            Some(JudgmentResponseProvenance::ProviderProbability),
+        )
+        .unwrap();
+        assert_eq!(invalid.work_lifecycle, WorkLifecycleIntent::NotRequired);
+        assert_eq!(invalid.assessment, None);
+    }
+
     #[test]
     fn mutation_target_fixed_prompt_budget_is_bounded() {
         let request = work_admission_classification_request(&Default::default());
@@ -647,10 +1166,10 @@ mod tests {
         // Reconstruct the pre-target-policy carrier to measure semantic overhead
         // independently of the unchanged context/schema and provider envelope.
         let mut baseline = request.clone();
-        baseline.state["policy"] = json!(RULES.replace(
+        baseline.state["policy"] = json!(format!("{} {USER_OBSERVATION_POLICY}", RULES.replace(
             "Domain=most specific",
             "Scope: workspace=bound project, external=outside it, mixed=both, unknown=unclear. Domain=most specific",
-        ));
+        )));
         for scope in SCOPES {
             let JudgmentQuestion::Noul {
                 instructions,
@@ -678,14 +1197,26 @@ mod tests {
         );
         // Fixed-policy/schema overhead only; dynamic user context is not
         // replaced by scenario examples or silently truncated to meet this cap.
-        // Reserve 1.25 KiB for the shared policy plus four expanded questions
+        // Reserve 2 KiB for the shared policy plus four expanded questions
         // (each appears in instructions and both criteria). This is a byte
         // budget, not a tokenizer-dependent claim about provider token usage.
-        assert!(request_bytes <= baseline_bytes + 1_280);
-        assert!(messages_bytes <= baseline_messages_bytes + 1_280);
+        assert!(request_bytes <= baseline_bytes + 2_048);
+        assert!(messages_bytes <= baseline_messages_bytes + 2_048);
+        let mut controls = request.clone();
+        controls
+            .questions
+            .retain(|id, _| !USER_OBSERVATION_IDS.contains(&id.as_str()));
+        let control_bytes = serde_json::to_vec(&controls).unwrap().len();
+        // Preserve the original 20-question control cap and separately bound
+        // the three new observation questions to 2 KiB of fixed schema.
         assert!(
-            request_bytes < 12_000,
-            "typed request: {request_bytes} bytes"
+            control_bytes < 13_000,
+            "Work control request: {control_bytes} bytes"
+        );
+        assert!(
+            request_bytes <= control_bytes + 2_048,
+            "optional questions: {} bytes",
+            request_bytes - control_bytes
         );
         assert!(
             messages_bytes < 16_000,
@@ -706,17 +1237,13 @@ mod tests {
                 .unwrap()
                 .contains(MUTATION_TARGET_SCOPE_POLICY)
         );
-        for messages in [
-            crate::turn_intent_judge::turn_intent_judge_messages(&ctx),
-            work_admission_judge_messages(&ctx),
-        ] {
-            assert!(
-                messages[0]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains(MUTATION_TARGET_SCOPE_POLICY)
-            );
-        }
+        let messages = work_admission_judge_messages(&ctx);
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains(MUTATION_TARGET_SCOPE_POLICY)
+        );
         for (scope, meaning) in [
             ("workspace", "Every required mutation target is inside"),
             ("external", "Every required mutation target is outside"),
@@ -1034,7 +1561,15 @@ mod tests {
             let TurnIntentJudgeError::Uncertain { ref diagnostics } = error else {
                 panic!("{error}")
             };
-            assert_eq!(diagnostics.evidence.len(), request.questions.len());
+            assert_eq!(
+                diagnostics.evidence.len(),
+                request.questions.len() - USER_OBSERVATION_IDS.len()
+            );
+            for id in USER_OBSERVATION_IDS {
+                assert!(!diagnostics.evidence.contains_key(id));
+                assert!(!diagnostics.locked_fields.contains_key(id));
+                assert!(!diagnostics.uncertain_fields.iter().any(|field| field == id));
+            }
             assert_eq!(
                 diagnostics.provenance,
                 JudgmentResponseProvenance::ProviderProbability
@@ -1091,13 +1626,19 @@ mod tests {
     #[test]
     fn clarification_preserves_canonical_protocol_and_locks_for_both_encodings() {
         let request = work_admission_classification_request(&Default::default());
-        assert!(request.questions.values().all(|q| matches!(
-            q,
-            JudgmentQuestion::Noul {
-                criteria: Some(_),
-                ..
+        for (id, question) in &request.questions {
+            if USER_OBSERVATION_IDS.contains(&id.as_str()) {
+                assert!(matches!(question, JudgmentQuestion::Choice { .. }));
+            } else {
+                assert!(matches!(
+                    question,
+                    JudgmentQuestion::Noul {
+                        criteria: Some(_),
+                        ..
+                    }
+                ));
             }
-        )));
+        }
         let error = parse_chat(
             &request,
             r#"{"true":["mutation.read_only","parallel_subruns"],"uncertain":["required"]}"#,

@@ -97,23 +97,3 @@ pub async fn sandbox_checkpoint_handler(
         .await?;
     Ok((StatusCode::CREATED, Json(checkpoint)))
 }
-
-pub async fn sandbox_restore_handler(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<SandboxCheckpointRequest>,
-) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let result = state
-        .data_versioning_service
-        .sandbox_restore(
-            user.user_id,
-            name,
-            SandboxCheckpointData {
-                checkpoint_name: request.checkpoint_name,
-            },
-        )
-        .await?;
-    Ok(Json(result))
-}

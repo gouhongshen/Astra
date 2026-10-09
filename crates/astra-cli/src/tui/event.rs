@@ -28,6 +28,11 @@ pub(crate) enum TuiEvent {
     /// into the composer would turn presentation bytes into a control
     /// protocol and could collide with real user input.
     RuntimeNotificationTurn,
+    /// Literal, owner-bound next-turn input; never a composer key event.
+    SessionContinuation {
+        target: crate::tui::event_loop::SessionContinuationTarget,
+        content: String,
+    },
 }
 
 pub(crate) struct TuiEventStream {
@@ -76,7 +81,11 @@ impl TuiEventStream {
                 }
             }
             let pending = self.resize_pending.load(Ordering::Acquire);
-            if pending || self.size_check.poll_tick(cx).is_ready() {
+            // A quarantined CPR can leave reconciliation pending. Retry on
+            // the existing watchdog tick, not before every keyboard poll.
+            // Poll through to Pending to register the next timer wake even
+            // when this tick finds no resize and terminal input stays idle.
+            while self.size_check.poll_tick(cx).is_ready() {
                 let size = crossterm::terminal::size().ok();
                 if let Some(size) = size
                     && (pending || self.observed_size != Some(size))

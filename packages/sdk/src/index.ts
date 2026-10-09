@@ -38,6 +38,7 @@ export type {
   ExplainAnalyzeAuxiliaryUsageV1,
   ExplainAnalyzeAuxiliaryCallV1,
   ExplainAnalyzeAuxiliaryDetailsV1,
+  ExplainAnalyzeDecisionDetailV1,
   ExplainAnalyzeAdmissionSettlementV1,
   ExplainAnalyzeRequestJudgmentFieldV1,
   ExplainAnalyzeRequestJudgmentResultV1,
@@ -100,6 +101,8 @@ export type {
   SSEClientOptions,
   // API types
   ChatRequest,
+  CompletionCheck,
+  CompletionCheckDeclarations,
   WorkBinding,
   RunInputRequestBody,
   RunInputResponse,
@@ -122,6 +125,7 @@ export type {
   RuntimeTranscriptParams,
   RuntimeModelAccessKind,
   RuntimeModelExecutionPlacement,
+  RuntimeModelCatalogPricing,
   RuntimeModelListItem,
   RuntimeModelCatalogCursor,
   RuntimeModelListPageResponse,
@@ -164,6 +168,7 @@ export type {
   SessionActivity,
   SessionActivityCursor,
   SessionAuditSummary,
+  ObservedTokenLane,
   SessionRequestUsageSummary,
   SessionCostSummary,
   SessionUpdateBody,
@@ -188,7 +193,6 @@ export type {
   ApprovalRespondRequestBody,
   EdgeRegisterRequestBody,
   EdgeHeartbeatRequestBody,
-  TaskLeaseMutationRequestBody,
   WorkApiErrorV1,
   WorkCreateCriterion,
   WorkCreateInput,
@@ -494,10 +498,6 @@ export {
   modelCheckPath,
   agentBindingPath,
   agentBindingDisablePath,
-  taskLeasePath,
-  taskLeaseClaimPath,
-  taskLeaseReleasePath,
-  taskLeaseRenewPath,
   workPath,
   workBranchesPath,
   workBranchComparisonsPath,
@@ -544,7 +544,7 @@ export {
   readAstraErrorDetail,
 } from "./http";
 export { AstraWebSocket } from "./websocket";
-export type { AstraWebSocketOptions, ToolApproval } from "./websocket";
+export type { AstraWebSocketOptions, ToolApproval, UserPromptAnswer } from "./websocket";
 
 export { layoutExplainAnalyzeGraph } from "./explain-analyze-layout";
 export type { ExplainAnalyzeLayoutNodeV1, ExplainAnalyzeLayoutEdgeKindV1, ExplainAnalyzeLayoutEdgeV1, ExplainAnalyzeLayoutDomainV1, ExplainAnalyzeLayoutV1, ExplainAnalyzeLayoutOptionsV1 } from "./explain-analyze-layout";

@@ -16,6 +16,7 @@
 //!
 //! These tests verify that infrastructure.
 
+use super::harness::{ProviderResponse, ProviderScript};
 use axum::http::StatusCode;
 use axum::{body::Body, http::Request};
 use futures_util::StreamExt;
@@ -32,7 +33,7 @@ use super::harness::{
 
 /// Collect the FULL SSE stream body (up to deadline), not just until session_info.
 /// Returns (status, body_text).
-async fn collect_full_sse_stream(
+pub(super) async fn collect_full_sse_stream(
     app: &axum::Router,
     req: Request<Body>,
     timeout_secs: u64,
@@ -125,7 +126,183 @@ async fn sse_deadline_accepts_a_complete_stream() {
     assert_eq!(body, expected);
 }
 
-fn mock_tool_call(id: &str, name: &str, args: Value) -> Value {
+fn delegation_assessment(body: &Value) -> Option<Value> {
+    body["messages"].as_array()?.iter().find_map(|message| {
+        let input: Value = serde_json::from_str(message["content"].as_str()?).ok()?;
+        (input["user_text"].is_string()
+            && input["candidates"].is_array()
+            && input["slots"].is_array())
+        .then_some(input)
+    })
+}
+
+// A dropped observer must never strand a gated provider fixture.
+struct ReleaseProviderGatesOnDrop(Vec<std::sync::Arc<tokio::sync::Notify>>);
+impl Drop for ReleaseProviderGatesOnDrop {
+    fn drop(&mut self) {
+        for gate in &self.0 {
+            gate.notify_one();
+        }
+    }
+}
+
+fn gated_native_delta(
+    delta: Value,
+    finish: &str,
+    gate: std::sync::Arc<tokio::sync::Notify>,
+) -> ProviderResponse {
+    ProviderResponse::Stream {
+        content_type: "text/event-stream",
+        chunks: vec![
+            format!(
+                "data: {}\n\n",
+                json!({"choices":[{"index":0,"delta":delta}]})
+            )
+            .into_bytes(),
+            format!(
+                "data: {}\n\n",
+                json!({"choices":[{"index":0,"delta":{},"finish_reason":finish}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})
+            )
+            .into_bytes(),
+            b"data: [DONE]\n\n".to_vec(),
+        ],
+        release_before_chunk: Some((0, gate)),
+    }
+}
+
+fn native_text_response(text: &str) -> ProviderResponse {
+    ProviderResponse::OpenAi(
+        json!({"choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}),
+    )
+}
+
+fn native_tool_response(call: Value) -> ProviderResponse {
+    ProviderResponse::OpenAi(
+        json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[call]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}),
+    )
+}
+
+fn native_search_response(id: &str, tool: &str) -> ProviderResponse {
+    native_tool_response(provider_tool_call(
+        id,
+        "tool_search",
+        json!({"query":format!("select:{tool}")}),
+    ))
+}
+
+fn native_invoke_response(id: &str, tool: &str, arguments: Value) -> ProviderResponse {
+    native_tool_response(provider_tool_call(
+        id,
+        "invoke_tool",
+        json!({"name":tool,"arguments":arguments}),
+    ))
+}
+
+fn native_child_script(
+    model: String,
+    root_message: &'static str,
+    task: &'static str,
+    response: ProviderResponse,
+) -> ProviderScript {
+    ProviderScript::new(
+        format!("exact delegated task: {task}"),
+        move |request| {
+            request.path == "/v1/chat/completions"
+                && request.body["model"] == model
+                && request.body["stream"] == true
+                && delegation_assessment(&request.body).is_none()
+                && request.body["messages"].as_array().is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message["role"] == "user" && message["content"] == task)
+                })
+                && !request.body["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["role"] == "user" && message["content"] == root_message
+                    })
+                })
+        },
+        vec![response],
+    )
+}
+
+async fn assert_native_delegation_without_auxiliary_selector(
+    ctx: &super::harness::MatrixE2eCtx,
+    user_text: &str,
+    slots: &[(&str, &str)],
+) {
+    let requests = ctx.native_provider_requests().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| delegation_assessment(&request.body).is_some())
+            .count(),
+        0,
+        "ordinary delegation must not make an auxiliary selector request"
+    );
+    let request = requests
+        .iter()
+        .rfind(|request| {
+            request.body["messages"].as_array().is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message["role"] == "user" && message["content"] == user_text)
+            })
+        })
+        .expect("parent must reach the provider");
+    assert_eq!(request.body["model"], format!("mock-{}", ctx.suffix));
+    assert_eq!(request.body["stream"], true);
+    let mut actual = Vec::new();
+    for call in request.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .filter_map(|message| message["tool_calls"].as_array())
+        .flatten()
+    {
+        let name = call["function"]["name"].as_str().unwrap();
+        let args: Value =
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        let (name, args) = if name == "invoke_tool" {
+            (args["name"].as_str().unwrap(), &args["arguments"])
+        } else {
+            (name, &args)
+        };
+        match (name, args["action"].as_str()) {
+            ("agent", Some("spawn")) => actual.push(args.clone()),
+            ("agent_fanout", Some("start")) => {
+                actual.extend(args["slots"].as_array().unwrap().iter().cloned())
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(actual.len(), slots.len());
+    for (index, (description, prompt)) in slots.iter().enumerate() {
+        assert_eq!(actual[index]["description"], *description);
+        assert_eq!(actual[index]["prompt"], *prompt);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(
+                    |request| request.body["model"] == format!("mock-{}", ctx.suffix)
+                        && request.body["stream"] == true
+                        && delegation_assessment(&request.body).is_none()
+                        && request.body["messages"]
+                            .as_array()
+                            .is_some_and(|messages| messages
+                                .iter()
+                                .any(|message| message["role"] == "user"
+                                    && message["content"] == *prompt))
+                )
+                .count(),
+            1,
+            "each declared slot must issue exactly one actual child request with its complete task"
+        );
+    }
+}
+
+fn provider_tool_call(id: &str, name: &str, args: Value) -> Value {
     json!({
         "id": id,
         "type": "function",
@@ -133,26 +310,6 @@ fn mock_tool_call(id: &str, name: &str, args: Value) -> Value {
             "name": name,
             "arguments": args.to_string()
         }
-    })
-}
-
-fn deferred_tool_search_round(call_id: &str, tool_name: &str) -> Value {
-    json!({
-        "tool_calls": [mock_tool_call(
-            call_id,
-            "tool_search",
-            json!({"query": format!("select:{tool_name}")}),
-        )]
-    })
-}
-
-fn deferred_tool_invoke_round(call_id: &str, tool_name: &str, arguments: Value) -> Value {
-    json!({
-        "tool_calls": [mock_tool_call(
-            call_id,
-            "invoke_tool",
-            json!({"name": tool_name, "arguments": arguments}),
-        )]
     })
 }
 
@@ -195,72 +352,179 @@ struct FanoutStreamEvidence {
     child_run_ids: Vec<String>,
 }
 
-fn concurrent_fanout_payload(
+fn concurrent_fanout_scripts(
     ctx: &super::harness::MatrixE2eCtx,
     case: &ConcurrentFanoutCase,
     shared_group_id: &str,
-) -> Value {
-    let child_round = match case.terminal {
-        OnlineFanoutTerminal::Completed => json!({
-            "full_text": case.child_provenance,
-            // Keep successful groups live long enough to overlap the other
-            // user/session requests without relying on scheduler timing.
-            "delay_ms": 250
-        }),
-        OnlineFanoutTerminal::Failed => json!({
-            "error": {
-                "message": case.child_provenance,
-                "kind": "provider_deadline"
-            }
-        }),
-    };
+) -> Vec<ProviderScript> {
+    let message = format!("Run the isolated fanout scenario {}.", case.name);
+    let root_message = message.clone();
+    let root_model = format!("mock-{}", ctx.suffix);
+    let child_model = root_model.clone();
+    let child_anchor = format!("{}: Return the", case.name);
     let call_id = format!("{}-fanout-start", case.name);
-    json!({
-        "message": format!("Run the isolated fanout scenario {}.", case.name),
-        "session_id": case.session_id,
-        "model_selection": seeded_model_selection(ctx),
-        "context": {
-            "test_work_admission": {
-                "work_lifecycle": "not_required",
-                "workspace_mutation": "read_only",
-                "execution_topology": "parallel_subruns",
-                "required_capabilities": ["agent_spawner"],
+    let responses = vec![
+        native_search_response(&format!("{}-tool-search", case.name), "agent_fanout"),
+        native_invoke_response(
+            &call_id,
+            "agent_fanout",
+            json!({
+                "action": "start",
+                // Intentional collision: a fanout group is scoped
+                // by owner + session + parent, never by this label.
+                "group_id": shared_group_id,
+                "title": "Concurrent isolation gate",
+                "target_count": 2,
+                "slots": [
+                    {
+                        "id": "first",
+                        "description": "First isolated child",
+                        "prompt": format!("{}: Return the first independent finding.",case.name)
+                    },
+                    {
+                        "id": "second",
+                        "description": "Second isolated child",
+                        "prompt": format!("{}: Return the second independent finding.",case.name)
+                    }
+                ],
+                "defaults": {"agent_type": "general-purpose"}
+            }),
+        ),
+        native_invoke_response(
+            "isolated-fanout-wait",
+            "agent",
+            json!({"action": "wait", "timeout_ms": 10000}),
+        ),
+        native_invoke_response(
+            &format!("{}-fanout-results", case.name),
+            "agent_fanout",
+            json!({"action": "get_results", "group_id": shared_group_id}),
+        ),
+        native_text_response(&case.final_reply),
+    ];
+    let child_response = || match case.terminal {
+        OnlineFanoutTerminal::Completed => native_text_response(&case.child_provenance),
+        OnlineFanoutTerminal::Failed => ProviderResponse::Json {
+            status: StatusCode::BAD_REQUEST,
+            body: json!({"error":{"message":case.child_provenance}}),
+        },
+    };
+    vec![
+        ProviderScript::new(
+            format!("{} exact root", case.name),
+            move |request| {
+                request.path == "/v1/chat/completions"
+                    && request.body["model"] == root_model
+                    && request.body["stream"] == true
+                    && delegation_assessment(&request.body).is_none()
+                    && request.body["messages"].as_array().is_some_and(|messages| {
+                        messages
+                            .iter()
+                            .any(|m| m["role"] == "user" && m["content"] == root_message)
+                    })
             },
-            "test_llm_rounds": [
-                deferred_tool_search_round(&format!("{}-tool-search", case.name), "agent_fanout"),
-                deferred_tool_invoke_round(
-                    &call_id,
-                    "agent_fanout",
-                    json!({
-                        "action": "start",
-                        // Intentional collision: a fanout group is scoped
-                        // by owner + session + parent, never by this label.
-                        "group_id": shared_group_id,
-                        "title": "Concurrent isolation gate",
-                        "target_count": 2,
-                        "slots": [
-                            {
-                                "id": "first",
-                                "description": "First isolated child",
-                                "prompt": "Return the first independent finding."
-                            },
-                            {
-                                "id": "second",
-                                "description": "Second isolated child",
-                                "prompt": "Return the second independent finding."
-                            }
-                        ],
-                        "defaults": {"agent_type": "general-purpose"}
-                    }),
-                ),
-                {"full_text": case.final_reply}
-            ],
-            "test_spawn_child_llm_rounds": [child_round]
-        }
-    })
+            responses,
+        ),
+        ProviderScript::new(
+            format!("{} exact children", case.name),
+            move |request| {
+                request.path == "/v1/chat/completions"
+                    && request.body["model"] == child_model
+                    && request.body["stream"] == true
+                    && delegation_assessment(&request.body).is_none()
+                    && request.body["messages"].as_array().is_some_and(|messages| {
+                        messages.iter().any(|m| {
+                            m["content"]
+                                .as_str()
+                                .is_some_and(|text| text.contains(&child_anchor))
+                        })
+                    })
+                    && !request.body["messages"].as_array().is_some_and(|messages| {
+                        messages
+                            .iter()
+                            .any(|m| m["role"] == "user" && m["content"] == message)
+                    })
+            },
+            vec![child_response(), child_response()],
+        ),
+    ]
 }
 
-fn assert_concurrent_fanout_stream(
+fn concurrent_fanout_payload(
+    ctx: &super::harness::MatrixE2eCtx,
+    case: &ConcurrentFanoutCase,
+) -> Value {
+    json!({"message":format!("Run the isolated fanout scenario {}.",case.name),"session_id":case.session_id,"model_selection":seeded_model_selection(ctx),"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}})
+}
+
+async fn captured_synthesis_children(
+    pool: &sqlx::MySqlPool,
+    user_id: &str,
+    session_id: &str,
+    root_run_id: &str,
+    final_reply: &str,
+    events: &[Value],
+) -> Vec<Value> {
+    let completed_rounds = events
+        .iter()
+        .find(|event| event["type"] == "turn_complete")
+        .and_then(|event| event["llm_rounds"].as_u64())
+        .and_then(|rounds| rounds.checked_sub(1))
+        .expect("accepted final provider round");
+    let captures = sqlx::query_scalar::<_, String>(
+        "SELECT content_json FROM session_artifacts \
+         WHERE user_id = ? AND session_id = ? AND turn = 1 \
+           AND artifact_kind = 'llm_capture' AND source = 'server_loop_host' \
+           AND round = ? LIMIT 2",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(completed_rounds)
+    .fetch_all(pool)
+    .await
+    .expect("actual provider exchanges");
+    assert_eq!(
+        captures.len(),
+        1,
+        "one capture for the accepted final round"
+    );
+    let exchange: Value = serde_json::from_str(&captures[0]).unwrap();
+    assert_eq!(exchange["response"]["full_text"], final_reply);
+    assert!(
+        exchange["response"]["tool_calls"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
+    let mut children = Vec::new();
+    for message in exchange["request"]["messages"].as_array().unwrap() {
+        let Some(payload) = message["content"]
+            .as_str()
+            .and_then(|content| content.strip_prefix("<runtime-required-context>\n"))
+            .and_then(|content| content.strip_suffix("\n</runtime-required-context>"))
+            .and_then(|content| serde_json::from_str::<Value>(content).ok())
+        else {
+            continue;
+        };
+        if payload["context"]["schema"] != "direct_child_completion.v1" {
+            continue;
+        }
+        assert_eq!(payload["kind"], "background_task_notification");
+        let payload = &payload["context"];
+        assert_eq!(payload["parent_run_id"], root_run_id);
+        children.extend(payload["children"].as_array().unwrap().iter().cloned());
+    }
+    for child in &children {
+        let result = child["result"]
+            .as_str()
+            .expect("authoritative child payload");
+        assert_eq!(child["result_truncated"], false);
+        assert_eq!(child["result_bytes"], result.len());
+    }
+    children
+}
+
+async fn assert_concurrent_fanout_stream(
+    pool: &sqlx::MySqlPool,
     case: &ConcurrentFanoutCase,
     shared_group_id: &str,
     all_child_provenances: &[String],
@@ -310,14 +574,24 @@ fn assert_concurrent_fanout_stream(
         "{}: parent synthesis preceded a child terminal: {raw_sse}",
         case.name
     );
+    let terminal_events = events
+        .iter()
+        .filter(|event| event["type"].as_str() == Some("turn_complete"))
+        .collect::<Vec<_>>();
     assert_eq!(
-        events
-            .iter()
-            .filter(|event| event["type"].as_str() == Some("turn_complete"))
-            .count(),
+        terminal_events.len(),
         1,
         "{}: one user turn must expose one terminal boundary",
         case.name
+    );
+    let root_terminal = events.iter().find(|event| {
+        event["type"] == "run_finished" && event["run_id"].as_str() == Some(root_run_id.as_str())
+    });
+    assert_eq!(
+        root_terminal.and_then(|event| event["status"].as_str()),
+        Some("completed"),
+        "{}: parent synthesis must finish successfully, including when children fail: {root_terminal:?}",
+        case.name,
     );
 
     let call_id = format!("{}-fanout-start", case.name);
@@ -332,40 +606,66 @@ fn assert_concurrent_fanout_stream(
         .unwrap_or_else(|| panic!("{}: missing canonical fanout result: {raw_sse}", case.name));
     assert_eq!(aggregate["group_id"].as_str(), Some(shared_group_id));
     assert_eq!(aggregate["target_count"].as_u64(), Some(2));
-    assert_eq!(aggregate["terminal"].as_u64(), Some(2));
-    assert_eq!(aggregate["active"].as_u64(), Some(0));
-    assert_eq!(
-        aggregate["completed"].as_u64(),
-        Some(if case.terminal == OnlineFanoutTerminal::Completed {
-            2
-        } else {
-            0
-        }),
-        "{}: {aggregate}",
-        case.name
-    );
-    assert_eq!(
-        aggregate["failed"].as_u64(),
-        Some(if case.terminal == OnlineFanoutTerminal::Failed {
-            2
-        } else {
-            0
-        }),
-        "{}: {aggregate}",
-        case.name
-    );
-    let results = aggregate["results"]
+    assert_eq!(aggregate["status"], "started");
+    let launched = aggregate["agents"]
         .as_array()
-        .unwrap_or_else(|| panic!("{}: canonical results missing: {aggregate}", case.name));
-    assert_eq!(results.len(), 2, "{}: {aggregate}", case.name);
+        .expect("accepted launch identities");
+    assert_eq!(launched.len(), 2);
+    assert_eq!(
+        launched
+            .iter()
+            .map(|child| child["slot_index"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    let results = captured_synthesis_children(
+        pool,
+        &case.user_id,
+        &case.session_id,
+        &root_run_id,
+        &case.final_reply,
+        &events,
+    )
+    .await;
+    assert_eq!(results.len(), 2, "{}: {results:?}", case.name);
     assert!(
         results
             .iter()
-            .all(|result| result.to_string().contains(&case.child_provenance)),
+            .all(|result| result["status"] == case.terminal.child_run_status())
+    );
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| (
+                result["agent_id"].as_str().unwrap(),
+                result["run_id"].as_str().unwrap()
+            ))
+            .collect::<std::collections::HashSet<_>>(),
+        launched
+            .iter()
+            .map(|child| (
+                child["agent_id"].as_str().unwrap(),
+                child["run_id"].as_str().unwrap()
+            ))
+            .collect::<std::collections::HashSet<_>>()
+    );
+    assert!(
+        results.iter().all(|result| {
+            let payload = result["result"].as_str().unwrap();
+            if case.terminal == OnlineFanoutTerminal::Completed {
+                payload == case.child_provenance
+            } else {
+                payload.contains("[invalid_request] LLM request rejected: 400")
+            }
+        }),
         "{}: every fixed slot must retain its own payload provenance: {aggregate}",
         case.name
     );
-    let aggregate_text = aggregate.to_string();
+    if case.terminal == OnlineFanoutTerminal::Failed {
+        assert!(!raw_sse.contains(&case.child_provenance));
+        assert!(!json!(results).to_string().contains(&case.child_provenance));
+    }
+    let aggregate_text = json!(results).to_string();
     assert!(
         all_child_provenances
             .iter()
@@ -374,16 +674,7 @@ fn assert_concurrent_fanout_stream(
         "{}: foreign user/session payload leaked into its fanout aggregate: {aggregate}",
         case.name
     );
-    assert_eq!(
-        results
-            .iter()
-            .filter_map(|result| result["slot_index"].as_u64())
-            .collect::<Vec<_>>(),
-        vec![0, 1],
-        "{}: slots must remain exact and ordered: {aggregate}",
-        case.name
-    );
-    let child_run_ids = results
+    let child_run_ids = launched
         .iter()
         .map(|result| {
             result["run_id"]
@@ -626,6 +917,13 @@ pub async fn run_stream_bootstrap_cleanup_preserves_live_fixture() {
     );
 
     let final_reply = "The first live fixture remains executable after a second bootstrap.";
+    let fixture_model = format!("mock-{}", first.ctx.suffix);
+    first.ctx.install_native_provider(&first.auth_header, vec![ProviderScript::new(
+        "live fixture still owns its admitted Offering",
+        move |request| request.path == "/v1/chat/completions" && request.body["model"] == fixture_model
+            && request.body["stream"] == true,
+        vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":final_reply},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))],
+    )]).await;
     let (status, raw_sse) = stream_chat_full(
         &first.ctx.app,
         &first.auth_header,
@@ -633,9 +931,7 @@ pub async fn run_stream_bootstrap_cleanup_preserves_live_fixture() {
             "message": "prove the first fixture still owns its session and model",
             "session_id": &first_session_id,
             "model_selection": seeded_model_selection(&first.ctx),
-            "context": {
-                "test_llm_rounds": [{"full_text": final_reply}]
-            }
+            "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}
         }),
     )
     .await;
@@ -651,6 +947,254 @@ pub async fn run_stream_bootstrap_cleanup_preserves_live_fixture() {
     second.ctx.close().await;
     stale.ctx.close().await;
     first.ctx.close().await;
+}
+
+pub async fn run_stream_corrects_invalid_model_policy_before_child_execution(explain: bool) {
+    let b = bootstrap().await;
+    let ctx = &b.ctx;
+    let user_text =
+        "Use the specified model for a child to calculate a value and report its result.";
+    let child_task = "Calculate 13 times 17 and return only the integer.";
+    let releases =
+        ReleaseProviderGatesOnDrop(vec![std::sync::Arc::new(tokio::sync::Notify::new())]);
+    let model = format!("mock-{}", ctx.suffix);
+    let policy = json!({"mode":"fixed","selector":{"kind":"configured_name","model_name":model}});
+    let corrected = json!({"action":"spawn","description":"Calculate a value","prompt":child_task,"requested_model_policy":policy});
+    let mut invalid = corrected.clone();
+    invalid["requested_model_policy"] = json!(policy.to_string());
+    ctx.install_native_provider(
+        &b.auth_header,
+        vec![
+            ProviderScript::new(
+                "parent argument correction",
+                move |request| {
+                    request.path == "/v1/chat/completions"
+                        && request.body["stream"] == true
+                        && request.body["messages"].as_array().is_some_and(|messages| {
+                            messages
+                                .iter()
+                                .any(|m| m["role"] == "user" && m["content"] == user_text)
+                        })
+                },
+                vec![
+                    native_tool_response(provider_tool_call("invalid-policy", "agent", invalid)),
+                    native_tool_response(provider_tool_call(
+                        "corrected-policy",
+                        "agent",
+                        corrected,
+                    )),
+                    native_tool_response(provider_tool_call(
+                        "wait-for-result",
+                        "agent",
+                        json!({"action":"wait","timeout_ms":10000}),
+                    )),
+                    native_text_response("The observed child result is 221."),
+                ],
+            ),
+            native_child_script(
+                model.clone(),
+                user_text,
+                child_task,
+                gated_native_delta(json!({"content":"221"}), "stop", releases.0[0].clone()),
+            ),
+        ],
+    )
+    .await;
+    let payload = json!({
+        "message":user_text,
+        "explain":explain,
+        "model_selection":seeded_model_selection(ctx),
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let response = tokio::time::timeout_at(
+        deadline,
+        ctx.app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/chat/stream")
+                .header("authorization", &b.auth_header)
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("bounded stream admission")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    let mut wait_observed = false;
+    // This scenario requires an admitted wait. Hold the child response
+    // until that receipt is published; a child arriving during inference
+    // correctly supersedes the stale response at the Action fence.
+    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .expect("bounded correction/wait/final sequence")
+    {
+        bytes.extend_from_slice(&chunk.unwrap());
+        if !wait_observed
+            && parse_sse_events(&String::from_utf8_lossy(&bytes))
+                .iter()
+                .any(|event| {
+                    event["type"] == "tool_call_end"
+                        && event["call_id"] == "wait-for-result"
+                        && event["success"] == true
+                })
+        {
+            wait_observed = true;
+            releases.0[0].notify_one();
+        }
+    }
+    assert!(
+        wait_observed,
+        "the wait must be admitted before releasing the child"
+    );
+    let raw = String::from_utf8(bytes).unwrap();
+    let events = parse_sse_events(&raw);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "agent_spawned")
+            .count(),
+        1,
+        "{raw}"
+    );
+    let requests = ctx.native_provider_requests().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.body["messages"].as_array().is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|m| m["role"] == "user" && m["content"] == user_text)
+                })
+            })
+            .count(),
+        4,
+        "Explain capture must not change the correction/spawn/wait/final execution sequence"
+    );
+    let children: Vec<_> = requests
+        .iter()
+        .filter(|r| {
+            r.body["messages"].as_array().is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|m| m["role"] == "user" && m["content"] == child_task)
+            })
+        })
+        .collect();
+    assert_eq!(
+        children.len(),
+        1,
+        "only the corrected call may start a child"
+    );
+    assert_eq!(children[0].body["model"], model);
+    let final_request = requests
+            .iter()
+            .find(|request| {
+                request.body["messages"].as_array().is_some_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message["tool_call_id"] == "wait-for-result")
+                })
+            })
+            .unwrap_or_else(|| {
+                let message_shapes: Vec<_> = requests
+                    .iter()
+                    .map(|request| {
+                        request.body["messages"].as_array().map(|messages| {
+                            messages
+                                .iter()
+                                .map(|message| {
+                                    serde_json::json!({
+                                        "role": message["role"],
+                                        "tool_call_id": message["tool_call_id"],
+                                        "tool_calls": message["tool_calls"],
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                panic!(
+                    "wait receipt must reach the final provider request; explain={explain}; messages={message_shapes:?}; events={raw}"
+                );
+            });
+    let final_messages = final_request.body["messages"].as_array().unwrap();
+    let wait: Value = final_messages
+        .iter()
+        .find(|message| message["tool_call_id"] == "wait-for-result")
+        .and_then(|message| message["content"].as_str())
+        .and_then(|content| serde_json::from_str(content).ok())
+        .expect("typed wait receipt");
+    assert_eq!(wait["success"], true);
+    assert!(
+        final_messages
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .flat_map(str::lines)
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(
+                |payload| payload["context"]["schema"] == "direct_child_completion.v1"
+                    && payload["context"]["children"]
+                        .as_array()
+                        .is_some_and(|children| {
+                            children.iter().any(|child| {
+                                child["status"] == "completed" && child["result"] == "221"
+                            })
+                        })
+            ),
+        "the final provider request must observe the actual completed child result"
+    );
+    let repair_request = requests
+        .iter()
+        .find(|r| {
+            r.body["messages"].as_array().is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|m| m["tool_call_id"] == "invalid-policy")
+            })
+        })
+        .expect("rejection must reach the next actual provider request");
+    let receipt: Value = repair_request.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["tool_call_id"] == "invalid-policy")
+        .and_then(|m| m["content"].as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .expect("typed model-facing rejection");
+    assert_eq!(receipt["executed"], false);
+    assert_eq!(receipt["retryable"], false);
+    assert_eq!(receipt["error_kind"], "tool_invalid_args");
+    assert_eq!(
+        receipt["recovery_evidence"]["recovery_actions"],
+        json!(["correct_arguments"])
+    );
+    let agent_schema = repair_request.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["function"]["name"] == "agent")
+        .expect("actual provider schema");
+    assert_eq!(
+        agent_schema["function"]["parameters"]["properties"]["requested_model_policy"]["type"],
+        "object"
+    );
+    assert!(
+        events.iter().any(|e| e["type"] == "text_delta"
+            && e["content"].as_str().is_some_and(|s| s.contains("221"))),
+        "{raw}"
+    );
+    let session_id = sse_first_data_json_with_type(&raw, "session_info").unwrap()["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
+    ctx.close().await;
 }
 
 /// B1: Session row persists, chat/stream completes, run status is queryable.
@@ -689,14 +1233,16 @@ pub async fn run_stream_session_and_run_status() {
         "session user_id should match"
     );
 
-    // ── Chat/stream with text-only mock LLM response ──
-    // test_llm_rounds in context takes the stream_chat() server-loop path.
+    // Complete a real provider-backed Server turn before checking its durable state.
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth,vec![ProviderScript::new("run_stream_session_and_run_status",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="phase-b persistence probe")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Persistence verified.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let payload = json!({
         "message": "phase-b persistence probe",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "session_id": &session_id,
         "model_selection": seeded_model_selection(ctx),
         "context": {
-            "test_llm_rounds": [{ "full_text": "Persistence verified." }]
+
         }
     });
     let (status, body) = stream_chat_full(app, auth, payload).await;
@@ -805,29 +1351,193 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
             }
         ]
     });
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    let root_model = fixture_model.clone();
+    let child_model = fixture_model.clone();
+    let releases = ReleaseProviderGatesOnDrop(
+        (0..4)
+            .map(|_| std::sync::Arc::new(tokio::sync::Notify::new()))
+            .collect(),
+    );
+    let child_markers = [
+        "durable storage finding",
+        "durable runtime finding",
+        "durable journey finding",
+    ];
+    ctx.install_native_provider(
+        auth,
+        vec![
+            ProviderScript::new(
+                "actual parent fanout execution",
+                move |request| {
+                    request.path == "/v1/chat/completions"
+                        && request.body["model"] == root_model
+                        && request.body["stream"] == true
+                        && delegation_assessment(&request.body).is_none()
+                        && request.body["messages"].as_array().is_some_and(|messages| {
+                            messages.iter().any(|message| {
+                                message["role"] == "user"
+                                    && message["content"]
+                                        == "Run three reviews as one structured work group."
+                            })
+                        })
+                },
+                vec![
+                    native_search_response("online-fanout-search", "agent_fanout"),
+                    native_invoke_response("online-fanout-start", "agent_fanout", fanout_args),
+                    gated_native_delta(json!({"tool_calls":[{"index":0,"id":"online-fanout-wait","type":"function","function":{"name":"invoke_tool","arguments":json!({"name":"agent","arguments":{"action":"wait","timeout_ms":10000}}).to_string()}}]}), "tool_calls", releases.0[3].clone()),
+                    native_text_response(final_reply),
+                ],
+            ),
+            native_child_script(
+                child_model.clone(),
+                "Run three reviews as one structured work group.",
+                "Inspect storage behavior and return one finding.",
+                gated_native_delta(json!({"content":child_markers[0]}), "stop", releases.0[0].clone()),
+            ),
+            native_child_script(
+                child_model.clone(),
+                "Run three reviews as one structured work group.",
+                "Inspect runtime behavior and return one finding.",
+                gated_native_delta(json!({"content":child_markers[1]}), "stop", releases.0[1].clone()),
+            ),
+            native_child_script(
+                child_model.clone(),
+                "Run three reviews as one structured work group.",
+                "Inspect the user journey and return one finding.",
+                gated_native_delta(json!({"content":child_markers[2]}), "stop", releases.0[2].clone()),
+            ),
+        ],
+    )
+    .await;
     let payload = json!({
         "message": "Run three reviews as one structured work group.",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "session_id": &session_id,
         "model_selection": seeded_model_selection(ctx),
         "context": {
-            "test_work_admission": {
-                "work_lifecycle": "not_required",
-                "workspace_mutation": "read_only",
-                "execution_topology": "parallel_subruns",
-                "required_capabilities": ["agent_spawner"],
-            },
-            "test_llm_rounds": [
-                deferred_tool_search_round("online-fanout-search", "agent_fanout"),
-                deferred_tool_invoke_round("online-fanout-start", "agent_fanout", fanout_args),
-                {"full_text": final_reply}
-            ],
-            "test_spawn_child_llm_rounds": [
-                {"full_text": "durable child review result"}
-            ]
+
         }
     });
-    let (status, raw_sse) = stream_chat_full(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/stream: {raw_sse}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let response = tokio::time::timeout_at(
+        deadline,
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/chat/stream")
+                .header("authorization", auth.as_str())
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("bounded stream admission")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    // The third root response stays in flight until every real child result
+    // arrives. This exercises exactly one Action-fence supersession, rather
+    // than depending on how a scheduler interleaves three independent inputs.
+    loop {
+        let requests = ctx.native_provider_requests().await;
+        let entered = requests
+            .iter()
+            .filter(|request| {
+                request.body["stream"] == true && delegation_assessment(&request.body).is_none()
+            })
+            .count();
+        if entered == 6 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "all real provider requests must enter"
+        );
+        tokio::select! {
+            chunk = stream.next() => {
+                bytes.extend_from_slice(&chunk.expect("stream before provider entry").unwrap());
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+    }
+    for gate in &releases.0[..3] {
+        gate.notify_one();
+    }
+    loop {
+        let chunk = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .unwrap()
+            .expect("live stream before child terminals")
+            .unwrap();
+        bytes.extend_from_slice(&chunk);
+        let events = parse_sse_events(&String::from_utf8_lossy(&bytes));
+        if events
+            .iter()
+            .filter(|event| {
+                event["type"] == "agent_completed" || event["event_type"] == "agent_completed"
+            })
+            .count()
+            == 3
+        {
+            break;
+        }
+    }
+    releases.0[3].notify_one();
+    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .unwrap()
+    {
+        bytes.extend_from_slice(&chunk.unwrap());
+    }
+    let raw_sse = String::from_utf8(bytes).unwrap();
+    let requests = ctx.native_provider_requests().await;
+    let root: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.body["stream"] == true
+                && delegation_assessment(&request.body).is_none()
+                && request.body["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|m| {
+                        m["role"] == "user"
+                            && m["content"] == "Run three reviews as one structured work group."
+                    })
+                })
+        })
+        .collect();
+    assert_eq!(root.len(), 4, "one supersession and one parent synthesis");
+    let final_context = root[3].body["messages"].to_string();
+    assert!(
+        final_context.contains("runtime_input_action_fence.v1"),
+        "the in-flight response must be fenced by real child input"
+    );
+    for marker in child_markers {
+        assert!(
+            final_context.contains(marker),
+            "final request must include {marker}"
+        );
+    }
+    assert_native_delegation_without_auxiliary_selector(
+        ctx,
+        "Run three reviews as one structured work group.",
+        &[
+            (
+                "Online storage review",
+                "Inspect storage behavior and return one finding.",
+            ),
+            (
+                "Online runtime review",
+                "Inspect runtime behavior and return one finding.",
+            ),
+            (
+                "Online journey review",
+                "Inspect the user journey and return one finding.",
+            ),
+        ],
+    )
+    .await;
     let events = parse_sse_events(&raw_sse);
     let session_info = events
         .iter()
@@ -1034,20 +1744,27 @@ pub async fn run_stream_structured_fanout_has_one_parent_synthesis_and_durable_t
 /// Four live fanouts intentionally reuse the same group/slot labels across
 /// two users and two sessions per user. The registry, stream projection, and
 /// durable tree must remain scoped by ownership rather than by presentation
-/// identifiers while successful and provider-deadline groups settle together.
+/// identifiers while successful and rejected-provider groups settle together.
 pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
     let pool = &ctx.pool;
 
+    let (status,a_first_session)=post_json(app,"/sessions",Some(b.auth_header.as_str()),json!({"title":"fanout isolation A session 1","metadata":{"suite":"fanout_concurrent_isolation","full_llm_capture":true}})).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create A first capture session: {a_first_session}"
+    );
+    let a_first_session_id = a_first_session["session_id"].as_str().unwrap().to_string();
     let (status, a_second_session) = post_json(
         app,
         "/sessions",
         Some(b.auth_header.as_str()),
         json!({
             "title": "fanout isolation A second session",
-            "metadata": {"suite": "fanout_concurrent_isolation"}
+            "metadata": {"suite": "fanout_concurrent_isolation", "full_llm_capture": true}
         }),
     )
     .await;
@@ -1094,7 +1811,7 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
             Some(b_auth.as_str()),
             json!({
                 "title": format!("fanout isolation B session {ordinal}"),
-                "metadata": {"suite": "fanout_concurrent_isolation"}
+                "metadata": {"suite": "fanout_concurrent_isolation", "full_llm_capture": true}
             }),
         )
         .await;
@@ -1116,7 +1833,7 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
             name: "a-one-success".to_string(),
             auth: b.auth_header.clone(),
             user_id: ctx.user_id.clone(),
-            session_id: ctx.session_id.clone(),
+            session_id: a_first_session_id.clone(),
             terminal: OnlineFanoutTerminal::Completed,
             final_reply: "A1 synthesized its two successful children once.".to_string(),
             child_provenance: "A1 child evidence belongs only to A1.".to_string(),
@@ -1128,7 +1845,7 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
             session_id: a_second_session_id.clone(),
             terminal: OnlineFanoutTerminal::Failed,
             final_reply: "A2 synthesized its two preserved failures once.".to_string(),
-            child_provenance: "A2 provider deadline belongs only to A2.".to_string(),
+            child_provenance: "A2 private provider body marker.".to_string(),
         },
         ConcurrentFanoutCase {
             name: "b-one-failure".to_string(),
@@ -1137,7 +1854,7 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
             session_id: b_session_ids[0].clone(),
             terminal: OnlineFanoutTerminal::Failed,
             final_reply: "B1 synthesized its two preserved failures once.".to_string(),
-            child_provenance: "B1 provider deadline belongs only to B1.".to_string(),
+            child_provenance: "B1 private provider body marker.".to_string(),
         },
         ConcurrentFanoutCase {
             name: "b-two-success".to_string(),
@@ -1150,9 +1867,14 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
         },
     ];
     let shared_group_id = "same-group-label-across-four-live-roots";
+    let scripts = cases
+        .iter()
+        .flat_map(|case| concurrent_fanout_scripts(ctx, case, shared_group_id))
+        .collect::<Vec<_>>();
+    ctx.install_native_provider(&b.auth_header, scripts).await;
     let payloads = cases
         .iter()
-        .map(|case| concurrent_fanout_payload(ctx, case, shared_group_id))
+        .map(|case| concurrent_fanout_payload(ctx, case))
         .collect::<Vec<_>>();
     let started = tokio::time::Instant::now();
     let responses =
@@ -1165,6 +1887,24 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
         "four bounded fanouts exceeded the online concurrency budget"
     );
 
+    for case in &cases {
+        assert_native_delegation_without_auxiliary_selector(
+            ctx,
+            &format!("Run the isolated fanout scenario {}.", case.name),
+            &[
+                (
+                    "First isolated child",
+                    &format!("{}: Return the first independent finding.", case.name),
+                ),
+                (
+                    "Second isolated child",
+                    &format!("{}: Return the second independent finding.", case.name),
+                ),
+            ],
+        )
+        .await;
+    }
+
     let all_child_provenances = cases
         .iter()
         .map(|case| case.child_provenance.clone())
@@ -1172,12 +1912,16 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
     let mut evidence = Vec::with_capacity(cases.len());
     for (case, (status, raw_sse)) in cases.iter().zip(responses) {
         assert_eq!(status, StatusCode::OK, "{}: {raw_sse}", case.name);
-        evidence.push(assert_concurrent_fanout_stream(
-            case,
-            shared_group_id,
-            &all_child_provenances,
-            &raw_sse,
-        ));
+        evidence.push(
+            assert_concurrent_fanout_stream(
+                pool,
+                case,
+                shared_group_id,
+                &all_child_provenances,
+                &raw_sse,
+            )
+            .await,
+        );
     }
     let all_run_ids = evidence
         .iter()
@@ -1214,6 +1958,7 @@ pub async fn run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
         );
     }
 
+    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &a_first_session_id).await;
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &a_second_session_id).await;
     for session_id in &b_session_ids {
         cleanup_session_data(&ctx.shared_pool, &b_user_id, session_id).await;
@@ -1247,20 +1992,17 @@ pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
         .expect("session_id")
         .to_string();
     let forbidden_late_reply = "This synthesis must not appear after root cancellation.";
-    let payload = json!({
-        "message": "Start three slow reviews; the user will cancel the live root.",
-        "session_id": session_id,
-        "model_selection": seeded_model_selection(ctx),
-        "context": {
-            "test_work_admission": {
-                "work_lifecycle": "not_required",
-                "workspace_mutation": "read_only",
-                "execution_topology": "parallel_subruns",
-                "required_capabilities": ["agent_spawner"],
-            },
-            "test_llm_rounds": [
-                deferred_tool_search_round("slow-fanout-tool-search", "agent_fanout"),
-                deferred_tool_invoke_round(
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    let root_model = fixture_model.clone();
+    let child_model = fixture_model.clone();
+    let releases = ReleaseProviderGatesOnDrop(
+        (0..3)
+            .map(|_| std::sync::Arc::new(tokio::sync::Notify::new()))
+            .collect::<Vec<_>>(),
+    );
+    let mut child_responses:Vec<_>=releases.0.iter().map(|release|ProviderResponse::Stream { content_type:"text/event-stream", chunks:vec![format!("data: {}\n\n",json!({"choices":[{"index":0,"delta":{"content":"late child output must be suppressed"}}]})).into_bytes(),format!("data: {}\n\n",json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})).into_bytes(),b"data: [DONE]\n\n".to_vec()],release_before_chunk:Some((0,release.clone())) }).collect();
+    ctx.install_native_provider(&auth,vec![
+        ProviderScript::new("cancel root exact requests",move |request|request.path=="/v1/chat/completions" && request.body["model"]==root_model && request.body["stream"]==true && delegation_assessment(&request.body).is_none() && request.body["messages"].as_array().is_some_and(|messages|messages.iter().any(|m|m["role"]=="user" && m["content"]=="Start three slow reviews; the user will cancel the live root.")),vec![native_search_response("slow-fanout-tool-search", "agent_fanout"),native_invoke_response(
                     "slow-fanout-before-root-cancel",
                     "agent_fanout",
                     json!({
@@ -1275,13 +2017,17 @@ pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
                         ],
                         "defaults": {"agent_type": "general-purpose"}
                     }),
-                ),
-                {"full_text": forbidden_late_reply}
-            ],
-            "test_spawn_child_llm_rounds": [{
-                "full_text": "late child output must be suppressed",
-                "delay_ms": 5000
-            }]
+                ),native_invoke_response("slow-fanout-wait","agent",json!({"action":"wait","timeout_ms":10000}))]),
+        native_child_script(child_model.clone(),"Start three slow reviews; the user will cancel the live root.","Return finding one.",child_responses.remove(0)),
+native_child_script(child_model.clone(),"Start three slow reviews; the user will cancel the live root.","Return finding two.",child_responses.remove(0)),
+native_child_script(child_model.clone(),"Start three slow reviews; the user will cancel the live root.","Return finding three.",child_responses.remove(0)),
+    ]).await;
+    let payload = json!({
+        "message": "Start three slow reviews; the user will cancel the live root.","execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+        "session_id": session_id,
+        "model_selection": seeded_model_selection(ctx),
+        "context": {
+
         }
     });
     let started = tokio::time::Instant::now();
@@ -1351,6 +2097,46 @@ pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
     assert_eq!(child_count, 3);
     assert_eq!(provider_child_ids.len(), 3);
 
+    loop {
+        let requests = ctx.native_provider_requests().await;
+        let calls = requests
+            .iter()
+            .filter(|request| {
+                request.body["stream"] == true && delegation_assessment(&request.body).is_none()
+            })
+            .collect::<Vec<_>>();
+        let root = calls
+            .iter()
+            .filter(|request| {
+                request.body["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|m| {
+                        m["role"] == "user"
+                            && m["content"]
+                                == "Start three slow reviews; the user will cancel the live root."
+                    })
+                })
+            })
+            .count();
+        if root == 3 && calls.len() == 6 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < provider_entry_deadline,
+            "three child HTTP requests and parent wait must enter before cancellation"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_native_delegation_without_auxiliary_selector(
+        ctx,
+        "Start three slow reviews; the user will cancel the live root.",
+        &[
+            ("Slow child one", "Return finding one."),
+            ("Slow child two", "Return finding two."),
+            ("Slow child three", "Return finding three."),
+        ],
+    )
+    .await;
+
     let (cancel_status, cancel_body) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         delete_json(
@@ -1387,6 +2173,7 @@ pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
             Err(_) => panic!("cancelled fanout stream did not terminate"),
         }
     }
+    drop(releases);
     let raw_sse = String::from_utf8_lossy(&stream_bytes).into_owned();
     assert_eq!(stream_status, StatusCode::OK, "cancelled stream: {raw_sse}");
     assert!(
@@ -1406,10 +2193,12 @@ pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
         .iter()
         .filter(|event| event["type"].as_str() == Some("agent_cancelled"))
         .collect::<Vec<_>>();
-    assert_eq!(
-        cancelled.len(),
-        3,
-        "each accepted slot must expose one cancellation terminal: {raw_sse}"
+    // The root waits for cancellation ownership transfer, while each child
+    // commits its terminal asynchronously. Verify any live terminals here;
+    // the exact all-child terminal contract belongs to durable replay below.
+    assert!(
+        cancelled.len() <= 3,
+        "duplicate cancellation terminals: {raw_sse}"
     );
     assert!(
         cancelled.iter().all(|event| {
@@ -1500,9 +2289,52 @@ pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
         .filter_map(|event| event["run_id"].as_str().map(ToString::to_string))
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(
-        streamed_child_ids, durable_child_ids,
-        "stream terminal identities must match the durable fixed group"
+        streamed_child_ids.len(),
+        cancelled.len(),
+        "live child cancellation identities must not repeat"
     );
+    assert!(
+        streamed_child_ids.is_subset(&durable_child_ids),
+        "live terminal must belong to the durable fixed group"
+    );
+    for child_run_id in &durable_child_ids {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/chat/runs/{child_run_id}/stream?last_index=0&replay_only=true"
+                    ))
+                    .header("authorization", auth.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("replay exact cancelled child");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let replay = parse_sse_events(&String::from_utf8_lossy(&bytes));
+        let terminal: Vec<_> = replay
+            .iter()
+            .filter(|event| event["type"] == "run_finished")
+            .collect();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "one durable cancellation receipt for {child_run_id}: {replay:?}"
+        );
+        assert_eq!(terminal[0]["run_id"], child_run_id.as_str());
+        assert_eq!(terminal[0]["status"], "cancelled");
+        assert_eq!(terminal[0]["cancellation_origin"], "user");
+        assert!(!replay.iter().any(|event| {
+            event["type"] == "text_done"
+                && event["full_text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("late child output must be suppressed"))
+        }));
+    }
     let orphan_transcripts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM session_transcript_items AS transcript \
          LEFT JOIN agent_runs AS run \
@@ -1546,17 +2378,8 @@ pub async fn run_stream_canonical_work_scheduler_prevents_decorative_plan() {
     let premature_reply = "Both tasks are already complete before the first attempt ran.";
     let second_premature_reply = "The second task is complete before its attempt ran.";
     let final_reply = "Both canonical tasks settled, and the verified result is ready.";
-    let (status, raw_sse) = stream_chat_full(
-        app,
-        auth,
-        json!({
-            "message": "Track this as one durable task and complete it.",
-            "session_id": &session_id,
-            "model_selection": seeded_model_selection(ctx),
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [mock_tool_call(
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth,vec![ProviderScript::new("run_stream_canonical_work_scheduler_prevents_decorative_plan",move |request|request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="Track this as one durable task and complete it.")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[provider_tool_call(
                             "create-canonical-work",
                             "start_work",
                             json!({
@@ -1573,56 +2396,39 @@ pub async fn run_stream_canonical_work_scheduler_prevents_decorative_plan() {
                                     }
                                 ]
                             })
-                        )]
-                    },
-                    {"full_text": premature_reply},
-                    {
-                        // The settlement gate accepts one successful
-                        // non-lifecycle execution as attempt evidence. This
-                        // harness is hermetic for Memoria (stubbed forwarder,
-                        // no live authority), so the visible `memory` tool
-                        // always fails with "memory access is not enabled" and
-                        // cannot authorize a delivered settlement. Use the
-                        // visible capability the run can actually execute.
-                        "tool_calls": [mock_tool_call(
+                        )]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":premature_reply,"reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[provider_tool_call(
                             "prepare-canonical-result",
                             "introspect",
-                            json!({"topic": "runtime", "facet": "session", "depth": "summary"})
-                        )]
-                    },
-                    {
-                        "tool_calls": [mock_tool_call(
+                            json!({"facet":"session"})
+                        )]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[provider_tool_call(
                             "settle-canonical-task",
                             "settle_work_item",
                             json!({
                                 "outcome": "delivered",
                                 "summary": "The primary session prepared the durable result."
                             })
-                        )]
-                    },
-                    {"full_text": second_premature_reply},
-                    {
-                        // Same evidence obligation for the second assignment: the
-                        // run must execute a visible capability instead of claiming
-                        // completion (see the first evidence round).
-                        "tool_calls": [mock_tool_call(
+                        )]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":second_premature_reply,"reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[provider_tool_call(
                             "verify-canonical-result",
                             "introspect",
-                            json!({"topic": "runtime", "facet": "overview", "depth": "summary"})
-                        )]
-                    },
-                    {
-                        "tool_calls": [mock_tool_call(
+                            json!({"facet":"overview"})
+                        )]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[provider_tool_call(
                             "settle-canonical-verification",
                             "settle_work_item",
                             json!({
                                 "outcome": "delivered",
                                 "summary": "The primary session verified the durable result."
                             })
-                        )]
-                    },
-                    {"full_text": final_reply}
-                ]
+                        )]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":final_reply,"reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let (status, raw_sse) = stream_chat_full(
+        app,
+        auth,
+        json!({
+            "message": "Track this as one durable task and complete it.",
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+            "session_id": &session_id,
+            "model_selection": seeded_model_selection(ctx),
+            "context": {
+
             }
         }),
     )
@@ -1892,17 +2698,8 @@ pub async fn run_stream_deferred_work_does_not_start_an_attempt() {
         .expect("session_id")
         .to_string();
     let final_reply = "The durable plan is ready; execution has not started.";
-    let (status, raw_sse) = stream_chat_full(
-        app,
-        auth,
-        json!({
-            "message": "Create a visible plan, but do not begin execution yet.",
-            "session_id": &session_id,
-            "model_selection": seeded_model_selection(ctx),
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [mock_tool_call(
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth,vec![ProviderScript::new("run_stream_deferred_work_does_not_start_an_attempt",move |request|request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="Create a visible plan, but do not begin execution yet.")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[provider_tool_call(
                             "create-deferred-work",
                             "start_work",
                             json!({
@@ -1919,10 +2716,17 @@ pub async fn run_stream_deferred_work_does_not_start_an_attempt() {
                                     }
                                 ]
                             })
-                        )]
-                    },
-                    {"full_text": final_reply}
-                ]
+                        )]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":final_reply,"reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let (status, raw_sse) = stream_chat_full(
+        app,
+        auth,
+        json!({
+            "message": "Create a visible plan, but do not begin execution yet.",
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+            "session_id": &session_id,
+            "model_selection": seeded_model_selection(ctx),
+            "context": {
+
             }
         }),
     )
@@ -1989,7 +2793,7 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
         Some(auth.as_str()),
         json!({
             "title": "failed structured fan-in online gate",
-            "metadata": {"suite": "structured_fanout_failure_online"}
+            "metadata": {"suite": "structured_fanout_failure_online", "full_llm_capture": true}
         }),
     )
     .await;
@@ -1999,23 +2803,15 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
         .expect("session_id")
         .to_string();
     let final_reply = "One parent synthesis disclosed all three failed child causes.";
-    let (status, raw_sse) = stream_chat_full(
-        app,
-        auth,
-        json!({
-            "message": "Run three reviews and preserve every failure cause.",
-            "session_id": &session_id,
-            "model_selection": seeded_model_selection(ctx),
-            "context": {
-                "test_work_admission": {
-                    "work_lifecycle": "not_required",
-                    "workspace_mutation": "read_only",
-                    "execution_topology": "parallel_subruns",
-                    "required_capabilities": ["agent_spawner"],
-                },
-                "test_llm_rounds": [
-                    deferred_tool_search_round("online-failed-fanout-search", "agent_fanout"),
-                    deferred_tool_invoke_round(
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    let releases =
+        ReleaseProviderGatesOnDrop(vec![std::sync::Arc::new(tokio::sync::Notify::new())]);
+    let root_model = fixture_model.clone();
+    let child_model = fixture_model.clone();
+    ctx.install_native_provider(auth,vec![
+        ProviderScript::new("actual parent fanout execution",move |request| request.path=="/v1/chat/completions" && request.body["model"]==root_model && request.body["stream"]==true && delegation_assessment(&request.body).is_none() && request.body["messages"].as_array().is_some_and(|messages|messages.iter().any(|message|message["role"]=="user" && message["content"]=="Run three reviews and preserve every failure cause.")),vec![
+                    native_search_response("online-failed-fanout-search", "agent_fanout"),
+                    native_invoke_response(
                         "online-failed-fanout-start",
                         "agent_fanout",
                         json!({
@@ -2031,19 +2827,77 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
                             "defaults": {"agent_type": "general-purpose"}
                         }),
                     ),
-                    {"full_text": final_reply}
-                ],
-                "test_spawn_child_llm_rounds": [{
-                    "error": {
-                        "message": "online child provider failed with preserved cause",
-                        "kind": "server_error"
-                    }
-                }]
-            }
-        }),
+                    gated_native_delta(
+                        json!({"tool_calls":[{"index":0,"id":"online-failed-fanout-wait","type":"function","function":{"name":"invoke_tool","arguments":json!({"name":"agent","arguments":{"action":"wait","timeout_ms":10000}}).to_string()}}]}),
+                        "tool_calls", releases.0[0].clone(),
+                    ), native_text_response(final_reply)]),
+        native_child_script(child_model.clone(),"Run three reviews and preserve every failure cause.","Inspect storage.",ProviderResponse::Json {status:StatusCode::BAD_REQUEST,body:json!({"error":{"message":"private failed child marker"}})}),
+native_child_script(child_model.clone(),"Run three reviews and preserve every failure cause.","Inspect runtime.",ProviderResponse::Json {status:StatusCode::BAD_REQUEST,body:json!({"error":{"message":"private failed child marker"}})}),
+native_child_script(child_model.clone(),"Run three reviews and preserve every failure cause.","Inspect journey.",ProviderResponse::Json {status:StatusCode::BAD_REQUEST,body:json!({"error":{"message":"private failed child marker"}})}),
+    ]).await;
+    let payload = json!({
+        "message": "Run three reviews and preserve every failure cause.",
+        "execution_policy": {"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+        "session_id": &session_id,
+        "model_selection": seeded_model_selection(ctx),
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let response = tokio::time::timeout_at(
+        deadline,
+        app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/chat/stream")
+                .header("authorization", auth.as_str())
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("bounded stream admission")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    // Independent child failures can arrive across provider rounds. Hold the
+    // third response until all real terminals arrive so this finite script
+    // tests one synthesis over the whole group, not scheduler timing. An
+    // agent wait is an input observation, not an all-children completion fence.
+    loop {
+        let chunk = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .expect("bounded child failure delivery")
+            .expect("live stream before child failures")
+            .unwrap();
+        bytes.extend_from_slice(&chunk);
+        if parse_sse_events(&String::from_utf8_lossy(&bytes))
+            .iter()
+            .filter(|event| event["type"] == "agent_failed")
+            .count()
+            == 3
+        {
+            break;
+        }
+    }
+    releases.0[0].notify_one();
+    while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .expect("bounded parent synthesis")
+    {
+        bytes.extend_from_slice(&chunk.unwrap());
+    }
+    let raw_sse = String::from_utf8(bytes).unwrap();
+    assert_native_delegation_without_auxiliary_selector(
+        ctx,
+        "Run three reviews and preserve every failure cause.",
+        &[
+            ("Failed storage review", "Inspect storage."),
+            ("Failed runtime review", "Inspect runtime."),
+            ("Failed journey review", "Inspect journey."),
+        ],
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "chat/stream: {raw_sse}");
     let events = parse_sse_events(&raw_sse);
     let root_run_id = events
         .iter()
@@ -2104,15 +2958,57 @@ pub async fn run_stream_failed_fanout_settles_once_without_orphaning_children() 
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
         .unwrap_or_else(|| panic!("missing failed fanout aggregate: {raw_sse}"));
     assert_eq!(aggregate["target_count"], 3, "{aggregate}");
-    assert_eq!(aggregate["completed"], 0, "{aggregate}");
-    assert_eq!(aggregate["failed"], 3, "{aggregate}");
+    assert_eq!(aggregate["status"], "started");
+    let launched = aggregate["agents"].as_array().unwrap();
+    assert_eq!(launched.len(), 3);
+    assert_eq!(
+        launched
+            .iter()
+            .map(|child| child["slot_index"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    let children = captured_synthesis_children(
+        pool,
+        user_id,
+        &session_id,
+        &root_run_id,
+        final_reply,
+        &events,
+    )
+    .await;
+    assert_eq!(children.len(), 3);
+    assert!(children.iter().all(|child| child["status"] == "failed"));
+    assert_eq!(
+        children
+            .iter()
+            .map(|child| (
+                child["agent_id"].as_str().unwrap(),
+                child["run_id"].as_str().unwrap()
+            ))
+            .collect::<std::collections::HashSet<_>>(),
+        launched
+            .iter()
+            .map(|child| (
+                child["agent_id"].as_str().unwrap(),
+                child["run_id"].as_str().unwrap()
+            ))
+            .collect::<std::collections::HashSet<_>>()
+    );
     assert!(
-        aggregate
-            .to_string()
-            .contains("online child provider failed with preserved cause"),
-        "failure provenance was lost: {aggregate}"
+        children.iter().all(|child| child["result"]
+            .as_str()
+            .unwrap()
+            .contains("[invalid_request] LLM request rejected: 400")),
+        "failure provenance was lost: {children:?}"
     );
 
+    assert!(!raw_sse.contains("private failed child marker"));
+    assert!(
+        !json!(children)
+            .to_string()
+            .contains("private failed child marker")
+    );
     let durable_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         let terminal: i64 = sqlx::query_scalar(
@@ -2188,16 +3084,16 @@ pub async fn run_stream_context_trace_persistence() {
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth,vec![ProviderScript::new("run_stream_context_trace_persistence",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="context trace persistence test")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Context trace reply.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{ "prompt_tokens": 100, "completion_tokens": 50,
+                    "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_input_tokens": 0} }}))])]).await;
     let payload = json!({
         "message": "context trace persistence test",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "session_id": &session_id,
         "model_selection": seeded_model_selection(ctx),
         "context": {
-            "test_llm_rounds": [{
-                "full_text": "Context trace reply.",
-                "usage": { "prompt_tokens": 100, "completion_tokens": 50,
-                    "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_input_tokens": 0} }
-            }]
+
         }
     });
     let (status, body) = stream_chat_full(app, auth, payload).await;
@@ -2389,12 +3285,15 @@ pub async fn run_stream_multi_turn_persistence() {
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
     // ── Turn 1 ──
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth,vec![ProviderScript::new("run_stream_multi_turn_persistence",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="multi-turn message one")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Response one.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let payload1 = json!({
         "message": "multi-turn message one",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "session_id": &session_id,
         "model_selection": seeded_model_selection(ctx),
         "context": {
-            "test_llm_rounds": [{ "full_text": "Response one." }]
+
         }
     });
     let (st1, body1) = stream_chat_full(app, auth, payload1).await;
@@ -2440,12 +3339,15 @@ pub async fn run_stream_multi_turn_persistence() {
     assert_eq!(uq1_count, 1, "after turn 1: exactly 1 user_query event");
 
     // ── Turn 2 ──
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth,vec![ProviderScript::new("run_stream_multi_turn_persistence",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="multi-turn message two")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Response two.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let payload2 = json!({
         "message": "multi-turn message two",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "session_id": &session_id,
         "model_selection": seeded_model_selection(ctx),
         "context": {
-            "test_llm_rounds": [{ "full_text": "Response two." }]
+
         }
     });
     let (st2, body2) = stream_chat_full(app, auth, payload2).await;

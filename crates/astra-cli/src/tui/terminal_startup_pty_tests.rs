@@ -40,6 +40,9 @@ struct PtyTiming {
     da1_written_ms: Option<u128>,
     startup_ready_seen_ms: Option<u128>,
     input_ready_seen_ms: Option<u128>,
+    resize_applied_ms: Option<u128>,
+    cursor_query_seen_ms: Vec<u128>,
+    cursor_response_write_end_ms: Vec<Option<u128>>,
 }
 
 fn terminal_modes_restored(
@@ -133,7 +136,37 @@ fn probe_child() {
     }
     let sixel_before = astra_tools::display_sixel::cached_sixel_support();
     startup.prepare_tui().unwrap();
-    let mut guard = crate::tui::terminal::TerminalGuard::init().unwrap();
+    if case == "keyboard_enhancement_panic" {
+        // Exercises the P2 review finding on #914: Push/Pop is a stack, not
+        // an idempotent toggle, so a panic that runs both the global panic
+        // hook and TerminalGuard's own Drop during unwind must still only
+        // remove Astra's own entry once. `_guard` deliberately lives inside
+        // this closure, not outside it, so its Drop runs as part of the
+        // unwind that catch_unwind stops here -- the same order a real
+        // uncaught panic during the interactive session would hit.
+        assert!(
+            startup.keyboard_enhancement_supported(),
+            "fixture must simulate a terminal that supports the protocol"
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard =
+                crate::tui::terminal::TerminalGuard::init(startup.keyboard_enhancement_supported())
+                    .unwrap();
+            panic!("deliberate panic to exercise keyboard-enhancement cleanup ownership");
+        }));
+        assert!(result.is_err(), "fixture must actually panic");
+        startup.handoff();
+        drop(startup);
+        let after = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
+        println!(
+            "{RESULT}{}",
+            serde_json::json!({ "restored": terminal_modes_restored(&before, &after) })
+        );
+        return;
+    }
+    let mut guard =
+        crate::tui::terminal::TerminalGuard::init(startup.keyboard_enhancement_supported())
+            .unwrap();
     if case == "resize_missed" {
         // The shared reader is initialized by startup. Discard SIGWINCH to
         // exercise the size watchdog, without a synthetic resize event.
@@ -183,18 +216,22 @@ fn probe_child() {
     let events = runtime.block_on(async {
         use tokio_stream::StreamExt;
         let mut events = Vec::new();
+        let mut resize_observed = false;
+        let budget = if matches!(
+            case.as_str(),
+            "escape" | "escape_then_f" | "arrow" | "alt" | "query_escape"
+        ) {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(2)
+        };
+        let mut deadline = tokio::time::Instant::now() + budget;
         while events.len() < expected_events(&case).len() {
-            let budget = if matches!(
-                case.as_str(),
-                "escape" | "escape_then_f" | "arrow" | "alt" | "query_escape"
-            ) {
-                Duration::from_millis(200)
-            } else {
-                Duration::from_secs(2)
-            };
-            let event = tokio::time::timeout(budget, stream.next())
+            let event = tokio::time::timeout_at(deadline, stream.next())
                 .await
-                .expect("input was not preserved")
+                .unwrap_or_else(|error| {
+                    panic!("input was not preserved: {error:?}; collected={events:?}")
+                })
                 .expect("input stream ended");
             if let crate::tui::event::TuiEvent::Resize {
                 cursor,
@@ -206,6 +243,7 @@ fn probe_child() {
                     .reconcile_resize(*cursor, *size, *interrupted)
                     .unwrap();
             }
+            let observed_before = events.len();
             match event {
                 crate::tui::event::TuiEvent::Key(key) => {
                     events.push(format!("key:{:?}:{:?}", key.code, key.modifiers))
@@ -229,9 +267,19 @@ fn probe_child() {
                     interrupted: false,
                 } if case.starts_with("resize_") => {
                     assert!(guard.terminal.viewport_area.y < size.1);
-                    events.push(format!("resize:{cursor:?}"));
+                    // One requested resize may produce OS notifications and
+                    // watchdog retries. They must not stand in for input.
+                    if !resize_observed {
+                        resize_observed = true;
+                        events.push(format!("resize:{cursor:?}"));
+                    }
                 }
                 _ => {}
+            }
+            // Keep the original per-input budget, but retries are not
+            // progress and cannot extend the wait for missing input.
+            if events.len() > observed_before {
+                deadline = tokio::time::Instant::now() + budget;
             }
         }
         // A late OSC reply must not become a fourth keyboard event.
@@ -481,6 +529,14 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                         std::thread::sleep(remaining);
                     }
                 }
+                if case == "keyboard_enhancement_panic" {
+                    // Answers CSI ?u before DA1, exactly like a real
+                    // supporting terminal per the Kitty protocol's own
+                    // recommended detection order -- flags=0 (no
+                    // enhancement currently active from any parent
+                    // program), which is still `Some(..)`, not `None`.
+                    master.write_all(b"\x1b[?0u").unwrap();
+                }
                 let da1 = if case == "no_sixel" {
                     b"\x1b[?1;2c".as_slice()
                 } else {
@@ -517,6 +573,11 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                 }
                 "resize_reply" | "resize_fragmented" | "resize_timeout" | "resize_missed"
                 | "resize_invalid" => {
+                    if case == "resize_missed" {
+                        // Let the idle reader consume an unchanged watchdog
+                        // tick before resizing without a SIGWINCH wake.
+                        std::thread::sleep(Duration::from_millis(150));
+                    }
                     let size = Winsize {
                         ws_row: 20,
                         ws_col: 60,
@@ -528,6 +589,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                         unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
                         0
                     );
+                    timing.resize_applied_ms = Some(parent_started.elapsed().as_millis());
                 }
                 "arrow" => master.write_all(b"\x1b[A").unwrap(),
                 "alt" => master.write_all(b"\x1bf").unwrap(),
@@ -555,6 +617,9 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
             .filter(|bytes| *bytes == b"\x1b[6n")
             .count();
         if queries > cursor_replies {
+            timing
+                .cursor_query_seen_ms
+                .push(parent_started.elapsed().as_millis());
             cursor_replies += 1;
             if cursor_replies == 1 {
                 master.write_all(b"\x1b[8;1R").unwrap();
@@ -581,6 +646,14 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
                     master.write_all(b"\x1b[200~resize paste\x1b[201~").unwrap();
                 }
             }
+            timing.cursor_response_write_end_ms.push(
+                if cursor_replies == 1 || (case.starts_with("resize_") && case != "resize_timeout")
+                {
+                    Some(parent_started.elapsed().as_millis())
+                } else {
+                    None
+                },
+            );
         }
         if child.try_wait().unwrap().is_some() {
             // Read remaining output on the next poll; the slave closes at exit.
@@ -613,6 +686,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
             | "poll_escape"
             | "early_palette"
             | "early_theme"
+            | "keyboard_enhancement_panic"
     ) {
         return (value, output);
     }
@@ -741,6 +815,44 @@ fn pty_late_da1_is_unknown_until_reply() {
     );
     assert!(value["sixel_before"].is_null());
     assert_eq!(value["sixel_after"], true);
+}
+
+/// Regression for the P2 review finding on #914: Push/Pop keyboard
+/// enhancement is a stack, not an idempotent toggle like bracketed paste.
+/// A panic after a successful init runs both the global panic hook and
+/// TerminalGuard's own Drop during unwind; only one of them may actually
+/// consume the still-outstanding push. Popping twice would, on a terminal
+/// where some parent program already had its own entry pushed, remove that
+/// parent's entry instead of harmlessly no-op'ing.
+#[test]
+fn pty_keyboard_enhancement_push_and_pop_survive_a_panic_exactly_once() {
+    let (_value, output) = run_case("keyboard_enhancement_panic");
+    let count = |needle: &[u8]| {
+        output
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count()
+    };
+    assert_eq!(
+        count(b"\x1b[?u"),
+        1,
+        "must query keyboard enhancement exactly once: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        count(b"\x1b[>1u"),
+        1,
+        "must push exactly once for a supported, detected terminal: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert_eq!(
+        count(b"\x1b[<1u"),
+        1,
+        "the panic hook and TerminalGuard::drop must not both pop the same \
+         outstanding push -- that would remove a pre-existing parent \
+         program's own keyboard mode instead of a no-op: {}",
+        String::from_utf8_lossy(&output)
+    );
 }
 
 #[cfg(debug_assertions)]

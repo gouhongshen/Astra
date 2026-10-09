@@ -72,6 +72,24 @@ Account identity, Work/history and Memoria memories are retained. This disconnec
 
 ---
 
+## Auto model routing for chat
+
+On `POST /chat` and `POST /chat/stream`, an authenticated Server-catalog user
+can opt into the configured economy/strong routing policy:
+
+```json
+{"message":"Explain this result", "execution_policy":{"model_routing":"auto"}}
+```
+
+Omit `model_selection` for Auto. Missing configuration returns
+`model_routing_unavailable`; explicit model state, provider model gateways,
+bound Work, or fixed-default semantic admission combined with Auto returns
+`model_routing_unsupported`. Existing Offering authorization still applies.
+With no Auto request, model selection behaves as before. The initial policy
+uses economy only for confidently easy, read-only tasks with compatible model
+contracts. See [model routing](../design/model-routing.md#deterministic-auto-selection-stage-3)
+for configuration, coverage, and persistence semantics.
+
 ## Active run permission mode
 
 ### POST /chat/runs/{run_id}/permission-mode
@@ -149,6 +167,11 @@ pagination parameters.
 ### PUT /agents/{agent_id}
 
 ### DELETE /agents/{agent_id} → 204
+
+Agent names are unique per owner. Creating a duplicate name or renaming an
+agent to another of the owner's names returns 409 without changing either
+record. Different owners may use the same name. Reads and mutations of another
+owner's agent, and reads or deletes of a missing agent, return 404.
 
 ---
 
@@ -266,24 +289,6 @@ filter.
 ### GET /sandbox/{name}
 
 ### DELETE /sandbox/{name} → 204
-
----
-
-## Replay
-
-### POST /sessions/{session_id}/replay
-
-Reserved for durable replay reconstruction. For an owned session this route
-currently returns HTTP 501 with an explicit unavailable detail; it does not
-create a replay identity or execute any provider, tool, or external call.
-Missing or foreign sessions return HTTP 404 without revealing ownership.
-
-### GET /sessions/{session_id}/replay/compare
-
-Reserved for durable replay reconstruction. For an owned session this route
-currently returns HTTP 501 with an explicit unavailable detail; it does not
-return replay or comparison counts. Missing or foreign sessions return HTTP
-404 without revealing ownership.
 
 ---
 

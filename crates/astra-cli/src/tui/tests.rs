@@ -123,13 +123,19 @@ mod textarea_tests {
         let mut ta = TextArea::new();
         ta.set_text("hello");
         assert_eq!(ta.handle_key(key(KeyCode::Enter)), TextAreaAction::Submit);
+        // Submit does not consume or alter the draft; the caller reads it
+        // separately before clearing.
+        assert_eq!(ta.text(), "hello");
     }
 
     #[test]
     fn shift_enter_inserts_newline() {
         let mut ta = TextArea::new();
         ta.set_text("line1");
-        ta.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(
+            ta.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            TextAreaAction::Changed
+        );
         ta.handle_key(key(KeyCode::Char('2')));
         assert_eq!(ta.text(), "line1\n2");
     }
@@ -337,11 +343,17 @@ mod stream_bridge_tests {
 
         // Send two tokens then drop the sender (simulates turn end)
         stream_tx
-            .send(StreamEvent::Token("hello ".to_string()))
+            .send(StreamEvent::Token {
+                model_item_id: None,
+                text: "hello ".to_string(),
+            })
             .await
             .unwrap();
         stream_tx
-            .send(StreamEvent::Token("world".to_string()))
+            .send(StreamEvent::Token {
+                model_item_id: None,
+                text: "world".to_string(),
+            })
             .await
             .unwrap();
         drop(stream_tx);
@@ -354,7 +366,7 @@ mod stream_bridge_tests {
         let mut stream_closed = false;
         while let Some(evt) = tui_rx.recv().await {
             match evt {
-                TuiAppEvent::Token(text) => {
+                TuiAppEvent::Token { text, .. } => {
                     token_batches += 1;
                     token_text.push_str(&text);
                 }

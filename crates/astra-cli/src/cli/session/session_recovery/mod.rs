@@ -1,22 +1,15 @@
 //! Session recovery: checkpoint, workspace, CSL, and I/O primitives.
 //! Sub-modules split by concern to keep files manageable.
 
-pub(crate) mod checkpoint;
 pub(crate) mod csl;
 pub(crate) mod io;
 pub(crate) mod workspace;
 
 // Re-export public items from sub-modules
-pub(crate) use checkpoint::{
-    RecoverySnapshotSyncError, build_manual_heavy_step_checkpoint, next_step_checkpoint_number,
-    persist_manual_heavy_and_composite, session_state_compact_from_heavy_checkpoint,
-    sync_recovery_snapshot_after_history_edit,
-};
 
 pub(crate) use workspace::{
     context_trace_signal_from_trace, sync_context_trace_to_workspace,
-    sync_session_state_to_workspace, workspace_metadata_from_live_state,
-    workspace_metadata_from_live_state_after_read_failure,
+    sync_session_state_to_workspace, workspace_metadata_from_live_state_after_read_failure,
 };
 
 #[cfg(test)]
@@ -24,30 +17,14 @@ pub(crate) use workspace::session_workspace_git_root;
 
 #[cfg(test)]
 mod tests {
-    use super::checkpoint::{
-        load_previous_recovery_state, persist_recovery_checkpoint, rollback_recovery_checkpoint,
-    };
-    use super::csl::{
-        ensure_loaded_csl_state, rebuild_csl_from_history, restore_csl_snapshot_after_failure,
-        write_full_csl_snapshot_atomic,
-    };
-    use super::io::{
-        composite_index_path_for, csl_log_path_for, csl_store_base_dir, read_optional_file_bytes,
-        restore_optional_file_bytes, write_bytes_atomic,
-    };
+    use super::csl::write_full_csl_snapshot_atomic;
+    use super::io::{csl_log_path_for, write_bytes_atomic};
     use super::{
-        build_manual_heavy_step_checkpoint, next_step_checkpoint_number,
-        persist_manual_heavy_and_composite, session_state_compact_from_heavy_checkpoint,
         session_workspace_git_root, sync_context_trace_to_workspace,
-        sync_recovery_snapshot_after_history_edit, sync_session_state_to_workspace,
-        workspace_metadata_from_live_state,
+        sync_session_state_to_workspace, workspace::workspace_metadata_from_live_state,
     };
     use crate::cli::session::session_state::SessionState;
-    use astra_pipeline::step_checkpoint::read_composite_snapshot_index;
-    use astra_pipeline::step_protocol::StepCheckpoint;
     use astra_services::session_journal;
-
-    const TEST_USER_ID: &str = "test-user";
 
     fn workspace_backup_path_for(session_id: &str) -> Option<std::path::PathBuf> {
         let workspace_dir = astra_services::session_workspace::workspace_dir_for(session_id);
@@ -69,7 +46,7 @@ mod tests {
         let sid = format!("workspace-live-missing-{}", uuid::Uuid::new_v4());
         let state = SessionState {
             session_id: Some(sid.clone()),
-            model: Some("gpt-5".to_string()),
+            model: Some(("gpt-5".to_string()).into()),
             turn: 3,
             total_prompt_tokens: 111,
             total_completion_tokens: 222,
@@ -104,7 +81,7 @@ mod tests {
 
         let state = SessionState {
             session_id: Some(sid.clone()),
-            model: Some("gpt-5".to_string()),
+            model: Some(("gpt-5".to_string()).into()),
             turn: 4,
             total_prompt_tokens: 500,
             total_completion_tokens: 250,
@@ -145,7 +122,7 @@ mod tests {
 
         let state = SessionState {
             session_id: Some(sid.clone()),
-            model: Some("gpt-5".to_string()),
+            model: Some(("gpt-5".to_string()).into()),
             turn: 7,
             total_prompt_tokens: 700,
             total_completion_tokens: 300,
@@ -172,7 +149,7 @@ mod tests {
 
         let state = SessionState {
             session_id: Some(sid.clone()),
-            model: Some("gpt-5".to_string()),
+            model: Some(("gpt-5".to_string()).into()),
             turn: 3,
             total_prompt_tokens: 100,
             total_completion_tokens: 50,
@@ -217,7 +194,7 @@ mod tests {
 
         let state = SessionState {
             session_id: Some(sid.clone()),
-            model: Some("gpt-5".to_string()),
+            model: Some(("gpt-5".to_string()).into()),
             ..Default::default()
         };
 
@@ -318,283 +295,6 @@ mod tests {
             trace.budget.as_ref().map(|budget| budget.total_used),
             Some(8_200)
         );
-    }
-
-    #[test]
-    fn next_step_checkpoint_number_empty_dir_starts_at_one() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        assert_eq!(
-            next_step_checkpoint_number(TEST_USER_ID, "sess-empty").unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn next_step_checkpoint_number_one_after_max_file() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = "sess-step";
-        let checkpoint = StepCheckpoint::light(
-            "step-7".to_string(),
-            "task-7".to_string(),
-            sid.to_string(),
-            astra_pipeline::step_protocol::ExecutionCursor::default(),
-        );
-        astra_pipeline::step_checkpoint::write_step_checkpoint(TEST_USER_ID, sid, 7, &checkpoint)
-            .unwrap();
-        assert_eq!(next_step_checkpoint_number(TEST_USER_ID, sid).unwrap(), 8);
-    }
-
-    #[test]
-    fn manual_heavy_checkpoint_maps_history_to_openai_messages() {
-        let mut state = SessionState::default();
-        state.history.push(("u1".into(), "a1".into()));
-        state.history.push(("u2".into(), "a2".into()));
-        state.recent_tools = vec!["bash".to_string()];
-        state.turn = 4;
-        state.total_prompt_tokens = 11;
-        state.total_completion_tokens = 22;
-        state.run_id = Some("run-z".to_string());
-
-        let checkpoint = build_manual_heavy_step_checkpoint(
-            &state,
-            "sess-h",
-            &astra_turn_core::conversation_log::SessionStateCompact::default(),
-            None,
-        );
-        let StepCheckpoint::Heavy(heavy) = checkpoint else {
-            panic!("expected Heavy checkpoint");
-        };
-        assert_eq!(heavy.messages.len(), 4);
-        assert_eq!(heavy.messages[0]["role"], "user");
-        assert_eq!(heavy.messages[0]["content"], "u1");
-        assert_eq!(heavy.messages[3]["content"], "a2");
-        assert_eq!(heavy.recent_tools, vec!["bash".to_string()]);
-        assert_eq!(heavy.light.agent_id, "sess-h");
-        assert_eq!(heavy.light.task_id, "run-z");
-        assert_eq!(heavy.light.total_tokens, 33);
-    }
-
-    #[test]
-    fn persist_manual_heavy_and_composite_writes_heavy_and_index() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = "sess-heavy-idx";
-        let state = SessionState::default();
-        let step_checkpoint = build_manual_heavy_step_checkpoint(
-            &state,
-            sid,
-            &astra_turn_core::conversation_log::SessionStateCompact::default(),
-            None,
-        );
-
-        let heavy_path = persist_manual_heavy_and_composite(
-            TEST_USER_ID,
-            sid,
-            2,
-            "label-z",
-            1,
-            &step_checkpoint,
-        )
-        .unwrap();
-        assert!(heavy_path.exists());
-        assert!(heavy_path.to_string_lossy().ends_with("-heavy.json"));
-
-        let index = read_composite_snapshot_index(TEST_USER_ID, sid).unwrap();
-        assert_eq!(index.snapshots.len(), 1);
-        assert_eq!(index.snapshots[0].label.as_deref(), Some("manual:label-z"));
-    }
-
-    #[test]
-    fn manual_heavy_checkpoint_drops_stale_recovery_fields_after_clean_turn() {
-        let mut state = SessionState::default();
-        state.recent_tools = vec!["bash".to_string()];
-        state.turn = 3;
-        state.total_prompt_tokens = 40;
-        state.total_completion_tokens = 12;
-        state.config_version_id = Some("cfg-live".to_string());
-        state.history.push(("u1".into(), "a1".into()));
-        state.runtime_pipeline_state = Some(serde_json::json!({"stale": "pipeline"}));
-        state.runtime_compaction_state = Some(serde_json::json!({"attempt_count": 99}));
-        state.runtime_consecutive_context_window_errors = 9;
-
-        let previous_heavy = astra_pipeline::step_protocol::HeavyCheckpoint {
-            light: astra_pipeline::step_protocol::LightCheckpoint {
-                protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
-                cursor: Default::default(),
-                step_id: "session-turn-3".to_string(),
-                task_id: "task-3".to_string(),
-                agent_id: "sess-prev".to_string(),
-                progress: 1.0,
-                total_tokens: 52,
-                created_at: astra_pipeline::step_protocol::epoch_ms(),
-            },
-            conversation_cursor: None,
-            messages: Vec::new(),
-            budget_remaining_tokens: 321,
-            budget_remaining_rounds: 7,
-            run_execution_budget: None,
-            run_execution_control: None,
-            blocked_tools: vec!["write_file".to_string()],
-            recent_tools: vec!["read_file".to_string()],
-            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
-                name: "github".to_string(),
-                schema_digest: "sha256:previous".to_string(),
-                descriptor: None,
-            }],
-            memory_context: Some(astra_pipeline::step_protocol::MemoryContext {
-                retrieved_memory_ids: vec!["m-1".to_string()],
-                domain_hints: vec!["rust".to_string()],
-                provenance: vec!["memoria".to_string()],
-                governance_actions: Vec::new(),
-                cluster_insights: Vec::new(),
-                snapshot_id: Some("snapshot-1".to_string()),
-            }),
-            delegation_id: None,
-            delegation_pattern: None,
-            delegation_sub_run_summaries: Vec::new(),
-            interruption: Some(serde_json::json!({"kind": "budget_exhausted"})),
-            approval_overrides: Some(serde_json::json!({"tool": "bash"})),
-            consecutive_context_window_errors: 2,
-            pipeline_state: Some(serde_json::json!({"ema": 0.9})),
-            compaction_state: Some(serde_json::json!({"attempt_count": 2})),
-            config_version_id: Some("cfg-old".to_string()),
-            workspace_observation_quarantine: None,
-        };
-
-        let session_state = session_state_compact_from_heavy_checkpoint(&previous_heavy);
-        let checkpoint = build_manual_heavy_step_checkpoint(
-            &state,
-            "sess-prev",
-            &session_state,
-            Some(&previous_heavy),
-        );
-        let StepCheckpoint::Heavy(heavy) = checkpoint else {
-            panic!("expected Heavy checkpoint");
-        };
-        assert_eq!(
-            heavy.deferred_tool_activations,
-            vec![astra_turn_types::DeferredToolActivation {
-                name: "github".to_string(),
-                schema_digest: "sha256:previous".to_string(),
-                descriptor: None,
-            }],
-            "manual recovery must retain typed deferred evidence independently of interruption state"
-        );
-        assert_eq!(heavy.budget_remaining_tokens, 0);
-        assert_eq!(heavy.budget_remaining_rounds, 0);
-        assert!(heavy.blocked_tools.is_empty());
-        let memory_context = heavy.memory_context.expect("memory context");
-        assert_eq!(memory_context.retrieved_memory_ids, vec!["m-1".to_string()]);
-        assert_eq!(memory_context.domain_hints, vec!["rust".to_string()]);
-        assert_eq!(memory_context.provenance, vec!["memoria".to_string()]);
-        assert_eq!(memory_context.snapshot_id.as_deref(), Some("snapshot-1"));
-        assert!(heavy.interruption.is_none());
-        assert!(heavy.approval_overrides.is_none());
-        assert_eq!(heavy.consecutive_context_window_errors, 0);
-        assert!(heavy.pipeline_state.is_none());
-        assert!(heavy.compaction_state.is_none());
-        assert_eq!(heavy.config_version_id.as_deref(), Some("cfg-live"));
-    }
-
-    #[test]
-    fn manual_heavy_checkpoint_preserves_explicit_interrupted_recovery_state() {
-        let mut state = SessionState::default();
-        state.recent_tools = vec!["bash".to_string()];
-        state.turn = 3;
-        state.total_prompt_tokens = 40;
-        state.total_completion_tokens = 12;
-        state.config_version_id = Some("cfg-live".to_string());
-        state.last_turn_interrupted = true;
-        state.resume_restricted_tools = vec!["read_file".to_string()];
-        state.runtime_pipeline_state = Some(serde_json::json!({"ema": 0.7}));
-        state.runtime_compaction_state = Some(serde_json::json!({"attempt_count": 5}));
-        state.runtime_consecutive_context_window_errors = 4;
-
-        let previous_heavy = astra_pipeline::step_protocol::HeavyCheckpoint {
-            light: astra_pipeline::step_protocol::LightCheckpoint {
-                protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
-                cursor: Default::default(),
-                step_id: "session-turn-3".to_string(),
-                task_id: "task-3".to_string(),
-                agent_id: "sess-prev".to_string(),
-                progress: 1.0,
-                total_tokens: 52,
-                created_at: astra_pipeline::step_protocol::epoch_ms(),
-            },
-            conversation_cursor: None,
-            messages: Vec::new(),
-            budget_remaining_tokens: 321,
-            budget_remaining_rounds: 7,
-            run_execution_budget: None,
-            run_execution_control: None,
-            blocked_tools: vec!["write_file".to_string()],
-            recent_tools: vec!["read_file".to_string()],
-            deferred_tool_activations: Vec::new(),
-            memory_context: None,
-            delegation_id: None,
-            delegation_pattern: None,
-            delegation_sub_run_summaries: Vec::new(),
-            interruption: Some(serde_json::json!({"kind": "budget_exhausted"})),
-            approval_overrides: Some(serde_json::json!({"tool": "bash"})),
-            consecutive_context_window_errors: 2,
-            pipeline_state: Some(serde_json::json!({"ema": 0.9})),
-            compaction_state: Some(serde_json::json!({"attempt_count": 2})),
-            config_version_id: Some("cfg-old".to_string()),
-            workspace_observation_quarantine: None,
-        };
-
-        let checkpoint = build_manual_heavy_step_checkpoint(
-            &state,
-            "sess-prev",
-            &astra_turn_core::conversation_log::SessionStateCompact::default(),
-            Some(&previous_heavy),
-        );
-        let StepCheckpoint::Heavy(heavy) = checkpoint else {
-            panic!("expected Heavy checkpoint");
-        };
-        assert_eq!(heavy.budget_remaining_tokens, 321);
-        assert_eq!(heavy.budget_remaining_rounds, 7);
-        assert_eq!(heavy.blocked_tools, vec!["read_file".to_string()]);
-        assert_eq!(
-            heavy.interruption,
-            Some(serde_json::json!({"kind": "budget_exhausted"}))
-        );
-        assert_eq!(
-            heavy.approval_overrides,
-            Some(serde_json::json!({"tool": "bash"}))
-        );
-        assert_eq!(heavy.consecutive_context_window_errors, 4);
-        assert_eq!(heavy.pipeline_state, Some(serde_json::json!({"ema": 0.7})));
-        assert_eq!(
-            heavy.compaction_state,
-            Some(serde_json::json!({"attempt_count": 5}))
-        );
-        assert_eq!(heavy.config_version_id.as_deref(), Some("cfg-live"));
-    }
-
-    #[test]
-    fn read_optional_file_bytes_returns_missing_and_existing_bytes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("blob.bin");
-
-        assert_eq!(read_optional_file_bytes(&path).unwrap(), None);
-
-        std::fs::write(&path, b"hello").unwrap();
-        assert_eq!(
-            read_optional_file_bytes(&path).unwrap(),
-            Some(b"hello".to_vec())
-        );
-    }
-
-    #[test]
-    fn restore_optional_file_bytes_writes_and_removes_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("nested").join("blob.bin");
-
-        restore_optional_file_bytes(&path, Some(b"restored".to_vec())).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"restored");
-
-        restore_optional_file_bytes(&path, None).unwrap();
-        assert!(!path.exists());
     }
 
     #[test]
@@ -738,33 +438,6 @@ mod tests {
     }
 
     #[test]
-    fn csl_rebuild_failure_rollback_restores_previous_snapshot() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("csl-rollback-{}", uuid::Uuid::new_v4());
-        let csl_path = csl_log_path_for(&sid);
-        std::fs::create_dir_all(csl_path.parent().unwrap()).unwrap();
-        std::fs::write(&csl_path, b"{\"old\":true}\n").unwrap();
-        let backup = read_optional_file_bytes(&csl_path).unwrap();
-
-        std::fs::write(&csl_path, b"{\"new_orphan\":true}\n").unwrap();
-        let message = restore_csl_snapshot_after_failure(
-            &csl_path,
-            backup,
-            "reload rewritten CSL state: injected failure".to_string(),
-        );
-
-        assert_eq!(std::fs::read(&csl_path).unwrap(), b"{\"old\":true}\n");
-        assert!(
-            message.contains("reload rewritten CSL state: injected failure"),
-            "{message}"
-        );
-        assert!(
-            message.contains("rolled back CSL snapshot"),
-            "rollback result should be reported: {message}"
-        );
-    }
-
-    #[test]
     #[serial_test::serial]
     fn session_workspace_git_root_returns_root_when_workspace_exists() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
@@ -796,129 +469,12 @@ mod tests {
     }
 
     #[test]
-    fn session_state_compact_from_heavy_checkpoint_keeps_prompt_material_only() {
-        let heavy = astra_pipeline::step_protocol::HeavyCheckpoint {
-            light: astra_pipeline::step_protocol::LightCheckpoint {
-                protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
-                cursor: Default::default(),
-                step_id: "step-1".to_string(),
-                task_id: "task-1".to_string(),
-                agent_id: "sess-1".to_string(),
-                progress: 1.0,
-                total_tokens: 12,
-                created_at: astra_pipeline::step_protocol::epoch_ms(),
-            },
-            conversation_cursor: None,
-            messages: Vec::new(),
-            budget_remaining_tokens: 321,
-            budget_remaining_rounds: 7,
-            run_execution_budget: None,
-            run_execution_control: None,
-            blocked_tools: vec!["bash".to_string()],
-            recent_tools: vec!["read_file".to_string()],
-            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
-                name: "github".to_string(),
-                schema_digest: "sha256:checkpoint".to_string(),
-                descriptor: None,
-            }],
-            memory_context: None,
-            delegation_id: Some("deleg-1".to_string()),
-            delegation_pattern: Some("fan_out".to_string()),
-            delegation_sub_run_summaries: vec![
-                astra_pipeline::step_protocol::DelegationSubRunSummary {
-                    run_id: "sub-1".to_string(),
-                    agent_id: "agent-1".to_string(),
-                    status: "completed".to_string(),
-                    error: None,
-                    prompt_tokens: 5,
-                    completion_tokens: 3,
-                    tool_calls: 1,
-                },
-            ],
-            interruption: Some(serde_json::json!({"kind": "context_overflow"})),
-            approval_overrides: Some(serde_json::json!({"bash": "allow"})),
-            consecutive_context_window_errors: 2,
-            pipeline_state: None,
-            compaction_state: Some(serde_json::json!({"attempt_count": 4})),
-            config_version_id: None,
-            workspace_observation_quarantine: None,
-        };
-
-        let compact = session_state_compact_from_heavy_checkpoint(&heavy);
-
-        assert_eq!(compact.recent_tools, vec!["read_file".to_string()]);
-        assert_eq!(compact.deferred_tool_activations.len(), 1);
-        assert!(compact.blocked_tools.is_empty());
-        assert!(compact.approval_overrides.is_none());
-        assert!(compact.compaction_tracker.is_none());
-        assert_eq!(compact.budget_remaining_tokens, 0);
-        assert_eq!(compact.budget_remaining_rounds, 0);
-        assert_eq!(compact.consecutive_ctx_errors, 0);
-        assert!(compact.interruption.is_none());
-        assert!(compact.delegation.is_none());
-    }
-
-    #[test]
-    fn session_state_compact_from_heavy_checkpoint_drops_partial_delegation() {
-        let heavy = astra_pipeline::step_protocol::HeavyCheckpoint {
-            light: astra_pipeline::step_protocol::LightCheckpoint {
-                protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
-                cursor: Default::default(),
-                step_id: "step-1".to_string(),
-                task_id: "task-1".to_string(),
-                agent_id: "sess-1".to_string(),
-                progress: 1.0,
-                total_tokens: 12,
-                created_at: astra_pipeline::step_protocol::epoch_ms(),
-            },
-            conversation_cursor: None,
-            messages: Vec::new(),
-            budget_remaining_tokens: 0,
-            budget_remaining_rounds: 0,
-            run_execution_budget: None,
-            run_execution_control: None,
-            blocked_tools: Vec::new(),
-            recent_tools: Vec::new(),
-            deferred_tool_activations: Vec::new(),
-            memory_context: None,
-            delegation_id: Some("deleg-1".to_string()),
-            delegation_pattern: None,
-            delegation_sub_run_summaries: vec![],
-            interruption: None,
-            approval_overrides: None,
-            consecutive_context_window_errors: 0,
-            pipeline_state: None,
-            compaction_state: None,
-            config_version_id: None,
-            workspace_observation_quarantine: None,
-        };
-
-        let compact = session_state_compact_from_heavy_checkpoint(&heavy);
-
-        assert!(
-            compact.delegation.is_none(),
-            "partial delegation payload should not be reconstructed"
-        );
-    }
-
-    #[test]
-    fn sync_session_state_to_workspace_copies_skills_and_adaptive_state() {
+    fn sync_session_state_to_workspace_preserves_workspace_history_and_config() {
         let mut state = SessionState::default();
         state.session_persistence_error = Some("journal append failed".to_string());
-        state.discovered_skills.insert("skill-b".to_string());
-
-        let obs = std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability::ObservabilitySession::new_simple("sid-adaptive"),
-        ));
-        {
-            let mut guard = obs.write().unwrap();
-            guard.last_scenario_change_turn = Some(11);
-            guard.last_token_budget_direction = -1;
-            guard.last_token_budget_change_turn = Some(7);
-        }
-        state.observability_session = Some(obs);
 
         let mut ws = astra_services::session_workspace::WorkspaceMetadata::new("sid-adaptive", "m");
+        ws.discovered_skills = vec!["skill-b".to_string()];
         sync_session_state_to_workspace(&state, &mut ws);
 
         assert_eq!(
@@ -926,508 +482,9 @@ mod tests {
             Some("journal append failed")
         );
         assert_eq!(ws.discovered_skills, vec!["skill-b".to_string()]);
-        assert_eq!(ws.last_scenario_change_turn, Some(11));
-        assert_eq!(ws.last_token_budget_direction, -1);
-        assert_eq!(ws.last_token_budget_change_turn, Some(7));
         assert!(
             ws.tuned_config_json.is_none(),
             "workspace config remains authoritative during recovery projection"
         );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn history_sync_drops_stale_recovery_state_without_existing_csl() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("history-sync-{}", uuid::Uuid::new_v4());
-        let mut state = SessionState {
-            session_id: Some(sid.clone()),
-            turn: 2,
-            history: vec![
-                ("question".to_string(), "answer".to_string()),
-                ("follow-up".to_string(), "done".to_string()),
-            ],
-            recent_tools: vec!["bash".to_string()],
-            runtime_pipeline_state: Some(serde_json::json!({"stale": "pipeline"})),
-            runtime_compaction_state: Some(serde_json::json!({"attempt_count": 99})),
-            runtime_consecutive_context_window_errors: 9,
-            ingestion_user_id: Some(TEST_USER_ID.to_string()),
-            ..Default::default()
-        };
-
-        let previous_heavy = astra_pipeline::step_protocol::HeavyCheckpoint {
-            light: astra_pipeline::step_protocol::LightCheckpoint {
-                protocol_version: astra_pipeline::step_protocol::PROTOCOL_VERSION,
-                cursor: Default::default(),
-                step_id: "session-turn-2".to_string(),
-                task_id: "task-2".to_string(),
-                agent_id: sid.clone(),
-                progress: 1.0,
-                total_tokens: 100,
-                created_at: astra_pipeline::step_protocol::epoch_ms(),
-            },
-            conversation_cursor: None,
-            messages: vec![serde_json::json!({"role": "user", "content": "stale"})],
-            budget_remaining_tokens: 1234,
-            budget_remaining_rounds: 9,
-            run_execution_budget: None,
-            run_execution_control: None,
-            blocked_tools: vec!["write_file".to_string()],
-            recent_tools: vec!["read_file".to_string()],
-            deferred_tool_activations: Vec::new(),
-            memory_context: None,
-            delegation_id: None,
-            delegation_pattern: None,
-            delegation_sub_run_summaries: Vec::new(),
-            interruption: Some(serde_json::json!({"kind": "budget_exhausted"})),
-            approval_overrides: Some(serde_json::json!({"tool": "bash"})),
-            consecutive_context_window_errors: 2,
-            pipeline_state: Some(serde_json::json!({"ema": 0.9})),
-            compaction_state: Some(serde_json::json!({"attempt_count": 2})),
-            config_version_id: None,
-            workspace_observation_quarantine: None,
-        };
-        astra_pipeline::step_checkpoint::write_step_checkpoint(
-            TEST_USER_ID,
-            &sid,
-            1,
-            &StepCheckpoint::Heavy(Box::new(previous_heavy)),
-        )
-        .unwrap();
-
-        sync_recovery_snapshot_after_history_edit(&mut state)
-            .await
-            .expect("history sync should succeed");
-
-        let restored = astra_pipeline::step_restore::restore_session(TEST_USER_ID, &sid)
-            .unwrap()
-            .expect("restored session");
-        assert_eq!(restored.messages.len(), 4);
-        assert!(restored.blocked_tools.is_empty());
-        assert_eq!(restored.budget_remaining_tokens, 0);
-        assert_eq!(restored.budget_remaining_rounds, 0);
-        assert!(restored.interruption.is_none());
-        assert!(restored.approval_overrides.is_none());
-        assert_eq!(restored.consecutive_context_window_errors, 0);
-        assert!(restored.compaction_state.is_none());
-        assert!(restored.pipeline_state.is_none());
-
-        let store = std::sync::Arc::new(
-            astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
-        );
-        let mut mgr = astra_turn_core::conversation_log::manager::CslManager::new(
-            store,
-            sid.clone(),
-            Default::default(),
-        )
-        .unwrap();
-        let mat = mgr.load().await.unwrap().expect("csl snapshot");
-        assert!(mat.session_state.blocked_tools.is_empty());
-        assert!(mat.session_state.interruption.is_none());
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn ensure_loaded_csl_state_uses_in_memory_manager_state() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("csl-state-{}", uuid::Uuid::new_v4());
-        let store = std::sync::Arc::new(
-            astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
-        );
-        let mut mgr = astra_turn_core::conversation_log::manager::CslManager::new(
-            store,
-            sid.clone(),
-            Default::default(),
-        )
-        .unwrap();
-        let session_state = astra_turn_core::conversation_log::SessionStateCompact {
-            blocked_tools: vec!["write_file".to_string()],
-            recent_tools: vec!["bash".to_string()],
-            ..Default::default()
-        };
-        mgr.persist_turn(
-            1,
-            &[serde_json::json!({"role": "user", "content": "hi"})],
-            &session_state,
-        )
-        .await
-        .unwrap();
-
-        let mut state = SessionState {
-            csl_manager: Some(mgr),
-            ..Default::default()
-        };
-        let loaded = ensure_loaded_csl_state(&mut state, &sid)
-            .await
-            .expect("load csl state")
-            .expect("in-memory state");
-        assert_eq!(loaded.blocked_tools, vec!["write_file".to_string()]);
-        assert_eq!(loaded.recent_tools, vec!["bash".to_string()]);
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn ensure_loaded_csl_state_returns_none_when_snapshot_missing() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("csl-empty-{}", uuid::Uuid::new_v4());
-        let mut state = SessionState::default();
-
-        let loaded = ensure_loaded_csl_state(&mut state, &sid)
-            .await
-            .expect("load csl state");
-
-        assert!(loaded.is_none());
-        assert!(
-            state.csl_manager.is_some(),
-            "manager should still initialize"
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn ensure_loaded_csl_state_returns_err_for_invalid_session_id() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let mut state = SessionState::default();
-
-        let error = ensure_loaded_csl_state(&mut state, "../not-a-session")
-            .await
-            .expect_err("invalid session id should fail");
-
-        assert!(error.contains("initialize CSL state"), "{error}");
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn ensure_loaded_csl_state_returns_err_for_corrupt_csl_snapshot() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("csl-corrupt-{}", uuid::Uuid::new_v4());
-        let store = astra_services::local_session_artifact_store();
-        let session_dir = astra_services::SessionArtifactStore::session_dir(&store, &sid).unwrap();
-        std::fs::create_dir_all(&session_dir).unwrap();
-        let csl_path = session_dir.join("conversation_log.jsonl");
-        std::fs::write(
-            &csl_path,
-            "not-json\n{\"kind\":\"snapshot\",\"seq\":1,\"turn\":1,\"messages\":[],\"session_state\":{}}\n",
-        )
-        .unwrap();
-
-        let mut state = SessionState::default();
-        let error = ensure_loaded_csl_state(&mut state, &sid)
-            .await
-            .expect_err("corrupt csl should fail");
-
-        assert!(error.contains("load CSL state"), "{error}");
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn load_previous_recovery_state_returns_err_when_checkpoint_dir_is_invalid() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("checkpoint-bad-{}", uuid::Uuid::new_v4());
-        let session_dir =
-            astra_pipeline::step_checkpoint::owner_session_dir_for(TEST_USER_ID, &sid).unwrap();
-        std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::write(session_dir.join("step_checkpoints"), "not-a-directory").unwrap();
-
-        let mut state = SessionState::default();
-        let error = load_previous_recovery_state(&mut state, TEST_USER_ID, &sid)
-            .await
-            .expect_err("invalid checkpoint directory should fail");
-
-        assert!(error.contains("read latest heavy checkpoint"), "{error}");
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn rebuild_csl_from_history_skips_persist_for_empty_turn_zero() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("empty-turn-{}", uuid::Uuid::new_v4());
-        let store = std::sync::Arc::new(
-            astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
-        );
-        let mgr = astra_turn_core::conversation_log::manager::CslManager::new(
-            store,
-            sid.clone(),
-            Default::default(),
-        )
-        .unwrap();
-        let mut state = SessionState {
-            csl_manager: Some(mgr),
-            ..Default::default()
-        };
-
-        rebuild_csl_from_history(
-            &mut state,
-            &sid,
-            &[],
-            &astra_turn_core::conversation_log::SessionStateCompact::default(),
-        )
-        .await
-        .expect("empty turn zero should be a no-op");
-
-        let mgr = state.csl_manager.as_ref().expect("manager");
-        assert_eq!(mgr.last_seq(), 0);
-        assert!(
-            !csl_log_path_for(&sid).exists(),
-            "empty turn zero should not persist a snapshot"
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn history_sync_rolls_back_checkpoint_and_index_when_csl_rebuild_fails() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("history-rollback-{}", uuid::Uuid::new_v4());
-
-        let mut existing_index = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
-        let mut existing_snapshot =
-            astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), 9)
-                .label("existing")
-                .session_state("000009-heavy.json")
-                .workspace_state(sid.clone())
-                .build();
-        existing_index.append(&mut existing_snapshot).unwrap();
-        astra_pipeline::step_checkpoint::write_composite_snapshot_index(
-            TEST_USER_ID,
-            &sid,
-            &existing_index,
-        )
-        .unwrap();
-
-        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "test-model");
-        ws.turn_count = 9;
-        astra_services::session_workspace::write_workspace(&ws).unwrap();
-
-        let store = astra_services::local_session_artifact_store();
-        let session_dir = astra_services::SessionArtifactStore::session_dir(&store, &sid).unwrap();
-        std::fs::create_dir_all(&session_dir).unwrap();
-        let csl_path = session_dir.join("conversation_log.jsonl");
-        std::fs::write(&csl_path, b"{\"stale\":true}\n").unwrap();
-        std::fs::create_dir(session_dir.join(".tmp-conversation_log.jsonl")).unwrap();
-
-        let store = std::sync::Arc::new(
-            astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
-        );
-        let mgr = astra_turn_core::conversation_log::manager::CslManager::new(
-            store,
-            sid.clone(),
-            Default::default(),
-        )
-        .unwrap();
-        let mut state = SessionState {
-            session_id: Some(sid.clone()),
-            turn: 1,
-            history: vec![("question".into(), "answer".into())],
-            csl_manager: Some(mgr),
-            ingestion_user_id: Some(TEST_USER_ID.to_string()),
-            ..Default::default()
-        };
-
-        let error = sync_recovery_snapshot_after_history_edit(&mut state)
-            .await
-            .expect_err("temporary CSL path conflict should fail");
-
-        assert!(error.message.contains("replace CSL snapshot"), "{error}");
-
-        let checkpoints =
-            astra_pipeline::step_checkpoint::list_checkpoints(TEST_USER_ID, &sid).unwrap();
-        assert!(
-            checkpoints.is_empty(),
-            "history-sync failure must not leave heavy checkpoint files behind"
-        );
-        let restored_index = read_composite_snapshot_index(TEST_USER_ID, &sid).unwrap();
-        assert_eq!(restored_index, existing_index);
-        let restored_workspace = astra_services::session_workspace::read_workspace(&sid).unwrap();
-        assert_eq!(restored_workspace.turn_count, 9);
-        assert_eq!(std::fs::read(&csl_path).unwrap(), b"{\"stale\":true}\n");
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn history_sync_rolls_back_when_workspace_yaml_is_corrupt() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("history-workspace-corrupt-{}", uuid::Uuid::new_v4());
-        let workspace_dir = astra_services::session_workspace::workspace_dir_for(&sid);
-        std::fs::create_dir_all(&workspace_dir).unwrap();
-        let workspace_path = workspace_dir.join("workspace.yaml");
-        let corrupt_bytes = b":\nnot-valid-yaml".to_vec();
-        std::fs::write(&workspace_path, &corrupt_bytes).unwrap();
-
-        let mut state = SessionState {
-            session_id: Some(sid.clone()),
-            model: Some("test-model".into()),
-            turn: 1,
-            history: vec![("question".into(), "answer".into())],
-            ingestion_user_id: Some(TEST_USER_ID.to_string()),
-            ..Default::default()
-        };
-
-        sync_recovery_snapshot_after_history_edit(&mut state)
-            .await
-            .expect("corrupt workspace should be repaired from live state");
-
-        let checkpoints =
-            astra_pipeline::step_checkpoint::list_checkpoints(TEST_USER_ID, &sid).unwrap();
-        assert_eq!(checkpoints.len(), 1);
-        assert!(
-            composite_index_path_for(TEST_USER_ID, &sid)
-                .unwrap()
-                .exists(),
-            "history sync should still persist a composite index"
-        );
-        let workspace = astra_services::session_workspace::read_workspace(&sid).unwrap();
-        assert_eq!(workspace.turn_count, 1);
-        assert_eq!(workspace.model.as_deref(), Some("test-model"));
-        assert_ne!(std::fs::read(&workspace_path).unwrap(), corrupt_bytes);
-        let backup = std::fs::read_dir(&workspace_dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("workspace.yaml.corrupt-"))
-            })
-            .expect("corrupt workspace should be backed up");
-        assert_eq!(std::fs::read(backup).unwrap(), corrupt_bytes);
-    }
-
-    #[test]
-    fn rollback_recovery_checkpoint_restores_index_and_deletes_heavy() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("history-rollback-token-{}", uuid::Uuid::new_v4());
-
-        let mut existing_index = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
-        let mut existing_snapshot =
-            astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), 4)
-                .label("existing")
-                .session_state("000004-heavy.json")
-                .workspace_state(sid.clone())
-                .build();
-        existing_index.append(&mut existing_snapshot).unwrap();
-        astra_pipeline::step_checkpoint::write_composite_snapshot_index(
-            TEST_USER_ID,
-            &sid,
-            &existing_index,
-        )
-        .unwrap();
-
-        let state = SessionState {
-            session_id: Some(sid.clone()),
-            turn: 1,
-            history: vec![("question".into(), "answer".into())],
-            ..Default::default()
-        };
-        let rollback = persist_recovery_checkpoint(
-            &state,
-            TEST_USER_ID,
-            &sid,
-            &astra_turn_core::conversation_log::SessionStateCompact::default(),
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(
-            astra_pipeline::step_checkpoint::list_checkpoints(TEST_USER_ID, &sid)
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            read_composite_snapshot_index(TEST_USER_ID, &sid)
-                .unwrap()
-                .snapshots
-                .len(),
-            2
-        );
-
-        rollback_recovery_checkpoint(TEST_USER_ID, &sid, &rollback).unwrap();
-
-        assert!(
-            astra_pipeline::step_checkpoint::list_checkpoints(TEST_USER_ID, &sid)
-                .unwrap()
-                .is_empty(),
-            "rollback should delete the just-written heavy checkpoint"
-        );
-        assert_eq!(
-            read_composite_snapshot_index(TEST_USER_ID, &sid).unwrap(),
-            existing_index
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn history_sync_persists_checkpoint_workspace_and_csl_snapshot() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let sid = format!("history-sync-success-{}", uuid::Uuid::new_v4());
-        let store = std::sync::Arc::new(
-            astra_turn_core::conversation_log::file_store::FileCslStore::new(csl_store_base_dir()),
-        );
-        let mgr = astra_turn_core::conversation_log::manager::CslManager::new(
-            store,
-            sid.clone(),
-            Default::default(),
-        )
-        .unwrap();
-        let mut state = SessionState {
-            session_id: Some(sid.clone()),
-            model: Some("test-model".into()),
-            turn: 2,
-            history: vec![
-                ("question".into(), "answer".into()),
-                ("follow-up".into(), "done".into()),
-            ],
-            recent_tools: vec!["bash".into()],
-            csl_manager: Some(mgr),
-            ingestion_user_id: Some(TEST_USER_ID.to_string()),
-            ..Default::default()
-        };
-
-        sync_recovery_snapshot_after_history_edit(&mut state)
-            .await
-            .expect("history sync should succeed");
-
-        let checkpoints =
-            astra_pipeline::step_checkpoint::list_checkpoints(TEST_USER_ID, &sid).unwrap();
-        assert_eq!(checkpoints.len(), 1);
-        assert_eq!(checkpoints[0].0, 1);
-
-        let index = read_composite_snapshot_index(TEST_USER_ID, &sid).unwrap();
-        assert_eq!(index.snapshots.len(), 1);
-        assert_eq!(
-            index.snapshots[0].session_state(),
-            Some("000001-heavy.json")
-        );
-        assert_eq!(index.snapshots[0].workspace_state(), Some(sid.as_str()));
-
-        let workspace = astra_services::session_workspace::read_workspace(&sid).unwrap();
-        assert_eq!(workspace.turn_count, 2);
-        assert_eq!(workspace.total_tokens_in, 0);
-        assert_eq!(workspace.total_tokens_out, 0);
-        assert_eq!(workspace.model.as_deref(), Some("test-model"));
-
-        let csl_path = csl_log_path_for(&sid);
-        assert!(
-            csl_path.exists(),
-            "history sync should persist a CSL snapshot"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&csl_path).unwrap().lines().count(),
-            1
-        );
-        let mgr = state
-            .csl_manager
-            .as_ref()
-            .expect("manager restored after sync");
-        assert_eq!(mgr.last_seq(), 1);
-        assert_eq!(
-            mgr.last_session_state().recent_tools,
-            vec!["bash".to_string()]
-        );
-
-        let restored = astra_pipeline::step_restore::restore_session(TEST_USER_ID, &sid)
-            .unwrap()
-            .expect("restored session");
-        assert_eq!(restored.messages.len(), 4);
     }
 }

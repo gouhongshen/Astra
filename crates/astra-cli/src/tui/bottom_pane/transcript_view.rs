@@ -129,6 +129,8 @@ pub(crate) enum TranscriptItemKind {
 /// projections of the same canonical cell; expansion state lives in the view.
 #[derive(Debug, Clone)]
 pub(crate) struct TranscriptItem {
+    model_item_id: Option<String>,
+    tool_identity: Option<(String, bool)>,
     id: TranscriptItemId,
     kind: TranscriptItemKind,
     content: TranscriptContent,
@@ -136,6 +138,23 @@ pub(crate) struct TranscriptItem {
 }
 
 impl TranscriptItem {
+    pub(crate) fn with_tool_use_id(mut self, tool_use_id: Option<&str>, settled: bool) -> Self {
+        self.tool_identity = tool_use_id.map(|id| (id.to_owned(), settled));
+        self
+    }
+
+    pub(crate) fn tool_identity(&self) -> Option<&str> {
+        self.tool_identity.as_ref().map(|(id, _)| id.as_str())
+    }
+
+    pub(crate) fn is_settled_tool(&self) -> bool {
+        self.tool_identity
+            .as_ref()
+            .is_some_and(|(_, settled)| *settled)
+    }
+    pub(crate) fn model_identity(&self) -> Option<(&str, TranscriptItemKind)> {
+        self.model_item_id.as_deref().map(|id| (id, self.kind))
+    }
     #[cfg(test)]
     pub(crate) fn id(&self) -> &TranscriptItemId {
         &self.id
@@ -147,6 +166,8 @@ impl TranscriptItem {
         separator_rows: usize,
     ) -> Self {
         Self {
+            model_item_id: cell.model_item_id().map(str::to_owned),
+            tool_identity: None,
             id,
             kind: committed_cell_kind(cell.as_ref()),
             content: TranscriptContent::Committed(cell),
@@ -169,6 +190,8 @@ impl TranscriptItem {
         separator_rows: usize,
     ) -> Self {
         Self {
+            model_item_id: None,
+            tool_identity: None,
             id,
             kind,
             content: TranscriptContent::Rendered(lines),
@@ -192,6 +215,8 @@ impl TranscriptItem {
             TranscriptContent::Rendered(lines)
         };
         Self {
+            model_item_id: cell.model_item_id().map(str::to_owned),
+            tool_identity: None,
             id,
             kind,
             content,
@@ -205,6 +230,8 @@ impl TranscriptItem {
         separator_rows: usize,
     ) -> Self {
         Self {
+            model_item_id: cell.model_item_id.clone(),
+            tool_identity: None,
             id,
             kind: TranscriptItemKind::Reasoning,
             content: TranscriptContent::Reasoning(cell),
@@ -214,6 +241,8 @@ impl TranscriptItem {
 
     pub(crate) fn tool(id: TranscriptItemId, cell: ToolCell, separator_rows: usize) -> Self {
         Self {
+            model_item_id: None,
+            tool_identity: None,
             id,
             kind: TranscriptItemKind::Tool,
             content: TranscriptContent::Tool(cell),
@@ -923,7 +952,7 @@ impl BottomPaneView for TranscriptView {
         // Helper: advance `y` by 1 with saturating add. Without this,
         // a child Rect placed near `u16::MAX` (deeply nested overlay /
         // tiled layout edge) would wrap to 0 and start drawing rows at
-        // the top of the buffer. Same fix as C-TUI-1 in task_detail_view.
+        // the top of the buffer.
         let next_y = |y: u16| y.saturating_add(1).min(bottom);
 
         // Title

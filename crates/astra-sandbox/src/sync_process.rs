@@ -168,12 +168,36 @@ pub fn run_sync_process(
     output_limit: usize,
     configure: impl FnOnce(&mut Command) -> io::Result<()>,
 ) -> Result<SyncProcessOutput, SyncProcessError> {
+    run_sync_process_with_cancel(program, args, timeout, output_limit, None, configure)
+}
+
+/// Cancellation uses the same termination and ownership settlement as timeout.
+/// The caller must await this worker before confirming execution has ended.
+pub fn run_sync_process_with_cancel(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    output_limit: usize,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    configure: impl FnOnce(&mut Command) -> io::Result<()>,
+) -> Result<SyncProcessOutput, SyncProcessError> {
     let before = |phase, error: io::Error| SyncProcessError {
         phase,
         detail: error.to_string(),
         started: false,
         ownership: None,
     };
+    let check_cancelled = || {
+        if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            Err(before(
+                "cancellation",
+                io::Error::new(io::ErrorKind::Interrupted, "execution cancelled"),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
     let (mut command, mut owner) =
         BashInvocationOwner::prepare(program, args).map_err(|e| before("owner setup", e))?;
     command
@@ -189,6 +213,7 @@ pub fn run_sync_process(
     owner
         .install(&mut command)
         .map_err(|e| before("owner setup", e))?;
+    check_cancelled()?;
     let mut child = command.spawn().map_err(|e| before("spawn", e))?;
     let pid = child.id();
     let result = (|| -> Result<Output, (&'static str, String)> {
@@ -207,6 +232,9 @@ pub fn run_sync_process(
         let mut status = None;
         let mut exit_deadline = None;
         loop {
+            if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+                return Err(("cancellation", "execution cancelled".into()));
+            }
             let out_eof = drain!(&mut stdout, out, total, output_limit);
             let err_eof = drain!(&mut stderr, err, total, output_limit);
             if status.is_none() {
@@ -253,6 +281,57 @@ pub fn run_sync_process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_waits_for_the_process_and_prevents_late_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let late = directory.path().join("late");
+        let token = tokio_util::sync::CancellationToken::new();
+        let worker_token = token.clone();
+        let args = vec![
+            "-c".into(),
+            "printf ready > \"$1\"; sleep 0.5; printf late > \"$2\"".into(),
+            "worker".into(),
+            ready.to_string_lossy().into_owned(),
+            late.to_string_lossy().into_owned(),
+        ];
+        let worker = std::thread::spawn(move || {
+            run_sync_process_with_cancel(
+                "sh",
+                &args,
+                Duration::from_secs(3),
+                1024,
+                Some(&worker_token),
+                |_| Ok(()),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "real child did not start");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        token.cancel();
+        let failure = worker.join().unwrap().unwrap_err();
+        assert_eq!(failure.phase, "cancellation");
+        assert!(failure.started);
+        std::thread::sleep(Duration::from_millis(550));
+        assert!(
+            !late.exists(),
+            "cancelled process must not keep writing after its receipt"
+        );
+        let failure = run_sync_process_with_cancel(
+            "sh",
+            &["-c".into(), "exit 99".into()],
+            Duration::from_secs(1),
+            1024,
+            Some(&token),
+            |_| panic!("pre-cancelled execution must not reach setup"),
+        )
+        .unwrap_err();
+        assert!(!failure.started);
+    }
+
     #[cfg(unix)]
     #[test]
     fn bounded_output_and_descendant_pipes_do_not_hang() {

@@ -6,8 +6,8 @@
 
 use crate::cli::cli_config::cli_args::{
     AgentArgs, AgentSubcommand, BugArgs, BugSubcommand, DebugArgs, DiffArgs, DiffSubcommand,
-    GrepArgs, GrepSubcommand, MemoryArgs, MemorySubcommand, MessagingArgs, MessagingSubcommand,
-    PermissionsArgs, PermissionsSubcommand, ReviewArgs, ReviewSubcommand, TeamArgs, TeamSubcommand,
+    GrepArgs, GrepSubcommand, MemoryArgs, MemorySubcommand, PermissionsArgs, PermissionsSubcommand,
+    ReviewArgs, ReviewSubcommand,
 };
 
 /// Prepend optional system instructions to a user message.
@@ -21,51 +21,6 @@ pub(crate) fn apply_system_prompt(message: &str, system_prompt: Option<&str>) ->
 /// Join a slice of words with space separators.
 pub(crate) fn join_words(words: &[String]) -> String {
     words.join(" ")
-}
-
-/// Render [`TeamArgs`] back into a stable textual argument list
-/// for plan replay, delegation, and audit.
-pub(crate) fn render_team_args(args: &TeamArgs) -> String {
-    match &args.command {
-        None | Some(TeamSubcommand::List) => String::new(),
-        Some(TeamSubcommand::Create(cmd)) => {
-            let suffix = join_words(&cmd.description);
-            if suffix.is_empty() {
-                format!("create {}", cmd.name)
-            } else {
-                format!("create {} {}", cmd.name, suffix)
-            }
-        }
-        Some(TeamSubcommand::AddMember(cmd)) => {
-            let suffix = join_words(&cmd.description);
-            if suffix.is_empty() {
-                format!("add-member {} {}", cmd.team, cmd.role)
-            } else {
-                format!("add-member {} {} {}", cmd.team, cmd.role, suffix)
-            }
-        }
-        Some(TeamSubcommand::Info(cmd)) => format!("info {}", cmd.name),
-        Some(TeamSubcommand::Delete(cmd)) => format!("delete {}", cmd.name),
-        Some(TeamSubcommand::Context(cmd)) => {
-            format!(
-                "context {} {} {}",
-                cmd.team,
-                cmd.key,
-                join_words(&cmd.value)
-            )
-        }
-        Some(TeamSubcommand::Run(cmd)) => format!("run {} {}", cmd.team, join_words(&cmd.task)),
-        Some(TeamSubcommand::History(cmd)) => format!("history {}", cmd.name),
-        Some(TeamSubcommand::Snapshot(cmd)) => {
-            let suffix = join_words(&cmd.label);
-            if suffix.is_empty() {
-                format!("snapshot {}", cmd.team)
-            } else {
-                format!("snapshot {} {}", cmd.team, suffix)
-            }
-        }
-        Some(TeamSubcommand::Restore(cmd)) => format!("restore {} {}", cmd.team, cmd.snapshot_id),
-    }
 }
 
 /// Render [`MemoryArgs`] back into a stable textual argument list.
@@ -150,15 +105,6 @@ pub(crate) fn render_agent_args(args: &AgentArgs) -> String {
         Some(AgentSubcommand::Status(cmd)) => format!("status {}", cmd.agent_id),
         Some(AgentSubcommand::Stop(cmd)) => format!("stop {}", cmd.agent_id),
         Some(AgentSubcommand::Logs(cmd)) => format!("logs {}", cmd.agent_id),
-    }
-}
-
-/// Render [`MessagingArgs`] back into a stable textual argument list.
-pub(crate) fn render_messaging_args(args: &MessagingArgs) -> String {
-    match &args.command {
-        None | Some(MessagingSubcommand::Metrics) => String::new(),
-        Some(MessagingSubcommand::Dlq) => "dlq".to_string(),
-        Some(MessagingSubcommand::Status) => "status".to_string(),
     }
 }
 

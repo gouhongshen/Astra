@@ -1,4 +1,5 @@
 //! Full product matrix journey: sessions through logout (see `main.rs` module docs).
+use super::harness::{ProviderResponse, ProviderScript};
 use axum::{
     body::Body,
     http::{Request, StatusCode},
@@ -10,10 +11,9 @@ use tower::util::ServiceExt;
 
 use super::harness::{
     MATRIX_E2E_EDGE_WORKSPACE_ROOT, MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data,
-    delete_json, delete_no_content, get_json, maybe_tool_result_payload_from_sse, parse_sse_events,
-    post_empty, post_json, post_json_with_headers, put_json, row_get_opt_i64, row_get_opt_str,
-    row_get_str, seed_pending_approval, seeded_model_selection, tool_result_payload,
-    wait_for_agent_event_types,
+    delete_no_content, get_json, maybe_tool_result_payload_from_sse, parse_sse_events, post_empty,
+    post_json, post_json_with_headers, put_json, row_get_opt_i64, row_get_opt_str, row_get_str,
+    seed_pending_approval, seeded_model_selection, tool_result_payload, wait_for_agent_event_types,
 };
 
 async fn run_tool_backed_chat_turn(
@@ -35,6 +35,17 @@ async fn run_tool_backed_chat_turn(
             }
         }
     });
+    // Background extraction resolves deployment candidates asynchronously and
+    // may skip or use another Offering. Only primary API requests are exact.
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth_header,vec![ProviderScript::new("run_tool_backed_chat_turn",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="read README through a tool")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[{
+                        "id": "ctx-trace-tool-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"README.md\"}"
+                        }
+                    }]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"tool-backed calibration reply","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{ "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16 }}))])]).await;
     let payload = json!({
         "agent_id": agent_id,
         "session_id": session_id,
@@ -57,6 +68,7 @@ async fn run_tool_backed_chat_turn(
             "status": "online"
         },
         "message": "read README through a tool",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "model_selection": seeded_model_selection(ctx),
         "context": {
             "edge_profile": {
@@ -64,25 +76,7 @@ async fn run_tool_backed_chat_turn(
                 "edge_agent_id": ctx.edge_agent_id,
                 "hostname": "system-matrix-edge"
             },
-            "edge_tools": [read_file_tool],
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [{
-                        "id": "ctx-trace-tool-1",
-                        "type": "function",
-                        "function": {
-                            "name": "read_file",
-                            "arguments": "{\"path\":\"README.md\"}"
-                        }
-                    }]
-                },
-                {
-                    "full_text": "tool-backed calibration reply",
-                    "reasoning": "",
-                    "usage": { "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16 }
-                }
-            ]
-        }
+            "edge_tools": [read_file_tool]}
     });
 
     let req = axum::http::Request::builder()
@@ -332,43 +326,6 @@ pub async fn run_product_matrix_full_journey(
     assert_eq!(st_msearch, StatusCode::OK, "marketplace search: {ms_j}");
     assert!(ms_j["results"].is_array(), "search results: {ms_j}");
 
-    let xuid = &[("x-user-id", user_id.as_str())];
-    let (st_gates, gates_j) = get_json(app, "/evaluation/gates?limit=10", None, xuid).await;
-    assert_eq!(st_gates, StatusCode::OK, "evaluation gates: {gates_j}");
-
-    let (st_cal, cal_j) = get_json(app, "/evaluation/calibration?days=7", None, xuid).await;
-    assert_eq!(st_cal, StatusCode::OK, "evaluation calibration: {cal_j}");
-
-    let (st_scores, scores_j) = get_json(
-        app,
-        "/evaluation/sessions/scores?limit=10&min_score=0",
-        None,
-        xuid,
-    )
-    .await;
-    assert_eq!(
-        st_scores,
-        StatusCode::OK,
-        "evaluation session scores: {scores_j}"
-    );
-    assert!(
-        scores_j["sessions"].is_array(),
-        "session scores payload: {scores_j}"
-    );
-
-    let (st_qt, qt_j) = get_json(app, "/evaluation/quality/trend?days=7", None, xuid).await;
-    assert_eq!(st_qt, StatusCode::OK, "evaluation quality trend: {qt_j}");
-
-    let (st_slo, slo_j) =
-        get_json(app, "/evaluation/slo/dashboard?period_days=7", None, xuid).await;
-    assert_eq!(st_slo, StatusCode::OK, "evaluation slo dashboard: {slo_j}");
-
-    let (st_mh, mh_j) = get_json(app, "/evaluation/memory-health", None, xuid).await;
-    assert_eq!(st_mh, StatusCode::OK, "evaluation memory-health: {mh_j}");
-
-    let (st_mm, mm_j) = get_json(app, "/evaluation/memory-metrics", None, xuid).await;
-    assert_eq!(st_mm, StatusCode::OK, "evaluation memory-metrics: {mm_j}");
-
     let (st_agent, agent_j) = post_json(
         app,
         "/agents",
@@ -431,30 +388,6 @@ pub async fn run_product_matrix_full_journey(
             .ok()
             .as_deref(),
         Some("matrix-crud-agent-renamed")
-    );
-
-    let trust_path = format!("/evaluation/trust-report?agent_id={agent_id}&days=7");
-    let (st_trust, trust_j) = get_json(app, &trust_path, None, xuid).await;
-    assert_eq!(
-        st_trust,
-        StatusCode::OK,
-        "evaluation trust-report: {trust_j}"
-    );
-
-    let slo_hist = format!("/evaluation/slo/{agent_id}/history?days=7");
-    let (st_slo_hist, slo_hist_j) = get_json(app, &slo_hist, None, xuid).await;
-    assert_eq!(
-        st_slo_hist,
-        StatusCode::OK,
-        "evaluation slo history: {slo_hist_j}"
-    );
-
-    let obs_path = format!("/evaluation/observability/metrics?agent_id={agent_id}&days=7");
-    let (st_obs, obs_j) = get_json(app, &obs_path, None, xuid).await;
-    assert_eq!(
-        st_obs,
-        StatusCode::OK,
-        "evaluation observability metrics: {obs_j}"
     );
 
     let (st_ev, ev_j) = post_json(
@@ -821,10 +754,6 @@ pub async fn run_product_matrix_full_journey(
     let (st_runs, runs) = get_json(app, "/runs", Some(auth_header), &[]).await;
     assert_eq!(st_runs, StatusCode::OK, "list runs: {runs}");
 
-    let (st_wf, wf_j) = get_json(app, "/workflows", Some(auth_header), &[]).await;
-    assert_eq!(st_wf, StatusCode::OK, "list workflows: {wf_j}");
-    assert!(wf_j.is_array(), "workflows JSON should be an array: {wf_j}");
-
     let (st_cpl, cpl_j) =
         get_json(app, "/data-versioning/checkpoints", Some(auth_header), &[]).await;
     assert_eq!(
@@ -885,58 +814,6 @@ pub async fn run_product_matrix_full_journey(
         "sandbox row should be removed after DELETE"
     );
 
-    let (st_tr, tr_j) = post_json(
-        app,
-        "/triggers",
-        Some(auth_header),
-        json!({
-            "trigger_type": "webhook",
-            "name": format!("wh_{suffix}"),
-            "agent_id": agent_id,
-            "user_input": "matrix e2e webhook trigger",
-            "session_id": session_id,
-            "context": { "suite": "matrix" }
-        }),
-    )
-    .await;
-    assert_eq!(st_tr, StatusCode::OK, "create webhook trigger: {tr_j}");
-    let trigger_id = tr_j["trigger_id"].as_str().expect("trigger_id").to_string();
-    let wh_secret = tr_j["secret"].as_str().expect("webhook secret");
-
-    let (st_tr_l, tr_l) = get_json(app, "/triggers", Some(auth_header), &[]).await;
-    assert_eq!(st_tr_l, StatusCode::OK, "list triggers: {tr_l}");
-    assert!(
-        tr_l.as_array().is_some_and(|a| {
-            a.iter()
-                .any(|t| t["trigger_id"].as_str() == Some(trigger_id.as_str()))
-        }),
-        "trigger not listed: {tr_l}"
-    );
-
-    let (st_fire, fire_j) = post_json(
-        app,
-        &format!("/triggers/{trigger_id}/fire"),
-        None,
-        json!({ "secret": wh_secret, "payload": { "hello": "matrix" } }),
-    )
-    .await;
-    assert_eq!(st_fire, StatusCode::OK, "fire webhook: {fire_j}");
-    assert_eq!(fire_j["fired"], true);
-
-    let (st_tr_d, tr_d) =
-        delete_json(app, &format!("/triggers/{trigger_id}"), Some(auth_header)).await;
-    assert_eq!(st_tr_d, StatusCode::OK, "delete trigger: {tr_d}");
-
-    let trig_gone = sqlx::query("SELECT 1 FROM wf_triggers WHERE trigger_id = ?")
-        .bind(&trigger_id)
-        .fetch_optional(pool)
-        .await
-        .expect("trigger gone");
-    assert!(
-        trig_gone.is_none(),
-        "wf_triggers row should be deleted: {trigger_id}"
-    );
-
     let (st_sks, sks_j) = get_json(app, "/skills", Some(auth_header), &[]).await;
     assert_eq!(st_sks, StatusCode::OK, "list skills: {sks_j}");
     assert!(sks_j["skills"].is_array(), "skills list record: {sks_j}");
@@ -982,15 +859,6 @@ pub async fn run_product_matrix_full_journey(
         "GET /models should return a paginated envelope: {models_j}"
     );
 
-    let (st_drift, drift) = get_json(
-        app,
-        "/evaluation/drift",
-        None,
-        &[("x-user-id", user_id.as_str())],
-    )
-    .await;
-    assert_eq!(st_drift, StatusCode::OK, "evaluation drift: {drift}");
-
     let reflect_path = format!("/chat/session/{session_id}/reflect");
     let (st_refl, refl) = get_json(app, &reflect_path, Some(auth_header), &[]).await;
     assert_eq!(st_refl, StatusCode::OK, "reflect: {refl}");
@@ -1000,21 +868,20 @@ pub async fn run_product_matrix_full_journey(
     assert_eq!(st_trace, StatusCode::OK, "decision-trace: {trace}");
 
     const LLM_TEXT: &str = "product-matrix-e2e-reply";
+    // Background extraction resolves deployment candidates asynchronously and
+    // may skip or use another Offering. Only primary API requests are exact.
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth_header,vec![ProviderScript::new("run_product_matrix_full_journey",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="matrix journey ping")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":LLM_TEXT,"reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{ "prompt_tokens": 5, "completion_tokens": 15,
+                    "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_input_tokens": 0},
+                    "total_tokens": 20 }}))])]).await;
     let chat_body = json!({
         "agent_id": agent_id,
         "session_id": session_id,
         "message": "matrix journey ping",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "model_selection": seeded_model_selection(ctx),
         "context": {
-            "edge_tools": [],
-            "test_llm_rounds": [{
-                "full_text": LLM_TEXT,
-                "reasoning": "",
-                "usage": { "prompt_tokens": 5, "completion_tokens": 15,
-                    "prompt_tokens_details": {"cached_tokens": 0, "cache_creation_input_tokens": 0},
-                    "total_tokens": 20 }
-            }]
-        }
+            "edge_tools": []}
     });
 
     let chat_req = axum::http::Request::builder()
@@ -1315,66 +1182,6 @@ pub async fn run_product_matrix_full_journey(
             .flatten()
             .is_some_and(|tools_available| tools_available >= 1),
         "context trace event should persist available tool count"
-    );
-    let assessment_row = sqlx::query(
-        "SELECT score, step_count \
-         FROM eval_quality_assessments \
-         WHERE user_id = ? AND target_id = ? AND level = 'session' \
-         ORDER BY updated_at DESC \
-         LIMIT 1",
-    )
-    .bind(&user_id)
-    .bind(&session_id)
-    .fetch_optional(pool)
-    .await
-    .expect("session quality assessment row");
-    let assessment_row = assessment_row.expect("session quality assessment after tool-backed turn");
-    assert!(
-        assessment_row
-            .try_get::<Option<i32>, _>("step_count")
-            .ok()
-            .flatten()
-            .is_some_and(|step_count| step_count >= 1),
-        "session quality assessment should record tool-backed step_count"
-    );
-
-    let (st_cal_after, cal_after_j) =
-        get_json(app, "/evaluation/calibration?days=7", None, xuid).await;
-    assert_eq!(
-        st_cal_after,
-        StatusCode::OK,
-        "evaluation calibration after tool-backed turn: {cal_after_j}"
-    );
-    assert!(
-        cal_after_j["sample_count"].as_u64().is_some(),
-        "calibration should expose numeric sample_count after tool-backed turn: {cal_after_j}"
-    );
-
-    let replay_cmp_path = format!("/sessions/{session_id}/replay/compare");
-    let (st_rcmp, rcmp_j) = get_json(app, &replay_cmp_path, Some(auth_header), &[]).await;
-    assert_eq!(
-        st_rcmp,
-        StatusCode::NOT_IMPLEMENTED,
-        "replay compare must remain unavailable: {rcmp_j}"
-    );
-    assert!(
-        rcmp_j["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("replay") && detail.contains("unavailable")),
-        "replay compare should explain the unavailable capability: {rcmp_j}"
-    );
-    let replay_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND event_type = 'replay'",
-    )
-    .bind(&session_id)
-    .bind(&user_id)
-    .fetch_one(pool)
-    .await
-    .expect("replay rows after unavailable compare");
-    assert_eq!(
-        replay_rows, 0,
-        "compare guardrail must not write replay rows"
     );
 
     cleanup_session_data(&ctx.shared_pool, &user_id, &session_id).await;

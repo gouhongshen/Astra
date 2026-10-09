@@ -69,7 +69,27 @@ When the same capability exists on Edge/CLI and Server, prefer Edge/CLI by defau
 
 Server fallback is allowed only when policy permits it and must be recorded in trace.
 
+### Web transport boundary
+
+Shared web fetch/search receives its transport policy from the execution owner,
+not model arguments. Server uses direct connections with validated, pinned public
+DNS addresses and ignores host proxy variables. Explicitly bound CLI and User
+Runner execution honors that process's HTTP(S)/ALL proxy and NO_PROXY environment.
+The latter trusts the user-selected proxy to resolve/connect safely: HTTP CONNECT
+and remote-resolution proxies cannot inherit the direct transport's IP-pinning
+guarantee. Both modes validate public destinations and every redirect locally;
+proxy-only DNS names are not supported. A failed proxy request never silently
+falls back to direct or Server execution. Cache identity includes transport mode.
+
+One total fetch deadline covers DNS, redirects and body reads. Network, timeout,
+HTTP and policy failures retain typed failure metadata through search and local
+tool callbacks; a failed connection is not reported as an unreadable search page.
+
 ## Offline and degraded behavior
+
+CLI SSE consumption executes only typed, admitted Server tool requests.
+Assistant text cannot be reinterpreted as a local tool call. Provider-level
+degraded call recovery remains on the Server before dispatch.
 
 | Condition | Behavior |
 | --- | --- |

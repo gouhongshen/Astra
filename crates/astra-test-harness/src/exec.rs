@@ -118,43 +118,72 @@ impl AstraCliExecutor {
     }
 }
 
+/// One launch boundary for execution and its subsequent inspection command.
+/// An implicit profile must stay implicit, particularly for native MOI auth.
+pub(crate) fn configured_astra_command(cfg: &RunnerConfig, case: &Case) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(&cfg.astra_bin);
+    if let Some(profile) = &cfg.profile {
+        command.args(["--profile", profile]);
+    }
+    if let Some(directory) = &cfg.working_dir {
+        command.current_dir(directory);
+    }
+    command.envs(&case.cli_env);
+    command
+}
+
 #[async_trait]
 impl CaseExecutor for AstraCliExecutor {
     async fn execute(&self, case: &Case, model: &str) -> RunOutcome {
-        run_case_subprocess(&self.cfg, case, model).await
+        let mut outcome = run_case_subprocess(&self.cfg, case, model).await;
+        if crate::criteria::requires_execution_capture(&case.criteria) {
+            let capture = crate::execution_capture::load(&self.cfg, case, &outcome).await;
+            if let Some(stream) = outcome.stream_capture.as_mut() {
+                match capture {
+                    Ok(capture) => stream.execution = Some(capture),
+                    Err(_) => stream.diagnose("canonical_execution_capture_failed"),
+                }
+            }
+        }
+        outcome
     }
 
     fn reproducer(&self, case: &Case, model: &str) -> String {
-        // Mirrors the args assembled below. Quote the prompt so it
-        // survives a copy-paste.
-        let has_session_id_in_extras = has_session_id(&case.extra_cli_args);
-        let mut parts = vec![
-            shell_escape(self.cfg.astra_bin.display().to_string()),
-            "chat".into(),
-            "-m".into(),
-            shell_escape(case.prompt.clone()),
-        ];
-        if !has_session_id_in_extras {
-            parts.push("--no-resume".into());
+        let mut parts = vec![shell_escape(self.cfg.astra_bin.display().to_string())];
+        if let Some(profile) = &self.cfg.profile {
+            parts.extend(["--profile".into(), shell_escape(profile.clone())]);
         }
-        parts.extend([
-            "--model".into(),
-            shell_escape(model.to_string()),
-            "--json".into(),
-            "--explain=on".into(),
-            "--stream-events".into(),
-            "\"$(mktemp -d)/events.jsonl\"".into(),
-            "-y".into(),
-        ]);
-        if let Some(cli_wall_time_seconds) = case.cli_wall_time_override_for(case.timeout_seconds) {
-            parts.push("--max-wall-time-seconds".into());
-            parts.push(shell_escape(cli_wall_time_seconds.to_string()));
-        }
-        for extra in &case.extra_cli_args {
-            parts.push(shell_escape(extra.clone()));
-        }
+        parts.extend(
+            case_cli_arguments(case, model, "events.jsonl")
+                .into_iter()
+                .map(shell_escape),
+        );
         parts.join(" ")
     }
+}
+
+/// One argument owner for execution and reproductions.
+fn case_cli_arguments(case: &Case, model: &str, events_path: &str) -> Vec<String> {
+    let mut args = vec!["--model".into(), model.into(), "-y".into()];
+    args.push("chat".into());
+    args.push("--json".into());
+    if !case
+        .extra_cli_args
+        .iter()
+        .any(|arg| arg == "--explain" || arg.starts_with("--explain="))
+    {
+        args.push("--explain=on".into());
+    }
+    args.extend(["--stream-events".into(), events_path.into()]);
+    if !has_session_id(&case.extra_cli_args) {
+        args.push("--no-resume".into());
+    }
+    if let Some(seconds) = case.cli_wall_time_override_for(case.timeout_seconds) {
+        args.extend(["--max-wall-time-seconds".into(), seconds.to_string()]);
+    }
+    args.extend(case.extra_cli_args.clone());
+    args.extend(["-m".into(), case.prompt.clone()]);
+    args
 }
 
 fn shell_escape(s: String) -> String {
@@ -275,6 +304,7 @@ struct MachineEventObservation {
     event_count: u64,
     invalid: Option<String>,
     explain: crate::explain_capture::ExplainCapture,
+    stream: Option<crate::runner::StreamCapture>,
 }
 
 impl MachineEventObservation {
@@ -295,6 +325,9 @@ impl MachineEventObservation {
         };
         self.event_count = self.event_count.saturating_add(1);
         self.explain.observe(&value);
+        if let Some(stream) = &mut self.stream {
+            stream.observe(&value, self.event_count);
+        }
         let observed = match event_type {
             "session_bound" => session_id_from_stream_event(line).map(|id| (true, id)),
             "run_bound" => run_id_from_stream_event(line).map(|id| (false, id)),
@@ -409,7 +442,10 @@ async fn observe_machine_event_file(
 }
 
 #[cfg(unix)]
-async fn kill_process_group_and_reap(child: &mut tokio::process::Child, group_id: Option<u32>) {
+pub(crate) async fn kill_process_group_and_reap(
+    child: &mut tokio::process::Child,
+    group_id: Option<u32>,
+) {
     if let Some(pid) = group_id
         && pid <= i32::MAX as u32
     {
@@ -433,7 +469,10 @@ async fn wait_for_user_cancel(flag: Option<&Arc<std::sync::atomic::AtomicBool>>)
 }
 
 #[cfg(not(unix))]
-async fn kill_process_group_and_reap(child: &mut tokio::process::Child, _group_id: Option<u32>) {
+pub(crate) async fn kill_process_group_and_reap(
+    child: &mut tokio::process::Child,
+    _group_id: Option<u32>,
+) {
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
@@ -552,7 +591,6 @@ async fn finish_failed_evidence_outcome(
 async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> RunOutcome {
     use std::process::Stdio;
     use std::time::Duration;
-    use tokio::process::Command;
 
     // Step-event files are append-only for a session. A continuation command
     // must report only the events it added, otherwise SuiteRunner sums the
@@ -576,11 +614,7 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
         }
     };
     let stream_event_path = stream_event_dir.path().join("events.jsonl");
-    let mut cmd = Command::new(&cfg.astra_bin);
-    if let Some(ref profile) = cfg.profile {
-        cmd.arg("--profile").arg(profile);
-    }
-    cmd.arg("chat").arg("-m").arg(&case.prompt);
+    let mut cmd = configured_astra_command(cfg, case);
     // A missing --session-id deliberately means "create a session".  The
     // server, not the harness, owns session identity: inventing a UUID here
     // turns the first turn into an explicit resume request, which a correctly
@@ -593,30 +627,11 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     // `astra chat` normally resumes the most recent one-shot session, so make
     // the root run explicitly isolated as well.  Do not add this on follow-up
     // turns: there `--session-id` is the authoritative continuation request.
-    if !has_session_id(&case.extra_cli_args) {
-        cmd.arg("--no-resume");
-    }
-    cmd.arg("--model")
-        .arg(model)
-        .arg("--json")
-        .arg("--explain=on")
-        // Exact lifecycle evidence used only for safe timeout convergence.
-        .arg("--stream-events")
-        .arg(&stream_event_path)
-        .arg("-y");
-    if let Some(cli_wall_time_seconds) = case.cli_wall_time_override_for(case.timeout_seconds) {
-        cmd.arg("--max-wall-time-seconds")
-            .arg(cli_wall_time_seconds.to_string());
-    }
-    if let Some(ref wd) = cfg.working_dir {
-        cmd.current_dir(wd);
-    }
-    for extra in &case.extra_cli_args {
-        cmd.arg(extra);
-    }
-    for (k, v) in &case.cli_env {
-        cmd.env(k, v);
-    }
+    cmd.args(case_cli_arguments(
+        case,
+        model,
+        &stream_event_path.to_string_lossy(),
+    ));
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -662,6 +677,7 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                 interruption_kind: None,
                 error_kind: None,
                 explain_capture: None,
+                stream_capture: None,
                 tool_result_class_counts: std::collections::BTreeMap::new(),
                 tool_calls_count: 0,
                 tools_used: vec![],
@@ -669,6 +685,7 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
                 prompt_tokens: 0,
                 cached_input_tokens: 0,
                 cache_creation_tokens: 0,
+                token_usage_coverage: None,
                 duration_ms: start.elapsed().as_millis() as u64,
                 turn_rounds: 0,
                 cache_hits: 0,
@@ -681,7 +698,12 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     let child_group_id = child.id();
     let stdout = child.stdout.take().expect("piped stdout is present");
     let stderr = child.stderr.take().expect("piped stderr is present");
-    let machine_observation = Arc::new(Mutex::new(MachineEventObservation::default()));
+    let machine_observation = Arc::new(Mutex::new(MachineEventObservation {
+        stream: (cfg.artifacts_dir.is_some()
+            || crate::criteria::requires_execution_capture(&case.criteria))
+        .then(Default::default),
+        ..Default::default()
+    }));
     let machine_observer_done = tokio_util::sync::CancellationToken::new();
     let mut machine_event_reader = tokio::spawn(observe_machine_event_file(
         stream_event_path,
@@ -949,7 +971,7 @@ fn retain_machine_capture(
     observation: &Arc<Mutex<MachineEventObservation>>,
 ) {
     let mut capture = crate::explain_capture::ExplainCapture::default();
-    if let Ok(observed) = observation.lock() {
+    if let Ok(mut observed) = observation.lock() {
         capture = observed.explain.clone();
         if observed.invalid.is_some() {
             capture.diagnose("invalid_machine_stream");
@@ -962,6 +984,22 @@ fn retain_machine_capture(
         } else {
             None
         });
+        if let Some(mut stream) = observed.stream.take() {
+            stream.session_id = observed.session_id.clone();
+            stream.root_run_id = observed.run_id.clone();
+            stream.identity_verified =
+                observed.invalid.is_none() && binding_matches && observed.run_id.is_some();
+            if observed.invalid.is_some() {
+                stream.diagnose("invalid_machine_stream");
+            }
+            if !stream.identity_verified {
+                stream.diagnose("unverified_run_scope");
+            }
+            if outcome.exit_code != 0 || outcome.final_state.as_deref() != Some("completed") {
+                stream.diagnose("execution_incomplete");
+            }
+            outcome.stream_capture = Some(stream);
+        }
     } else {
         capture.diagnose("capture_reader_unavailable");
     }
@@ -1255,6 +1293,7 @@ pub(crate) mod test_support {
                     prompt_tokens: 0,
                     cached_input_tokens: 0,
                     cache_creation_tokens: 0,
+                    token_usage_coverage: None,
                     duration_ms: 0,
                     turn_rounds: 0,
                     cache_hits: 0,
@@ -1264,6 +1303,7 @@ pub(crate) mod test_support {
                     interruption_kind: None,
                     error_kind: None,
                     explain_capture: None,
+                    stream_capture: None,
                     tool_result_class_counts: std::collections::BTreeMap::new(),
                 })
         }
@@ -1305,6 +1345,10 @@ mod tests {
             r#"{"type":"run_bound","run_id":"8a0dcb50-38a7-4402-bef3-2c1aee9a4e85"}"#,
         );
         assert!(observation.invalid.is_none());
+        assert!(
+            observation.stream.is_none(),
+            "raw capture requires artifact opt-in"
+        );
         assert_eq!(
             observation.session_id.as_deref(),
             Some("550e8400-e29b-41d4-a716-446655440000")
@@ -1322,14 +1366,27 @@ mod tests {
 
     #[test]
     fn incomplete_execution_retains_explain_facts_without_certifying_identity() {
-        let mut observed = MachineEventObservation::default();
+        let mut observed = MachineEventObservation {
+            stream: Some(Default::default()),
+            ..Default::default()
+        };
         observed.observe_line(r#"{"type":"explain_analyze","schema_version":1,"event_id":"e","run_id":"foreign","turn_id":"t","node_id":"n","producer_id":"p","clock_domain_id":"c","kind":"admission","label":"Admission","transition":"started","elapsed_ms":0}"#);
+        observed.observe_line(r#"{"type":"agent_live","event":{"run_id":"child","agent_id":"agent","kind":{"type":"output_delta","model_item_id":null,"text":"partial\n"}}}"#);
         observed.observe_line("corrupt trailing evidence");
         let mut outcome = RunOutcome {
             exit_code: 124,
             ..Default::default()
         };
         retain_machine_capture(&mut outcome, &Arc::new(Mutex::new(observed)));
+        let stream = outcome.stream_capture.unwrap();
+        assert_eq!(stream.records.len(), 1);
+        assert!(!stream.identity_verified);
+        assert!(
+            stream
+                .diagnostics
+                .contains(&"invalid_machine_stream".into())
+        );
+        assert!(stream.diagnostics.contains(&"execution_incomplete".into()));
         let capture = outcome.explain_capture.unwrap();
         assert_eq!(capture.events.len(), 1);
         assert!(!capture.identity_verified);
@@ -1339,6 +1396,49 @@ mod tests {
                 .contains(&"invalid_machine_stream".into())
         );
         assert!(capture.diagnostics.contains(&"execution_incomplete".into()));
+    }
+
+    #[test]
+    fn stream_capture_bounds_and_gaps_do_not_invalidate_explain() {
+        use crate::runner::{MAX_STREAM_CAPTURE_BYTES, MAX_STREAM_CAPTURE_RECORDS, StreamCapture};
+
+        let mut observed = MachineEventObservation {
+            stream: Some(Default::default()),
+            ..Default::default()
+        };
+        observed.explain.observe(&serde_json::json!({
+            "type":"explain_analyze_snapshot", "delivery_degraded":false,
+            "events":[{"schema_version":1,"event_id":"e","run_id":"r","turn_id":"t",
+                "node_id":"n","producer_id":"p","clock_domain_id":"c",
+                "kind":"admission","label":"Admission","transition":"started","elapsed_ms":0}]
+        }));
+        observed.explain.bind(Some("r"));
+        let mut wire = serde_json::json!({"type":"agent_live","event":{
+            "run_id":"child","agent_id":"agent","kind":{
+                "type":"output_delta","model_item_id":"item","text":"界".repeat(MAX_STREAM_CAPTURE_BYTES / 6)
+            }
+        }});
+        for _ in 0..3 {
+            observed.observe_line(&wire.to_string());
+        }
+        observed.observe_line(r#"{"type":"agent_live","event":{}}"#);
+        observed.observe_line(r#"{"type":"agent_live_gap","gap":{"run_id":"child","agent_id":"agent","dropped_event_count":1}}"#);
+        let stream = observed.stream.unwrap();
+        assert!(stream.diagnostics.contains(&"capture_truncated".into()));
+        assert!(stream.diagnostics.contains(&"invalid_agent_live".into()));
+        assert!(stream.diagnostics.contains(&"agent_live_gap".into()));
+        assert!(serde_json::to_vec(&stream).unwrap().len() <= MAX_STREAM_CAPTURE_BYTES);
+        assert!(observed.invalid.is_none());
+        assert!(observed.explain.canonical_graph().is_some());
+
+        wire["event"]["kind"]["text"] = serde_json::json!("x");
+        let mut stream = StreamCapture::default();
+        for index in 0..=MAX_STREAM_CAPTURE_RECORDS {
+            stream.observe(&wire, index as u64);
+        }
+        assert_eq!(stream.records.len(), MAX_STREAM_CAPTURE_RECORDS);
+        assert!(stream.diagnostics.contains(&"capture_truncated".into()));
+        assert!(serde_json::to_vec(&stream).unwrap().len() <= MAX_STREAM_CAPTURE_BYTES);
     }
 
     #[tokio::test]
@@ -1395,22 +1495,90 @@ mod tests {
     async fn machine_event_file_observer_reads_dedicated_jsonl_before_shutdown() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("events.jsonl");
-        let observation = Arc::new(Mutex::new(MachineEventObservation::default()));
+        let observation = Arc::new(Mutex::new(MachineEventObservation {
+            stream: Some(Default::default()),
+            ..Default::default()
+        }));
         let done = tokio_util::sync::CancellationToken::new();
         let mut reader = tokio::spawn(observe_machine_event_file(
             path.clone(),
             Arc::clone(&observation),
             done.clone(),
         ));
-        tokio::fs::write(
-            path,
-            concat!(
-                "{\"type\":\"session_bound\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}\n",
-                "{\"type\":\"run_bound\",\"run_id\":\"8a0dcb50-38a7-4402-bef3-2c1aee9a4e85\"}\n",
+        let owner = serde_json::json!({"account_id":"account", "profile_name":"profile", "api_origin":"https://example.invalid"});
+        let mut events = [
+            serde_json::json!({"type":"session_bound", "session_id":"550e8400-e29b-41d4-a716-446655440000", "owner":owner}),
+            serde_json::json!({"type":"run_bound", "run_id":"8a0dcb50-38a7-4402-bef3-2c1aee9a4e85", "owner":owner}),
+        ].iter().map(|event| event.to_string()).collect::<Vec<_>>().join("\n") + "\n";
+        for (run_id, kind) in [
+            (
+                "child-a",
+                serde_json::json!({"type":"signal","signal":"run_started",
+                "parent_run_id":"8a0dcb50-38a7-4402-bef3-2c1aee9a4e85","depth":1,
+                "spawn_tool_call_id":"spawn-a","transcript_location":"durable_server"}),
             ),
-        )
-        .await
-        .unwrap();
+            (
+                "child-a",
+                serde_json::json!({"type":"output_delta","model_item_id":"item-a","text":"4"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"thinking_delta","model_item_id":null,"text":"excluded-secret"}),
+            ),
+            (
+                "child-b",
+                serde_json::json!({"type":"signal","signal":"run_started",
+                "parent_run_id":"child-a","depth":2,"spawn_tool_call_id":"spawn-b",
+                "transcript_location":"local_journal"}),
+            ),
+            (
+                "child-b",
+                serde_json::json!({"type":"output_delta","model_item_id":"item-b","text":"other"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"output_delta","model_item_id":"item-a","text":"4"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"output_delta","model_item_id":"item-c","text":"2\n"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"status","text":"excluded-secret"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"tool_completed","name":"read_file",
+                "description":"excluded-secret","status":"completed","duration_ms":0,
+                "output_summary":null,"output":"excluded-secret","tool_use_id":"tool"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"signal","signal":"ask_user_prompted",
+                "request_id":"ask","prompt":{"text":"excluded-secret"}}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"signal","signal":"transcript_committed",
+                "model_item_id":null,"source_event_id":"response:child-a:turn-1",
+                "transcript_location":"durable_server"}),
+            ),
+            (
+                "child-a",
+                serde_json::json!({"type":"agent_terminated","termination":"completed",
+                "duration_ms":3,"reason":null}),
+            ),
+        ] {
+            events.push_str(
+                &serde_json::json!({"type":"agent_live","event":{
+                    "run_id":run_id,"agent_id":"shared-agent","kind":kind
+                }})
+                .to_string(),
+            );
+            events.push('\n');
+        }
+        tokio::fs::write(path, events).await.unwrap();
 
         let (session_id, run_id) = finish_machine_event_observer(done, &mut reader, &observation)
             .await
@@ -1424,6 +1592,53 @@ mod tests {
             run_id.as_deref(),
             Some("8a0dcb50-38a7-4402-bef3-2c1aee9a4e85")
         );
+        let mut outcome = RunOutcome::new("m")
+            .with_session_id(session_id.unwrap())
+            .with_final_state("completed");
+        outcome.run_id = run_id;
+        retain_machine_capture(&mut outcome, &observation);
+        directory.close().unwrap();
+        let stream = outcome.stream_capture.as_ref().unwrap();
+        assert!(stream.identity_verified);
+        assert!(stream.diagnostics.is_empty());
+        let records = serde_json::to_value(&stream.records).unwrap();
+        assert_eq!(stream.records.len(), 8);
+        assert_eq!(records[2]["event"]["kind"]["parent_run_id"], "child-a");
+        assert_eq!(records[3]["event"]["run_id"], "child-b");
+        assert_eq!(
+            records[1]["event"]["kind"]["text"],
+            records[4]["event"]["kind"]["text"]
+        );
+        assert_eq!(records[5]["event"]["kind"]["model_item_id"], "item-c");
+        assert_eq!(records[5]["event"]["kind"]["text"], "2\n");
+        assert_eq!(
+            records[6]["event"]["kind"]["source_event_id"],
+            "response:child-a:turn-1"
+        );
+        assert!(records[6]["event"]["kind"]["model_item_id"].is_null());
+        assert_eq!(records[7]["event"]["kind"]["termination"], "completed");
+        assert!(
+            !serde_json::to_string(stream)
+                .unwrap()
+                .contains("excluded-secret")
+        );
+        assert!(
+            serde_json::to_value(&outcome)
+                .unwrap()
+                .get("stream_capture")
+                .is_none()
+        );
+        let mut mismatched = outcome.clone();
+        mismatched.run_id = Some("foreign".into());
+        observation.lock().unwrap().stream = outcome.stream_capture.clone();
+        retain_machine_capture(&mut mismatched, &observation);
+        let stream = mismatched.stream_capture.unwrap();
+        assert!(!stream.identity_verified);
+        assert_eq!(
+            stream.root_run_id.as_deref(),
+            Some("8a0dcb50-38a7-4402-bef3-2c1aee9a4e85")
+        );
+        assert_eq!(stream.records.len(), 8);
     }
 
     #[tokio::test]
@@ -1571,7 +1786,7 @@ mod tests {
         assert!(repro.contains("--model"));
         assert!(repro.contains("qwen-flash"));
         assert!(repro.contains("--verbose"));
-        assert!(repro.contains("--max-wall-time-seconds '150'"));
+        assert!(repro.contains("'--max-wall-time-seconds' '150'"));
         let mut default_case = simple_case();
         assert!(
             !exec
@@ -1594,6 +1809,36 @@ mod tests {
             repro.contains(r"'say '\''hello'\'''"),
             "POSIX single-quote escape expected: {repro}"
         );
+    }
+
+    #[test]
+    fn explicit_explain_mode_overrides_capture_default() {
+        let ordinary = Case::from_path(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/cases/runtime_observation_recovery/ordinary_previous_run.yaml"
+        )))
+        .unwrap();
+        assert_eq!(ordinary.extra_cli_args, ["--explain=off"]);
+        assert!(
+            !case_cli_arguments(&ordinary, "test-model", "events.jsonl")
+                .contains(&"--explain=on".into())
+        );
+        for explicit in [vec![], vec!["--explain=off"], vec!["--explain", "off"]] {
+            let mut case = simple_case();
+            case.extra_cli_args = explicit.iter().map(|arg| (*arg).into()).collect();
+            crate::case::validate_extra_cli_args(&case.extra_cli_args).unwrap();
+            let args = case_cli_arguments(&case, "test-model", "events.jsonl");
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| *arg == "--explain" || arg.starts_with("--explain="))
+                    .count(),
+                1
+            );
+            assert_eq!(args.contains(&"--explain=on".into()), explicit.is_empty());
+            for arg in explicit {
+                assert!(args.contains(&arg.to_string()));
+            }
+        }
     }
 
     #[tokio::test]
@@ -1628,47 +1873,57 @@ mod tests {
             args_path.to_string_lossy().into_owned(),
         );
         let exec = AstraCliExecutor::new(RunnerConfig::new(shim));
-        let root = exec.execute(&case, "m").await;
-        let root_args = std::fs::read_to_string(&args_path).expect("root args");
-        assert_eq!(
-            root.session_id.as_deref(),
-            Some("550e8400-e29b-41d4-a716-446655440000"),
-            "root outcome: {root:?}; args={root_args:?}"
-        );
-        assert!(
-            !root_args.lines().any(|arg| arg == "--session-id"),
-            "root turn must not fabricate a resumable id: {root_args:?}"
-        );
-        assert!(root_args.lines().any(|arg| arg == "--no-resume"));
-        assert!(
-            !root_args
-                .lines()
-                .any(|arg| arg == "--max-wall-time-seconds"),
-            "unconfigured cases must preserve the outer watchdog budget: {root_args:?}"
-        );
+        {
+            case.extra_cli_args.clear();
+            let root = exec.execute(&case, "m").await;
+            let root_args = std::fs::read_to_string(&args_path).expect("root args");
+            let args: Vec<_> = root_args.lines().collect();
+            assert_eq!(&args[..3], &["--model", "m", "-y"]);
+            assert_eq!(args[3], "chat");
+            assert_eq!(args[args.len() - 2], "-m");
+            assert_eq!(args.last().copied(), Some(case.prompt.as_str()));
+            assert_eq!(
+                root.session_id.as_deref(),
+                Some("550e8400-e29b-41d4-a716-446655440000"),
+                "root outcome: {root:?}; args={root_args:?}"
+            );
+            assert!(
+                !root_args.lines().any(|arg| arg == "--session-id"),
+                "root turn must not fabricate a resumable id: {root_args:?}"
+            );
+            assert!(root_args.lines().any(|arg| arg == "--no-resume"));
+            assert!(
+                !root_args
+                    .lines()
+                    .any(|arg| arg == "--max-wall-time-seconds"),
+                "unconfigured cases must preserve the outer watchdog budget: {root_args:?}"
+            );
 
-        case.extra_cli_args = vec![
-            "--session-id".into(),
-            "550e8400-e29b-41d4-a716-446655440000".into(),
-        ];
-        let follow_up = exec.execute(&case, "m").await;
-        assert_eq!(
-            follow_up.session_id.as_deref(),
-            Some("550e8400-e29b-41d4-a716-446655440000")
-        );
-        let follow_up_args = std::fs::read_to_string(&args_path).expect("follow-up args");
-        assert!(
-            follow_up_args
-                .lines()
-                .collect::<Vec<_>>()
-                .windows(2)
-                .any(|pair| { pair == ["--session-id", "550e8400-e29b-41d4-a716-446655440000"] }),
-            "follow-up must preserve the server-issued id: {follow_up_args:?}"
-        );
-        assert!(
-            !follow_up_args.lines().any(|arg| arg == "--no-resume"),
-            "follow-up must use the explicit server session, not disable resume: {follow_up_args:?}"
-        );
+            case.extra_cli_args = vec![
+                "--session-id".into(),
+                "550e8400-e29b-41d4-a716-446655440000".into(),
+            ];
+            let follow_up = exec.execute(&case, "m").await;
+            assert_eq!(
+                follow_up.session_id.as_deref(),
+                Some("550e8400-e29b-41d4-a716-446655440000")
+            );
+            let follow_up_args = std::fs::read_to_string(&args_path).expect("follow-up args");
+            assert!(
+                follow_up_args
+                    .lines()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|pair| {
+                        pair == ["--session-id", "550e8400-e29b-41d4-a716-446655440000"]
+                    }),
+                "follow-up must preserve the server-issued id: {follow_up_args:?}"
+            );
+            assert!(
+                !follow_up_args.lines().any(|arg| arg == "--no-resume"),
+                "follow-up must use the explicit server session, not disable resume: {follow_up_args:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1705,6 +1960,263 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
         assert_eq!(
             crate::classify::classify(&out, &[]),
             crate::classify::FailureClass::BehaviorContractViolation
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canonical_capture_without_archiving_reuses_launch_context_and_checks_account_before_spawn()
+     {
+        let tmp = tempfile::tempdir().unwrap();
+        let shim = tmp.path().join("astra-protocol-fixture");
+        let session = "550e8400-e29b-41d4-a716-446655440000";
+        let root = "550e8400-e29b-41d4-a716-446655440001";
+        let mut capture = crate::execution_capture::tests::capture();
+        capture.session_id = session.into();
+        capture.run_tree.session_id = session.into();
+        capture.reflection.session_id = session.into();
+        let page = capture.transcript.as_mut().unwrap();
+        page.session_id = session.into();
+        for item in &mut page.items {
+            item.session_id = session.into();
+        }
+        capture.run_tree.runs[0].run_id = root.into();
+        for run in &mut capture.run_tree.runs {
+            run.root_run_id = Some(root.into());
+            if run.parent_run_id.is_some() {
+                run.parent_run_id = Some(root.into());
+            }
+        }
+        capture
+            .reflection
+            .model_requests
+            .terminal
+            .as_mut()
+            .unwrap()
+            .groups[0]
+            .parent_run_id = Some(root.into());
+        for fact in capture.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()["execution_spine"]["facts"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if fact["run_id"] == "root" {
+                fact["run_id"] = serde_json::json!(root);
+            }
+            fact["parent_run_id"] = serde_json::json!(root);
+        }
+        let capture_path = tmp.path().join("capture.json");
+        std::fs::write(&capture_path, serde_json::to_vec(&capture).unwrap()).unwrap();
+        let pending_path = tmp.path().join("pending-capture.json");
+        let mut pending = capture.clone();
+        pending.reflection.graph_slice.nodes[0]
+            .metadata
+            .as_mut()
+            .unwrap()["execution_spine"]["facts"] = serde_json::json!([]);
+        std::fs::write(&pending_path, serde_json::to_vec(&pending).unwrap()).unwrap();
+        let bindings = [
+            serde_json::json!({"type":"session_bound", "session_id":session, "owner":capture.owner}),
+            serde_json::json!({"type":"run_bound", "run_id":root, "owner":capture.owner}),
+        ].iter().map(|event| event.to_string()).collect::<Vec<_>>().join("\n") + "\n";
+        let bindings_path = tmp.path().join("bindings.jsonl");
+        std::fs::write(&bindings_path, bindings).unwrap();
+        let terminal_path = tmp.path().join("terminal.json");
+        std::fs::write(
+            &terminal_path,
+            serde_json::to_vec(&serde_json::json!({
+                "trace_id":null,"request_id":null,"run_id":root,"session_id":session,
+                "text":"observed-value","final_state":"completed","interruption_kind":null,
+                "tool_result_class_counts":{},"prompt_tokens":1,"fresh_prompt_tokens":1,
+                "cache":{"hit":false,"read_tokens":0,"creation_tokens":0},"completion_tokens":1,
+                "llm_rounds":1,"tool_calls_count":0,"tools_used":[],"persistence_error":null,
+                "exit_code":0,"success":true,"error_kind":null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let log = tmp.path().join("inspection-calls");
+        crate::test_support::write_executable_shim(
+            &shim,
+            r#"#!/bin/sh
+test "$PROBE_VALUE" = expected || exit 20
+test "$PWD" = "$EXPECTED_CWD" || exit 21
+test "$1" != --profile || exit 22
+if [ "$1" = session ]; then
+  if [ "$HANG_SECOND" = 1 ]; then
+    printf 'inspection\n' >> "$PROBE_LOG"
+    if [ -f "$HANG_SEEN" ]; then
+      printf '%s' "$$" > "$HANG_SEEN.pid"
+      sleep 60; exit 0
+    fi
+    : > "$HANG_SEEN"
+    cat "$PENDING_CAPTURE_FILE"
+    exit 0
+  fi
+  if [ -f "$PROBE_LOG" ]; then cat "$CAPTURE_FILE";
+  else cat "$PENDING_CAPTURE_FILE"; fi
+  printf 'inspection\n' >> "$PROBE_LOG"
+  exit 0
+fi
+next=0
+for arg in "$@"; do
+  if [ "$next" = 1 ]; then cat "$BINDINGS_FILE" > "$arg"; next=0;
+  elif [ "$arg" = --stream-events ]; then next=1; fi
+done
+cat "$TERMINAL_FILE"
+"#,
+        )
+        .unwrap();
+        let mut case = simple_case();
+        case.criteria = vec![crate::criteria::Criterion::ExecutionChildResultsAdopted {
+            children: vec![crate::criteria::ChildExecutionExpectation {
+                expected_result: crate::criteria::ChildResultExpectation::Text(
+                    "observed-value".into(),
+                ),
+                model: "test-model".into(),
+                initial_thinking: None,
+                answered_question: false,
+                workspace_mutation: None,
+                logical_rounds: None,
+                slot_index: None,
+            }],
+            fanout_group: None,
+        }];
+        for (key, value) in [
+            ("PROBE_VALUE", "expected".to_string()),
+            ("EXPECTED_CWD", tmp.path().display().to_string()),
+            ("PROBE_LOG", log.display().to_string()),
+            ("CAPTURE_FILE", capture_path.display().to_string()),
+            ("PENDING_CAPTURE_FILE", pending_path.display().to_string()),
+            ("BINDINGS_FILE", bindings_path.display().to_string()),
+            ("TERMINAL_FILE", terminal_path.display().to_string()),
+        ] {
+            case.cli_env.insert(key.into(), value);
+        }
+        let mut cfg = RunnerConfig::new(shim);
+        cfg.working_dir = Some(tmp.path().into());
+        cfg.artifact_owner_scopes = vec![astra_services::OwnerScope::user("account").unwrap()];
+        assert!(cfg.profile.is_none() && cfg.artifacts_dir.is_none());
+        let outcome = AstraCliExecutor::new(cfg.clone())
+            .execute(&case, "test-model")
+            .await;
+        assert_eq!(outcome.exit_code, 0, "{}", outcome.text);
+        let stream = outcome.stream_capture.as_ref().unwrap();
+        assert!(stream.identity_verified);
+        assert!(crate::criteria::evaluate_deterministic(&case.criteria, &outcome)[0].passed);
+        case.criteria = vec![crate::criteria::Criterion::ExecutionChildResultsAdopted {
+            children: vec![crate::criteria::ChildExecutionExpectation {
+                expected_result: crate::criteria::ChildResultExpectation::Text(
+                    "wrong-result".into(),
+                ),
+                model: "test-model".into(),
+                initial_thinking: None,
+                answered_question: false,
+                workspace_mutation: None,
+                logical_rounds: None,
+                slot_index: None,
+            }],
+            fanout_group: None,
+        }];
+        let wrong_result = AstraCliExecutor::new(cfg.clone())
+            .execute(&case, "test-model")
+            .await;
+        let results = crate::criteria::evaluate_deterministic(&case.criteria, &wrong_result);
+        assert!(!results[0].passed);
+        assert_eq!(
+            crate::classify::classify(&wrong_result, &results),
+            crate::classify::FailureClass::BehaviorContractViolation
+        );
+        let foreign_path = tmp.path().join("foreign-capture.json");
+        let mut foreign = capture.clone();
+        foreign.owner.account_id = "other-account".into();
+        std::fs::write(&foreign_path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+        case.cli_env
+            .insert("CAPTURE_FILE".into(), foreign_path.display().to_string());
+        let foreign_result = AstraCliExecutor::new(cfg.clone())
+            .execute(&case, "test-model")
+            .await;
+        assert!(
+            foreign_result
+                .stream_capture
+                .as_ref()
+                .unwrap()
+                .execution
+                .is_none()
+        );
+        cfg.artifact_owner_scopes =
+            vec![astra_services::OwnerScope::user("other-account").unwrap()];
+        let rejected = AstraCliExecutor::new(cfg.clone())
+            .execute(&case, "test-model")
+            .await;
+        assert!(
+            rejected
+                .stream_capture
+                .as_ref()
+                .unwrap()
+                .execution
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "inspection\ninspection\ninspection\ninspection\n",
+            "pending observation retries once; wrong result and foreign owner do not retry; unauthorized account does not inspect"
+        );
+        cfg.artifact_owner_scopes = vec![astra_services::OwnerScope::user("account").unwrap()];
+        case.cli_env
+            .insert("CAPTURE_FILE".into(), pending_path.display().to_string());
+        case.cli_env.insert("HANG_SECOND".into(), "1".into());
+        case.cli_env.insert(
+            "HANG_SEEN".into(),
+            tmp.path()
+                .join("hanging-observer-started")
+                .display()
+                .to_string(),
+        );
+        // Exercise the same observer with a short absolute deadline, not a
+        // twenty-second wall-clock wait inside a fifteen-second test budget.
+        let partial = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::execution_capture::load_until(
+                &cfg,
+                &case,
+                &outcome,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+            ),
+        )
+        .await
+        .expect("observation deadline must include all retries and waits")
+        .expect("the last owner-bound partial capture must survive");
+        let mut unresolved = outcome.clone();
+        unresolved.stream_capture.as_mut().unwrap().execution = Some(partial);
+        let reader_pid = std::fs::read_to_string(tmp.path().join("hanging-observer-started.pid"))
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(reader_pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "the owned inspection process must be reaped before returning"
+        );
+        let stream = unresolved.stream_capture.as_ref().unwrap();
+        assert!(
+            stream
+                .execution
+                .as_ref()
+                .unwrap()
+                .awaiting_completion_evidence(Some(root)),
+            "last partial snapshot must survive the deadline"
+        );
+        let results = crate::criteria::evaluate_deterministic(&case.criteria, &unresolved);
+        assert_eq!(
+            crate::classify::classify(&unresolved, &results),
+            crate::classify::FailureClass::InfraVerificationUnavailable
+        );
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap().lines().count(),
+            6,
+            "deadline must reap the second reader without launching a third"
         );
     }
 
@@ -1817,12 +2329,15 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
                 "printf '%s\\n' '{\"type\":\"run_bound\",\"run_id\":\"550e8400-e29b-41d4-a716-446655440001\"}' >> \"$events\"\n",
                 r#"printf '%s\n' '{"type":"explain_analyze","schema_version":1,"event_id":"e","run_id":"550e8400-e29b-41d4-a716-446655440001","turn_id":"t","node_id":"n","producer_id":"p","clock_domain_id":"c","kind":"admission","label":"Admission","transition":"started","elapsed_ms":0}' >> "$events""#,
                 "\n",
+                r#"printf '%s\n' '{"type":"agent_live","event":{"run_id":"child","agent_id":"agent","kind":{"type":"output_delta","model_item_id":"item","text":"partial"}}}' >> "$events""#,
+                "\n",
                 "sleep 10\n",
             ),
         )
         .expect("write shim");
 
-        let cfg = RunnerConfig::new(shim.clone());
+        let mut cfg = RunnerConfig::new(shim.clone());
+        cfg.artifacts_dir = Some(tmp.path().join("artifacts"));
         let exec = AstraCliExecutor::new(cfg);
         let case = Case {
             name: "timeout_probe".into(),
@@ -1866,6 +2381,13 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             "timeout didn't kill subprocess — elapsed {}s",
             elapsed.as_secs()
         );
+        let stream = outcome
+            .stream_capture
+            .as_ref()
+            .expect("timeout retains child evidence");
+        assert_eq!(stream.records.len(), 1);
+        assert!(stream.identity_verified);
+        assert!(stream.diagnostics.contains(&"execution_incomplete".into()));
         // Synthetic outcome: POSIX 124 + explanatory text. This is
         // the contract downstream report rendering + reproducer
         // hinting rely on.
@@ -1924,6 +2446,8 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
                 "done\n",
                 "printf '%s\\n' '{\"type\":\"session_bound\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\"}' > \"$events\"\n",
                 "printf '%s\\n' '{\"type\":\"run_bound\",\"run_id\":\"550e8400-e29b-41d4-a716-446655440001\"}' >> \"$events\"\n",
+                r#"printf '%s\n' '{"type":"agent_live","event":{"run_id":"child","agent_id":"agent","kind":{"type":"output_delta","model_item_id":"item","text":"partial"}}}' >> "$events""#,
+                "\n",
                 "touch \"$HARNESS_READY_PATH\"\n",
                 "sleep 10\n",
             ),
@@ -1933,6 +2457,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut cfg = RunnerConfig::new(shim);
         cfg.cancel_flag = Some(flag.clone());
+        cfg.artifacts_dir = Some(tmp.path().join("artifacts"));
         let exec = AstraCliExecutor::new(cfg);
         let mut case = simple_case();
         case.timeout_seconds = 15;
@@ -1964,6 +2489,13 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             Some("550e8400-e29b-41d4-a716-446655440001")
         );
         assert!(outcome.text.contains("observed session cancelled"));
+        let stream = outcome
+            .stream_capture
+            .as_ref()
+            .expect("cancel retains stream evidence");
+        assert_eq!(stream.records.len(), 1);
+        assert!(stream.identity_verified);
+        assert!(stream.diagnostics.contains(&"execution_incomplete".into()));
     }
 
     #[tokio::test]
@@ -2131,6 +2663,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             prompt_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_tokens: 0,
+            token_usage_coverage: None,
             duration_ms: 0,
             turn_rounds: 0,
             cache_hits: 0,
@@ -2140,6 +2673,7 @@ printf '%s\n' '{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":
             interruption_kind: None,
             error_kind: None,
             explain_capture: None,
+            stream_capture: None,
             tool_result_class_counts: std::collections::BTreeMap::new(),
         };
         seed.exit_code = 0;

@@ -1,0 +1,50 @@
+name: flash_fanout_model_default
+description: |
+  Real DeepSeek Flash parent and children exercise a shared explicit reasoning
+  setting in a two-slot atomic fanout. model_default must not invent a
+  provider-specific effort.
+prompt: |
+  Run exactly one foreground agent_fanout.start group with group_id
+  flash-model-selection-test and target_count 2.
+  Set defaults.reasoning to {"mode":"model_default"}. Give both slots
+  agent_type "explore". Ask slot 0 to reply exactly FLASH-SLOT-ALPHA and
+  slot 1 to reply exactly FLASH-SLOT-BETA. Do not retry or replace slots.
+  Wait for the group result, then report both exact replies and 2/2. Do not
+  call Reflect or any other diagnostic tool.
+debug_log: true
+capability: delegation
+timeout_seconds: 240
+criteria:
+  - type: exit_code
+    code: 0
+  - type: turn_rounds_between
+    min: 2
+    max: 4
+  - type: execution_tool_count
+    name: agent_fanout
+    root_only: true
+    min: 1
+    max: 1
+    predicates:
+      - document: arguments
+        path: /action
+        equals: start
+  - type: execution_child_results_adopted
+    fanout_group: flash-model-selection-test
+    children:
+      - slot_index: 0
+        expected_result: {text: FLASH-SLOT-ALPHA}
+        model: deepseek-v4-flash
+        initial_thinking: {kind: exact, config: {mode: model_default}}
+      - slot_index: 1
+        expected_result: {text: FLASH-SLOT-BETA}
+        model: deepseek-v4-flash
+        initial_thinking: {kind: exact, config: {mode: model_default}}
+  - type: text_contains
+    needle: FLASH-SLOT-ALPHA
+  - type: text_contains
+    needle: FLASH-SLOT-BETA
+  - type: execution_tool_count
+    name: reflect
+    min: 0
+    max: 0

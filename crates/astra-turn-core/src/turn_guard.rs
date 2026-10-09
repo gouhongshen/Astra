@@ -318,9 +318,25 @@ impl TurnGuard {
         result_str: &str,
         source_error_kind: Option<astra_core::ErrorKind>,
     ) -> ResultQuality {
-        let quality = match result_quality::classify_result(result_str) {
-            ResultQuality::Error => ResultQuality::Success,
-            other => other,
+        use crate::orchestration::agent_result_wire::{
+            DecodedAgentToolResult, agent_control_result_value, decode_agent_tool_result,
+        };
+        let admitted_control = tool_name == "agent"
+            && agent_control_result_value(result_str).is_some_and(|value| {
+                matches!(
+                    decode_agent_tool_result(&value),
+                    Some(DecodedAgentToolResult::ControlReceipt(_))
+                )
+            });
+        // An accepted coordination operation is meaningful, even without a
+        // finished child result. This does not promote it to child completion.
+        let quality = if admitted_control {
+            ResultQuality::Success
+        } else {
+            match result_quality::classify_result(result_str) {
+                ResultQuality::Error => ResultQuality::Success,
+                other => other,
+            }
         };
         self.record_tool_result_quality_with_kind(tool_name, source_error_kind, quality)
     }

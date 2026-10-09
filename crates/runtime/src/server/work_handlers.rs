@@ -303,8 +303,14 @@ fn map_recovery_point_blocker(
             false,
             vec![WorkApiActionHint::RefreshWork],
         ),
-        Blocker::RunFrontierUnavailable
-        | Blocker::EdgeIdentityMissing
+        Blocker::WorkspaceArtifactInvalid => work_error(
+            StatusCode::CONFLICT,
+            "workspace_recovery_package_invalid",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ),
+        Blocker::EdgeIdentityMissing
         | Blocker::UnsupportedExecutor
         | Blocker::ContextUnavailable
         | Blocker::WorkspaceArtifactUnavailable => {
@@ -711,12 +717,21 @@ async fn authenticated_work_user(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(WorkOwnerId, astra_services::AuthUserRecord), (StatusCode, Json<WorkApiErrorV1>)> {
-    let user = state
+    authenticated_work_principal(state, headers)
+        .await
+        .map(|(owner, principal)| (owner, principal.user))
+}
+
+async fn authenticated_work_principal(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(WorkOwnerId, astra_services::AuthPrincipal), (StatusCode, Json<WorkApiErrorV1>)> {
+    let principal = state
         .auth_service
-        .current_user(headers)
+        .current_principal(headers)
         .await
         .map_err(map_auth_error)?;
-    let owner_id = WorkOwnerId::parse(user.user_id.clone()).map_err(|error| {
+    let owner_id = WorkOwnerId::parse(principal.user.user_id.clone()).map_err(|error| {
         tracing::error!(error = %error, "authenticated owner identity violates Work contract");
         work_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -726,7 +741,7 @@ async fn authenticated_work_user(
             Vec::new(),
         )
     })?;
-    Ok((owner_id, user))
+    Ok((owner_id, principal))
 }
 
 fn work_digest(domain: &str, fields: &[&str]) -> String {
@@ -3860,7 +3875,7 @@ pub(super) async fn post_work_branch_turn_handler(
             Vec::new(),
         )
     })?;
-    let owner_id = authenticated_work_owner(&state, &headers).await?;
+    let (owner_id, principal) = authenticated_work_principal(&state, &headers).await?;
     let work_id = WorkId::parse(work_id).map_err(|_| {
         work_error(
             StatusCode::BAD_REQUEST,
@@ -3937,6 +3952,16 @@ pub(super) async fn post_work_branch_turn_handler(
         .flatten();
     let expected_run_id = turn.start_idempotency.run_id().to_string();
     let request = ChatRequestData {
+        completion_checks: None,
+        execution_authentication: principal.execution_authentication_provenance(),
+        model_catalog_reader: Some(
+            astra_services::models::AuthorizedModelCatalogReader::with_cache(
+                state.model_service.clone(),
+                state.auth_service.clone(),
+                principal,
+                state.model_catalog_cache.clone(),
+            ),
+        ),
         message: turn.message,
         user_intent: None,
         parts: Vec::new(),
@@ -3958,8 +3983,10 @@ pub(super) async fn post_work_branch_turn_handler(
         full_llm_capture: false,
         agent_id: None,
         model: None,
+        expected_model_name: None,
         model_selection_mode: ModelSelectionMode::ServerDefault,
         model_selection: None,
+        requested_model_policy: None,
         resolved_model_selection: None,
         admitted_model_execution: None,
         capability_descriptors: None,
@@ -4716,7 +4743,7 @@ pub(super) async fn post_work_branch_interaction_handler(
                     )
                 })?;
             let safe_reason = reason.as_deref().map(|reason| {
-                astra_tools::credential_redaction::redact_credentials_for_display(reason).0
+                astra_text_utils::credential_redaction::redact_credentials_for_display(reason).0
             });
             let decision = match decision {
                 WorkApprovalDecisionV1::Allow => "allow",
@@ -5062,7 +5089,6 @@ fn map_execution_switch_error(
         ),
         astra_services::SessionContextCoordinatorError::ExecutionBindingFenced { .. }
         | astra_services::SessionContextCoordinatorError::ExecutionBindingBusy
-        | astra_services::SessionContextCoordinatorError::ExecutionWorkspaceClaimed { .. }
         | astra_services::SessionContextCoordinatorError::ExecutionBindingNotReady(_) => {
             work_error(
                 StatusCode::CONFLICT,
@@ -6205,14 +6231,15 @@ pub(super) async fn get_work_workspace_recovery_chunk_handler(
                 Vec::new(),
             )
         })?;
-    let mut response = Response::new(axum::body::Body::from(chunk.bytes.clone()));
+    let byte_size = chunk.bytes.len();
+    let mut response = Response::new(axum::body::Body::from(chunk.bytes));
     response.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/octet-stream"),
     );
     response.headers_mut().insert(
         axum::http::header::CONTENT_LENGTH,
-        axum::http::HeaderValue::from_str(&chunk.bytes.len().to_string()).expect("length header"),
+        axum::http::HeaderValue::from_str(&byte_size.to_string()).expect("length header"),
     );
     response.headers_mut().insert(
         axum::http::header::ETAG,
@@ -6302,7 +6329,7 @@ pub(super) async fn post_work_workspace_recovery_artifact_seal_handler(
             Vec::new(),
         ));
     }
-    store
+    let stored = store
         .seal_byte_artifact(
             owner_id.as_str(),
             binding.session_id.as_str(),
@@ -6312,13 +6339,7 @@ pub(super) async fn post_work_workspace_recovery_artifact_seal_handler(
         )
         .await
         .map_err(map_workspace_artifact_store_error)?;
-    let (stored, manifest) = load_verified_workspace_artifact(
-        &store,
-        owner_id.as_str(),
-        binding.session_id.as_str(),
-        &artifact_id,
-    )
-    .await?;
+    let (stored, manifest) = verify_workspace_artifact_content(stored)?;
     let metadata_matches = stored
         .artifact
         .metadata
@@ -6383,6 +6404,18 @@ async fn load_verified_workspace_artifact(
                 Vec::new(),
             )
         })?;
+    verify_workspace_artifact_content(stored)
+}
+
+fn verify_workspace_artifact_content(
+    stored: astra_services::StoredSessionArtifactContentV1,
+) -> Result<
+    (
+        astra_services::StoredSessionArtifactContentV1,
+        WorkspaceSnapshotManifestV1,
+    ),
+    (StatusCode, Json<WorkApiErrorV1>),
+> {
     let manifest: WorkspaceSnapshotManifestV1 = serde_json::from_value(stored.manifest.clone())
         .map_err(|_| {
             work_error(
@@ -6444,14 +6477,9 @@ async fn load_verified_workspace_artifact(
                 vec![WorkApiActionHint::RefreshWork],
             ));
         }
-        blobs.insert(blob_ref.clone(), chunk.bytes.clone());
+        blobs.insert(blob_ref.as_str(), chunk.bytes.as_slice());
     }
-    WorkspaceSnapshotPackage {
-        manifest: manifest.clone(),
-        blobs,
-    }
-    .verify()
-    .map_err(|_| {
+    WorkspaceSnapshotPackage::verify_blobs(&manifest, blobs).map_err(|_| {
         work_error(
             StatusCode::CONFLICT,
             "workspace_recovery_package_invalid",
@@ -7149,43 +7177,28 @@ pub(super) async fn post_work_branch_recovery_point_handler(
             .await
             .map_err(|error| map_branch_repository_error(work_id.as_str(), error))?;
         let store = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool);
-        let (stored, manifest) = load_verified_workspace_artifact(
+        // Load only the immutable manifest/descriptor needed to form the
+        // reference. The canonical publication transaction below locks and
+        // verifies the full package against the current Session/Work basis;
+        // preloading bytes here duplicates I/O without closing that boundary.
+        let plan = load_workspace_artifact_upload_plan(
             &store,
             owner_id.as_str(),
             binding.session_id.as_str(),
+            &work_id,
+            &branch_id,
             &artifact_id,
+            Some(&payload.request_id),
         )
         .await?;
-        let metadata_matches = stored
-            .artifact
-            .metadata
-            .as_ref()
-            .and_then(|value| value.get("work_id"))
-            .and_then(serde_json::Value::as_str)
-            == Some(work_id.as_str())
-            && stored
-                .artifact
-                .metadata
-                .as_ref()
-                .and_then(|value| value.get("branch_id"))
-                .and_then(serde_json::Value::as_str)
-                == Some(branch_id.as_str())
-            && stored
-                .artifact
-                .metadata
-                .as_ref()
-                .and_then(|value| value.get("request_id"))
-                .and_then(serde_json::Value::as_str)
-                == Some(payload.request_id.as_str());
-        if !metadata_matches {
-            return Err(work_error(
-                StatusCode::NOT_FOUND,
-                "workspace_recovery_artifact_not_found",
-                WorkApiErrorCategory::NotFound,
-                false,
-                Vec::new(),
+        if !plan.descriptor.sealed {
+            return Err(map_workspace_artifact_read_error(
+                astra_services::SessionArtifactStoreError::ByteArtifactNotSealed {
+                    artifact_id: artifact_id.clone(),
+                },
             ));
         }
+        let manifest = plan.manifest;
         let workspace = astra_turn_types::RecoveryPointWorkspaceReferenceV1 {
             snapshot_id: manifest.snapshot_id.clone(),
             logical_workspace_id: manifest.logical_workspace_id.clone(),
@@ -7199,13 +7212,13 @@ pub(super) async fn post_work_branch_recovery_point_handler(
                 )
             })?,
             content_root: manifest.content.content_root.clone(),
-            byte_size: stored.descriptor.byte_size,
+            byte_size: plan.descriptor.byte_size,
             complete: true,
         };
         let artifact = astra_turn_types::RecoveryPointArtifactReferenceV1 {
             artifact_id: artifact_id.clone(),
             artifact_type: "workspace_snapshot_package_v1".to_string(),
-            digest: stored.descriptor.digest.clone(),
+            digest: plan.descriptor.digest.clone(),
             location_ref: Some(format!("session-artifact:{artifact_id}")),
         };
         repository
@@ -8417,6 +8430,7 @@ pub(super) async fn post_work_branch_patch_artifact_handler(
     })?;
     super::work_patch_export_runtime::export_work_patch(
         pool,
+        state.execution.run_lifecycle_service.as_ref(),
         super::work_patch_export_runtime::WorkPatchExportCommand {
             owner_id,
             work_id,

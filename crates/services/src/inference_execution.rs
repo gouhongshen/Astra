@@ -1,10 +1,8 @@
-use astra_core::{
-    SharedPool, matrixone_statement_with_null_shape, push_matrixone_bound_string_set,
-};
+use astra_core::{SharedPool, matrixone_statement_with_null_shape};
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, MySql, QueryBuilder, Row};
+use sqlx::{Acquire, Row};
 
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 
@@ -18,23 +16,6 @@ use crate::models::{ModelAccessKind, ModelExecutionPlacement, validate_model_off
 use crate::service_error::{ServiceError, ServiceErrorKind, ServiceResult};
 
 const INFERENCE_ID_HEX_LEN: usize = 32;
-const MAX_TOOL_RESULT_PROJECTION_DECISION_BYTES: usize = 512 * 1024;
-const MAX_TOOL_RESULT_PROJECTION_RECEIPT_BYTES: usize = 64 * 1024;
-const MAX_TOOL_RESULT_PROJECTION_DECISIONS_PER_SESSION: u64 = 4_096;
-const MAX_TOOL_RESULT_PROJECTION_BYTES_PER_SESSION: u64 = 64 * 1024 * 1024;
-
-fn projection_wire_state_name(
-    state: &astra_turn_types::ToolResultProjectionWireStateV1,
-) -> &'static str {
-    match state {
-        astra_turn_types::ToolResultProjectionWireStateV1::Included => "included",
-        astra_turn_types::ToolResultProjectionWireStateV1::PartiallyIncluded => {
-            "partially_included"
-        }
-        astra_turn_types::ToolResultProjectionWireStateV1::Omitted => "omitted",
-        astra_turn_types::ToolResultProjectionWireStateV1::Unknown => "unknown",
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceInvocationInput {
@@ -42,7 +23,7 @@ pub struct InferenceInvocationInput {
     pub scope: InferenceInvocationScope,
     /// Exact durable execution capability for a run-scoped invocation.
     ///
-    /// Session/harness work has its own owner boundary and must leave this
+    /// Session work has its own owner boundary and must leave this
     /// empty. A run-scoped provider admission is executable only while all of
     /// these immutable facts still match in the same transaction that inserts
     /// the invocation row.
@@ -76,6 +57,9 @@ pub struct InferenceInvocationPlan {
     owner_token: String,
     owner_generation: u64,
     input: InferenceInvocationInput,
+    // Serialized once from validated admission material. Pricing is evidence,
+    // not part of invocation identity: a catalog update cannot authorize replay.
+    price_snapshot_json: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -99,7 +83,6 @@ pub struct InferenceProviderAttemptPlan {
     canonical_transition_predecessor: Option<astra_turn_types::ProviderCanonicalHistoryIdentityV2>,
     canonical_transition_result: Option<astra_turn_types::ProviderCanonicalHistoryIdentityV2>,
     canonical_transition_recovery_mode: Option<astra_turn_types::ProviderCanonicalRecoveryModeV2>,
-    tool_result_projections: Vec<astra_turn_types::ToolResultProjectionBindingV1>,
     invocation_input: InferenceInvocationInput,
     request_context: ModelRequestContextSeed,
 }
@@ -130,6 +113,32 @@ pub struct InferenceProviderWireIdentity {
 }
 
 impl InferenceInvocationPlan {
+    /// Offline verification observes the exact admitted run authority without
+    /// exposing opaque admission or owner tokens.
+    #[cfg(feature = "e2e-hooks")]
+    pub fn e2e_admission_coordinates(
+        &self,
+    ) -> (
+        astra_turn_types::InferenceInvocationScope,
+        Option<InferenceRunAdmissionAuthority>,
+    ) {
+        (self.input.scope.clone(), self.input.run_authority.clone())
+    }
+
+    pub fn with_price_snapshot(
+        mut self,
+        snapshot: Option<&crate::models::InferencePriceSnapshot>,
+    ) -> ServiceResult<Self> {
+        self.price_snapshot_json =
+            snapshot
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    ServiceError::invalid(format!("serialize inference price: {error}"))
+                })?;
+        Ok(self)
+    }
+
     #[must_use]
     pub fn route_id(&self) -> &str {
         &self.route_id
@@ -278,465 +287,6 @@ impl InferenceProviderAttemptPlan {
         })?);
         Ok(self)
     }
-
-    /// Bind optional context projection facts to the same admission event as
-    /// the exact provider payload. The event's owner/session/generation and
-    /// physical-attempt identity provide the durable isolation envelope.
-    pub fn with_tool_result_projections(
-        mut self,
-        bindings: Vec<astra_turn_types::ToolResultProjectionBindingV1>,
-    ) -> ServiceResult<Self> {
-        if bindings.len() > 32 {
-            return Err(ServiceError::invalid(
-                "too many tool-result projections for one provider request",
-            ));
-        }
-        if !bindings.is_empty()
-            && (self.invocation_input.purpose != InferencePurpose::PrimaryAgent
-                || !matches!(
-                    self.invocation_input.scope,
-                    InferenceInvocationScope::Run { .. }
-                ))
-        {
-            return Err(ServiceError::invalid(
-                "tool-result projections require a run-scoped primary-agent owner",
-            ));
-        }
-        let mut freeze_keys = std::collections::BTreeSet::new();
-        for binding in &bindings {
-            binding.validate().map_err(|error| {
-                ServiceError::invalid(format!("invalid tool-result projection binding: {error}"))
-            })?;
-            if binding.receipt.provider_wire_sha256 != self.wire.provider_wire_hash {
-                return Err(ServiceError::invalid(
-                    "tool-result projection receipt does not name the exact provider wire",
-                ));
-            }
-            if !freeze_keys.insert(binding.decision.freeze_key_sha256.as_str()) {
-                return Err(ServiceError::invalid(
-                    "duplicate tool-result projection freeze key",
-                ));
-            }
-        }
-        let mut bindings = bindings;
-        bindings.sort_by(|left, right| {
-            left.decision
-                .freeze_key_sha256
-                .cmp(&right.decision.freeze_key_sha256)
-        });
-        self.tool_result_projections = bindings;
-        Ok(self)
-    }
-}
-
-async fn freeze_tool_result_projection_decisions(
-    connection: &mut sqlx::MySqlConnection,
-    attempt: &InferenceProviderAttemptPlan,
-) -> ServiceResult<()> {
-    if attempt.tool_result_projections.is_empty() {
-        return Ok(());
-    }
-    let session_id = match &attempt.invocation_input.scope {
-        InferenceInvocationScope::Run { session_id, .. }
-            if attempt.invocation_input.purpose == InferencePurpose::PrimaryAgent =>
-        {
-            session_id
-        }
-        _ => {
-            return Err(ServiceError::invalid(
-                "tool-result projection freeze requires a run-scoped primary-agent owner",
-            ));
-        }
-    };
-    let mut serialized_decisions = Vec::with_capacity(attempt.tool_result_projections.len());
-    for binding in &attempt.tool_result_projections {
-        let decision = &binding.decision;
-        let json = serde_json::to_string(decision).map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Internal,
-                "serialize projection decision",
-                error,
-            )
-        })?;
-        if json.len() > MAX_TOOL_RESULT_PROJECTION_DECISION_BYTES {
-            return Err(ServiceError::invalid(
-                "tool-result projection decision exceeds its durable byte bound",
-            ));
-        }
-        let decision_bytes = i64::try_from(json.len())
-            .map_err(|_| ServiceError::invalid("projection decision is too large"))?;
-        serialized_decisions.push((decision, json, decision_bytes));
-    }
-
-    // MatrixOne 4.2 may return only a prefix for a prepared IN predicate
-    // across joins. Use the repository-wide derived relation helper and lock
-    // all existing decisions in one round trip.
-    let mut decision_query = QueryBuilder::<MySql>::new(
-        "SELECT decision.freeze_key_sha256, decision.decision_sha256,
-                decision.decision_json, decision.decision_bytes,
-                decision.canonical_message_sha256, decision.source_sha256,
-                decision.source_bytes, decision.rendered_body_sha256,
-                decision.rendered_body_bytes, decision.producer_run_id,
-                decision.producer_call_id
-         FROM tool_result_projection_decisions AS decision INNER JOIN ",
-    );
-    push_matrixone_bound_string_set(
-        &mut decision_query,
-        serialized_decisions
-            .iter()
-            .map(|(decision, _, _)| decision.freeze_key_sha256.as_str()),
-    );
-    decision_query
-        .push(" AS requested ON requested.value = decision.freeze_key_sha256")
-        .push(" WHERE decision.user_id = ")
-        .push_bind(&attempt.user_id)
-        .push(" AND decision.session_id = ")
-        .push_bind(session_id)
-        .push(" ORDER BY decision.freeze_key_sha256 ASC FOR UPDATE");
-    let decision_rows = decision_query
-        .build()
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "lock durable tool-result projection decisions",
-                error,
-            )
-        })?;
-    let requested_decisions = serialized_decisions
-        .iter()
-        .map(|(decision, _, _)| decision.freeze_key_sha256.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut existing_decisions = std::collections::BTreeMap::new();
-    for row in decision_rows {
-        let persisted = decode_tool_result_projection_decision(&row)?;
-        if !requested_decisions.contains(persisted.freeze_key_sha256.as_str())
-            || existing_decisions
-                .insert(persisted.freeze_key_sha256.clone(), persisted)
-                .is_some()
-        {
-            return Err(ServiceError::conflict(
-                "durable tool-result projection decision identity mismatch",
-            ));
-        }
-    }
-    let mut new_rows = Vec::new();
-    for &(decision, ref json, bytes) in &serialized_decisions {
-        if let Some(persisted) = existing_decisions.get(&decision.freeze_key_sha256) {
-            if *persisted != *decision {
-                return Err(ServiceError::conflict(
-                    "tool-result projection freeze key already has a different decision",
-                ));
-            }
-        } else {
-            let source_bytes = checked_i64(decision.source_bytes, "projection source bytes")?;
-            let rendered_body_bytes =
-                checked_i64(decision.rendered_body_bytes, "projection body bytes")?;
-            new_rows.push((decision, json, bytes, source_bytes, rendered_body_bytes));
-        }
-    }
-    if !new_rows.is_empty() {
-        let aggregate = sqlx::query(
-            "SELECT CAST(COUNT(*) AS SIGNED) AS decision_count,
-                CAST(COALESCE(SUM(decision_bytes), 0) AS SIGNED) AS decision_bytes
-         FROM tool_result_projection_decisions
-         WHERE user_id = ? AND session_id = ?",
-        )
-        .bind(&attempt.user_id)
-        .bind(session_id)
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "measure session projection decisions",
-                error,
-            )
-        })?;
-        let existing_count: i64 = aggregate.try_get("decision_count").map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode session projection decision count",
-                error,
-            )
-        })?;
-        let existing_bytes: i64 = aggregate.try_get("decision_bytes").map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode session projection decision bytes",
-                error,
-            )
-        })?;
-        let new_count = u64::try_from(new_rows.len()).unwrap_or(u64::MAX);
-        let new_bytes = new_rows
-            .iter()
-            .try_fold(0_u64, |total, (_, _, bytes, _, _)| {
-                total.checked_add(u64::try_from(*bytes).unwrap_or(u64::MAX))
-            })
-            .ok_or_else(|| {
-                ServiceError::invalid("tool-result projection decision bytes overflow")
-            })?;
-        if u64::try_from(existing_count)
-            .unwrap_or(u64::MAX)
-            .saturating_add(new_count)
-            > MAX_TOOL_RESULT_PROJECTION_DECISIONS_PER_SESSION
-            || u64::try_from(existing_bytes)
-                .unwrap_or(u64::MAX)
-                .saturating_add(new_bytes)
-                > MAX_TOOL_RESULT_PROJECTION_BYTES_PER_SESSION
-        {
-            return Err(ServiceError::conflict(
-                "session tool-result projection decision capacity is exhausted",
-            ));
-        }
-        let mut insert = QueryBuilder::<MySql>::new(
-            "INSERT INTO tool_result_projection_decisions
-             (user_id, session_id, freeze_key_sha256, decision_sha256,
-              decision_json, decision_bytes, canonical_message_sha256,
-              source_sha256, source_bytes, rendered_body_sha256, rendered_body_bytes,
-              producer_run_id, producer_call_id, first_admitted_attempt_id, created_at) ",
-        );
-        insert.push_values(new_rows.iter(), |mut row, item| {
-            let &(decision, json, bytes, source_bytes, rendered_body_bytes) = item;
-            row.push_bind(&attempt.user_id)
-                .push_bind(session_id)
-                .push_bind(&decision.freeze_key_sha256)
-                .push_bind(&decision.decision_sha256)
-                .push_bind(json)
-                .push_bind(bytes)
-                .push_bind(&decision.canonical_message_sha256)
-                .push_bind(&decision.source_sha256)
-                .push_bind(source_bytes)
-                .push_bind(&decision.rendered_body_sha256)
-                .push_bind(rendered_body_bytes)
-                .push_bind(&decision.producer_run_id)
-                .push_bind(&decision.producer_call_id)
-                .push_bind(&attempt.attempt_id)
-                .push("NOW(6)");
-        });
-        let inserted = insert
-            .build()
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| {
-                if astra_core::is_duplicate_key_error(&error) {
-                    ServiceError::conflict(
-                        "tool-result projection decision was frozen concurrently",
-                    )
-                } else {
-                    ServiceError::with_source(
-                        ServiceErrorKind::Persistence,
-                        "freeze tool-result projection decisions",
-                        error,
-                    )
-                }
-            })?;
-        if inserted.rows_affected() != u64::try_from(new_rows.len()).unwrap_or(u64::MAX) {
-            return Err(ServiceError::conflict(
-                "tool-result projection decisions were not frozen exactly once",
-            ));
-        }
-    }
-
-    struct PendingReceipt<'a> {
-        binding: &'a astra_turn_types::ToolResultProjectionBindingV1,
-        json: String,
-        receipt_sha256: String,
-        wire_state: &'static str,
-        receipt_bytes: i64,
-    }
-    let mut pending_receipts = Vec::with_capacity(attempt.tool_result_projections.len());
-    for binding in &attempt.tool_result_projections {
-        let json = serde_json::to_string(&binding.receipt).map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Internal,
-                "serialize tool-result projection receipt",
-                error,
-            )
-        })?;
-        if json.len() > MAX_TOOL_RESULT_PROJECTION_RECEIPT_BYTES {
-            return Err(ServiceError::invalid(
-                "tool-result projection receipt exceeds its durable byte bound",
-            ));
-        }
-        let receipt_sha256 = format!("{:x}", Sha256::digest(json.as_bytes()));
-        pending_receipts.push(PendingReceipt {
-            binding,
-            receipt_bytes: i64::try_from(json.len())
-                .map_err(|_| ServiceError::invalid("projection receipt is too large"))?,
-            json,
-            receipt_sha256,
-            wire_state: projection_wire_state_name(&binding.receipt.state),
-        });
-    }
-
-    if pending_receipts.is_empty() {
-        return Ok(());
-    }
-    let mut receipt_query = QueryBuilder::<MySql>::new(
-        "SELECT receipt.session_id, receipt.freeze_key_sha256,
-                receipt.decision_sha256, receipt.provider_wire_sha256,
-                receipt.receipt_sha256, receipt.receipt_json, receipt.receipt_bytes,
-                receipt.wire_state
-         FROM tool_result_projection_receipts AS receipt INNER JOIN ",
-    );
-    push_matrixone_bound_string_set(
-        &mut receipt_query,
-        pending_receipts
-            .iter()
-            .map(|pending| pending.binding.decision.freeze_key_sha256.as_str()),
-    );
-    receipt_query
-        .push(" AS requested ON requested.value = receipt.freeze_key_sha256")
-        .push(" WHERE receipt.user_id = ")
-        .push_bind(&attempt.user_id)
-        .push(" AND receipt.attempt_id = ")
-        .push_bind(&attempt.attempt_id)
-        .push(" ORDER BY receipt.freeze_key_sha256 ASC FOR UPDATE");
-    let receipt_rows = receipt_query
-        .build()
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "lock durable tool-result projection receipts",
-                error,
-            )
-        })?;
-    let requested_receipts = pending_receipts
-        .iter()
-        .map(|pending| pending.binding.decision.freeze_key_sha256.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut existing_receipts = std::collections::BTreeMap::new();
-    for row in receipt_rows {
-        let session: String = row.try_get("session_id").map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode projection receipt session",
-                error,
-            )
-        })?;
-        let key: String = row.try_get("freeze_key_sha256").map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode projection receipt freeze key",
-                error,
-            )
-        })?;
-        if session.as_str() != session_id
-            || !requested_receipts.contains(key.as_str())
-            || existing_receipts.insert(key.clone(), row).is_some()
-        {
-            return Err(ServiceError::conflict(
-                "durable tool-result projection receipt identity mismatch",
-            ));
-        }
-    }
-    let mut new_receipts = Vec::new();
-    for pending in &pending_receipts {
-        if let Some(row) = existing_receipts.get(&pending.binding.decision.freeze_key_sha256) {
-            let persisted_decision: String = row.try_get("decision_sha256").map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "decode projection receipt decision",
-                    error,
-                )
-            })?;
-            let persisted_provider_wire: String =
-                row.try_get("provider_wire_sha256").map_err(|error| {
-                    ServiceError::with_source(
-                        ServiceErrorKind::Persistence,
-                        "decode projection receipt provider wire",
-                        error,
-                    )
-                })?;
-            let persisted_hash: String = row.try_get("receipt_sha256").map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "decode projection receipt hash",
-                    error,
-                )
-            })?;
-            let persisted_json: String = row.try_get("receipt_json").map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "decode projection receipt JSON",
-                    error,
-                )
-            })?;
-            let persisted_bytes: i64 = row.try_get("receipt_bytes").map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "decode projection receipt bytes",
-                    error,
-                )
-            })?;
-            let persisted_wire_state: String = row.try_get("wire_state").map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "decode projection receipt wire state",
-                    error,
-                )
-            })?;
-            if persisted_decision != pending.binding.receipt.decision_sha256
-                || persisted_provider_wire != pending.binding.receipt.provider_wire_sha256
-                || persisted_wire_state != pending.wire_state
-                || persisted_hash != pending.receipt_sha256
-                || persisted_json != pending.json
-                || persisted_bytes != pending.receipt_bytes
-            {
-                return Err(ServiceError::conflict(
-                    "physical attempt already has a different or corrupt projection receipt",
-                ));
-            }
-        } else {
-            new_receipts.push(pending);
-        }
-    }
-    if !new_receipts.is_empty() {
-        let mut insert = QueryBuilder::<MySql>::new(
-            "INSERT INTO tool_result_projection_receipts
-             (user_id, session_id, attempt_id, freeze_key_sha256, decision_sha256,
-              provider_wire_sha256, receipt_sha256, receipt_json, receipt_bytes,
-              wire_state, created_at) ",
-        );
-        insert.push_values(new_receipts.iter(), |mut row, pending| {
-            row.push_bind(&attempt.user_id)
-                .push_bind(session_id)
-                .push_bind(&attempt.attempt_id)
-                .push_bind(&pending.binding.decision.freeze_key_sha256)
-                .push_bind(&pending.binding.receipt.decision_sha256)
-                .push_bind(&pending.binding.receipt.provider_wire_sha256)
-                .push_bind(&pending.receipt_sha256)
-                .push_bind(&pending.json)
-                .push_bind(pending.receipt_bytes)
-                .push_bind(pending.wire_state)
-                .push("NOW(6)");
-        });
-        let inserted = insert
-            .build()
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| {
-                if astra_core::is_duplicate_key_error(&error) {
-                    ServiceError::conflict("tool-result projection receipt was frozen concurrently")
-                } else {
-                    ServiceError::with_source(
-                        ServiceErrorKind::Persistence,
-                        "freeze tool-result projection receipts",
-                        error,
-                    )
-                }
-            })?;
-        if inserted.rows_affected() != u64::try_from(new_receipts.len()).unwrap_or(u64::MAX) {
-            return Err(ServiceError::conflict(
-                "tool-result projection receipts were not frozen exactly once",
-            ));
-        }
-    }
-    Ok(())
 }
 
 impl InferenceProviderWireIdentity {
@@ -887,19 +437,14 @@ pub enum InferenceProviderDeliveryState {
 /// the database acknowledgement.
 ///
 /// Resolution is performed while holding the same durable scope locks as the
-/// original admission transaction, so `Absent` cannot race a late commit.
+/// original admission transaction, so confirmed absence cannot race a late
+/// commit. Scope authority is returned separately from this settlement fact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InferenceInvocationAdmissionResolution {
-    /// The old admission is absent or closed; apply guidance before new work.
-    GuidancePending,
     Settled,
     ExactTerminal,
     ConflictingIdentity,
     ScopeUnavailable,
-    /// The exact ambiguous identity was conclusively closed, but the caller's
-    /// run generation/owner/lease/control capability is no longer live. The
-    /// caller must not create a replacement logical attempt.
-    AuthorityLost,
 }
 
 /// Authoritative result of projecting one exact durable settlement decision.
@@ -989,9 +534,6 @@ pub fn plan_inference_invocation(
     if let Some(run_id) = input.scope.run_id() {
         validate_identity(run_id, "run_id", 64)?;
     }
-    if let Some(harness_run_id) = input.scope.harness_run_id() {
-        validate_identity(harness_run_id, "harness_run_id", 128)?;
-    }
     validate_identity(input.scope.operation_id(), "operation_id", 64)?;
     match (&input.scope, &input.run_authority) {
         (InferenceInvocationScope::Run { .. }, Some(authority)) => {
@@ -1016,7 +558,7 @@ pub fn plan_inference_invocation(
         }
         (_, Some(_)) => {
             return Err(ServiceError::invalid(
-                "run execution authority cannot cross a session or harness scope",
+                "run execution authority cannot cross a session scope",
             ));
         }
         (_, None) => {}
@@ -1038,7 +580,6 @@ pub fn plan_inference_invocation(
         input.scope.kind(),
         input.scope.session_id().unwrap_or(""),
         input.scope.run_id().unwrap_or(""),
-        input.scope.harness_run_id().unwrap_or(""),
         turn.as_deref().unwrap_or(""),
         round.as_deref().unwrap_or(""),
         input.scope.operation_id(),
@@ -1060,82 +601,13 @@ pub fn plan_inference_invocation(
         owner_token: new_admission_token(),
         owner_generation: 1,
         input,
+        price_snapshot_json: None,
     })
 }
 
-/// Return the first unused two-attempt allocation after durable history for
-/// one exact logical operation. `N` is the requested identity and `N + 1` is
-/// reserved for the single foreground ambiguity recovery. This is a cursor
-/// read, not provider authority: concurrent callers are still serialized by
-/// the unique invocation identity at admission and losers must re-read.
-///
-/// Selection callers use the existing inference ledger as a read-side
-/// scheduler: operation IDs are their content-addressed selection subjects,
-/// while the joined route columns keep a route change eligible.
-pub async fn load_existing_inference_operation_ids_for_route(
-    pool: &SharedPool,
-    input: &InferenceInvocationInput,
-) -> ServiceResult<std::collections::BTreeSet<String>> {
-    let _ = plan_inference_invocation(input.clone())?;
-    let rows = sqlx::query(
-        "SELECT invocation.operation_id
-         FROM inference_invocations AS invocation
-         INNER JOIN inference_routes AS route
-           ON route.user_id = invocation.user_id
-          AND route.route_id = invocation.route_id
-         WHERE invocation.user_id = ?
-           AND invocation.scope_kind = ?
-           AND invocation.session_id <=> ?
-           AND invocation.run_id <=> ?
-           AND invocation.harness_run_id <=> ?
-           AND invocation.turn_index <=> ?
-           AND invocation.purpose = ?
-           AND route.offering_id = ?
-           AND route.resolved_model_name = ?
-           AND route.upstream_model_name = ?
-           AND route.provider = ?
-           AND route.execution_placement = ?
-           AND route.access_kind = ?
-           AND route.purpose = ?",
-    )
-    .bind(&input.user_id)
-    .bind(input.scope.kind())
-    .bind(input.scope.session_id())
-    .bind(input.scope.run_id())
-    .bind(input.scope.harness_run_id())
-    .bind(input.scope.turn().map(i64::from))
-    .bind(input.purpose.as_str())
-    .bind(&input.offering_id)
-    .bind(&input.resolved_model_name)
-    .bind(&input.upstream_model_name)
-    .bind(&input.provider)
-    .bind(input.execution_placement.as_str())
-    .bind(input.access_kind.as_str())
-    .bind(input.purpose.as_str())
-    .fetch_all(pool.get())
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "load existing inference selection subjects",
-            error,
-        )
-    })?;
-    rows.into_iter()
-        .map(|row| {
-            let operation_id: String = row.try_get("operation_id").map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "decode existing inference selection subject",
-                    error,
-                )
-            })?;
-            validate_identity(&operation_id, "operation_id", 64)?;
-            Ok(operation_id)
-        })
-        .collect()
-}
-
+/// First unused two-attempt allocation for one exact logical operation.
+/// Concurrent callers remain fenced by unique invocation identity at admission;
+/// a losing caller must re-read this cursor.
 pub async fn next_inference_logical_attempt_pair_base(
     pool: &SharedPool,
     input: &InferenceInvocationInput,
@@ -1150,7 +622,6 @@ pub async fn next_inference_logical_attempt_pair_base(
            AND scope_kind = ?
            AND session_id <=> ?
            AND run_id <=> ?
-           AND harness_run_id <=> ?
            AND turn_index <=> ?
            AND round_index <=> ?
            AND operation_id = ?
@@ -1160,7 +631,6 @@ pub async fn next_inference_logical_attempt_pair_base(
     .bind(input.scope.kind())
     .bind(input.scope.session_id())
     .bind(input.scope.run_id())
-    .bind(input.scope.harness_run_id())
     .bind(input.scope.turn().map(i64::from))
     .bind(input.scope.round().map(i64::from))
     .bind(input.scope.operation_id())
@@ -1247,293 +717,9 @@ pub fn plan_inference_provider_attempt_with_context(
         canonical_transition_predecessor: None,
         canonical_transition_result: None,
         canonical_transition_recovery_mode: None,
-        tool_result_projections: Vec::new(),
         invocation_input: invocation.input.clone(),
         request_context,
     }
-}
-
-pub async fn load_tool_result_projection_decisions(
-    pool: &SharedPool,
-    user_id: &str,
-    session_id: &str,
-    freeze_keys: &[String],
-) -> ServiceResult<
-    std::collections::BTreeMap<String, astra_turn_types::ToolResultProjectionDecisionV1>,
-> {
-    if user_id.trim().is_empty() || session_id.trim().is_empty() || freeze_keys.len() > 32 {
-        return Err(ServiceError::invalid(
-            "tool-result projection lookup identity or key count is invalid",
-        ));
-    }
-    if freeze_keys.is_empty() {
-        return Ok(std::collections::BTreeMap::new());
-    }
-    let mut unique = std::collections::BTreeSet::new();
-    for key in freeze_keys {
-        if key.len() != 64
-            || !key
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-            || !unique.insert(key.as_str())
-        {
-            return Err(ServiceError::invalid(
-                "tool-result projection lookup contains an invalid or duplicate freeze key",
-            ));
-        }
-    }
-    let mut query = QueryBuilder::<MySql>::new(
-        "SELECT decision.freeze_key_sha256, decision.decision_sha256,
-                decision.decision_json, decision.decision_bytes,
-                decision.canonical_message_sha256, decision.source_sha256,
-                decision.source_bytes, decision.rendered_body_sha256,
-                decision.rendered_body_bytes, decision.producer_run_id,
-                decision.producer_call_id
-         FROM tool_result_projection_decisions AS decision INNER JOIN ",
-    );
-    push_matrixone_bound_string_set(&mut query, freeze_keys.iter().map(String::as_str));
-    query
-        .push(" AS requested ON requested.value = decision.freeze_key_sha256")
-        .push(" WHERE decision.user_id = ")
-        .push_bind(user_id)
-        .push(" AND decision.session_id = ")
-        .push_bind(session_id)
-        .push(" ORDER BY decision.freeze_key_sha256 ASC");
-    let rows = query.build().fetch_all(pool.get()).await.map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "load tool-result projection decisions",
-            error,
-        )
-    })?;
-    let mut decisions = std::collections::BTreeMap::new();
-    for row in rows {
-        let decision = decode_tool_result_projection_decision(&row)?;
-        let freeze_key = decision.freeze_key_sha256.clone();
-        if !unique.contains(freeze_key.as_str()) {
-            return Err(ServiceError::conflict(
-                "durable tool-result projection decision identity mismatch",
-            ));
-        }
-        decisions.insert(freeze_key, decision);
-    }
-    Ok(decisions)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolResultProjectionApplicationFact {
-    pub attempt_id: String,
-    pub binding: astra_turn_types::ToolResultProjectionBindingV1,
-}
-
-/// Bounded authoritative provider-wire receipts for one authenticated session.
-/// These immutable rows outlive the diagnostic model-request context window.
-pub async fn load_session_tool_result_projection_applications(
-    pool: &SharedPool,
-    user_id: &str,
-    session_id: &str,
-    max_receipts: usize,
-) -> ServiceResult<(Vec<ToolResultProjectionApplicationFact>, bool, usize)> {
-    validate_identity(user_id, "user_id", 128)?;
-    validate_identity(session_id, "session_id", 64)?;
-    let limit = max_receipts.min(512);
-    // Callers may impose a deadline. A dropped query must not return a
-    // connection with an unfinished MySQL exchange to the shared pool.
-    let mut connection = CancellationSafePoolConnection::acquire(pool.get())
-        .await
-        .map_err(|_| ServiceError::persistence("projection application connection unavailable"))?;
-    let rows = sqlx::query(
-        "SELECT receipt.attempt_id, receipt.freeze_key_sha256, receipt.decision_sha256,
-                receipt.provider_wire_sha256, receipt.receipt_sha256, receipt.receipt_json,
-                receipt.receipt_bytes, receipt.wire_state, decision.decision_json,
-                decision.decision_bytes
-         FROM tool_result_projection_receipts AS receipt
-         LEFT JOIN tool_result_projection_decisions AS decision
-           ON decision.user_id = receipt.user_id
-          AND decision.session_id = receipt.session_id
-          AND decision.freeze_key_sha256 = receipt.freeze_key_sha256
-          AND decision.decision_sha256 = receipt.decision_sha256
-         WHERE receipt.user_id = ? AND receipt.session_id = ?
-         ORDER BY receipt.created_at DESC, receipt.attempt_id DESC
-         LIMIT ?",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(
-        i64::try_from(limit.saturating_add(1))
-            .map_err(|_| ServiceError::invalid("invalid tool-result application capture budget"))?,
-    )
-    .fetch_all(connection.connection_mut())
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "load tool-result projection applications",
-            error,
-        )
-    })?;
-    connection.release();
-    let truncated = rows.len() > limit;
-    let mut facts = Vec::with_capacity(rows.len().min(limit));
-    let mut invalid = 0usize;
-    for row in rows.into_iter().take(limit) {
-        let attempt_id: String = row.try_get("attempt_id").map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode application attempt",
-                error,
-            )
-        })?;
-        validate_identity(&attempt_id, "attempt_id", 64)?;
-        let decision_json: Option<String> = row.try_get("decision_json").map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode application decision",
-                error,
-            )
-        })?;
-        let Some(decision_json) = decision_json else {
-            invalid = invalid.saturating_add(1);
-            continue;
-        };
-        let receipt_json: String = row.try_get("receipt_json").map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode application receipt",
-                error,
-            )
-        })?;
-        let decision_bytes: i64 = row.try_get("decision_bytes").map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode application decision bytes",
-                error,
-            )
-        })?;
-        let receipt_bytes: i64 = row.try_get("receipt_bytes").map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode application receipt bytes",
-                error,
-            )
-        })?;
-        if usize::try_from(decision_bytes).ok() != Some(decision_json.len())
-            || usize::try_from(receipt_bytes).ok() != Some(receipt_json.len())
-            || decision_json.len() > MAX_TOOL_RESULT_PROJECTION_DECISION_BYTES
-            || receipt_json.len() > MAX_TOOL_RESULT_PROJECTION_RECEIPT_BYTES
-        {
-            return Err(ServiceError::conflict(
-                "invalid durable projection application byte identity",
-            ));
-        }
-        let decision: astra_turn_types::ToolResultProjectionDecisionV1 =
-            serde_json::from_str(&decision_json).map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "parse application decision",
-                    error,
-                )
-            })?;
-        let receipt: astra_turn_types::ToolResultProjectionReceiptV1 =
-            serde_json::from_str(&receipt_json).map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "parse application receipt",
-                    error,
-                )
-            })?;
-        let receipt_hash = format!("{:x}", Sha256::digest(receipt_json.as_bytes()));
-        let wire_state: String = row.try_get("wire_state").unwrap_or_default();
-        let expected_wire_state = projection_wire_state_name(&receipt.state);
-        if row
-            .try_get::<String, _>("freeze_key_sha256")
-            .ok()
-            .as_deref()
-            != Some(decision.freeze_key_sha256.as_str())
-            || row.try_get::<String, _>("decision_sha256").ok().as_deref()
-                != Some(decision.decision_sha256.as_str())
-            || row
-                .try_get::<String, _>("provider_wire_sha256")
-                .ok()
-                .as_deref()
-                != Some(receipt.provider_wire_sha256.as_str())
-            || row.try_get::<String, _>("receipt_sha256").ok().as_deref()
-                != Some(receipt_hash.as_str())
-            || wire_state != expected_wire_state
-            || receipt.validate_against(&decision).is_err()
-        {
-            return Err(ServiceError::conflict(
-                "durable projection application metadata mismatch",
-            ));
-        }
-        facts.push(ToolResultProjectionApplicationFact {
-            attempt_id,
-            binding: astra_turn_types::ToolResultProjectionBindingV1 { decision, receipt },
-        });
-    }
-    Ok((facts, truncated, invalid))
-}
-
-fn decode_tool_result_projection_decision(
-    row: &sqlx::mysql::MySqlRow,
-) -> ServiceResult<astra_turn_types::ToolResultProjectionDecisionV1> {
-    let text = |column: &str| -> ServiceResult<String> {
-        row.try_get(column).map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                format!("decode projection decision {column}"),
-                error,
-            )
-        })
-    };
-    let number = |column: &str| -> ServiceResult<i64> {
-        row.try_get(column).map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                format!("decode projection decision {column}"),
-                error,
-            )
-        })
-    };
-    let json = text("decision_json")?;
-    let decision_bytes = number("decision_bytes")?;
-    if usize::try_from(decision_bytes).ok() != Some(json.len())
-        || json.len() > MAX_TOOL_RESULT_PROJECTION_DECISION_BYTES
-    {
-        return Err(ServiceError::conflict(
-            "durable tool-result projection decision has invalid byte identity",
-        ));
-    }
-    let decision: astra_turn_types::ToolResultProjectionDecisionV1 = serde_json::from_str(&json)
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "parse projection decision JSON",
-                error,
-            )
-        })?;
-    decision.validate().map_err(|error| {
-        ServiceError::conflict(format!(
-            "invalid durable tool-result projection decision: {error}"
-        ))
-    })?;
-    let source_bytes = number("source_bytes")?;
-    let rendered_body_bytes = number("rendered_body_bytes")?;
-    let metadata_matches = text("freeze_key_sha256")? == decision.freeze_key_sha256
-        && text("decision_sha256")? == decision.decision_sha256
-        && text("canonical_message_sha256")? == decision.canonical_message_sha256
-        && text("source_sha256")? == decision.source_sha256
-        && u64::try_from(source_bytes).ok() == Some(decision.source_bytes)
-        && text("rendered_body_sha256")? == decision.rendered_body_sha256
-        && u64::try_from(rendered_body_bytes).ok() == Some(decision.rendered_body_bytes)
-        && text("producer_run_id")? == decision.producer_run_id
-        && text("producer_call_id")? == decision.producer_call_id;
-    if !metadata_matches {
-        return Err(ServiceError::conflict(
-            "durable tool-result projection decision metadata mismatch",
-        ));
-    }
-    Ok(decision)
 }
 
 fn checked_i64(value: u64, label: &str) -> ServiceResult<i64> {
@@ -1592,7 +778,6 @@ fn model_request_event(
             owner_scope: input.user_id.clone(),
             session_id: input.scope.session_id().map(str::to_string),
             run_id: input.scope.run_id().map(str::to_string),
-            harness_run_id: input.scope.harness_run_id().map(str::to_string),
             turn: input.scope.turn(),
             round: attempt
                 .request_context
@@ -1632,7 +817,6 @@ fn model_request_event(
         usage: None,
         composition: attempt.request_context.composition.clone(),
         wire_composition: attempt.wire.composition.clone(),
-        tool_result_projections: attempt.tool_result_projections.clone(),
         cache: attempt.request_context.cache.clone(),
         compaction: attempt.request_context.compaction.clone(),
         terminal_status: terminal.map(|terminal| terminal.status.as_str().to_string()),
@@ -1778,20 +962,18 @@ async fn insert_model_request_context_event_with_expiry(
     if context_expired_at.is_none() {
         let session_id = attempt.invocation_input.scope.session_id();
         let run_id = attempt.invocation_input.scope.run_id();
-        let harness_run_id = attempt.invocation_input.scope.harness_run_id();
         let terminal_status = event.terminal_status.as_deref();
         let usage_present = usage.is_some();
         let insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO model_request_context_events
-         (event_id, user_id, attempt_id, invocation_id, session_id, run_id, harness_run_id,
+         (event_id, user_id, attempt_id, invocation_id, session_id, run_id,
           event_stage, terminal_status, topology, provider, model_family, purpose,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
           event_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
             [
                 session_id.is_some(),
                 run_id.is_some(),
-                harness_run_id.is_some(),
                 terminal_status.is_some(),
                 usage_present,
                 usage_present,
@@ -1806,7 +988,6 @@ async fn insert_model_request_context_event_with_expiry(
             .bind(&attempt.invocation_id)
             .bind(session_id)
             .bind(run_id)
-            .bind(harness_run_id)
             .bind(stage.as_str())
             .bind(terminal_status)
             .bind(event.identity.topology.as_str())
@@ -1843,9 +1024,6 @@ async fn insert_model_request_context_event_with_expiry(
             InferenceInvocationScope::Run { session_id, .. }
             | InferenceInvocationScope::Session { session_id, .. } => {
                 ModelRequestContextScope::Session(session_id)
-            }
-            InferenceInvocationScope::HarnessRun { harness_run_id, .. } => {
-                ModelRequestContextScope::HarnessRun(harness_run_id)
             }
         };
         // A normal request appends an accepted/terminal pair. Compact once at
@@ -2036,15 +1214,14 @@ async fn insert_recovered_model_request_terminal_tx(
     }
     let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO model_request_context_events
-         (event_id, user_id, attempt_id, invocation_id, session_id, run_id, harness_run_id,
+         (event_id, user_id, attempt_id, invocation_id, session_id, run_id,
           event_stage, terminal_status, topology, provider, model_family, purpose,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
           event_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'terminal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+         VALUES (?, ?, ?, ?, ?, ?, 'terminal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         [
             event.identity.session_id.is_some(),
             event.identity.run_id.is_some(),
-            event.identity.harness_run_id.is_some(),
             observed_usage.is_some(),
             observed_usage.is_some(),
             observed_usage.is_some(),
@@ -2058,7 +1235,6 @@ async fn insert_recovered_model_request_terminal_tx(
         .bind(invocation_id)
         .bind(event.identity.session_id.as_deref())
         .bind(event.identity.run_id.as_deref())
-        .bind(event.identity.harness_run_id.as_deref())
         .bind(&terminal.status)
         .bind(event.identity.topology.as_str())
         .bind(&event.identity.provider)
@@ -2121,16 +1297,19 @@ async fn rollback_inference_tx(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InvocationScopeAuthority {
     Live,
-    GuidancePending,
-    Unavailable,
+    Rejected(InferenceScopeRejection),
 }
 
 /// Typed admission fence. New guidance invalidates a request snapshot, not
-/// the execution owner; callers must reconcile it before trying new work.
+/// the execution owner; a retained pause suspends that same owner. Callers must
+/// reconcile these control causes before trying new work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceScopeRejection {
     GuidancePending,
+    /// The exact run owner retains a live lease and a waiting obligation.
+    /// Provider delivery remains forbidden until the existing pause clears.
+    Paused,
     Unavailable,
 }
 
@@ -2138,12 +1317,43 @@ impl std::fmt::Display for InferenceScopeRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::GuidancePending => "new user guidance requires a fresh execution snapshot",
+            Self::Paused => "inference execution is paused with retained owner authority",
             Self::Unavailable => "inference execution scope is no longer available",
         })
     }
 }
 
 impl std::error::Error for InferenceScopeRejection {}
+
+fn classify_run_invocation_scope_authority(
+    expected: &InferenceRunAdmissionAuthority,
+    stored_generation: i64,
+    owner_pod_id: Option<&str>,
+    lease_active: bool,
+    cancellation_requested: bool,
+    status: &str,
+    has_waiting_obligation: bool,
+) -> ServiceResult<InvocationScopeAuthority> {
+    let expected_generation = i64::try_from(expected.expected_owner_generation).map_err(|_| {
+        ServiceError::invalid("expected_owner_generation exceeds the durable BIGINT range")
+    })?;
+    if stored_generation != expected_generation
+        || owner_pod_id != Some(expected.expected_owner_pod_id.as_str())
+        || !lease_active
+        || cancellation_requested
+    {
+        return Ok(InvocationScopeAuthority::Rejected(
+            InferenceScopeRejection::Unavailable,
+        ));
+    }
+    Ok(match status {
+        "running" => InvocationScopeAuthority::Live,
+        "paused" if has_waiting_obligation => {
+            InvocationScopeAuthority::Rejected(InferenceScopeRejection::Paused)
+        }
+        _ => InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+    })
+}
 
 async fn lock_invocation_scope_authority(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
@@ -2182,10 +1392,11 @@ async fn lock_invocation_scope_authority(
                     }
                 };
             if !scope_admitted {
-                InvocationScopeAuthority::Unavailable
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable)
             } else {
                 let row = sqlx::query(
                     "SELECT status, run_generation, owner_pod_id, last_event_idx,
+                            CAST(waiting_for IS NOT NULL AS SIGNED) AS has_waiting_obligation,
                             CAST(cancellation_requested_at IS NOT NULL AS SIGNED)
                                 AS cancellation_requested,
                             CAST(CASE WHEN owner_lease_expires_at >= NOW(6) THEN 1 ELSE 0 END AS SIGNED)
@@ -2207,7 +1418,9 @@ async fn lock_invocation_scope_authority(
                     )
                 })?;
                 let Some(row) = row else {
-                    return Ok(InvocationScopeAuthority::Unavailable);
+                    return Ok(InvocationScopeAuthority::Rejected(
+                        InferenceScopeRejection::Unavailable,
+                    ));
                 };
                 let status: String = row.try_get("status").map_err(|error| {
                     ServiceError::with_source(
@@ -2253,25 +1466,34 @@ async fn lock_invocation_scope_authority(
                             error,
                         )
                     })?;
-                let expected_generation = i64::try_from(expected.expected_owner_generation)
-                    .map_err(|_| {
-                        ServiceError::invalid(
-                            "expected_owner_generation exceeds the durable BIGINT range",
+                let has_waiting_obligation: i64 =
+                    row.try_get("has_waiting_obligation").map_err(|error| {
+                        ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "decode inference run waiting obligation",
+                            error,
                         )
                     })?;
-                if expected.expected_control_epoch > last_event_idx {
+                let authority = classify_run_invocation_scope_authority(
+                    expected,
+                    stored_generation,
+                    owner_pod_id.as_deref(),
+                    lease_active == 1,
+                    cancellation_requested != 0,
+                    &status,
+                    has_waiting_obligation == 1,
+                )?;
+                if authority
+                    != InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable)
+                    && expected.expected_control_epoch > last_event_idx
+                {
                     return Err(ServiceError::invalid(format!(
                         "inference control epoch {} is ahead of durable run event index {}",
                         expected.expected_control_epoch, last_event_idx
                     )));
                 }
-                if status != "running"
-                    || stored_generation != expected_generation
-                    || owner_pod_id.as_deref() != Some(expected.expected_owner_pod_id.as_str())
-                    || lease_active != 1
-                    || cancellation_requested != 0
-                {
-                    InvocationScopeAuthority::Unavailable
+                if authority != InvocationScopeAuthority::Live {
+                    authority
                 } else {
                     // The run row is held before its event range, preserving
                     // canonical session -> lifecycle-fence/slot -> run -> run-events
@@ -2299,7 +1521,7 @@ async fn lock_invocation_scope_authority(
                         )
                     })?;
                     if control_fence.is_some() {
-                        InvocationScopeAuthority::GuidancePending
+                        InvocationScopeAuthority::Rejected(InferenceScopeRejection::GuidancePending)
                     } else {
                         InvocationScopeAuthority::Live
                     }
@@ -2311,7 +1533,9 @@ async fn lock_invocation_scope_authority(
                 .await
             {
                 Ok(()) => InvocationScopeAuthority::Live,
-                Err(sqlx::Error::RowNotFound) => InvocationScopeAuthority::Unavailable,
+                Err(sqlx::Error::RowNotFound) => {
+                    InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable)
+                }
                 Err(error) => {
                     return Err(ServiceError::with_source(
                         ServiceErrorKind::Persistence,
@@ -2319,27 +1543,6 @@ async fn lock_invocation_scope_authority(
                         error,
                     ));
                 }
-            }
-        }
-        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => {
-            let status = sqlx::query_scalar::<_, String>(
-                "SELECT status FROM harness_runs
-                 WHERE user_id = ? AND harness_run_id = ? LIMIT 1 FOR UPDATE",
-            )
-            .bind(&input.user_id)
-            .bind(harness_run_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "verify inference harness scope",
-                    error,
-                )
-            })?;
-            match status.as_deref() {
-                Some("running") => InvocationScopeAuthority::Live,
-                Some(_) | None => InvocationScopeAuthority::Unavailable,
             }
         }
     };
@@ -2351,13 +1554,14 @@ fn unavailable_scope_error(
     authority: InvocationScopeAuthority,
 ) -> ServiceError {
     let reason = match authority {
-        InvocationScopeAuthority::GuidancePending => InferenceScopeRejection::GuidancePending,
-        InvocationScopeAuthority::Unavailable => InferenceScopeRejection::Unavailable,
+        InvocationScopeAuthority::Rejected(reason) => reason,
         InvocationScopeAuthority::Live => unreachable!("live authority is not a rejection"),
     };
     ServiceError::with_source(
         match reason {
-            InferenceScopeRejection::GuidancePending => ServiceErrorKind::Conflict,
+            InferenceScopeRejection::GuidancePending | InferenceScopeRejection::Paused => {
+                ServiceErrorKind::Conflict
+            }
             InferenceScopeRejection::Unavailable => ServiceErrorKind::NotFound,
         },
         format!(
@@ -2597,8 +1801,8 @@ async fn insert_inference_invocation_admission(
             "INSERT INTO inference_routes
                  (route_id, user_id, session_id, scope_kind, run_id,
                   offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+                  execution_placement, access_kind, purpose, price_snapshot_json, created_at)
+                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
@@ -2608,22 +1812,12 @@ async fn insert_inference_invocation_admission(
             "INSERT INTO inference_routes
                  (route_id, user_id, session_id, scope_kind,
                   offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+                  execution_placement, access_kind, purpose, price_snapshot_json, created_at)
+                 VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
         )
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
         .bind(session_id),
-        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => sqlx::query(
-            "INSERT INTO inference_routes
-                 (route_id, user_id, scope_kind, harness_run_id,
-                  offering_id, resolved_model_name, upstream_model_name, provider,
-                  execution_placement, access_kind, purpose, created_at)
-                 VALUES (?, ?, 'harness_run', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(&plan.route_id)
-        .bind(&plan.input.user_id)
-        .bind(harness_run_id),
     };
     route_query
         .bind(&plan.input.offering_id)
@@ -2633,6 +1827,7 @@ async fn insert_inference_invocation_admission(
         .bind(plan.input.execution_placement.as_str())
         .bind(plan.input.access_kind.as_str())
         .bind(plan.input.purpose.as_str())
+        .bind(&plan.price_snapshot_json)
         .execute(&mut *connection)
         .await
         .map_err(|error| {
@@ -2675,20 +1870,6 @@ async fn insert_inference_invocation_admission(
         .bind(&plan.route_id)
         .bind(&plan.input.user_id)
         .bind(session_id),
-        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => sqlx::query(
-            "INSERT INTO inference_invocations
-                 (invocation_id, route_id, user_id, scope_kind, harness_run_id,
-                  admission_token, owner_token, owner_generation, owner_lease_expires_at,
-                  operation_id, logical_attempt, purpose, status, terminal_fingerprint,
-                  usage_status, provider_delivery_state, created_at, terminal_at)
-                 VALUES (?, ?, ?, 'harness_run', ?, ?, ?, ?,
-                         DATE_ADD(NOW(6), INTERVAL 60 SECOND), ?, ?, ?,
-                         'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
-        )
-        .bind(&plan.invocation_id)
-        .bind(&plan.route_id)
-        .bind(&plan.input.user_id)
-        .bind(harness_run_id),
     };
     let invocation_query = invocation_query
         .bind(&plan.admission_token)
@@ -2701,7 +1882,6 @@ async fn insert_inference_invocation_admission(
         | InferenceInvocationScope::Session { turn, round, .. } => invocation_query
             .bind(i64::from(*turn))
             .bind(i64::from(*round)),
-        InferenceInvocationScope::HarnessRun { .. } => invocation_query,
     };
     invocation_query
         .bind(plan.input.scope.operation_id())
@@ -2727,11 +1907,18 @@ async fn insert_inference_invocation_admission(
 /// admission token decide the outcome. Scope validation uses the same short
 /// `FOR UPDATE` lock as the original transaction, so deletion cannot race the
 /// recovery insert.
+///
+/// Return the confirmed recovery fact separately from its scope fence.
+/// A paused owner may resume an absent plan, but never an identity already
+/// transferred to settlement. No result is returned before commit/debt proof.
 pub async fn settle_uncertain_inference_admission(
     pool: &SharedPool,
     plan: &InferenceInvocationPlan,
     terminal: &InferenceInvocationTerminal,
-) -> ServiceResult<InferenceInvocationAdmissionResolution> {
+) -> ServiceResult<(
+    InferenceInvocationAdmissionResolution,
+    Option<InferenceScopeRejection>,
+)> {
     if terminal.status != InferenceTerminalStatus::Cancelled
         || terminal.usage != InferenceUsage::default()
         || terminal.usage_status != InferenceUsageStatus::Unavailable
@@ -2787,7 +1974,7 @@ pub async fn settle_uncertain_inference_admission(
             error,
         )
     })?;
-    let mut resolution = match row {
+    let resolution = match row {
         None => {
             if scope_authority == InvocationScopeAuthority::Live {
                 insert_inference_invocation_admission(&mut tx, plan).await?;
@@ -2882,29 +2069,16 @@ pub async fn settle_uncertain_inference_admission(
         )
         .await?;
     }
-    if scope_authority == InvocationScopeAuthority::GuidancePending
-        && matches!(
-            resolution,
-            InferenceInvocationAdmissionResolution::Settled
-                | InferenceInvocationAdmissionResolution::ExactTerminal
-                | InferenceInvocationAdmissionResolution::ScopeUnavailable
-        )
-    {
-        resolution = InferenceInvocationAdmissionResolution::GuidancePending;
-    }
-    if scope_authority == InvocationScopeAuthority::Unavailable
-        && matches!(
-            resolution,
-            InferenceInvocationAdmissionResolution::Settled
-                | InferenceInvocationAdmissionResolution::ExactTerminal
-        )
-    {
-        resolution = InferenceInvocationAdmissionResolution::AuthorityLost;
-    }
     let error = match tx.commit().await {
         Ok(()) => {
             connection.release();
-            return Ok(resolution);
+            return Ok((
+                resolution,
+                match scope_authority {
+                    InvocationScopeAuthority::Live => None,
+                    InvocationScopeAuthority::Rejected(reason) => Some(reason),
+                },
+            ));
         }
         Err(error) => {
             drop(connection);
@@ -2941,7 +2115,13 @@ pub async fn settle_uncertain_inference_admission(
     .await;
     reconciliation.release();
     match match_result {
-        Ok(true) => Ok(resolution),
+        Ok(true) => Ok((
+            resolution,
+            match scope_authority {
+                InvocationScopeAuthority::Live => None,
+                InvocationScopeAuthority::Rejected(reason) => Some(reason),
+            },
+        )),
         Ok(false) => Err(commit_error),
         Err(read_error) => {
             tracing::warn!(
@@ -3755,15 +2935,14 @@ async fn insert_inference_provider_attempt_admission(
     attempt: &InferenceProviderAttemptPlan,
     provider_wire_bytes: i64,
 ) -> ServiceResult<()> {
-    freeze_tool_result_projection_decisions(connection, attempt).await?;
     let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO inference_provider_attempts
-         (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
+         (attempt_id, invocation_id, user_id, session_id, run_id, attempt_index,
           provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
           canonical_transition_id, canonical_parent_transition_id,
           canonical_transition_hash,
           status, usage_status, started_at, terminal_at)
-         SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
+         SELECT ?, invocation_id, user_id, session_id, run_id,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
@@ -4528,18 +3707,14 @@ pub async fn begin_inference_provider_attempt(
             attempt.invocation_id
         )));
     }
-    if let Err(error) = freeze_tool_result_projection_decisions(&mut tx, attempt).await {
-        rollback_inference_tx(tx, "freeze tool-result projection decisions").await;
-        return Err(error);
-    }
     let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO inference_provider_attempts
-         (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
+         (attempt_id, invocation_id, user_id, session_id, run_id, attempt_index,
           provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
           canonical_transition_id, canonical_parent_transition_id,
           canonical_transition_hash,
           status, usage_status, started_at, terminal_at)
-         SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
+         SELECT ?, invocation_id, user_id, session_id, run_id,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
@@ -6296,13 +5471,13 @@ async fn write_inference_settlement_debt(
     })?;
     sqlx::query(
         "INSERT IGNORE INTO inference_invocation_settlement_debts
-         (user_id, invocation_id, session_id, harness_run_id,
+         (user_id, invocation_id, session_id,
           terminal_status, terminal_fingerprint, usage_status,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
           provider_response_id, error_kind, error_message, provider_attempt_id,
           provider_delivery_state)
          SELECT invocation.user_id, invocation.invocation_id,
-                invocation.session_id, invocation.harness_run_id,
+                invocation.session_id,
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          FROM inference_invocations AS invocation
          WHERE invocation.user_id = ? AND invocation.invocation_id = ?",
@@ -8392,7 +7567,7 @@ fn projected_cache_read_share(
         .then(|| usage.input.cache_read_tokens as f64 / total as f64)
 }
 
-fn projected_auxiliary_usage(
+pub(crate) fn projected_auxiliary_usage(
     protocol: &str,
     status: &str,
     counts: [i64; 4],
@@ -8519,8 +7694,11 @@ pub async fn load_session_auxiliary_capture(
     } else {
         "SELECT a.attempt_id, a.provider, a.provider_protocol, r.offering_id, r.upstream_model_name, i.purpose, i.operation_id, a.usage_status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.cache_creation_tokens"
     };
+    // Delegation/model-selector judgments use request-specific operation IDs;
+    // classify their usage by the admitted introspection purpose instead of
+    // attempting to enumerate hashed operation identities.
     let rows = sqlx::query(&format!(
-        "{select} FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND (i.operation_id IN ('request_judgment', 'skill_auto_route', 'work_plan', 'memory_relevance', 'memory_feedback', 'verification_judge', 'completion_proxy:turn_intent', 'completion_proxy:tool_result_rerank') OR i.purpose IN ('memory_retrieval_rerank', 'tool_result_rerank', 'verification_judge')) ORDER BY a.attempt_id LIMIT ?"
+        "{select} FROM inference_invocations i JOIN inference_provider_attempts a ON a.user_id = i.user_id AND a.invocation_id = i.invocation_id JOIN inference_routes r ON r.user_id = i.user_id AND r.route_id = i.route_id WHERE i.user_id = ? AND i.session_id = ? AND (i.operation_id IN ('request_judgment', 'skill_auto_route', 'work_plan', 'memory_relevance', 'memory_feedback', 'verification_judge', 'completion_proxy:turn_intent', 'completion_proxy:tool_result_rerank') OR i.purpose IN ('introspection', 'memory_retrieval_rerank', 'tool_result_rerank', 'verification_judge')) ORDER BY a.attempt_id LIMIT ?"
     ))
         .bind(user_id)
         .bind(session_id)
@@ -8677,6 +7855,483 @@ mod tests {
         }
     }
 
+    fn assert_scope_rejection(error: &ServiceError, expected: InferenceScopeRejection) {
+        assert_eq!(
+            error.kind,
+            match expected {
+                InferenceScopeRejection::GuidancePending | InferenceScopeRejection::Paused => {
+                    ServiceErrorKind::Conflict
+                }
+                InferenceScopeRejection::Unavailable => ServiceErrorKind::NotFound,
+            }
+        );
+        assert_eq!(
+            error
+                .source
+                .as_deref()
+                .and_then(|source| source.downcast_ref::<InferenceScopeRejection>()),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn retained_pause_requires_exact_live_uncancelled_owner_and_waiting_obligation() {
+        let input = input();
+        let expected = input.run_authority.as_ref().unwrap();
+        let owner = Some(expected.expected_owner_pod_id.as_str());
+        for (status, generation, stored_owner, lease_live, cancelled, waiting, authority) in [
+            (
+                "running",
+                0,
+                owner,
+                true,
+                false,
+                false,
+                InvocationScopeAuthority::Live,
+            ),
+            (
+                "running",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Live,
+            ),
+            (
+                "paused",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Paused),
+            ),
+            (
+                "paused",
+                0,
+                owner,
+                true,
+                false,
+                false,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                1,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                0,
+                Some("other-owner"),
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                0,
+                None,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                0,
+                owner,
+                false,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "paused",
+                0,
+                owner,
+                true,
+                true,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "running",
+                0,
+                owner,
+                false,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "running",
+                0,
+                owner,
+                true,
+                true,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "waiting",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "cancelled",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+            (
+                "completed",
+                0,
+                owner,
+                true,
+                false,
+                true,
+                InvocationScopeAuthority::Rejected(InferenceScopeRejection::Unavailable),
+            ),
+        ] {
+            assert_eq!(
+                classify_run_invocation_scope_authority(
+                    expected,
+                    generation,
+                    stored_owner,
+                    lease_live,
+                    cancelled,
+                    status,
+                    waiting,
+                )
+                .unwrap(),
+                authority,
+                "status={status}, generation={generation}, owner={stored_owner:?}, lease={lease_live}, cancelled={cancelled}, waiting={waiting}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and a current-schema MatrixOne database"]
+    async fn retained_pause_fences_real_logical_and_final_provider_admission() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let mut settings = astra_core::MatrixOneSettings::from_env();
+        settings.db_pool_max_connections = 2;
+        settings.db_pool_min_connections = 0;
+        let catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        crate::storage::ensure_core_schema(&settings, &catalog)
+            .await
+            .unwrap();
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let user_id = format!("retained-pause-{suffix}");
+        let session_id = format!("retained-pause-session-{suffix}");
+        let run_id = format!("retained-pause-run-{suffix}");
+        sqlx::query(
+            "INSERT INTO agent_sessions
+             (session_id, user_id, status, event_count, project_retention_policy,
+              created_at, updated_at, last_active_at)
+             VALUES (?, ?, 'active', 0, 'session', NOW(6), NOW(6), NOW(6))",
+        )
+        .bind(&session_id)
+        .bind(&user_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_runs
+             (run_id, user_id, session_id, root_run_id, ancestor_path, depth, retry_scope,
+              status, execution_mode, owner_pod_id, owner_lease_expires_at,
+              run_generation, last_event_idx, total_prompt_tokens,
+              total_completion_tokens, total_tool_calls, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 0, 'node', 'running', 'web_agent',
+                     'test-inference-owner', TIMESTAMPADD(MINUTE, 5, NOW(6)),
+                     0, 0, 0, 0, 0, NOW(6), NOW(6))",
+        )
+        .bind(&run_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&run_id)
+        .bind(&run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        let plan = |operation_id: &str| {
+            let mut input = input();
+            input.user_id = user_id.clone();
+            input.scope = InferenceInvocationScope::Run {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                turn: 0,
+                round: 0,
+                operation_id: operation_id.into(),
+                logical_attempt: 0,
+            };
+            plan_inference_invocation(input).unwrap()
+        };
+        let attempt = |plan: &InferenceInvocationPlan| {
+            plan_inference_provider_attempt(
+                plan,
+                0,
+                InferenceProviderWireIdentity::new("openai_compatible", "a".repeat(64), 2).unwrap(),
+            )
+        };
+        let final_plan = plan("paused_final");
+        admit_inference_invocation(&pool, &final_plan)
+            .await
+            .unwrap();
+        let settlement_plan = plan("paused_settlement");
+        admit_inference_invocation(&pool, &settlement_plan)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_runs SET status = 'paused', waiting_for = 'user_resume' WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        let logical_plan = plan("paused_logical");
+        let combined_plan = plan("paused_combined");
+        for error in [
+            admit_inference_invocation(&pool, &logical_plan)
+                .await
+                .unwrap_err(),
+            admit_inference_invocation_with_first_provider_attempt(
+                &pool,
+                &combined_plan,
+                &attempt(&combined_plan),
+            )
+            .await
+            .unwrap_err(),
+            begin_inference_provider_attempt(&pool, &attempt(&final_plan))
+                .await
+                .unwrap_err(),
+        ] {
+            assert_scope_rejection(&error, InferenceScopeRejection::Paused);
+        }
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Cancelled,
+            usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
+            provider_response_id: None,
+            error_kind: Some("cancelled".into()),
+            error_message: None,
+        };
+        for (plan, resolution) in [
+            (
+                &logical_plan,
+                InferenceInvocationAdmissionResolution::ScopeUnavailable,
+            ),
+            (
+                &settlement_plan,
+                InferenceInvocationAdmissionResolution::Settled,
+            ),
+        ] {
+            assert_eq!(
+                settle_uncertain_inference_admission(&pool, plan, &terminal)
+                    .await
+                    .unwrap(),
+                (resolution, Some(InferenceScopeRejection::Paused)),
+            );
+        }
+        assert_eq!(
+            settle_uncertain_inference_admission(&pool, &plan("paused_settlement"), &terminal)
+                .await
+                .unwrap(),
+            (
+                InferenceInvocationAdmissionResolution::ConflictingIdentity,
+                Some(InferenceScopeRejection::Paused)
+            ),
+        );
+        for (table, expected) in [
+            ("inference_routes", 2_i64),
+            ("inference_invocations", 2),
+            ("inference_provider_attempts", 0),
+            ("inference_invocation_settlement_debts", 1),
+        ] {
+            let count: i64 =
+                sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE user_id = ?"))
+                    .bind(&user_id)
+                    .fetch_one(pool.get())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                count, expected,
+                "paused recovery has an unexpected row count in {table}"
+            );
+        }
+        let waiting_for: Option<String> = sqlx::query_scalar(
+            "SELECT waiting_for FROM agent_runs WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(waiting_for.as_deref(), Some("user_resume"));
+        sqlx::query("UPDATE agent_runs SET waiting_for = NULL WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id)
+            .bind(&run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert_scope_rejection(
+            &admit_inference_invocation(&pool, &logical_plan)
+                .await
+                .unwrap_err(),
+            InferenceScopeRejection::Unavailable,
+        );
+        sqlx::query("UPDATE agent_runs SET waiting_for = 'user_resume', owner_lease_expires_at = TIMESTAMPADD(SECOND, -1, NOW(6)) WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        assert_scope_rejection(
+            &admit_inference_invocation(&pool, &logical_plan)
+                .await
+                .unwrap_err(),
+            InferenceScopeRejection::Unavailable,
+        );
+        // Resume the same owner and the already-admitted invocation. A pause
+        // must not force logical re-admission or replace its physical identity.
+        sqlx::query("UPDATE agent_runs SET status = 'running', waiting_for = NULL, owner_lease_expires_at = TIMESTAMPADD(MINUTE, 5, NOW(6)) WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&run_id).execute(pool.get()).await.unwrap();
+        assert_eq!(
+            begin_inference_provider_attempt(&pool, &attempt(&settlement_plan))
+                .await
+                .unwrap_err()
+                .kind,
+            ServiceErrorKind::Conflict,
+            "resume must not revive an invocation already handed to settlement",
+        );
+        begin_inference_provider_attempt(&pool, &attempt(&final_plan))
+            .await
+            .unwrap();
+        let resumed_attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inference_provider_attempts WHERE user_id = ?",
+        )
+        .bind(&user_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(resumed_attempts, 1);
+        for table in [
+            "inference_invocation_settlement_debts",
+            "inference_provider_attempts",
+            "inference_invocations",
+            "inference_routes",
+            "agent_runs",
+            "agent_sessions",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
+                .bind(&user_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and a current-schema MatrixOne database"]
+    async fn inference_price_snapshot_survives_persisted_replay_and_recovery() {
+        let _ = dotenvy::dotenv();
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let mut settings = astra_core::MatrixOneSettings::from_env();
+        settings.db_pool_max_connections = 2;
+        settings.db_pool_min_connections = 0;
+        let catalog =
+            std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+        crate::storage::ensure_core_schema(&settings, &catalog)
+            .await
+            .unwrap();
+        let pool = SharedPool::new(&settings).await.unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let user_id = format!("price-snapshot-{suffix}");
+        let session_id = format!("price-snapshot-{suffix}");
+        sqlx::query("INSERT INTO agent_sessions (session_id, user_id, status, event_count, project_retention_policy, created_at, updated_at, last_active_at) VALUES (?, ?, 'active', 0, 'session', NOW(6), NOW(6), NOW(6))")
+            .bind(&session_id).bind(&user_id).execute(pool.get()).await.unwrap();
+        let mut input = input();
+        input.user_id = user_id.clone();
+        input.run_authority = None;
+        input.scope = InferenceInvocationScope::Session {
+            session_id: session_id.clone(),
+            turn: 0,
+            round: 0,
+            operation_id: "price_snapshot".into(),
+            logical_attempt: 0,
+        };
+        let snapshot = |rate| {
+            crate::models::InferencePriceSnapshot::from_stored(
+                &json!({
+                    "calculation_version": 1,
+                    "currency": "USD", "unit": "per_token", "source": "configured",
+                    "prompt": rate, "completion": rate,
+                    "configuration_updated_at": "2026-09-27",
+                })
+                .to_string(),
+            )
+            .unwrap()
+        };
+        let original = plan_inference_invocation(input.clone())
+            .unwrap()
+            .with_price_snapshot(Some(&snapshot(0.000001)))
+            .unwrap();
+        admit_inference_invocation(&pool, &original).await.unwrap();
+        let replay = plan_inference_invocation(input)
+            .unwrap()
+            .with_price_snapshot(Some(&snapshot(0.000002)))
+            .unwrap();
+        assert_eq!(original.route_id(), replay.route_id());
+        assert_eq!(original.invocation_id(), replay.invocation_id());
+        assert_ne!(original.price_snapshot_json, replay.price_snapshot_json);
+        assert!(admit_inference_invocation(&pool, &replay).await.is_err());
+        let recovery = original
+            .clone()
+            .with_price_snapshot(Some(&snapshot(0.000002)))
+            .unwrap();
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Cancelled,
+            usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
+            provider_response_id: None,
+            error_kind: Some("cancelled".into()),
+            error_message: None,
+        };
+        assert_eq!(
+            settle_uncertain_inference_admission(&pool, &recovery, &terminal)
+                .await
+                .unwrap(),
+            (InferenceInvocationAdmissionResolution::Settled, None),
+        );
+        let retained: String = sqlx::query_scalar(
+            "SELECT CAST(price_snapshot_json AS CHAR) FROM inference_routes WHERE user_id = ? AND route_id = ?",
+        )
+        .bind(&user_id).bind(original.route_id()).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(
+            crate::models::InferencePriceSnapshot::from_stored(&retained),
+            Some(snapshot(0.000001))
+        );
+        for table in [
+            "inference_invocation_settlement_debts",
+            "inference_invocations",
+            "inference_routes",
+            "agent_sessions",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
+                .bind(&user_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+    }
+
     #[test]
     fn invocation_identity_changes_with_inference_purpose() {
         let primary = plan_inference_invocation(input()).expect("primary plan");
@@ -8772,19 +8427,8 @@ mod tests {
         };
         session_input.run_authority = None;
         let session = plan_inference_invocation(session_input).expect("session plan");
-        let mut harness_input = input();
-        harness_input.scope = InferenceInvocationScope::HarnessRun {
-            harness_run_id: "harness-run-1".to_string(),
-            operation_id: "skillify_extract".to_string(),
-            logical_attempt: 0,
-        };
-        harness_input.run_authority = None;
-        harness_input.purpose = InferencePurpose::SkillSynthesis;
-        let harness = plan_inference_invocation(harness_input).expect("harness plan");
 
         assert_ne!(run.invocation_id(), session.invocation_id());
-        assert_ne!(run.invocation_id(), harness.invocation_id());
-        assert_ne!(session.invocation_id(), harness.invocation_id());
     }
 
     #[test]
@@ -8808,57 +8452,6 @@ mod tests {
             "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
         assert_eq!(wire.provider_wire_bytes(), 4_096);
-    }
-
-    #[test]
-    fn provider_attempt_binds_validated_tool_result_projection_to_exact_wire() {
-        let base_attempt = exact_provider_attempt_with_transition();
-        let wire_hash = base_attempt.wire().provider_wire_hash().to_string();
-        let decision = astra_turn_types::ToolResultProjectionDecisionV1::new(
-            "run-1",
-            "call-1",
-            "a".repeat(64),
-            100,
-            "b".repeat(64),
-            "c".repeat(64),
-            astra_turn_types::ToolResultProjectionDispositionV1::Baseline,
-            Vec::new(),
-            None,
-            Some(astra_turn_types::ToolResultProjectionFallbackV1::JudgmentUnavailable),
-            b"baseline body",
-        )
-        .unwrap();
-        let binding = astra_turn_types::ToolResultProjectionBindingV1 {
-            receipt: astra_turn_types::ToolResultProjectionReceiptV1 {
-                decision_sha256: decision.decision_sha256.clone(),
-                provider_wire_sha256: wire_hash,
-                state: astra_turn_types::ToolResultProjectionWireStateV1::Included,
-                actual_ranges: Vec::new(),
-                actual_body_sha256: Some(decision.rendered_body_sha256.clone()),
-                reason: None,
-            },
-            decision,
-        };
-        let attempt = base_attempt
-            .clone()
-            .with_tool_result_projections(vec![binding.clone()])
-            .unwrap();
-        let (_, encoded, event) =
-            model_request_event(&attempt, ModelRequestEventStage::Accepted, None).unwrap();
-        assert_eq!(event.tool_result_projections, vec![binding.clone()]);
-        let decoded: ModelRequestContextEvent = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(
-            decoded.tool_result_projections,
-            event.tool_result_projections
-        );
-
-        let mut wrong_binding = binding;
-        wrong_binding.receipt.provider_wire_sha256 = "e".repeat(64);
-        assert!(
-            base_attempt
-                .with_tool_result_projections(vec![wrong_binding])
-                .is_err()
-        );
     }
 
     #[test]

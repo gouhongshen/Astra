@@ -4,11 +4,10 @@ use std::time::Duration;
 
 use astra_services::tool_invocation_ledger::DatabaseToolInvocationLedger;
 use astra_services::work::{
-    DatabaseWorkBranchDeletionService, DatabaseWorkRepository, NewWorkRecoveryPoint,
-    WorkBranchDeletionRequest, WorkBranchId, WorkBranchRevision, WorkChangeRef,
-    WorkConflictResource, WorkId, WorkOwnerId, WorkRecoveryPointCaptureRequest,
-    WorkRecoveryPointQuery, WorkRecoveryPointStatus, WorkRepository, WorkRepositoryError,
-    WorkRevision,
+    DatabaseWorkBranchDeletionService, DatabaseWorkRepository, WorkBranchDeletionRequest,
+    WorkBranchId, WorkBranchRevision, WorkChangeRef, WorkConflictResource, WorkId, WorkOwnerId,
+    WorkRecoveryPointCaptureRequest, WorkRecoveryPointQuery, WorkRecoveryPointStatus,
+    WorkRepository, WorkRepositoryError, WorkRevision,
 };
 use astra_services::{
     AcquireWriterOutcome, DatabaseSessionContextCoordinator, DatabaseSessionService,
@@ -16,10 +15,8 @@ use astra_services::{
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
-    CanonicalDeltaModeV1, CanonicalTurnDeltaV1, CoordinatorMutationV1,
-    RECOVERY_POINT_MANIFEST_SCHEMA_VERSION, RecoveryPointEnvironmentRequirementsV1,
-    RecoveryPointExecutionBindingV1, RecoveryPointExecutorKindV1, RecoveryPointManifestV1,
-    RecoveryPointReasonV1, SessionContextHeadV1, SessionCursorV1, SessionKeyV1, SessionSurfaceV1,
+    CanonicalDeltaModeV1, CanonicalTurnDeltaV1, CoordinatorMutationV1, RecoveryPointReasonV1,
+    SessionCursorV1, SessionKeyV1, SessionSurfaceV1,
 };
 use axum::http::StatusCode;
 use sha2::{Digest, Sha256};
@@ -52,68 +49,6 @@ async fn add_non_delivery_branch(
     .execute(pool.get())
     .await
     .expect("add non-delivery branch");
-}
-
-fn manifest(
-    owner_id: &str,
-    work_id: &str,
-    branch_id: &str,
-    session_id: &str,
-) -> RecoveryPointManifestV1 {
-    let session_key = SessionKeyV1::owner_session("tenant", owner_id, session_id, "main");
-    let session_cursor = SessionCursorV1 {
-        schema_version: 1,
-        owner_id: owner_id.to_owned(),
-        session_id: session_id.to_owned(),
-        branch_id: "main".to_owned(),
-        completed_turn: 1,
-        journal_event_seq: 1,
-        conversation_seq: 1,
-        canonical_root_hash: "a".repeat(64),
-        projection_schema: 1,
-        compaction_generation: 0,
-        config_version_id: None,
-    };
-    let mut manifest = RecoveryPointManifestV1 {
-        schema_version: RECOVERY_POINT_MANIFEST_SCHEMA_VERSION,
-        recovery_point_id: common::id("recovery-point"),
-        owner_id: owner_id.to_owned(),
-        work_id: work_id.to_owned(),
-        branch_id: branch_id.to_owned(),
-        work_revision: 1,
-        branch_revision: 1,
-        graph_revision: 1,
-        goal_revision: 1,
-        criteria_set_revision: 1,
-        session_key: session_key.clone(),
-        session_cursor: session_cursor.clone(),
-        context_head: SessionContextHeadV1 {
-            schema_version: 1,
-            key: session_key.clone(),
-            cursor: session_cursor,
-            latest_manifest_root: "a".repeat(64),
-            total_canonical_bytes: 1,
-            total_message_count: 1,
-            writer_epoch: 1,
-        },
-        run: None,
-        execution: RecoveryPointExecutionBindingV1 {
-            binding_generation: 1,
-            binding_state: astra_turn_types::RecoveryPointBindingStateV1::Ready,
-            logical_workspace_id: common::id("workspace"),
-            executor_kind: RecoveryPointExecutorKindV1::Server,
-            executor_id: common::id("server"),
-            binding_hash: String::new(),
-            physical_workspace_id: None,
-        },
-        workspace: None,
-        artifacts: vec![],
-        environment: RecoveryPointEnvironmentRequirementsV1::default(),
-        reason: RecoveryPointReasonV1::UserRequested,
-        created_at: "2026-09-16T00:00:00Z".to_owned(),
-    };
-    manifest.execution.binding_hash = manifest.execution.content_hash();
-    manifest
 }
 
 async fn commit_context_turn(
@@ -197,7 +132,7 @@ async fn commit_context_turn(
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn recovery_point_capture_is_preparing_and_owner_scoped() {
+async fn canonical_recovery_capture_is_owner_scoped_and_idempotent() {
     let pool = common::setup_pool().await;
     let repository = DatabaseWorkRepository::new(pool.clone());
     let owner_id = common::id("owner");
@@ -218,39 +153,42 @@ async fn recovery_point_capture_is_preparing_and_owner_scoped() {
         .await
         .expect("create Work");
 
+    commit_context_turn(&pool, &owner_id, &session_id, 1).await;
     let owner = WorkOwnerId::parse(&owner_id).expect("owner");
     let work = WorkId::parse(&work_id).expect("work");
     let branch = WorkBranchId::parse(&branch_id).expect("branch");
-    let request = NewWorkRecoveryPoint {
+    let request = WorkRecoveryPointCaptureRequest {
         owner_id: owner.clone(),
         work_id: work.clone(),
-        branch_id: branch,
+        branch_id: branch.clone(),
         request_id: WorkChangeRef::parse(common::id("request")).expect("request"),
-        manifest: manifest(&owner_id, &work_id, &branch_id, &session_id),
+        expected_work_revision: 1,
+        expected_branch_revision: 1,
+        reason: RecoveryPointReasonV1::UserRequested,
     };
     let record = repository
         .recovery_points()
-        .record_preparing(request.clone())
+        .capture_canonical(request.clone())
         .await
         .expect("record recovery capture");
-    assert_eq!(record.status, WorkRecoveryPointStatus::Preparing);
+    assert_eq!(record.status, WorkRecoveryPointStatus::Captured);
     assert!(record.ready_at.is_none());
 
     // A retry of the exact admitted request must return the same durable row,
-    // while reusing the request identity for a different manifest is a typed
+    // while reusing the request identity for a different reason is a typed
     // conflict rather than a second capture.
     let replay = repository
         .recovery_points()
-        .record_preparing(request.clone())
+        .capture_canonical(request.clone())
         .await
         .expect("replay recovery capture");
     assert_eq!(replay, record);
     let mut changed_request = request.clone();
-    changed_request.manifest.created_at = "2026-09-16T00:00:01Z".to_owned();
+    changed_request.reason = RecoveryPointReasonV1::SafeBoundary;
     assert!(matches!(
         repository
             .recovery_points()
-            .record_preparing(changed_request)
+            .capture_canonical(changed_request)
             .await,
         Err(WorkRepositoryError::Conflict {
             resource: WorkConflictResource::RecoveryPointRequest
@@ -259,8 +197,8 @@ async fn recovery_point_capture_is_preparing_and_owner_scoped() {
 
     let replay_repository = repository.recovery_points();
     let (left, right) = tokio::join!(
-        replay_repository.record_preparing(request.clone()),
-        replay_repository.record_preparing(request.clone()),
+        replay_repository.capture_canonical(request.clone()),
+        replay_repository.capture_canonical(request.clone()),
     );
     let left = left.expect("concurrent left replay");
     let right = right.expect("concurrent right replay");
@@ -296,36 +234,31 @@ async fn recovery_point_capture_is_preparing_and_owner_scoped() {
             &branch_id,
             &other_session_id,
             &common::id("intent"),
-            "A second owner may use the same opaque recovery-point identifier in another Work.",
+            "A second owner may use the same request identity in another Work.",
         ))
         .await
         .expect("create second owner Work");
-    let mut other_manifest = manifest(
-        &other_owner_id,
-        &other_work_id,
-        &branch_id,
-        &other_session_id,
-    );
-    other_manifest.recovery_point_id = record.recovery_point_id.clone();
-    other_manifest.execution.binding_hash = other_manifest.execution.content_hash();
+    commit_context_turn(&pool, &other_owner_id, &other_session_id, 1).await;
     let other_record = repository
         .recovery_points()
-        .record_preparing(NewWorkRecoveryPoint {
+        .capture_canonical(WorkRecoveryPointCaptureRequest {
             owner_id: other_owner.clone(),
             work_id: WorkId::parse(&other_work_id).expect("other work"),
             branch_id: WorkBranchId::parse(&branch_id).expect("other branch"),
-            request_id: WorkChangeRef::parse(common::id("request")).expect("other request"),
-            manifest: other_manifest,
+            request_id: request.request_id.clone(),
+            expected_work_revision: 1,
+            expected_branch_revision: 1,
+            reason: RecoveryPointReasonV1::UserRequested,
         })
         .await
-        .expect("record second owner recovery capture");
-    assert_eq!(other_record.recovery_point_id, record.recovery_point_id);
+        .expect("capture second owner boundary");
+    assert_ne!(other_record.recovery_point_id, record.recovery_point_id);
     let other_loaded = repository
         .recovery_points()
         .load(
             &other_owner,
             &WorkId::parse(&other_work_id).expect("other work"),
-            &record.recovery_point_id,
+            &other_record.recovery_point_id,
         )
         .await
         .expect("load second owner recovery point")
@@ -342,6 +275,16 @@ async fn recovery_point_capture_is_preparing_and_owner_scoped() {
             .is_none()
     );
 
+    assert!(matches!(
+        repository
+            .recovery_points()
+            .capture_canonical(WorkRecoveryPointCaptureRequest {
+                owner_id: other_owner,
+                ..request
+            })
+            .await,
+        Err(WorkRepositoryError::NotFound)
+    ));
     common::cleanup_work_owner(&pool, &owner_id).await;
     common::cleanup_work_owner(&pool, &other_owner_id).await;
 }
@@ -532,22 +475,19 @@ async fn recovery_point_capture_rejects_a_criterion_set_with_a_missing_member() 
         .await
         .expect("create Work");
 
+    commit_context_turn(&pool, &owner_id, &session_id, 1).await;
     let owner = WorkOwnerId::parse(&owner_id).expect("owner");
     let work = WorkId::parse(&work_id).expect("work");
     let branch = WorkBranchId::parse(&branch_id).expect("branch");
-    let request = NewWorkRecoveryPoint {
+    let request = WorkRecoveryPointCaptureRequest {
         owner_id: owner.clone(),
         work_id: work.clone(),
         branch_id: branch.clone(),
         request_id: WorkChangeRef::parse(common::id("request")).expect("request"),
-        manifest: manifest(&owner_id, &work_id, &branch_id, &session_id),
+        expected_work_revision: 1,
+        expected_branch_revision: 1,
+        reason: RecoveryPointReasonV1::UserRequested,
     };
-    let record = repository
-        .recovery_points()
-        .record_preparing(request)
-        .await
-        .expect("record recovery capture");
-
     // Keep the set envelope internally self-consistent, but point it at a
     // revision that is absent. Capture must validate the complete immutable
     // member set in the same transaction; checking only revision/count/hash
@@ -571,17 +511,22 @@ async fn recovery_point_capture_rejects_a_criterion_set_with_a_missing_member() 
     assert!(matches!(
         repository
             .recovery_points()
-            .mark_captured(&owner, &work, &branch, &record.recovery_point_id)
+            .capture_canonical(request)
             .await,
         Err(WorkRepositoryError::Corrupt { entity, .. }) if entity == "criterion definition"
     ));
-    let loaded = repository
-        .recovery_points()
-        .load(&owner, &work, &record.recovery_point_id)
-        .await
-        .expect("load rejected recovery point")
-        .expect("recovery point remains durable");
-    assert_eq!(loaded.status, WorkRecoveryPointStatus::Preparing);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_recovery_points WHERE owner_id = ? AND work_id = ?",
+    )
+    .bind(&owner_id)
+    .bind(&work_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("count rejected captures");
+    assert_eq!(
+        count, 0,
+        "failed capture must not publish a partial boundary"
+    );
 
     common::cleanup_work_owner(&pool, &owner_id).await;
 }
@@ -607,17 +552,20 @@ async fn delivery_session_delete_explains_work_management_path() {
         ))
         .await
         .expect("create Work");
+    commit_context_turn(&pool, &owner_id, &session_id, 1).await;
     let owner = WorkOwnerId::parse(&owner_id).expect("owner");
     let work = WorkId::parse(&work_id).expect("work");
     let branch = WorkBranchId::parse(&branch_id).expect("branch");
     repository
         .recovery_points()
-        .record_preparing(NewWorkRecoveryPoint {
+        .capture_canonical(WorkRecoveryPointCaptureRequest {
             owner_id: owner,
             work_id: work,
             branch_id: branch,
             request_id: WorkChangeRef::parse(common::id("request")).expect("request"),
-            manifest: manifest(&owner_id, &work_id, &branch_id, &session_id),
+            expected_work_revision: 1,
+            expected_branch_revision: 1,
+            reason: RecoveryPointReasonV1::UserRequested,
         })
         .await
         .expect("record delivery recovery point");
@@ -684,17 +632,20 @@ async fn branch_deletion_removes_branch_recovery_points() {
     .await
     .expect("create branch session");
 
+    commit_context_turn(&pool, &owner_id, &session_id, 1).await;
     let owner = WorkOwnerId::parse(&owner_id).expect("owner");
     let work = WorkId::parse(&work_id).expect("work");
     let branch = WorkBranchId::parse(&branch_id).expect("branch");
     let record = repository
         .recovery_points()
-        .record_preparing(NewWorkRecoveryPoint {
+        .capture_canonical(WorkRecoveryPointCaptureRequest {
             owner_id: owner.clone(),
             work_id: work.clone(),
             branch_id: branch.clone(),
             request_id: WorkChangeRef::parse(common::id("request")).expect("request"),
-            manifest: manifest(&owner_id, &work_id, &branch_id, &session_id),
+            expected_work_revision: 1,
+            expected_branch_revision: 1,
+            reason: RecoveryPointReasonV1::UserRequested,
         })
         .await
         .expect("record recovery point");

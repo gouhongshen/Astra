@@ -27,7 +27,6 @@ pub enum RuntimeControlInvocationKind {
     WorkEstablishment,
     WorkScheduler,
     WorkSettlement,
-    OutcomeReconciliation,
 }
 
 impl RuntimeControlInvocationKind {
@@ -37,7 +36,6 @@ impl RuntimeControlInvocationKind {
             Self::WorkEstablishment => "start_work",
             Self::WorkScheduler => "run_next_work_item",
             Self::WorkSettlement => "settle_work_item",
-            Self::OutcomeReconciliation => "submit_task_resolution",
         }
     }
 }
@@ -88,75 +86,12 @@ pub struct CanonicalToolInvocation {
     target: InvocationTarget,
 }
 
-/// One provider response after canonicalization, retaining provider order.
-///
-/// The two projections are intentionally exposed only as parallel views of
-/// the same ordered records. Callers must never concatenate admitted and
-/// rejected subsets to rebuild history: provider ordering is transcript and
-/// prompt-cache evidence.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CanonicalToolInvocationBatch {
-    invocations: Vec<CanonicalToolInvocation>,
-}
-
-impl CanonicalToolInvocationBatch {
-    #[must_use]
-    pub fn new(invocations: Vec<CanonicalToolInvocation>) -> Self {
-        Self { invocations }
-    }
-
-    #[must_use]
-    pub fn invocations(&self) -> &[CanonicalToolInvocation] {
-        &self.invocations
-    }
-
-    #[must_use]
-    pub fn physical_provider_calls(&self) -> Vec<Value> {
-        self.invocations
-            .iter()
-            .map(|call| call.physical_provider_call().clone())
-            .collect()
-    }
-
-    #[must_use]
-    pub fn logical_target_calls(&self) -> Vec<Value> {
-        self.invocations
-            .iter()
-            .map(|call| call.logical_target_call().clone())
-            .collect()
-    }
-
-    /// The same provider identity must address both views, exactly once and
-    /// in the exact provider sequence. This makes joining execution outcomes
-    /// back to transcript evidence deterministic.
-    pub fn validate(&self) -> Result<(), &'static str> {
-        let mut ids = HashSet::with_capacity(self.invocations.len());
-        for invocation in &self.invocations {
-            let physical_id = invocation
-                .provider_call_id()
-                .ok_or("provider call id is missing")?;
-            let logical_id = invocation
-                .logical_target_call()
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or("logical target id is missing")?;
-            if physical_id != logical_id {
-                return Err("physical and logical call ids differ");
-            }
-            if !ids.insert(physical_id) {
-                return Err("provider batch contains duplicate call ids");
-            }
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 enum InvocationTarget {
     Direct,
-    Deferred {
+    Carrier {
         logical_target_call: Value,
-        activation: DeferredToolActivation,
+        activation: Option<DeferredToolActivation>,
     },
     RuntimeControl {
         logical_target_call: Value,
@@ -239,6 +174,49 @@ impl CanonicalToolInvocation {
         }))
     }
 
+    /// Resolve a carrier whose target is already resident on the current
+    /// model-facing surface.  The carrier remains the provider identity while
+    /// the nested call follows the same logical admission and execution path
+    /// as a direct call.  Runtime callers must prove the target is currently
+    /// visible and bound before using this constructor.
+    pub fn resident_from_carrier(
+        canonical_call: &Value,
+    ) -> Result<Self, DeferredToolInvocationError> {
+        if crate::tool::args::shape::tool_call_name(canonical_call)
+            != Some(DEFERRED_TOOL_INVOCATION_CARRIER)
+        {
+            return Err(DeferredToolInvocationError::Malformed);
+        }
+        let args = crate::tool::args::shape::parse_tool_call_arguments(canonical_call)
+            .map_err(|_| DeferredToolInvocationError::Malformed)?;
+        let invocation = parse_deferred_tool_invocation(&args)
+            .map_err(|_| DeferredToolInvocationError::Malformed)?;
+        if invocation.name == DEFERRED_TOOL_INVOCATION_CARRIER {
+            return Err(DeferredToolInvocationError::NotActivated);
+        }
+        let id = canonical_call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or(DeferredToolInvocationError::Malformed)?;
+        let arguments = serde_json::to_string(&invocation.arguments)
+            .map_err(|_| DeferredToolInvocationError::Malformed)?;
+        Ok(Self {
+            physical_provider_call: canonical_call.clone(),
+            target: InvocationTarget::Carrier {
+                logical_target_call: serde_json::json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": invocation.name,
+                        "arguments": arguments,
+                    },
+                }),
+                activation: None,
+            },
+        })
+    }
+
     #[must_use]
     pub fn provider_call_id(&self) -> Option<&str> {
         self.physical_provider_call
@@ -255,7 +233,7 @@ impl CanonicalToolInvocation {
     pub fn logical_target_call(&self) -> &Value {
         match &self.target {
             InvocationTarget::Direct => &self.physical_provider_call,
-            InvocationTarget::Deferred {
+            InvocationTarget::Carrier {
                 logical_target_call,
                 ..
             } => logical_target_call,
@@ -270,7 +248,7 @@ impl CanonicalToolInvocation {
     pub fn activation(&self) -> Option<&DeferredToolActivation> {
         match &self.target {
             InvocationTarget::Direct => None,
-            InvocationTarget::Deferred { activation, .. } => Some(activation),
+            InvocationTarget::Carrier { activation, .. } => activation.as_ref(),
             InvocationTarget::RuntimeControl { .. } => None,
         }
     }
@@ -279,7 +257,7 @@ impl CanonicalToolInvocation {
     pub fn runtime_control_kind(&self) -> Option<RuntimeControlInvocationKind> {
         match &self.target {
             InvocationTarget::RuntimeControl { kind, .. } => Some(*kind),
-            InvocationTarget::Direct | InvocationTarget::Deferred { .. } => None,
+            InvocationTarget::Direct | InvocationTarget::Carrier { .. } => None,
         }
     }
 }
@@ -294,11 +272,6 @@ impl std::ops::Deref for CanonicalToolInvocation {
         self.logical_target_call()
     }
 }
-
-/// Compatibility name for a resolved carrier invocation. New runtime code
-/// should use [`CanonicalToolInvocation`] so normal and deferred calls share
-/// one admission representation.
-pub type CanonicalDeferredToolInvocation = CanonicalToolInvocation;
 
 /// Why a carrier request cannot be converted into its logical target. These
 /// are protocol facts, not policy decisions: after a successful conversion,
@@ -364,7 +337,7 @@ pub fn canonicalize_deferred_tool_invocation<F>(
     canonical_call: &Value,
     activations: &[DeferredToolActivation],
     current_schema_digest: F,
-) -> Result<Option<CanonicalDeferredToolInvocation>, DeferredToolInvocationError>
+) -> Result<Option<CanonicalToolInvocation>, DeferredToolInvocationError>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -412,45 +385,13 @@ where
             "arguments": arguments,
         },
     });
-    Ok(Some(CanonicalDeferredToolInvocation {
+    Ok(Some(CanonicalToolInvocation {
         physical_provider_call: canonical_call.clone(),
-        target: InvocationTarget::Deferred {
+        target: InvocationTarget::Carrier {
             logical_target_call,
-            activation: activation.clone(),
+            activation: Some(activation.clone()),
         },
     }))
-}
-
-/// Canonicalize one provider batch into paired invocations.
-///
-/// Ordinary calls retain their single canonical value. A carrier is resolved
-/// only from schema-addressed activation evidence supplied by retained
-/// canonical history; callers receive a per-call result so one stale carrier
-/// cannot erase independent calls in a mixed provider batch.
-pub fn canonicalize_tool_invocation_batch<F>(
-    provider_calls: &[Value],
-    activations: &[DeferredToolActivation],
-    current_schema_digest: F,
-) -> Vec<Result<CanonicalToolInvocation, DeferredToolInvocationError>>
-where
-    F: Fn(&str) -> Option<String> + Copy,
-{
-    provider_calls
-        .iter()
-        .map(|provider_call| {
-            let canonical =
-                crate::tool::args::shape::canonicalize_tool_call_for_execution(provider_call)
-                    .map_err(|_| DeferredToolInvocationError::Malformed)?;
-            match canonicalize_deferred_tool_invocation(
-                &canonical,
-                activations,
-                current_schema_digest,
-            )? {
-                Some(invocation) => Ok(invocation),
-                None => Ok(CanonicalToolInvocation::ordinary(canonical)),
-            }
-        })
-        .collect()
 }
 
 /// Current tool surface installed by the runtime for admission/search.
@@ -607,6 +548,9 @@ pub fn deferred_tool_activations_from_tool_search_output(
     if value.get("mode").and_then(Value::as_str) != Some("select") {
         return Vec::new();
     }
+    if value.get("status").and_then(Value::as_str) != Some("completed") {
+        return Vec::new();
+    }
     let Some(query) = value.get("query").and_then(Value::as_str) else {
         return Vec::new();
     };
@@ -667,32 +611,6 @@ pub fn deferred_tool_activations_from_tool_search_output(
         }
     }
     activations
-}
-
-/// Keep only schema-addressed selections that this turn's deferred manifest
-/// actually offered and that the current runtime can bind. Visible tools
-/// (notably the carrier itself) are searchable for discovery but never become
-/// carrier targets merely because a model selected them.
-#[must_use]
-pub fn recordable_deferred_tool_activations<F>(
-    output: &str,
-    surface: &ToolSurfaceNames,
-    has_runtime_binding: F,
-) -> Vec<DeferredToolActivation>
-where
-    F: Fn(&str) -> bool,
-{
-    let Some(activatable) = surface.activatable() else {
-        return Vec::new();
-    };
-    deferred_tool_activations_from_tool_search_output(output)
-        .into_iter()
-        .filter(|activation| {
-            activation.name != DEFERRED_TOOL_INVOCATION_CARRIER
-                && activatable.contains(&activation.name)
-                && has_runtime_binding(&activation.name)
-        })
-        .collect()
 }
 
 /// Apply newly selected evidence to a session's carrier activation state.
@@ -1035,44 +953,11 @@ mod tests {
     }
 
     #[test]
-    fn recordable_carrier_activations_require_deferred_manifest_not_visibility() {
-        let digest = format!("sha256:{}", "a".repeat(64));
-        let output = json!({
-            "mode": "select",
-            "query": "select:invoke_tool,read_file,web_fetch",
-            "requested": ["invoke_tool", "read_file", "web_fetch"],
-            "resolved": ["invoke_tool", "read_file", "web_fetch"],
-            "matches": [
-                {"name": "invoke_tool", "schema_digest": digest},
-                {"name": "read_file", "schema_digest": format!("sha256:{}", "b".repeat(64))},
-                {"name": "web_fetch", "schema_digest": format!("sha256:{}", "c".repeat(64))}
-            ],
-            "missing": []
-        })
-        .to_string();
-        let surface = ToolSurfaceNames::installed(
-            HashSet::from([
-                DEFERRED_TOOL_INVOCATION_CARRIER.to_string(),
-                "read_file".to_string(),
-            ]),
-            HashSet::from(["web_fetch".to_string()]),
-        );
-
-        assert_eq!(
-            recordable_deferred_tool_activations(&output, &surface, |_| true),
-            vec![DeferredToolActivation {
-                name: "web_fetch".to_string(),
-                schema_digest: format!("sha256:{}", "c".repeat(64)),
-                descriptor: None,
-            }]
-        );
-    }
-
-    #[test]
     fn carrier_activation_requires_schema_addressed_selection_evidence() {
         let digest = format!("sha256:{}", "a".repeat(64));
         let selected = json!({
             "mode": "select",
+            "status": "completed",
             "query": "select:github,web_fetch",
             "requested": ["github", "web_fetch"],
             "resolved": ["github", "web_fetch"],
@@ -1100,6 +985,7 @@ mod tests {
         let valid_digest = format!("sha256:{}", "b".repeat(64));
         let base = json!({
             "mode": "select",
+            "status": "completed",
             "query": "select:github",
             "requested": ["github"],
             "resolved": ["github"],
@@ -1110,6 +996,10 @@ mod tests {
             deferred_tool_activations_from_tool_search_output(&base.to_string()).len(),
             1
         );
+
+        let mut failed = base.clone();
+        failed["status"] = json!("failed");
+        assert!(deferred_tool_activations_from_tool_search_output(&failed.to_string()).is_empty());
 
         let mut forged = base.clone();
         forged["requested"] = json!(["web_fetch"]);
@@ -1284,6 +1174,28 @@ mod tests {
     }
 
     #[test]
+    fn resident_carrier_reuses_logical_tool_path_without_deferred_evidence() {
+        let carrier = json!({
+            "id": "provider-resident-1",
+            "type": "function",
+            "function": {
+                "name": DEFERRED_TOOL_INVOCATION_CARRIER,
+                "arguments": r#"{"name":"agent","arguments":{"action":"wait"}}"#,
+            }
+        });
+        let invocation = CanonicalToolInvocation::resident_from_carrier(&carrier)
+            .expect("resident carrier is well formed");
+
+        assert_eq!(invocation.physical_provider_call(), &carrier);
+        assert_eq!(
+            crate::tool::args::shape::tool_call_name(invocation.logical_target_call()),
+            Some("agent")
+        );
+        assert_eq!(invocation.activation(), None);
+        assert_eq!(invocation.runtime_control_kind(), None);
+    }
+
+    #[test]
     fn carrier_canonicalization_fails_closed_for_unactivated_or_stale_target() {
         let carrier = json!({
             "id": "provider-call-2",
@@ -1368,36 +1280,6 @@ mod tests {
     }
 
     #[test]
-    fn batch_resolution_keeps_independent_direct_calls_when_carrier_is_stale() {
-        let calls = vec![
-            json!({"id":"direct-1","type":"function","function":{"name":"read_file","arguments":"{}"}}),
-            json!({"id":"carrier-1","type":"function","function":{"name":"invoke_tool","arguments":"{\"name\":\"web_fetch\",\"arguments\":{}}"}}),
-        ];
-        let resolved = canonicalize_tool_invocation_batch(
-            &calls,
-            &[DeferredToolActivation {
-                name: "web_fetch".to_string(),
-                schema_digest: format!("sha256:{}", "a".repeat(64)),
-                descriptor: None,
-            }],
-            |_| Some(format!("sha256:{}", "b".repeat(64))),
-        );
-
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(
-            resolved[0]
-                .as_ref()
-                .expect("direct call survives")
-                .logical_target_call()["function"]["name"],
-            "read_file"
-        );
-        assert_eq!(
-            resolved[1],
-            Err(DeferredToolInvocationError::ActivationStale)
-        );
-    }
-
-    #[test]
     fn refreshing_carrier_activation_replaces_the_previous_schema_revision() {
         let mut activations = vec![DeferredToolActivation {
             name: "web_fetch".to_string(),
@@ -1428,6 +1310,7 @@ mod tests {
         let selection = |digest: char| {
             json!({
                 "mode": "select",
+                "status": "completed",
                 "query": "select:web_fetch",
                 "requested": ["web_fetch"],
                 "resolved": ["web_fetch"],
@@ -1564,47 +1447,6 @@ mod tests {
         assert!(
             msg.contains("tool_search(query=\"select:github\")"),
             "{msg}"
-        );
-    }
-
-    #[test]
-    fn paired_batch_preserves_provider_order_and_identity_across_views() {
-        let direct = CanonicalToolInvocation::ordinary(json!({
-            "id": "direct-1", "type": "function",
-            "function": {"name": "read_file", "arguments": "{}"}
-        }));
-        let carrier = json!({
-            "id": "carrier-2", "type": "function",
-            "function": {"name": "invoke_tool", "arguments": "{\"name\":\"web_fetch\",\"arguments\":{}}"}
-        });
-        let activation = DeferredToolActivation {
-            name: "web_fetch".to_string(),
-            schema_digest: "sha256:current".to_string(),
-            descriptor: None,
-        };
-        let deferred = canonicalize_deferred_tool_invocation(&carrier, &[activation], |_| {
-            Some("sha256:current".to_string())
-        })
-        .expect("carrier is valid")
-        .expect("carrier resolves");
-        let batch = CanonicalToolInvocationBatch::new(vec![direct, deferred]);
-
-        assert!(batch.validate().is_ok());
-        assert_eq!(
-            batch
-                .physical_provider_calls()
-                .iter()
-                .filter_map(|call| crate::tool::args::shape::tool_call_name(call))
-                .collect::<Vec<_>>(),
-            vec!["read_file", "invoke_tool"]
-        );
-        assert_eq!(
-            batch
-                .logical_target_calls()
-                .iter()
-                .filter_map(|call| crate::tool::args::shape::tool_call_name(call))
-                .collect::<Vec<_>>(),
-            vec!["read_file", "web_fetch"]
         );
     }
 

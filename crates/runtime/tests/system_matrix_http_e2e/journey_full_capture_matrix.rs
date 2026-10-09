@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 
 use super::harness::{
-    bootstrap, cleanup_session_data, collect_full_sse_stream, put_json, seeded_model_selection,
+    ProviderResponse, ProviderScript, bootstrap, cleanup_session_data, collect_full_sse_stream,
+    put_json, seeded_model_selection,
 };
 
 fn read_journal_events(user_id: &str, session_id: &str) -> Vec<Value> {
@@ -74,9 +75,6 @@ async fn wait_for_full_capture_events(user_id: &str, session_id: &str) -> Vec<Va
 }
 
 pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() {
-    let Some(test_secret) = std::env::var("ASTRA_TEST_E2E_SECRET").ok() else {
-        panic!("ASTRA_TEST_E2E_SECRET not set — deterministic inference is fail-closed");
-    };
     let temp = tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
 
@@ -101,23 +99,14 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
     assert_eq!(st_put, StatusCode::OK, "update session metadata: {put_j}");
     assert_eq!(put_j["metadata"]["full_llm_capture"], true);
 
-    let payload = json!({
-        "message": "matrix full capture probe",
-        "session_id": &session_id,
-        "model_selection": seeded_model_selection(ctx),
-        "context": {
-            "test_llm_stream_blocks": [
-                "data: {\"type\":\"text_delta\",\"content\":\"Matrix capture verified.\"}\n\n",
-                "data: {\"type\":\"_inprocess_summary\",\"full_text\":\"Matrix capture verified.\",\"reasoning\":\"\",\"tool_calls\":[],\"usage\":{\"prompt\":10,\"completion\":4,\"total\":14},\"model_used\":\"server-e2e-mock\"}\n\n"
-            ]
-        }
-    });
+    let model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth,vec![ProviderScript::new("full capture of a native provider exchange",move |request|request.path=="/v1/chat/completions" && request.body["model"]==model && request.body["stream"]==true,vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Matrix capture verified."},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}))])]).await;
+    let payload = json!({"message":"matrix full capture probe","session_id":&session_id,"model_selection":seeded_model_selection(ctx),"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}});
     let req = Request::builder()
         .method("POST")
         .uri("/chat/stream")
         .header("authorization", auth)
         .header("content-type", "application/json")
-        .header("x-astra-e2e-test-secret", &test_secret)
         .body(Body::from(payload.to_string()))
         .expect("stream request");
     let (status, body) = collect_full_sse_stream(app, req, 30).await;

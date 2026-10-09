@@ -40,6 +40,12 @@ Model access and inference defines how Astra presents model capability as a prod
 
 ## Ownership
 
+Opt-in Auto chat routing uses the existing authenticated Offering admission
+for its baseline and selected model. It cannot authorize a new access source,
+change billing ownership, or replace a provider-bound model with a Server
+credential. The currently implemented scope and selection policy are described
+in [model routing](model-routing.md#deterministic-auto-selection-stage-3).
+
 This document owns:
 
 - the user-facing Model Access product model;
@@ -110,6 +116,17 @@ Model Access readiness and `available_model_count` are calculated from the
 complete effective catalog, not from the current page. Only the first page
 may carry `default_offering_id`; continuation pages carry `null` and clients
 must preserve the first-page server decision.
+
+Catalog entries expose `pricing` only when the deployment configuration has
+explicit `currency=USD`, `unit=per_token`, and valid input and output rates.
+An explicit zero is a rate; unannotated legacy prices, missing or malformed
+rates, other currencies, personal BYOK, Genesis, and device Offerings
+report `null`, not a fabricated free price. Optional cache rates stay nullable.
+Administrators must explicitly reconfigure legacy prices before they can be
+shown or used by future cost routing; the system never infers their currency.
+`configuration_updated_at` dates the whole model configuration, not a provider
+price verification or a bill. This projection uses the existing catalog query
+and does not replace execution-time admission or physical-usage accounting.
 
 Both endpoints accept `purpose=chat|typed_judgment`, defaulting to `chat`.
 Only `/models` additionally accepts `purpose=all` for registry inspection;
@@ -241,6 +258,12 @@ their own provider account.
   OpenAI transport; adding user ownership does not create another agent loop.
 - Inference admission revalidates `(user_id, offering_id, is_active)` and
   decrypts the current credential immediately before provider execution.
+  Server child fanout admits a bounded set of distinct Offerings with batched
+  owner-scoped and deployment reads, preserving per-Offering freshness without
+  one database round trip per child. The all-or-nothing batch is validated
+  before any child is launched; inherited parent admission adds no read.
+  Strict compatible-endpoint policy checks distinct child endpoints in one
+  trusted-domain query; the default public-HTTPS policy uses no domain read.
 - Create, credential rotation and explicit probe validate connectivity with a
   small output budget using the same provider-specific wire-field rule as
   inference: OpenAI (including o-series) and the generic OpenAI-compatible
@@ -722,6 +745,11 @@ durable ownership before provider I/O. Producers must never invent a run ID to
 make auxiliary work billable, and consumers must never infer ownership from an
 operation label or prompt text.
 
+A forked skill retains its parent run/session and execution authority. Its
+inference operation identity derives from the canonical child turn chain,
+which includes the outer invocation identity. Distinct forks cannot alias the
+same inference invocation; replay of one outer invocation retains its identity.
+
 Server persists route, admitted invocation, and first provider-attempt identity before contacting the provider.
 
 Retries reuse the logical invocation but create a new provider attempt. The invocation ID is sent upstream as an idempotency key only when the final provider explicitly supports that contract. If delivery may have occurred and the provider cannot answer idempotently, the result is `DeliveryUnknown`; Astra does not blindly retry or claim zero usage.
@@ -811,6 +839,18 @@ This rule applies to primary, delegated, compaction, memory, reflection,
 verification, and introspection calls. Auxiliary paths must not create their
 own provider heuristics.
 
+Model catalogs expose the resolved, non-secret thinking protocol alongside the
+probed capability. Model pickers and execution admission share the exact control
+support policy: a binary protocol supports `On`/`Off`, not an invented effort or
+token budget. Explicit effort and budget requests are rejected when unsupported,
+never silently converted to a toggle. An unsuffixed model preserves its default;
+`(thinking:on)` and `(thinking:off)` retain explicit intent across surfaces.
+
+The unconnected per-turn complexity dampener (`TurnComplexitySignals`,
+`scale_for_turn`, and `capped_at`) is retired from the source API; requested
+thinking controls, Offering admission and provider emission keep their existing
+contracts.
+
 ### Resolved generation policy
 
 Model admission resolves the call-level generation behavior before provider
@@ -824,7 +864,9 @@ struct ResolvedGenerationPolicy {
 }
 
 enum ThinkingConfig {
+    ModelDefault,
     Off,
+    On,
     Enabled { budget_tokens: u32 },
     Adaptive { effort: ThinkingEffort },
 }
@@ -992,16 +1034,25 @@ published using configuration- and previous-observation-matching conditional upd
 rotation cannot publish a result for the replacement configuration. Resolution
 reuses only matching observations, without network probing; explicit checks
 refresh them. Credential/configuration changes invalidate observations. Old
-rows remain usable, and schema migration never makes provider requests. Legacy
-administrator capability values are imported as explicitly marked legacy hints
-when the first new check is inconclusive, not evidence of a verified wire protocol.
+rows remain usable without a reasoning-control capability. Only a snapshot bound
+to the current configuration, protocol and adapter revision supplies capability
+or probe diagnostics. Explicit
+model checks refresh missing or stale observations without probing during resolution.
 A failed/inconclusive check retains a prior capability only for the same bound
 configuration and protocol while recording the latest error separately. Stale
-or malformed snapshots never fall back to an unbound legacy capability column.
+or malformed snapshots provide no capability or diagnostics.
 
 User model responses optionally include `thinking_probe`; a missing or stale
 observation is absent, while an inconclusive check has an error. A thinking
 probe failure does not disable a model whose connectivity check succeeded.
+Connectivity status is also committed only to the checked row and configuration;
+rotation or replacement during either probe returns a conflict requiring a fresh check.
+Administrator credential updates validate the effective replacement configuration
+before a short transaction commits all PATCH fields and observation invalidation together.
+Concurrent row or configuration edits return 409 and require an explicit refresh
+and retry; no partial update or automatic replay is performed. Empty PATCHes
+preserve configuration versions and observations, and supplied quirks replace
+the complete quirks object.
 
 `ASTRA_INTROSPECTION_TOTAL_BUDGET_S` defaults to 8 seconds, capped by the global
 LLM budget, for no-tool introspection provider execution. It uses the existing
@@ -1211,7 +1262,7 @@ failure.
 
 Clients obtain one Server projection containing Model Access, effective Offerings, default selection, typed statuses/actions, and a catalog revision.
 
-Chat submits only the user selection:
+Normal chat clients submit only the user selection:
 
 ```json
 {
@@ -1222,6 +1273,12 @@ Chat submits only the user selection:
   }
 }
 ```
+
+A locally orchestrated CLI child run may also send `expected_model_name` after
+batch preflight. It is only an expected-value assertion: Server freshly admits
+the selected Offering and returns `model_identity_changed` if its resolved name
+drifted. The field never authorizes a route or replaces Offering admission.
+Ordinary clients omit it.
 
 Normal run requests never contain:
 
@@ -1249,9 +1306,9 @@ Refresh or reconnect resumes from a durable event cursor. The SDK does not inven
 wire types, not parallel Web/CLI/Server structs. Non-streaming SDK calls use a
 typed `CompletionRequest` and `CompletionResponse`; callers do not construct a
 free-form JSON envelope or index into an unvalidated response. A completion
-scope is an authenticated agent run, a real session-owned operation, or a
-durable Harness run. Memory and compaction require session ownership; Skillify
-requires Harness ownership. Neither fabricates a run or session identity.
+scope is an authenticated agent run or a real session-owned operation. Memory
+and compaction require session ownership; neither fabricates a run or session
+identity.
 
 Version-2 typed judgment responses carry execution-owned `judgment_provenance`
 alongside text and the adapter's model identity. TypeSafe System One supplies
@@ -1267,9 +1324,17 @@ object keys before conversion into a map. The model identity is the existing
 adapter's execution identity, not a guarantee that every upstream provider
 exposes a resolved model version.
 
+Choice questions declare their local `optional` answer policy explicitly.
+Required answers retain strict identity, distribution and execution-provenance
+validation. Missing or invalid optional observations are omitted by the shared
+codec, without invented probabilities; unknown IDs, duplicate JSON and invalid
+response envelopes still fail. TypeSafe requests strip this local policy and
+send the provider's existing Choice schema. Its adapter retains only the local
+question contract across I/O, rather than copying user evidence for validation.
+
 These response facts do not add a ledger, query or persistence projection.
-Malformed judgments use the consumer's existing failure/baseline behavior;
-they are not semantic abstentions authorizing another clarification request.
+Malformed required judgments use the consumer's existing failure/baseline
+behavior; they do not authorize another clarification request.
 
 This contract intentionally replaces the former `selected_model` and raw
 model/provider/gateway request shapes. There is no dual interpretation or
@@ -1384,6 +1449,19 @@ The following boundaries are normative for every inference surface:
 These rules deliberately keep caches, skill metadata, client requests, and caller
 futures as consumers of lifecycle truth rather than additional lifecycle
 producers.
+
+For a live run paused before provider delivery, admission retains the original
+logical plan and physical request identity. Resume does not replay the Host or
+reset its deadline, retry budget, or one-shot controls. Waiting uses the existing
+run control signal outside the single admission-I/O timeout; it adds no database
+polling. Cancellation, execution-lease loss, and the original total deadline still
+bound the wait. New guidance fences the frozen request and returns control to the
+ordinary input boundary before provider delivery.
+
+Uncertain admission must first recover an authoritative commit/settlement fact.
+A paused scope permits reuse only when recovery proves that the original plan
+is absent. An already-settled identity cannot be revived; it follows the existing
+bounded replacement path. A pause signal alone is not proof of either outcome.
 
 ### Causal verification gates
 
@@ -1507,9 +1585,8 @@ Tests validate behavior, persisted facts, wire payloads, streams, and product pr
 - External-account and cross-tenant isolation.
 - CAS transition and revoke races.
 - Route/invocation/attempt persistence before provider execution.
-- Run-owned, session-owned, and Harness-owned admission, including cross-user
-  rejection and no fabricated run/session identity for memory, compaction,
-  reflection, or Skillify work.
+- Run-owned and session-owned admission, including cross-user rejection and no
+  fabricated run/session identity for memory, compaction, or reflection work.
 - Idempotent usage settlement and crash recovery.
 - Revision invalidation across multiple Server instances.
 
@@ -1590,3 +1667,20 @@ Cover Web, CLI + Server, Server Only, and Edge + Server:
 - No client can select an endpoint, credential, or placement directly.
 - Refresh, reconnect, process crash, credential rotation, and Server failover preserve truthful run state.
 - Online tests validate multi-tenant isolation and actual TaaS/MatrixOne contracts.
+
+Cache-break diagnosis consumes dispatched provider-attempt receipts with exact
+request and attempt identity. Missing cache evidence remains unknown; planned
+prompt snapshots and normalized zero cache-read counts cannot substitute for
+physical-attempt evidence. Runtime feedback still owns section accounting,
+truncation recovery and turn statistics. The unused source-only cache compression
+hint and warm-cache rollout diagnostic APIs are retired; compression and rollout
+policy remain at their active owners.
+Cache checkpoints persist structural and usage-bearing baselines independently.
+Restoration does not seed a missing usage baseline from structural-only evidence.
+
+The source-only `record_turn` and default-source shortcuts are retired. Callers
+submit explicit physical request/attempt identities to the receipt API. Planned
+system, tool, and cache-marker hashes remain diagnostic metadata; they never
+substitute for provider-final identities in structural break classification.
+Protocol changes are attributed separately; protocol-native marker changes are
+represented by the exact component identity that contains those markers.

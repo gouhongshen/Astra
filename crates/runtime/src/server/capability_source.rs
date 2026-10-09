@@ -12,6 +12,7 @@ use astra_services::runs::RunStateStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 pub(crate) const CONTRACT_VERSION: &str = "astra-capability-source-v1";
 pub(crate) const CONFIG_METADATA_KEY: &str = "astra.capability_source";
@@ -157,6 +158,16 @@ pub(crate) enum SourceError {
     CustodyUnavailable,
     #[error("capability_source_run_superseded")]
     RunSuperseded,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SourceInvocationError {
+    #[error(transparent)]
+    Rpc(#[from] super::runtime_mcp::AgentBindingMcpRpcError),
+    #[error("capability_source_admission_deadline_expired")]
+    AdmissionDeadlineExpired,
+    #[error("capability_source_cancelled_before_dispatch")]
+    CancelledBeforeDispatch,
 }
 
 pub(crate) struct CapabilitySourceCustody {
@@ -729,23 +740,47 @@ impl CapabilitySourceRuntime {
         &self,
         request: &super::tool_execution_binding::ToolExecutionRequest,
         interaction: Option<&astra_turn_types::ProviderInteractionResponse>,
-    ) -> Result<astra_mcp::McpToolCallResult, super::runtime_mcp::AgentBindingMcpRpcError> {
-        let invalid =
-            |error: SourceError| super::runtime_mcp::capability_source_rpc_error(error.to_string());
-        self.request_scope(request).map_err(invalid)?;
-        let materialized = self
-            .materialize(&request.tool_name, false)
-            .await
-            .map_err(invalid)?;
-        let scope = self
-            .scope
-            .get()
-            .ok_or_else(|| invalid(SourceError::CustodyUnavailable))?;
-        let receipt = self
-            .custody
-            .candidate_receipt(scope, &request.tool_name)
-            .await
-            .map_err(invalid)?;
+        cancel_token: Option<&CancellationToken>,
+    ) -> Result<astra_mcp::McpToolCallResult, SourceInvocationError> {
+        let invalid = |error: SourceError| {
+            SourceInvocationError::Rpc(super::runtime_mcp::capability_source_rpc_error(
+                error.to_string(),
+            ))
+        };
+        // Preparation reads contracts and durable custody only. It may be
+        // dropped on cancellation; an effectful RPC below must retain the
+        // canonical transport's acknowledgement and settlement ownership.
+        let prepare = async {
+            self.request_scope(request).map_err(invalid)?;
+            let materialized = self
+                .materialize(&request.tool_name, false)
+                .await
+                .map_err(invalid)?;
+            let scope = self
+                .scope
+                .get()
+                .ok_or_else(|| invalid(SourceError::CustodyUnavailable))?;
+            let receipt = self
+                .custody
+                .candidate_receipt(scope, &request.tool_name)
+                .await
+                .map_err(invalid)?;
+            Ok::<_, SourceInvocationError>((materialized, receipt))
+        };
+        let (materialized, receipt) = match cancel_token {
+            Some(token) => tokio::select! {
+                biased;
+                _ = token.cancelled() => return Err(SourceInvocationError::CancelledBeforeDispatch),
+                result = prepare => result?,
+            },
+            None => prepare.await?,
+        };
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return Err(SourceInvocationError::CancelledBeforeDispatch);
+        }
+        if request.policy.dispatch_deadline_rejection().is_some() {
+            return Err(SourceInvocationError::AdmissionDeadlineExpired);
+        }
         let response = self
             .transport
             .capability_rpc(
@@ -758,7 +793,7 @@ impl CapabilitySourceRuntime {
                 true,
             )
             .await?;
-        super::runtime_mcp::extract_capability_source_result(&response)
+        super::runtime_mcp::extract_capability_source_result(&response).map_err(Into::into)
     }
 
     pub(crate) fn owns_materialized(&self, key: &str) -> bool {
@@ -1097,6 +1132,7 @@ pub(crate) mod tests {
         pub candidate: CapabilityCandidate,
         pub calls: Arc<std::sync::Mutex<Vec<Value>>>,
         pub bundle: super::super::runtime_mcp::RuntimeMcpBundle,
+        endpoint_url: String,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -1119,17 +1155,34 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn http_fixture_with_inventory(skill: bool, size: usize) -> HttpFixture {
-        http_fixture_with_scope_inventory(skill, size, false).await
+        http_fixture_with_scope_inventory(skill, size, false, None).await
     }
 
     pub(crate) async fn http_fixture_with_bindings(skill: bool, size: usize) -> HttpFixture {
-        http_fixture_with_scope_inventory(skill, size, true).await
+        http_fixture_with_scope_inventory(skill, size, true, None).await
+    }
+
+    struct RpcGate {
+        method: &'static str,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl RpcGate {
+        fn new(method: &'static str) -> Self {
+            Self {
+                method,
+                started: Default::default(),
+                release: Default::default(),
+            }
+        }
     }
 
     async fn http_fixture_with_scope_inventory(
         skill: bool,
         size: usize,
         distinct_bindings: bool,
+        rpc_gate: Option<Arc<RpcGate>>,
     ) -> HttpFixture {
         assert!(size > 0);
         let (store, scope) = fixture().await;
@@ -1163,10 +1216,14 @@ pub(crate) mod tests {
         candidate = inventory[0].0.clone();
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let app = axum::Router::new().route("/mcp", axum::routing::post(
-            |axum::extract::State((calls, inventory)): axum::extract::State<(Arc<std::sync::Mutex<Vec<Value>>>, Vec<(CapabilityCandidate, String)>)>,
+            |axum::extract::State((calls, inventory, gate)): axum::extract::State<(Arc<std::sync::Mutex<Vec<Value>>>, Vec<(CapabilityCandidate, String)>, Option<Arc<RpcGate>>)>,
              headers: axum::http::HeaderMap, axum::Json(request): axum::Json<Value>| async move {
                 assert_eq!(headers.get("authorization").unwrap(), "Bearer test");
                 calls.lock().unwrap().push(request.clone());
+                if let Some(gate) = gate && request["method"] == gate.method {
+                    gate.started.notify_one();
+                    gate.release.notified().await;
+                }
                 let result = match request["method"].as_str().unwrap() {
                     "astra/capabilities/describe" | "astra/capabilities/read_skill" => {
 						assert_eq!(request["params"]["discovery_tool"], "search");
@@ -1200,7 +1257,7 @@ pub(crate) mod tests {
                 };
                 axum::Json(json!({"jsonrpc":"2.0", "id":request["id"], "result":result}))
             }
-        )).with_state((calls.clone(), inventory));
+        )).with_state((calls.clone(), inventory, rpc_gate));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -1226,6 +1283,7 @@ pub(crate) mod tests {
             candidate,
             calls,
             bundle,
+            endpoint_url: endpoint,
             server,
         }
     }
@@ -1277,6 +1335,172 @@ pub(crate) mod tests {
             .selection_key
     }
 
+    #[tokio::test]
+    async fn source_tool_search_cancellation_releases_resolution_and_endpoint_capacity() {
+        use super::super::runtime_tool_executor::RuntimeToolExecutor;
+        use super::super::tool_local_transport::ServerLocalToolTransport;
+        let gate = Arc::new(RpcGate::new("astra/capabilities/describe"));
+        let fixture = http_fixture_with_scope_inventory(false, 1, false, Some(gate.clone())).await;
+        let source = fixture.source();
+        let key = register_fixture_candidate(&source, &fixture).await;
+        let mut held_permits = Vec::new();
+        while let Ok(permit) =
+            crate::capability_endpoint_pool::try_acquire_endpoint_permit(&fixture.endpoint_url)
+        {
+            held_permits.push(permit);
+        }
+        assert!(
+            held_permits.pop().is_some(),
+            "reserve exactly one slot for describe"
+        );
+        let workspace = tempfile::tempdir().unwrap();
+        let mut executor = RuntimeToolExecutor::new(
+            workspace.path().to_path_buf(),
+            fixture.scope.user_id.clone(),
+            fixture.scope.session_id.clone(),
+            None,
+            None,
+        );
+        executor.set_agent_binding_mcp(fixture.transport.clone());
+        executor.set_capability_source(Some(source.clone()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let search = request(
+            &fixture.scope,
+            "tool_search",
+            json!({"query":format!("select:{key}")}),
+        );
+        let execution = executor.execute_server_local_tool(&search, Some(&cancel));
+        tokio::pin!(execution);
+        tokio::select! {
+            _ = gate.started.notified() => {},
+            result = &mut execution => panic!("describe must remain blocked: {:?}", result.result),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => panic!("describe did not start"),
+        }
+        assert!(source.resolution.try_lock().is_err());
+        assert!(
+            crate::capability_endpoint_pool::try_acquire_endpoint_permit(&fixture.endpoint_url)
+                .is_err()
+        );
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+            .await
+            .unwrap()
+            .result;
+        assert!(result.is_error);
+        let metadata = result.metadata.as_ref().unwrap();
+        assert_eq!(
+            metadata["error_kind"],
+            astra_tools::TOOL_ERROR_KIND_CANCELLED
+        );
+        assert_eq!(metadata["status"], astra_tools::TOOL_ERROR_KIND_CANCELLED);
+        assert_eq!(metadata["cancelled"], true);
+        assert_eq!(metadata["retryable"], false);
+        assert!(source.resolution.try_lock().is_ok());
+        let permit =
+            crate::capability_endpoint_pool::try_acquire_endpoint_permit(&fixture.endpoint_url)
+                .expect("cancelled describe must release the exact occupied slot");
+        drop(permit);
+        drop(held_permits);
+        gate.release.notify_one();
+        let calls = fixture.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0]["method"], "astra/capabilities/describe",
+            "cancellation must never dispatch an effectful invoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_invocation_rechecks_deadline_after_blocked_custody_resolution() {
+        let fixture = http_fixture(false).await;
+        let source = fixture.source();
+        let key = register_fixture_candidate(&source, &fixture).await;
+        source.materialize(&key, true).await.unwrap();
+        tokio::time::pause();
+        source.materialized.write().unwrap().clear();
+        let resolution = source.resolution.lock().await;
+        let mut invocation = request(&fixture.scope, &key, json!({}));
+        invocation.policy.admission_deadline =
+            Some((tokio::time::Instant::now() + std::time::Duration::from_secs(5)).into_std());
+        assert!(invocation.policy.dispatch_deadline_rejection().is_none());
+        let execution = source.invoke(&invocation, None, None);
+        tokio::pin!(execution);
+        assert!(futures_util::poll!(&mut execution).is_pending());
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        drop(resolution);
+        assert!(matches!(
+            execution.await,
+            Err(SourceInvocationError::AdmissionDeadlineExpired)
+        ));
+        assert_eq!(
+            fixture.calls.lock().unwrap().len(),
+            1,
+            "after the initial describe, no invoke may dispatch across the cutoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_invocation_cancels_blocked_custody_before_physical_dispatch() {
+        let fixture = http_fixture(false).await;
+        let source = fixture.source();
+        let key = register_fixture_candidate(&source, &fixture).await;
+        source.materialize(&key, true).await.unwrap();
+        source.materialized.write().unwrap().clear();
+        let resolution = source.resolution.lock().await;
+        let invocation = request(&fixture.scope, &key, json!({}));
+        let cancel = CancellationToken::new();
+        let execution = source.invoke(&invocation, None, Some(&cancel));
+        tokio::pin!(execution);
+        assert!(futures_util::poll!(&mut execution).is_pending());
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+            .await
+            .expect("preparation must settle without waiting for the blocked read");
+        assert!(matches!(
+            result,
+            Err(SourceInvocationError::CancelledBeforeDispatch)
+        ));
+        drop(resolution);
+        assert!(source.resolution.try_lock().is_ok());
+        assert_eq!(
+            fixture.calls.lock().unwrap().len(),
+            1,
+            "only the initial describe may dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_invocation_cancellation_preserves_already_dispatched_acknowledgement() {
+        let gate = Arc::new(RpcGate::new("astra/capabilities/invoke"));
+        let fixture = http_fixture_with_scope_inventory(false, 1, false, Some(gate.clone())).await;
+        let source = fixture.source();
+        let key = register_fixture_candidate(&source, &fixture).await;
+        source.materialize(&key, true).await.unwrap();
+        let invocation = request(&fixture.scope, &key, json!({}));
+        let cancel = CancellationToken::new();
+        let execution = source.invoke(&invocation, None, Some(&cancel));
+        tokio::pin!(execution);
+        tokio::select! {
+            _ = gate.started.notified() => {},
+            result = &mut execution => panic!("invoke must remain in flight: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => panic!("invoke did not dispatch"),
+        }
+        cancel.cancel();
+        assert!(
+            futures_util::poll!(&mut execution).is_pending(),
+            "an in-flight invocation must not be dropped on cancellation"
+        );
+        gate.release.notify_one();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.output, "account-read-complete");
+        let calls = fixture.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1]["method"], "astra/capabilities/invoke");
+    }
+
     // Predict the scripted model's selection without registering any authority.
     // The real discovery response must create the receipt during the loop.
     pub(crate) fn fixture_selection_key(
@@ -1307,7 +1531,7 @@ pub(crate) mod tests {
         );
         drop(_resolution);
         source
-            .invoke(&request(&fixture.scope, &key, json!({})), None)
+            .invoke(&request(&fixture.scope, &key, json!({})), None, None)
             .await
             .unwrap();
         let reopened =
@@ -1315,7 +1539,7 @@ pub(crate) mod tests {
         reopened.bind_scope(fixture.scope.clone()).unwrap();
         reopened.materialize(&key, false).await.unwrap();
         reopened
-            .invoke(&request(&fixture.scope, &key, json!({})), None)
+            .invoke(&request(&fixture.scope, &key, json!({})), None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1334,7 +1558,7 @@ pub(crate) mod tests {
         );
         let mut wrong = request(&fixture.scope, &key, json!({}));
         wrong.session_id = "other-session".into();
-        assert!(reopened.invoke(&wrong, None).await.is_err());
+        assert!(reopened.invoke(&wrong, None, None).await.is_err());
         assert_eq!(fixture.calls.lock().unwrap().len(), 3);
     }
 

@@ -20,26 +20,21 @@ fn items() -> Vec<SlashItem> {
 // ─── Open/close predicate ─────────────────────────────────────────
 
 #[test]
-fn is_open_for_slash_prefix() {
-    assert!(is_open_for("/"));
-    assert!(is_open_for("/h"));
-    assert!(is_open_for("/help"));
-    assert!(is_open_for("/hel world"));
-}
-
-#[test]
-fn is_open_for_non_slash_is_closed() {
-    assert!(!is_open_for(""));
-    assert!(!is_open_for("hello"));
-    assert!(!is_open_for(" /help"), "leading space breaks the rule");
-    // Multi-line buffers where the first line isn't a slash.
-    assert!(!is_open_for("hello\n/help"));
-}
-
-#[test]
-fn is_open_for_checks_first_line_only() {
-    // If the first line starts with '/', we're open even with more text below.
-    assert!(is_open_for("/help\nmore content"));
+fn completion_stops_at_arguments_and_multiline_input() {
+    for text in ["/", "/h", "/help"] {
+        assert!(is_open_for(text, &items()), "{text:?}");
+    }
+    for text in [
+        "",
+        "hello",
+        " /help",
+        "/hel world",
+        "/help ",
+        "/help\nmore",
+        "hello\n/help",
+    ] {
+        assert!(!is_open_for(text, &items()), "{text:?}");
+    }
 }
 
 // ─── Empty filter: lists everything ───────────────────────────────

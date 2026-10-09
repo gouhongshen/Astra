@@ -86,13 +86,6 @@ const SESSION_LOCK_AGENT_RUNS_SQL: &str = "SELECT run_id FROM agent_runs
          ORDER BY run_id ASC
          FOR UPDATE";
 
-const SESSION_DELETE_PLAN_STEP_RUNS_SQL: &str = "DELETE FROM plan_step_runs
-         WHERE user_id = ?
-           AND plan_id IN (
-               SELECT plan_id FROM plans
-               WHERE session_id = ? AND user_id = ?
-           )";
-
 const SESSION_DELETE_CHILD_FORKS_SELECT_SQL: &str =
     "SELECT isolation_domain, fork_id, parent_session_id
        FROM session_forks
@@ -152,10 +145,6 @@ const SESSION_DELETE_ORPHAN_MANIFEST_REFERENCES_SQL: &str =
 const SESSION_DELETE_WORKSPACE_CLEANUP_DEBT_MESSAGE: &str =
     "session hard delete requested cloud workspace cleanup";
 
-const SESSION_CLEAR_CONFIG_VERSION_FIRST_SEEN_SESSION_SQL: &str = "UPDATE config_versions \
-     SET first_seen_session = NULL \
-     WHERE user_id = ? AND first_seen_session = ?";
-
 const SESSION_DELETE_SESSION_ORIGIN_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "session_state_item_events",
@@ -174,48 +163,14 @@ const SESSION_DELETE_SESSION_ORIGIN_TABLES: &[SessionDeleteStatement] = &[
     },
 ];
 
-const SESSION_DELETE_DERIVED_PARENT_TABLES: &[SessionDeleteStatement] = &[
-    SessionDeleteStatement {
-        label: "context_manifest_items",
-        sql: "DELETE FROM context_manifest_items
+const SESSION_DELETE_DERIVED_PARENT_TABLES: &[SessionDeleteStatement] = &[SessionDeleteStatement {
+    label: "context_manifest_items",
+    sql: "DELETE FROM context_manifest_items
              WHERE (user_id, manifest_id) IN (
                  SELECT user_id, manifest_id FROM context_manifests
                  WHERE session_id = ? AND user_id = ?
              )",
-    },
-    SessionDeleteStatement {
-        label: "harness_citations",
-        sql: "DELETE FROM harness_citations
-             WHERE harness_run_id IN (
-                 SELECT harness_run_id FROM harness_runs
-                 WHERE session_id = ? AND user_id = ?
-             )",
-    },
-    SessionDeleteStatement {
-        label: "harness_skill_rules",
-        sql: "DELETE FROM harness_skill_rules
-             WHERE harness_run_id IN (
-                 SELECT harness_run_id FROM harness_runs
-                 WHERE session_id = ? AND user_id = ?
-             )",
-    },
-    SessionDeleteStatement {
-        label: "harness_skill_drafts",
-        sql: "DELETE FROM harness_skill_drafts
-             WHERE harness_run_id IN (
-                 SELECT harness_run_id FROM harness_runs
-                 WHERE session_id = ? AND user_id = ?
-             )",
-    },
-    SessionDeleteStatement {
-        label: "harness_items",
-        sql: "DELETE FROM harness_items
-             WHERE harness_run_id IN (
-                 SELECT harness_run_id FROM harness_runs
-                 WHERE session_id = ? AND user_id = ?
-             )",
-    },
-];
+}];
 
 const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
@@ -289,10 +244,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM session_execution_switches WHERE session_id = ? AND owner_user_id = ?",
     },
     SessionDeleteStatement {
-        label: "session_execution_workspace_claims",
-        sql: "DELETE FROM session_execution_workspace_claims WHERE session_id = ? AND owner_user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "session_context_heads",
         sql: "DELETE FROM session_context_heads WHERE session_id = ? AND owner_user_id = ?",
     },
@@ -361,16 +312,8 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM ctx_decision_audits WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
-        label: "session_delegations",
-        sql: "DELETE FROM session_delegations WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
         label: "harness_snapshots",
         sql: "DELETE FROM harness_snapshots WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "harness_runs",
-        sql: "DELETE FROM harness_runs WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
         label: "skill_selection_events",
@@ -383,22 +326,6 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "session_checkpoints",
         sql: "DELETE FROM session_checkpoints WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "wf_triggers",
-        sql: "DELETE FROM wf_triggers WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "eval_user_feedback",
-        sql: "DELETE FROM eval_user_feedback WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "eval_calibration_assessments",
-        sql: "DELETE FROM eval_calibration_assessments WHERE session_id = ? AND user_id = ?",
-    },
-    SessionDeleteStatement {
-        label: "team_snapshots",
-        sql: "DELETE FROM team_snapshots WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
         label: "tool_invocation_ledger",
@@ -443,20 +370,6 @@ const SESSION_DELETE_ARTIFACT_TABLES: &[SessionDeleteStatement] = &[
 ];
 
 const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
-    SessionBatchDeleteStatement {
-        label: "tool_result_projection_receipts",
-        sql: "DELETE FROM tool_result_projection_receipts
-             WHERE session_id = ? AND user_id = ?
-             ORDER BY attempt_id ASC, freeze_key_sha256 ASC
-             LIMIT ?",
-    },
-    SessionBatchDeleteStatement {
-        label: "tool_result_projection_decisions",
-        sql: "DELETE FROM tool_result_projection_decisions
-             WHERE session_id = ? AND user_id = ?
-             ORDER BY freeze_key_sha256 ASC
-             LIMIT ?",
-    },
     SessionBatchDeleteStatement {
         label: "inference_invocation_settlement_debts",
         sql: SESSION_DELETE_INFERENCE_SETTLEMENT_DEBTS_SQL,
@@ -574,10 +487,6 @@ const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
         label: "agent_sessions",
         sql: "DELETE FROM agent_sessions WHERE session_id = ? AND user_id = ?",
     },
-    SessionDeleteStatement {
-        label: "eval_quality_assessments",
-        sql: "DELETE FROM eval_quality_assessments WHERE target_id = ? AND user_id = ? AND level = 'session'",
-    },
 ];
 
 const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
@@ -586,7 +495,6 @@ const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
     ("session_context_heads", "owner_user_id"),
     ("session_execution_bindings", "owner_user_id"),
     ("session_execution_switches", "owner_user_id"),
-    ("session_execution_workspace_claims", "owner_user_id"),
     ("session_context_operation_receipts", "owner_user_id"),
     ("session_context_authority_events", "owner_user_id"),
     ("session_handoff_events", "owner_user_id"),
@@ -676,7 +584,6 @@ pub(crate) struct SessionTableDeleteOutcome {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SessionDatabaseDeleteOutcome {
     pub rows_deleted: u64,
-    pub session_references_cleared: u64,
     pub workspace_cleanup_debts_enqueued: u64,
     pub tables: Vec<SessionTableDeleteOutcome>,
 }
@@ -850,20 +757,6 @@ async fn enqueue_workspace_cleanup_debts_for_session_delete(
     }
 
     Ok(enqueued)
-}
-
-async fn clear_session_provenance_references(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    session_id: &str,
-    user_id: &str,
-) -> Result<u64, String> {
-    query(SESSION_CLEAR_CONFIG_VERSION_FIRST_SEEN_SESSION_SQL)
-        .bind(user_id)
-        .bind(session_id)
-        .execute(&mut **tx)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(|source| format!("delete_session.config_versions.first_seen_session: {source}"))
 }
 
 async fn delete_child_fork_state(
@@ -1044,16 +937,6 @@ pub(crate) async fn hard_delete_session_rows(
         record_table_delete(&mut outcome, statement.label, rows_deleted)?;
     }
 
-    let rows_deleted = query(SESSION_DELETE_PLAN_STEP_RUNS_SQL)
-        .bind(user_id)
-        .bind(session_id)
-        .bind(user_id)
-        .execute(&mut **tx)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(|source| format!("delete_session.plan_step_runs: {source}"))?;
-    record_table_delete(&mut outcome, "plan_step_runs", rows_deleted)?;
-
     for statement in SESSION_DELETE_DERIVED_PARENT_TABLES {
         let rows_deleted = delete_session_rows_session_user(
             tx,
@@ -1068,8 +951,6 @@ pub(crate) async fn hard_delete_session_rows(
 
     outcome.workspace_cleanup_debts_enqueued =
         enqueue_workspace_cleanup_debts_for_session_delete(tx, session_id, user_id).await?;
-    outcome.session_references_cleared =
-        clear_session_provenance_references(tx, session_id, user_id).await?;
 
     // A child fork owns the pin that keeps its parent's exact prefix alive.
     // Remove that dependency before deleting the child; parent deletion keeps
@@ -1237,7 +1118,6 @@ pub(crate) async fn hard_delete_session_rows(
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SessionHardDeleteOutcome {
     pub database_rows_deleted: u64,
-    pub session_references_cleared: u64,
     pub workspace_cleanup_debts_enqueued: u64,
     pub database_tables_deleted: Vec<SessionTableDeleteOutcome>,
     pub local_bytes_freed: u64,
@@ -1549,7 +1429,6 @@ pub(crate) async fn hard_delete_session(
 
     let mut outcome = SessionHardDeleteOutcome {
         database_rows_deleted: database_delete.rows_deleted,
-        session_references_cleared: database_delete.session_references_cleared,
         workspace_cleanup_debts_enqueued: database_delete.workspace_cleanup_debts_enqueued,
         database_tables_deleted: database_delete.tables,
         database_delete_ms,
@@ -1705,7 +1584,6 @@ mod tests {
     fn session_database_delete_outcome_fails_loudly_on_row_total_overflow() {
         let mut outcome = SessionDatabaseDeleteOutcome {
             rows_deleted: u64::MAX,
-            session_references_cleared: 0,
             workspace_cleanup_debts_enqueued: 0,
             tables: Vec::new(),
         };
@@ -1750,8 +1628,6 @@ mod tests {
                 "prompt_request_records",
                 "session_tool_output_batches",
                 "session_tool_outputs",
-                "tool_result_projection_decisions",
-                "tool_result_projection_receipts",
             ])
         );
         for statement in statements {
@@ -1991,11 +1867,8 @@ mod tests {
                 let session_owner_scoped = normalized.contains("session_id = ? AND user_id = ?")
                     || normalized.contains("session_id = ? AND owner_id = ?")
                     || normalized.contains("session_id = ? AND owner_user_id = ?");
-                let session_quality_scoped = statement.label == "eval_quality_assessments"
-                    && normalized.contains("target_id = ? AND user_id = ?")
-                    && normalized.contains("level = 'session'");
                 assert!(
-                    session_owner_scoped || session_quality_scoped,
+                    session_owner_scoped,
                     "{} must be scoped by session identity and its owner",
                     statement.label
                 );
@@ -2031,12 +1904,6 @@ mod tests {
             .join(" ");
         assert!(lock_agent_runs_sql.contains("session_id = ? AND user_id = ?"));
         assert!(lock_agent_runs_sql.ends_with("ORDER BY run_id ASC FOR UPDATE"));
-        let plan_step_runs_sql = SESSION_DELETE_PLAN_STEP_RUNS_SQL
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(plan_step_runs_sql.contains("user_id = ?"));
-        assert!(plan_step_runs_sql.contains("session_id = ? AND user_id = ?"));
     }
 
     #[test]

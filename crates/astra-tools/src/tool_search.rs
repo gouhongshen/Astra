@@ -11,6 +11,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const SELECT_DESCRIPTION_MAX_CHARS: usize = 220;
+/// Selection evidence must reach the model whole. The server and CLI mark a
+/// successful selection as source-bounded instead of applying generic 8K
+/// truncation; oversized batches fail atomically and can be selected in
+/// smaller groups.
+pub const MAX_SELECTION_RESULT_BYTES: usize = 16_000;
 const TOOL_RESULT_STATUS_COMPLETED: &str = "completed";
 const TOOL_RESULT_STATUS_FAILED: &str = "failed";
 
@@ -96,6 +101,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
             "status": TOOL_RESULT_STATUS_COMPLETED,
             "selection_status": outcome,
             "query": query,
+            "invocation": "Selection never changes tools[], even when the tool name is already resident. Native calls must match their current tools[] schema. If the tool is absent from tools[] or needs selected-only arguments, call invoke_tool with name=matches[].name and arguments=the selected tool's arguments.",
             "requested": requested,
             "resolved": resolved,
             "matches": found,
@@ -105,13 +111,42 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         });
         let message = select_message(outcome, &result);
         add_tool_search_guidance(&mut result, outcome, message);
-        return result.to_string();
+        let output = result.to_string();
+        return if output.len() <= MAX_SELECTION_RESULT_BYTES {
+            output
+        } else {
+            tool_search_error("Selection contract is too large to present completely; select fewer tools at once.").to_string()
+        };
     }
 
     tool_search_error(
         "'query' must use select:NAME or select:NAME1,NAME2; intent matching is not performed",
     )
     .to_string()
+}
+
+/// Shared server/CLI/default-executor result contract. Only a complete,
+/// producer-bounded selection is presented inline and can become activation
+/// evidence; an oversized or malformed request is an ordinary tool failure.
+pub fn tool_search_result(schemas: &[Value], args: &Value) -> crate::ToolResult {
+    let output = tool_search(schemas, args);
+    let completed = serde_json::from_str::<Value>(&output)
+        .ok()
+        .is_some_and(|value| value["status"] == TOOL_RESULT_STATUS_COMPLETED);
+    if !completed {
+        crate::ToolResult::error(output)
+    } else {
+        crate::ToolResult::text(output).with_source_bounded_model_projection()
+    }
+}
+
+pub fn selection_presentation_failure() -> crate::ToolResult {
+    crate::ToolResult::error(
+        tool_search_error(
+            "Selection result could not be delivered intact; select fewer tools or retry.",
+        )
+        .to_string(),
+    )
 }
 
 pub use astra_core::tool_schema::tool_schema_name;
@@ -396,7 +431,12 @@ fn compact_select_parameters(params: &Value) -> Value {
         .as_object()
         .and_then(crate::schemas::action_contract_description);
     let mut compact = params.clone();
-    strip_schema_descriptions(&mut compact);
+    // The tool-level summary is already returned beside parameters. Nested
+    // producers may use the same annotation for load-bearing parameter choices.
+    if let Some(object) = compact.as_object_mut() {
+        object.remove("x-astra-discovery-summary");
+    }
+    compact_parameter_descriptions(&mut compact, false);
     // Keep the load-bearing conditional fields after removing internal
     // producer annotations.  This stays a single compact description rather
     // than reintroducing the full schema prose or a provider-specific union.
@@ -408,38 +448,46 @@ fn compact_select_parameters(params: &Value) -> Value {
     compact
 }
 
-fn strip_schema_descriptions(value: &mut Value) {
+/// Compact a canonical parameter schema, retaining producer-owned guidance.
+/// Consumes the summary annotation instead of storing it twice. Resident schemas
+/// retain other internal annotations; selected schemas remove them for the model.
+pub fn compact_parameter_descriptions(value: &mut Value, retain_internal_metadata: bool) {
     match value {
         Value::Object(map) => {
             map.remove("description");
-            map.retain(|key, _| !key.starts_with("x-astra-"));
+            if let Some(Value::String(summary)) = map.remove("x-astra-discovery-summary") {
+                map.insert("description".to_string(), Value::String(summary));
+            }
+            if !retain_internal_metadata {
+                map.retain(|key, _| !key.starts_with("x-astra-"));
+            }
             for (key, child) in map {
                 if is_schema_map_key(key) {
-                    strip_schema_map_descriptions(child);
+                    compact_schema_map_descriptions(child, retain_internal_metadata);
                 } else {
-                    strip_schema_descriptions(child);
+                    compact_parameter_descriptions(child, retain_internal_metadata);
                 }
             }
         }
         Value::Array(values) => {
             for child in values {
-                strip_schema_descriptions(child);
+                compact_parameter_descriptions(child, retain_internal_metadata);
             }
         }
         _ => {}
     }
 }
 
-fn strip_schema_map_descriptions(value: &mut Value) {
+fn compact_schema_map_descriptions(value: &mut Value, retain_internal_metadata: bool) {
     match value {
         Value::Object(map) => {
             for child in map.values_mut() {
-                strip_schema_descriptions(child);
+                compact_parameter_descriptions(child, retain_internal_metadata);
             }
         }
         Value::Array(values) => {
             for child in values {
-                strip_schema_descriptions(child);
+                compact_parameter_descriptions(child, retain_internal_metadata);
             }
         }
         _ => {}
@@ -591,6 +639,14 @@ mod tests {
         assert!(
             parsed["matches"][0].get("score").is_none(),
             "select mode must return schema entries, not relevance scores: {parsed}"
+        );
+        assert!(
+            parsed["invocation"]
+                .as_str()
+                .is_some_and(|guidance| guidance.contains("invoke_tool")
+                    && guidance.contains("tools[]")
+                    && guidance.contains("even when the tool name is already resident")),
+            "selection must explain the carrier path without changing native tools: {parsed}"
         );
     }
 
@@ -1088,7 +1144,16 @@ mod tests {
                 "parameters": {
                     "type": "object",
                     "x-astra-discovery-summary": "start needs action+scope; observe needs work_id",
-                    "properties": {"action": {"type": "string"}}
+                    "properties": {
+                        "action": {"type": "string"},
+                        "description": {
+                            "type": "string",
+                            "description": "Long catalog prose must not survive.",
+                            "x-astra-discovery-summary": "Choose an authorized scope.",
+                            "x-astra-internal-note": "not model-visible"
+                        },
+                        "other": {"type": "string", "description": "Discard prose", "x-astra-discovery-summary": false}
+                    }
                 }
             }
         })];
@@ -1099,6 +1164,19 @@ mod tests {
             selected["matches"][0]["description"],
             "start needs action+scope; observe needs work_id"
         );
+        let parameters = &selected["matches"][0]["parameters"];
+        assert!(parameters.get("description").is_none());
+        assert_eq!(parameters["properties"]["description"]["type"], "string");
+        assert_eq!(
+            parameters["properties"]["description"]["description"],
+            "Choose an authorized scope."
+        );
+        assert!(
+            parameters["properties"]["other"]
+                .get("description")
+                .is_none()
+        );
+        assert!(!parameters.to_string().contains("x-astra-"));
         assert!(
             selected["matches"][0]["parameters"]
                 .get("x-astra-discovery-summary")
@@ -1134,29 +1212,167 @@ mod tests {
     #[test]
     fn explicit_selection_preserves_deferred_agent_constraints() {
         let schemas = crate::schemas::all_tool_schemas();
+        for (name, paths) in [
+            ("agent", vec!["/properties/isolated"]),
+            (
+                "agent_fanout",
+                vec![
+                    "/properties/defaults/properties/isolated",
+                    "/properties/slots/items/properties/isolated",
+                ],
+            ),
+        ] {
+            let selected: Value = serde_json::from_str(&tool_search(
+                &schemas,
+                &json!({"query": format!("select:{name}")}),
+            ))
+            .unwrap();
+            for path in paths {
+                let field = selected["matches"][0]["parameters"].pointer(path).unwrap();
+                let guidance = field["description"].as_str().unwrap();
+                assert!(
+                    guidance.contains("Writable child")
+                        && guidance.contains("read-only parent ceiling")
+                );
+                assert!(field.get("x-astra-discovery-summary").is_none());
+            }
+        }
 
         let result = tool_search(&schemas, &json!({"query": "select:agent_fanout"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();
         let fanout = &parsed["matches"][0];
         let desc = fanout["description"].as_str().unwrap_or_default();
         assert!(
-            desc.contains("exactly that many slots")
+            desc.contains("target_count slots")
                 && desc.contains("description+prompt")
-                && desc.contains("never embed diffs")
-                && desc.contains("no brief/agents/background"),
-            "selection summary must keep the current fanout shape and shared-workspace constraints: {desc}"
+                && desc.contains("atomic")
+                && desc.contains("hard requirements bind"),
+            "selection summary must keep the current fanout admission contract: {desc}"
         );
+    }
 
-        let result = tool_search(&schemas, &json!({"query": "select:agent"}));
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        let agent = &parsed["matches"][0];
-        let desc = agent["description"].as_str().unwrap_or_default();
-        assert!(
-            desc.contains("description+prompt")
-                && desc.contains("agent_id")
-                && desc.contains("foreground")
-                && desc.contains("run_chain"),
-            "selection summary must keep agent action constraints: {desc}"
+    #[test]
+    fn agent_selection_is_complete_within_source_bound() {
+        let schemas = crate::schemas::all_tool_schemas();
+        for query in [
+            "select:agent",
+            "select:agent_fanout",
+            "select:agent,agent_fanout",
+        ] {
+            let selected = tool_search(&schemas, &json!({"query": query}));
+            let parsed: Value = serde_json::from_str(&selected).unwrap();
+            assert_eq!(parsed["selection_status"], "ok", "{query}: {parsed}");
+            for selected in parsed["matches"].as_array().unwrap() {
+                let parameters = &selected["parameters"]["properties"];
+                let brief = if selected["name"] == "agent" {
+                    &parameters["prompt"]
+                } else {
+                    &parameters["slots"]["items"]["properties"]["prompt"]
+                };
+                let guidance = brief["description"].as_str().unwrap();
+                let normalized = guidance.to_ascii_lowercase();
+                assert!(
+                    normalized.contains("exact output")
+                        || normalized.contains("exact child output")
+                );
+                assert!(guidance.contains("parent uses model/status receipts"));
+                assert!(brief.get("x-astra-discovery-summary").is_none());
+                let reasoning = if selected["name"] == "agent" {
+                    vec![&parameters["reasoning"]]
+                } else {
+                    vec![
+                        &parameters["defaults"]["properties"]["reasoning"],
+                        &parameters["slots"]["items"]["properties"]["reasoning"],
+                    ]
+                };
+                for control in reasoning {
+                    assert_eq!(control["description"], "Omit outside user-requested scope.");
+                    assert!(control.get("x-astra-discovery-summary").is_none());
+                }
+                let policies = if selected["name"] == "agent" {
+                    vec![&parameters["requested_model_policy"]]
+                } else {
+                    vec![
+                        &parameters["defaults"]["properties"]["requested_model_policy"],
+                        &parameters["slots"]["items"]["properties"]["requested_model_policy"],
+                    ]
+                };
+                for policy in policies {
+                    let source = &policy["oneOf"][1]["properties"]["selector"]["oneOf"][1]["properties"]
+                        ["source"];
+                    assert_eq!(source["description"], "Exact provider/access_label.");
+                    assert!(source.get("x-astra-discovery-summary").is_none());
+                }
+                let profiles = if selected["name"] == "agent" {
+                    vec![("/properties/agent_type", &parameters["agent_type"])]
+                } else {
+                    vec![
+                        (
+                            "/properties/defaults/properties/agent_type",
+                            &parameters["defaults"]["properties"]["agent_type"],
+                        ),
+                        (
+                            "/properties/slots/items/properties/agent_type",
+                            &parameters["slots"]["items"]["properties"]["agent_type"],
+                        ),
+                    ]
+                };
+                let source = schemas
+                    .iter()
+                    .find(|schema| super::tool_schema_name(schema) == selected["name"].as_str())
+                    .unwrap();
+                let source_parameters = &source["function"]["parameters"];
+                for (path, profile) in profiles {
+                    let mut expected = source_parameters.pointer(path).unwrap().clone();
+                    super::compact_parameter_descriptions(&mut expected, false);
+                    assert_eq!(profile, &expected, "{query}: {path}");
+                    assert!(profile.get("x-astra-discovery-summary").is_none());
+                }
+            }
+            assert!(
+                selected.len() <= super::MAX_SELECTION_RESULT_BYTES,
+                "{query} exceeds the source-bounded presentation: {} bytes",
+                selected.len()
+            );
+            let result = super::tool_search_result(&schemas, &json!({"query":query}));
+            assert!(!result.is_error);
+            assert_eq!(result.output, selected);
+            assert_eq!(
+                crate::model_result_presentation(result.metadata.as_ref()),
+                crate::ModelResultPresentation::SourceBounded
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_selection_fails_atomically_without_activation_evidence() {
+        let schemas = (0..100)
+            .map(|index| {
+                json!({"type":"function","function":{
+                    "name":format!("tool_{index}"),
+                    "description":"bounded selection test",
+                    "parameters":{"type":"object","properties":{
+                        "value":{"type":"string","enum":["x".repeat(200)]}
+                    }}
+                }})
+            })
+            .collect::<Vec<_>>();
+        let query = format!(
+            "select:{}",
+            (0..100)
+                .map(|index| format!("tool_{index}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let result = super::tool_search_result(&schemas, &json!({"query":query}));
+        assert!(result.is_error);
+        let parsed: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(parsed["status"], "failed");
+        assert!(parsed.get("matches").is_none());
+        assert!(result.output.len() <= super::MAX_SELECTION_RESULT_BYTES);
+        assert_eq!(
+            crate::model_result_presentation(result.metadata.as_ref()),
+            crate::ModelResultPresentation::Generic
         );
     }
 

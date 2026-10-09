@@ -1,7 +1,5 @@
 //! UC native sessions are verified user identities, never MOI runtime grants.
-use super::{
-    AuthHttpError, AuthPrincipal, AuthPrincipalOrigin, AuthUserRecord, DatabaseAuthService,
-};
+use super::{AuthHttpError, AuthPrincipal, AuthUserRecord, DatabaseAuthService};
 use astra_core::{config::UcNativeSettings, error_response_coded, internal_error};
 use axum::http::{HeaderMap, StatusCode};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -312,19 +310,18 @@ impl DatabaseAuthService {
             .resolve_verified_provider_identity(&mut tx, &provider_id, &identity.subject)
             .await?;
         tx.commit().await.map_err(internal_error)?;
-        Ok(AuthPrincipal {
-            user: AuthUserRecord {
+        Ok(AuthPrincipal::from_verified_provider_session(
+            AuthUserRecord {
                 user_id: user.user_id,
                 username: user.username,
                 email: identity.email,
                 display_name: Some(identity.display_name),
             },
-            session_id: Some(identity.session_id),
-            origin: AuthPrincipalOrigin::VerifiedProvider {
-                provider_id,
-                external_subject: identity.subject,
-            },
-        })
+            identity.session_id,
+            provider_id,
+            identity.subject,
+            None,
+        ))
     }
 }
 

@@ -16,11 +16,11 @@ pub mod action_compensation;
 pub mod active_conversation;
 pub mod activity;
 pub mod agent_live_event;
+pub mod database_snapshots;
 
 pub mod agentic;
 pub mod alert_dispatcher;
 pub mod approval;
-pub mod cache;
 pub mod cache_diagnostics;
 pub mod cache_placement;
 mod canonical_json;
@@ -36,13 +36,10 @@ pub mod chat_turn_step_plan;
 pub mod cloud;
 pub mod compaction_types;
 pub mod compression_types;
-pub mod concurrency_safety;
-pub mod confidence_contract;
 pub mod context;
 pub mod conversation_log;
 pub mod edge_ledger;
 pub mod edge_prompt_context;
-pub mod emergent_context;
 pub mod error_recovery;
 pub mod evaluation;
 pub mod execution_state;
@@ -59,8 +56,8 @@ pub mod interaction_types;
 pub mod interruption;
 pub mod introspect;
 pub mod invocation_ledger;
-pub mod lru_map;
 pub mod microcompact;
+pub mod model_catalog;
 pub mod observer;
 pub mod optimize_limits;
 pub mod orchestration;
@@ -76,19 +73,17 @@ pub mod recent_arg_hints;
 pub mod recovery_state;
 pub mod response_guard;
 pub mod resume_hydration;
-pub mod routing;
 pub mod runtime_scaffolding;
 pub mod safety_middleware;
 pub mod section_types;
 pub mod semantic_read_cache;
 pub mod session_latches;
-pub mod spill_backend;
 pub mod sse;
 pub mod stall;
 pub mod state;
 pub mod stop_hooks;
-pub mod streaming_tool_exec;
 pub mod sync_utils;
+pub mod turn_checkpoint;
 pub use sync_utils::{
     rwlock_check_contains_or_default, rwlock_read_clone_or_default, rwlock_write_reset_on_poison,
 };
@@ -104,9 +99,7 @@ pub mod turn_metrics;
 pub mod working_memory;
 pub mod xml_tool_call_fallback;
 
-pub mod circuit_breaker;
 pub mod contracts;
-pub mod e2e_hooks;
 pub mod rate_limit_cooldown;
 pub mod sse_events;
 pub mod stream_events;
@@ -129,10 +122,7 @@ pub mod turn_trace_collector;
 pub mod view;
 
 // Re-exports: old flat module names → new directory paths
-pub mod decision_explainer;
 pub mod delegation_tree;
-pub mod liquid_step_signals;
-pub mod liquid_tactical;
 pub mod llm_request_dump;
 
 pub use cloud::approval_policy as cloud_approval_policy;
@@ -150,11 +140,9 @@ pub use tool::categories::workaround as tool_workaround;
 pub use tool::health as tool_health;
 pub use tool::health::persistence as tool_health_persistence;
 pub use tool::policy as tool_policy;
-pub use tool::policy::hooks as tool_hooks;
 pub use tool::policy::preview as tool_preview;
 pub use tool::registry::chain as tool_registry_chain;
 pub use tool::registry::meta as tool_registry_meta;
-pub use tool::registry::plugin as tool_registry_plugin;
 pub use tool::registry::report as tool_registry_report;
 pub use tool::result::compression as tool_result_compression;
 pub use tool::result::sanitize as tool_result_sanitize;
@@ -205,11 +193,9 @@ pub use permission::types as permission_types;
 
 // Re-exports: orchestration_* → orchestration::*
 pub use orchestration::builtin_agents as orchestration_builtin_agents;
-pub use orchestration::context_cache as orchestration_context_cache;
 pub use orchestration::fanout_group as orchestration_fanout_group;
 pub use orchestration::progress as orchestration_progress;
 pub use orchestration::spawn_tool as orchestration_spawn_tool;
-pub use orchestration::team_config as orchestration_team_config;
 pub use orchestration::types as orchestration_types;
 
 // Re-exports: pipeline_* → pipeline::*
@@ -221,7 +207,6 @@ pub use pipeline::session_serde as pipeline_session_serde;
 pub use pipeline::stats as pipeline_stats;
 
 // Re-exports: fork_* → fork::*
-pub use fork::cache_event as fork_cache_event;
 pub use fork::capture as fork_capture;
 pub use fork::prefix as fork_prefix;
 pub use fork::prefix_store as fork_prefix_store;
@@ -236,3 +221,4 @@ pub use sse::stream_host as sse_stream_host;
 
 // Re-exports: stop_hooks_* → stop_hooks::*
 pub use stop_hooks::stop_hooks_yaml;
+pub mod model_routing;

@@ -1,21 +1,8 @@
 //! Tool-surface contract tests: `tool_search` is the first-class always_load
-//! activation primitive, while selected deferred tools are queued for the next
-//! request's `tools[]` instead of becoming long-lived validator state.
-//!
-//! Pre-phase-4 state:
-//!   - `tool_search` was hidden inside the `session` meta-tool's `action`
-//!     enum, so the LLM had to call `session(action="tool_search", …)`.
-//!     Hoisting it to a top-level always_load tool gives the deferred
-//!     activation flow an unambiguous entry point.
-//!   - Some paths treated an activated deferred name as an execution allowlist.
-//!     The fixed contract makes activation schema-injection state retained
-//!     while canonical activation state remains valid, including after calls;
-//!     execution still depends on the current request's visible schema set or
-//!     an explicit transport/plugin grant.
-//!
-//! `introspect` and `reflect` stay eager as the observation plane's compact
-//! first-class entrypoints. Their canonical schemas remain searchable for
-//! advanced fields without re-entering the resident provider prefix.
+//! activation primitive. Selection returns a contract for `invoke_tool` without
+//! adding deferred schemas to the resident provider prefix or granting access.
+//! `introspect` stays eager for artifact recovery; `memory`, `reflect`, and
+//! `notify` remain discoverable through the same selection protocol.
 
 use astra_tools::schemas::all_tool_schemas;
 use astra_turn_core::tool_registry_meta::TOOL_CATALOG;
@@ -86,10 +73,10 @@ fn tool_search_schema_advertises_select_mode() {
     );
 }
 
-// ── 2. observation entrypoints are eager and advanced contracts searchable ──
+// ── 2. artifact recovery is eager and deferred workflows remain searchable ──
 
 #[test]
-fn observation_entrypoints_are_eager_and_advanced_contracts_searchable() {
+fn artifact_recovery_is_eager_and_deferred_workflows_are_searchable() {
     let introspect = TOOL_CATALOG
         .iter()
         .find(|t| t.name == "introspect")
@@ -105,10 +92,6 @@ fn observation_entrypoints_are_eager_and_advanced_contracts_searchable() {
     assert!(
         always_load.iter().any(|name| name == "introspect"),
         "artifact recovery must not require a discovery round"
-    );
-    assert!(
-        always_load.iter().any(|name| name == "reflect"),
-        "persisted reflection is a first-class observation entrypoint"
     );
 
     let schemas = all_tool_schemas();
@@ -134,15 +117,26 @@ fn observation_entrypoints_are_eager_and_advanced_contracts_searchable() {
         .map(|entry| entry.name.as_str())
         .collect();
     assert!(!deferred.contains("introspect"));
-    assert!(!deferred.contains("reflect"));
+    let resident = surface.always_load_schemas();
+    for name in ["memory", "reflect", "notify"] {
+        assert!(names.iter().any(|schema| schema == name));
+        assert!(!always_load.iter().any(|tool| tool == name));
+        assert!(!schema_names(&resident).iter().any(|tool| tool == name));
+        assert!(deferred.contains(name));
 
-    let selected = astra_tools::tool_search::tool_search(
-        &schemas,
-        &serde_json::json!({"query": "select:reflect"}),
-    );
-    let selected: Value = serde_json::from_str(&selected).expect("structured select result");
-    assert_eq!(selected["mode"], "select");
-    assert_eq!(selected["resolved"], serde_json::json!(["reflect"]));
+        let selected = astra_tools::tool_search::tool_search(
+            &schemas,
+            &serde_json::json!({"query": format!("select:{name}")}),
+        );
+        let selected: Value = serde_json::from_str(&selected).expect("structured select result");
+        assert_eq!(selected["mode"], "select");
+        assert_eq!(selected["resolved"], serde_json::json!([name]));
+        assert_eq!(selected["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(selected["matches"][0]["name"], name);
+        assert!(selected["matches"][0]["parameters"]["properties"].is_object());
+        assert!(selected["missing"].as_array().unwrap().is_empty());
+        assert!(selected["ambiguous"].as_array().unwrap().is_empty());
+    }
 
     let introspect_schema = schemas
         .iter()
@@ -161,8 +155,8 @@ fn observation_entrypoints_are_eager_and_advanced_contracts_searchable() {
 //
 // The validator logic lives in runtime/turn/headless_tool_pipeline/policy.rs
 // and gates on `valid_tool_names`. The helper may include caller-supplied
-// extras for runtime/plugin transports, but deferred-tool activation should be
-// consumed earlier by surface assembly so the selected schema becomes visible.
+// extras for runtime/plugin transports. Deferred selection grants no native
+// visibility; invoke_tool revalidates the selected contract and current access.
 
 #[test]
 fn admissible_tool_names_includes_explicit_runtime_extras_beyond_visible_tools() {

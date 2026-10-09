@@ -100,6 +100,11 @@ parallel execution: serial admission permits only an exact one-slot fanout,
 and an authoritative parallel admission rejects a direct single-agent substitute.
 Capability and provider restrictions continue to apply independently.
 
+Each synchronous tool-admission boundary shares one local catalog/policy/provider
+projection across its batch. It is discarded before approval waits. Durable
+dispatch re-reads current policy and offer identity under the existing policy
+read leases; request visibility or approval never authorizes a stale offer.
+
 
 ### One fact source
 
@@ -364,6 +369,11 @@ Three mechanisms are separate:
 | Semantic read-result cache | descriptor + canonical args + freshness context | Optionally reuse a fresh successful pure-read result |
 | Repetition/stall policy | sequence of distinct invocation IDs and observations | Detect likely model loops without collapsing user intent |
 
+Semantic near-duplicate detection emits guidance after observing the tool result.
+Its former source APIs for pre-execution blocking, context inventories and a
+private duplicate-audit buffer are retired. It does not authorize result reuse;
+actual invocation replay and journal/trace recording keep their canonical owners.
+
 Prompt caching is a fourth, unrelated optimization owned by prompt lifecycle.
 A prompt-cache key is never an invocation or semantic result-cache key.
 
@@ -542,6 +552,16 @@ MayHaveDispatched
 
 The runtime maps these facts into its durable outcome state. It does not infer
 failure from words such as `error` in output text.
+When a tool may have applied an effect but its acknowledgement is lost, the
+provider reports `tool_outcome_unknown` with `retryable=false`. Recovery
+guidance requires reconciliation of the provider state or invocation receipt
+before any new call that could repeat the effect, even if the connection has
+already recovered.
+An acknowledged JSON-RPC error remains a known failure with its error code and
+details; a successful RPC response with `isError=true` remains a tool failure.
+CLI result advertisements retain the MCP binding verified at dispatch time.
+Connection recovery changes availability for later invocations, not the binding
+or uncertainty of the result already being reported.
 
 The runtime result envelope preserves:
 
@@ -743,3 +763,13 @@ must satisfy one suite:
   lifecycle and safety semantics.
 - No compatibility constraint from a current provider upgrade path may define
   Astra's canonical internal model.
+
+The first-child fork-cache estimate telemetry prototype is retired: its sink
+configuration, event/probe APIs and stderr criterion were never connected to
+production execution. The Server child executor starts from its admitted task
+and rejects explicit parent-prefix inheritance requests, including optional
+requests, before preparing any child. Process-local capture or resolver success
+is not proof of authorized, durable child context or actual provider-prefix reuse.
+Canonical session forks remain a separate owner/cursor/manifest boundary.
+Provider cache facts continue to come from canonical request usage, trace and
+Explain; child admission and result adoption do not prove a provider cache hit.

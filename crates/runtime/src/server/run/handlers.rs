@@ -46,6 +46,19 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
             .and_then(serde_json::Value::as_object)
             .and_then(|data| data.get("owner_generation"))
             .cloned();
+        let run_finished_has_failure_facts = event_type == "run_finished"
+            && event
+                .get("data")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|data| {
+                    data.get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+                        || data
+                            .get("error_code")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some()
+                });
 
         let event_belongs_to_root = producer_run_id
             .as_deref()
@@ -230,7 +243,7 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
                 Some("cancelled")
             } else if run_finished_interrupted {
                 Some("paused")
-            } else if pending_run_error.is_some() {
+            } else if run_finished_has_failure_facts || pending_run_error.is_some() {
                 Some("failed")
             } else {
                 Some("completed")
@@ -559,9 +572,10 @@ pub(crate) async fn stream_run_handler(
             .stream_run(run_id.clone(), principal.user.user_id, query.last_index)
             .await
         {
-            Ok(events) => {
-                sse_json_response(transform_stream_run_events_for_client(&run_id, events))
-            }
+            Ok(delta) => sse_json_response(transform_stream_run_events_for_client(
+                &run_id,
+                delta.events,
+            )),
             Err((status, error)) => sse_error_response_from_error_with_context(
                 status,
                 error.0,
@@ -1337,6 +1351,41 @@ mod tests {
     }
 
     #[test]
+    fn failed_terminal_replay_does_not_require_the_preceding_run_error() {
+        // An inclusive cursor at index 11 can replay this durable event after
+        // the client has already received its usage projection, while the
+        // preceding run_error at index 10 is outside the replay tail.
+        let projected = transform_stream_run_events_for_client(
+            "run-failed",
+            vec![json!({
+                "event_type": "run_finished",
+                "index": 11,
+                "data": {
+                    "error": "boom",
+                    "error_code": "network",
+                    "owner_generation": 7,
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1
+                }
+            })],
+        );
+        assert_eq!(projected[0]["type"], "usage");
+        assert_eq!(projected[0]["index"], 11);
+        assert_eq!(
+            projected[1],
+            json!({
+                "type": "run_finished",
+                "run_id": "run-failed",
+                "index": 11,
+                "status": "failed",
+                "error": "boom",
+                "error_code": "network",
+                "owner_generation": 7
+            })
+        );
+    }
+
+    #[test]
     fn projected_terminal_usage_is_accepted_by_the_chat_sse_consumer() {
         let projected = transform_stream_run_events_for_client(
             "run-usage-boundary",
@@ -1778,17 +1827,20 @@ mod tests {
             )
             .await
             .expect("persist run_finished");
-        engine
-            .persist_status(
-                "u1",
-                "session-http",
-                "run-durable-http",
-                astra_core::STATUS_COMPLETED,
-                None,
-                None,
-            )
-            .await
-            .expect("mark completed");
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "u1",
+                    expected_session_id: "session-http",
+                    run_id: "run-durable-http",
+                    status: astra_core::STATUS_COMPLETED,
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .expect("mark completed")
+        );
 
         let lifecycle = AgenticRunLifecycleService::new(
             test_matrixone(),
@@ -1871,17 +1923,20 @@ mod tests {
             )
             .await
             .expect("persist run_finished");
-        engine
-            .persist_status(
-                "provider-user-1",
-                "session-provider-stream",
-                "run-provider-stream",
-                astra_core::STATUS_COMPLETED,
-                None,
-                None,
-            )
-            .await
-            .expect("mark completed");
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "provider-user-1",
+                    expected_session_id: "session-provider-stream",
+                    run_id: "run-provider-stream",
+                    status: astra_core::STATUS_COMPLETED,
+                    waiting_for: None,
+                    error_message: None,
+                    expected_statuses: &["running"],
+                })
+                .await
+                .expect("mark completed")
+        );
 
         let lifecycle = AgenticRunLifecycleService::new(
             test_matrixone(),
@@ -1965,7 +2020,7 @@ mod tests {
                 .with_owner_pod_id("stream-replay-http-it-pod"),
         );
         let engine = RunEngine::new(store);
-        engine
+        let authority = engine
             .start_run(&run_id, user_id, &session_id)
             .await
             .expect("start durable DB run");
@@ -2006,11 +2061,12 @@ mod tests {
             }),
         ];
         let transitioned = engine
-            .transition_status_with_events_if_current(
+            .transition_status_with_events_if_current_owner(
                 user_id,
                 &session_id,
                 &run_id,
                 &[astra_core::STATUS_RUNNING],
+                authority.owner_generation,
                 astra_core::STATUS_COMPLETED,
                 None,
                 None,
@@ -2131,7 +2187,7 @@ mod tests {
         use astra_services::runs::InMemoryRunStateStore;
 
         let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-        engine
+        let authority = engine
             .start_run("run-projection-http", "u1", "session-projection")
             .await
             .expect("start durable run");
@@ -2199,7 +2255,15 @@ mod tests {
             .await
             .expect("persist run finished");
         engine
-            .persist_usage("u1", "session-projection", "run-projection-http", 5, 2, 0)
+            .persist_usage_if_current_owner(
+                "u1",
+                "session-projection",
+                "run-projection-http",
+                authority.owner_generation,
+                5,
+                2,
+                0,
+            )
             .await
             .expect("persist usage");
         engine
@@ -2211,17 +2275,20 @@ mod tests {
             )
             .await
             .expect("persist checkpoint");
-        engine
-            .persist_status(
-                "u1",
-                "session-projection",
-                "run-projection-http",
-                astra_core::STATUS_FAILED,
-                None,
-                Some("boom"),
-            )
-            .await
-            .expect("mark failed");
+        assert!(
+            engine
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: "u1",
+                    expected_session_id: "session-projection",
+                    run_id: "run-projection-http",
+                    status: astra_core::STATUS_FAILED,
+                    waiting_for: None,
+                    error_message: Some("boom"),
+                    expected_statuses: &["running"],
+                })
+                .await
+                .expect("mark failed")
+        );
 
         let lifecycle = AgenticRunLifecycleService::new(
             test_matrixone(),
@@ -2332,16 +2399,17 @@ mod tests {
         use astra_services::runs::InMemoryRunStateStore;
 
         let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-        engine
+        let authority = engine
             .start_run("run-projection-repair-http", "u1", "session-projection")
             .await
             .expect("start durable run");
         engine
-            .transition_status_with_events_if_current(
+            .transition_status_with_events_if_current_owner(
                 "u1",
                 "session-projection",
                 "run-projection-repair-http",
                 &[astra_core::STATUS_RUNNING],
+                authority.owner_generation,
                 astra_core::STATUS_FAILED,
                 None,
                 Some("boom"),
@@ -2431,7 +2499,7 @@ mod tests {
                 .with_owner_pod_id("projection-repair-http-it-pod"),
         );
         let engine = RunEngine::new(store);
-        engine
+        let authority = engine
             .start_run(&run_id, user_id, &session_id)
             .await
             .expect("start durable DB run");
@@ -2446,11 +2514,12 @@ mod tests {
             .expect("save checkpoint before terminal transition");
         assert!(checkpoint_saved);
         let transitioned = engine
-            .transition_status_with_events_if_current(
+            .transition_status_with_events_if_current_owner(
                 user_id,
                 &session_id,
                 &run_id,
                 &[astra_core::STATUS_RUNNING],
+                authority.owner_generation,
                 astra_core::STATUS_FAILED,
                 None,
                 Some("boom"),

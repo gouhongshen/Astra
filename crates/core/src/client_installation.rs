@@ -113,42 +113,46 @@ pub fn early_command(
     Ok(Some(status.code().unwrap_or(1)))
 }
 
-pub fn startup_notice(executable: &Path, args: &[String]) {
-    // Explicit agent marker supplements TTY detection. One-shot/JSON/helper
-    // commands never add update text to their output streams.
+/// Called by the interactive UI only. Deliver cached and freshly checked
+/// notices to its event loop, never directly to the terminal or transcript.
+pub fn startup_notice(executable: &Path, on_notice: impl Fn(Option<String>) + Send + 'static) {
     if std::env::var("MOI_AGENT_CALL").as_deref() == Ok("1")
         || !io::stdin().is_terminal()
         || !io::stderr().is_terminal()
-        || !(args.is_empty() || args == ["interactive"])
     {
         return;
     }
     let Ok(Some(root)) = managed_root(executable) else {
         return;
     };
-    if let (Ok(cache), Ok(state)) = (
-        json_file(&root.join("cache.json")),
-        json_file(&root.join("state.json")),
-    ) && let Some(notice) = cached_notice(&cache, &state, chrono::Utc::now())
-    {
-        eprintln!("{notice}");
-    }
     let Ok(exe) = executable.canonicalize() else {
         return;
     };
     let sibling = exe.parent().unwrap().join("moi-cli");
     // A bounded, short-lived anonymous checker, not a resident daemon. Reap it
-    // off the UI thread. The Go owner applies the shared 24-hour cache and lock.
+    // off the UI thread. The Go owner applies the shared cache TTL and lock.
     let _ = std::thread::Builder::new()
         .name("moi-update-check".into())
         .spawn(move || {
-            let _ = Command::new(sibling)
-                .args(["update", "refresh"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            check_and_notify(&root, &sibling, on_notice);
         });
+}
+
+fn read_notice(root: &Path) -> Option<String> {
+    let cache = json_file(&root.join("cache.json")).ok()?;
+    let state = json_file(&root.join("state.json")).ok()?;
+    cached_notice(&cache, &state, chrono::Utc::now())
+}
+
+fn check_and_notify(root: &Path, sibling: &Path, on_notice: impl Fn(Option<String>)) {
+    on_notice(read_notice(root));
+    let _ = Command::new(sibling)
+        .args(["update", "refresh"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    on_notice(read_notice(root));
 }
 
 fn cached_notice(
@@ -176,8 +180,9 @@ fn cached_notice(
             "MOI new release: {bundle}. This release requires a separate installation. Use the official installer with a new --dir and --skill-dir; keep the current installation and login data."
         ));
     }
-    (cache["available"].as_bool() == Some(true))
-        .then(|| format!("MOI update available: {bundle}. Run astra update."))
+    (cache["available"].as_bool() == Some(true)).then(|| {
+        format!("Update available ({bundle}) · Exit Astra, then run astra update to upgrade.")
+    })
 }
 
 #[cfg(test)]
@@ -208,7 +213,7 @@ mod tests {
         assert!(
             cached_notice(&cache, &state, now)
                 .unwrap()
-                .contains("Run astra update.")
+                .contains("Exit Astra, then run astra update to upgrade.")
         );
         cache["channel"]["bundle_version"] = serde_json::json!("bad\u{1b}[31m");
         assert!(cached_notice(&cache, &state, now).is_none());
@@ -233,6 +238,50 @@ mod tests {
         File::create(root.join("runtime.lock")).unwrap();
         symlink(&release, root.join("current")).unwrap();
         (temp, exe)
+    }
+
+    #[test]
+    fn update_notice_refresh_reaches_the_same_session() {
+        use std::{cell::RefCell, os::unix::fs::PermissionsExt};
+
+        let (temp, exe) = fixture();
+        let root = temp.path();
+        fs::write(root.join("state.json"), r#"{"current":"old"}"#).unwrap();
+        let sibling = exe.parent().unwrap().join("moi-cli");
+        let cache = serde_json::json!({
+            "available": true,
+            "channel": {
+                "bundle_version": "2026.09.28.1-qa",
+                "manifest_sha256": "b".repeat(64),
+                "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            }
+        });
+        fs::write(sibling.with_extension("cache"), cache.to_string()).unwrap();
+        fs::write(&sibling, "#!/bin/sh\n[ \"$1 $2\" = 'update refresh' ] || exit 1\ncp \"$0.cache\" \"$(dirname \"$0\")/../../cache.json\"\n").unwrap();
+        fs::set_permissions(&sibling, fs::Permissions::from_mode(0o700)).unwrap();
+        let notices = RefCell::new(Vec::new());
+        check_and_notify(root, &sibling, |notice| notices.borrow_mut().push(notice));
+        let notices = notices.into_inner();
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[0], None);
+        assert_eq!(
+            notices[1].as_deref(),
+            Some(
+                "Update available (2026.09.28.1-qa) · Exit Astra, then run astra update to upgrade."
+            )
+        );
+
+        // An unavailable checker must not remove an existing valid notice or
+        // modify installation state. The Go worker owns network failures.
+        let state_before = fs::read(root.join("state.json")).unwrap();
+        let notices = RefCell::new(Vec::new());
+        check_and_notify(root, &root.join("missing-checker"), |notice| {
+            notices.borrow_mut().push(notice);
+        });
+        let notices = notices.into_inner();
+        assert!(notices[0].is_some());
+        assert_eq!(notices[0], notices[1]);
+        assert_eq!(state_before, fs::read(root.join("state.json")).unwrap());
     }
     #[test]
     fn managed_lease_blocks_switch_and_releases_on_drop() {

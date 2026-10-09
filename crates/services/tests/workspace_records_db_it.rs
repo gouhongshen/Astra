@@ -109,3 +109,70 @@ async fn database_workspace_records_reject_corrupt_rows() {
         .execute(&pool)
         .await;
 }
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn database_server_workspace_identity_is_fenced_during_concurrent_metadata_updates() {
+    use astra_services::workspace_records::WorkspaceRecordEntry;
+    let pool = common::setup_pool().await;
+    let store = DatabaseWorkspaceRecordStore::new(pool.clone());
+    let owner = Uuid::new_v4().to_string();
+    let session = format!("managed-session-{}", Uuid::new_v4());
+    let mut record = workspace_record(&session);
+    record.kind = WorkspaceBindingKind::ServerSandbox;
+    record.owner_scope = WorkspaceOwnerScope::ServerSession;
+    record.source = WorkspaceSource::ServerSandbox {
+        session_id: session.clone(),
+        executor_id: "executor-a".into(),
+    };
+    let original =
+        WorkspaceRecordEntry::new(&owner, Some(session.clone()), Some("run-a".into()), record);
+    store
+        .upsert_workspace_record(original.clone())
+        .await
+        .unwrap();
+    let mut metadata = original.clone();
+    metadata.run_id = Some("run-b".into());
+    metadata.record.revision = "revision-b".into();
+    let mut foreign = original;
+    foreign.record.source = WorkspaceSource::ServerSandbox {
+        session_id: session.clone(),
+        executor_id: "executor-b".into(),
+    };
+    let (updated, rejected) = tokio::join!(
+        store.upsert_workspace_record(metadata.clone()),
+        store.upsert_workspace_record(foreign)
+    );
+    updated.unwrap();
+    assert!(matches!(
+        rejected,
+        Err(WorkspaceRecordStoreError::PhysicalIdentityConflict { .. })
+    ));
+    assert_eq!(
+        store
+            .load_workspace_record(&owner, &session)
+            .await
+            .unwrap()
+            .unwrap(),
+        metadata
+    );
+    let mut moved = metadata.clone();
+    moved.record.root_or_volume_ref = "/other-instance/workspace".into();
+    assert!(matches!(
+        store.upsert_workspace_record(moved).await,
+        Err(WorkspaceRecordStoreError::PhysicalIdentityConflict { .. })
+    ));
+    assert_eq!(
+        store
+            .load_workspace_record(&owner, &session)
+            .await
+            .unwrap()
+            .unwrap(),
+        metadata
+    );
+    sqlx::query("DELETE FROM workspace_records WHERE owner_id = ?")
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .unwrap();
+}

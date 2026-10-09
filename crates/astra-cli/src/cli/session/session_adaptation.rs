@@ -1,4 +1,3 @@
-use super::session_diagnosis::maybe_run_auto_invoke;
 use super::session_lessons::ensure_bootstrapped_lessons;
 use crate::cli::session::session_state::SessionState;
 
@@ -15,15 +14,9 @@ pub(crate) async fn prepare_turn_adaptation(
     ensure_bootstrapped_lessons(state, api, token, message).await;
 }
 
-pub(crate) async fn finalize_turn_adaptation(state: &mut SessionState, interrupted: bool) {
-    if !interrupted {
-        maybe_run_auto_invoke(state).await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{finalize_turn_adaptation, prepare_turn_adaptation};
+    use super::prepare_turn_adaptation;
     use crate::cli::session::session_state::SessionState;
 
     #[tokio::test]
@@ -38,28 +31,5 @@ mod tests {
         prepare_turn_adaptation(&mut state, &api, "token", "不对，修这里").await;
 
         assert_eq!(state.drift_original_query.as_deref(), Some("不对，修这里"));
-        assert!(state.drift_user_corrections.is_empty());
-    }
-
-    #[tokio::test]
-    async fn finalize_turn_adaptation_skips_auto_invoke_when_interrupted() {
-        let mut state = SessionState::default();
-        let session = std::sync::Arc::new(std::sync::RwLock::new(
-            astra_runtime::observability::ObservabilitySession::new_simple("p8-skip"),
-        ));
-        {
-            let mut guard = session.write().unwrap();
-            guard.record_stall_event();
-            guard.record_stall_event();
-            guard.record_stall_event();
-            guard.record_stall_event();
-            guard.record_stall_event();
-        }
-        state.observability_session = Some(session);
-
-        finalize_turn_adaptation(&mut state, true).await;
-
-        assert!(state.latest_skill_diagnosis.is_none());
-        assert!(state.auto_invoke_handler.is_none());
     }
 }

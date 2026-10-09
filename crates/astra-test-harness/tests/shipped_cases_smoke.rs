@@ -18,6 +18,19 @@ fn shipped_cases_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cases")
 }
 
+fn shipped_suite_dirs() -> Vec<PathBuf> {
+    let root = shipped_cases_dir();
+    let mut dirs = vec![root.clone()];
+    dirs.extend(
+        std::fs::read_dir(&root)
+            .expect("read shipped cases directory")
+            .map(|entry| entry.expect("read shipped case entry").path())
+            .filter(|path| path.is_dir()),
+    );
+    dirs.sort();
+    dirs
+}
+
 #[test]
 fn every_shipped_case_yaml_loads_cleanly() {
     // If a rename (criterion variant, reserved flag, serde tag)
@@ -25,15 +38,19 @@ fn every_shipped_case_yaml_loads_cleanly() {
     // an Err with the offending file and line. That's the signal
     // this test is designed to surface at PR time rather than at
     // "deploy + run" time.
-    let dir = shipped_cases_dir();
-    let cases = Case::load_dir(&dir).unwrap_or_else(|e| {
-        panic!(
-            "Case::load_dir({}) failed. If you renamed a Criterion variant, \
-             a reserved-flag entry, or a required field, every shipped \
-             cases/*.yaml must be updated in the same PR. Error: {e:#}",
-            dir.display()
-        )
-    });
+    let cases: Vec<Case> = shipped_suite_dirs()
+        .into_iter()
+        .flat_map(|dir| {
+            Case::load_dir(&dir).unwrap_or_else(|e| {
+                panic!(
+                    "Case::load_dir({}) failed. If you renamed a Criterion variant, \
+                     a reserved-flag entry, or a required field, every shipped \
+                     case must be updated in the same PR. Error: {e:#}",
+                    dir.display()
+                )
+            })
+        })
+        .collect();
 
     // Sanity guard — we expect at least the fork_prefix + behavior +
     // selector + text cases. If this drops sharply, someone deleted
@@ -95,32 +112,16 @@ fn product_capability_model_probes_resolve_to_shipped_cases() {
 // text_rejects_hallucinated_file_claim removed — merged into anti_hallucination_two_vectors
 
 #[test]
-fn fork_prefix_spawn_inherits_uses_canonical_agent_not_delegate() {
-    let case = Case::from_path(&shipped_cases_dir().join("fork_prefix_spawn_inherits.yaml"))
-        .expect("load case");
-    let requires_delegate = case.criteria.iter().any(|c| {
-        matches!(c, astra_test_harness::criteria::Criterion::ToolCalled { name } if name == "delegate")
-    });
-    let requires_agent = case.criteria.iter().any(|c| {
-        matches!(c, astra_test_harness::criteria::Criterion::ToolCalled { name } if name == "agent")
-    });
-    assert!(
-        requires_agent && !requires_delegate,
-        "fork_prefix_spawn_inherits must not require tool_called: delegate. \
-         The delegate tool is not available in `astra chat` — it only exists \
-         in the server-side DelegationEngine. Use canonical agent spawn instead."
-    );
-}
-
-#[test]
 fn shipped_case_criteria_round_trip_through_real_serde() {
     // Criterion's Serde definition is the only variant vocabulary. A second
     // string whitelist inevitably rejects the next legitimate variant (as it
     // did for hard_judger) or accepts a removed one. Round-tripping every real
     // shipped instance also checks that the read and write contracts agree,
     // without treating YAML layout or unrelated `type:` fields as criteria.
-    let cases = Case::load_dir(&shipped_cases_dir()).expect("load shipped cases");
-    for case in cases {
+    for case in shipped_suite_dirs()
+        .into_iter()
+        .flat_map(|dir| Case::load_dir(&dir).expect("load shipped suite"))
+    {
         let criteria = case
             .criteria
             .iter()

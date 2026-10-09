@@ -930,6 +930,12 @@ pub fn tool_content_from_ledger_entry(entry: &Value) -> String {
     } else {
         String::new()
     };
+    tool_content_from_callback_output(status, output)
+}
+
+/// Model-visible callback content. Local and remote audit projections use
+/// this same value; transport status is not a second result payload.
+pub fn tool_content_from_callback_output(status: &str, output: String) -> String {
     if output.is_empty() {
         serde_json::to_string(&json!({"status": status})).unwrap_or_else(|_| status.to_string())
     } else if status == "completed" || serde_json::from_str::<Value>(&output).is_ok() {

@@ -63,6 +63,11 @@ fn is_deterministic_product_oracle(criterion: &Criterion) -> bool {
         | Criterion::SessionEventCount {
             optional: false, ..
         }
+        | Criterion::SessionChildResultAdopted { .. }
+        | Criterion::ExecutionChildResultsAdopted { .. }
+        | Criterion::ExecutionToolCount { .. }
+        | Criterion::ExecutionToolSequence { .. }
+        | Criterion::ExecutionChildCount { .. }
         | Criterion::JournalTurnEvaluationSignalCount { .. }
         | Criterion::JournalToolCalled {
             optional: false, ..
@@ -76,7 +81,6 @@ fn is_deterministic_product_oracle(criterion: &Criterion) -> bool {
         | Criterion::JournalArtifactConsumed { .. }
         | Criterion::JournalToolValueFlow { .. }
         | Criterion::JournalToolValueFlowBound { .. }
-        | Criterion::ForkCacheOutcome { .. }
         | Criterion::ToolSequence { .. }
         | Criterion::JournalToolSequence { .. }
         | Criterion::JournalToolPrecedence { .. }
@@ -272,6 +276,8 @@ mod tests {
             Criterion::SessionEventCount {
                 event_type: "turn".into(),
                 min: 1,
+                max: None,
+                json_match: None,
                 optional: true,
             },
         ];

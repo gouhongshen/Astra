@@ -133,6 +133,7 @@ impl AgentTreeNode {
             }
             AgentStatus::Idle => ("◯", "idle".to_string()),
             AgentStatus::Waiting { reason } => ("◌", format!("waiting: {reason}")),
+            AgentStatus::Paused { reason } => ("◌", format!("paused: {reason}")),
             AgentStatus::Completed { .. } => ("✓", "done".to_string()),
             AgentStatus::Interrupted { finish_reason, .. } => {
                 ("◌", format!("interrupted: {finish_reason}"))
@@ -256,7 +257,6 @@ mod tests {
             ended_at,
             metrics: SpawnedAgentMetrics::default(),
             has_permission_issues: false,
-            run_in_background: false,
             spawn_tool_call_id: None,
             fanout_slot: None,
         }

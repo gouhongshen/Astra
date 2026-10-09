@@ -3,14 +3,14 @@ description: |
   **What**: Use the canonical `agent` surface with the task execution profile.
   **Tests**: The product distinguishes an agent profile from a tool name and
   still makes the selected profile callable through the visible agent tool.
-  **Pass means**: One foreground task-profile child is accepted, reaches a
+  **Pass means**: One task-profile child is accepted, reaches a
   terminal completed state, and its result is delivered to the parent.
   **Fail means**: The model is pushed toward a nonexistent `task(...)` tool,
   the task profile is rejected despite being advertised, or completion is
   claimed without a terminal child result.
 prompt: |
   Use the visible `agent` tool with action `spawn` and `agent_type: "task"` to
-  start exactly one foreground child. Ask it to reply with the exact marker
+  start exactly one child. Ask it to reply with the exact marker
   "task-profile-callable" without using tools. Surface that exact child result
   in your final answer. Do not call a generic `task` tool.
 models:
@@ -39,11 +39,27 @@ criteria:
     name: agent
     document: result
     path: /status
-    equals: completed
-  - type: journal_tool_json_contains
+    equals: launched
+  - type: journal_tool_json
     name: agent
     document: result
-    path: /result
-    contains: task-profile-callable
+    path: /result_family
+    equals: control_receipt
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/status
+      equals: completed
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: session_child_result_adopted
+    expected_result: "task-profile-callable"
   - type: text_contains
     needle: task-profile-callable

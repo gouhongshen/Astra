@@ -14,11 +14,8 @@ use crate::context_planner::ContextPlan;
 use crate::microcompact::{CompactStrategy, PromptCacheProtocol};
 use crate::optimize_limits::OptimizeLimits;
 use crate::pipeline_config::ProviderCachePolicy;
-use crate::section_types::{
-    BoundSection, CacheScope, SectionArtifact, SectionKind, estimate_text_tokens,
-};
+use crate::section_types::{BoundSection, CacheScope, SectionKind, estimate_text_tokens};
 use crate::session_latches::SessionLatches;
-use crate::spill_backend::SpillBackend;
 
 /// A cache marker placed in the optimized output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,15 +23,6 @@ pub struct CacheMarker {
     pub after_section_index: usize,
     pub scope: CacheScope,
     pub cumulative_tokens: u32,
-}
-
-/// A tool result that was spilled to disk during optimization.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpilledEntry {
-    pub call_id: String,
-    pub tool_name: String,
-    pub original_tokens: u32,
-    pub path: String,
 }
 
 /// Record of a skipped optimization step (for EXPLAIN).
@@ -50,7 +38,6 @@ pub struct OptimizeStats {
     pub tool_results_cleared: u32,
     pub tokens_cleared: u32,
     pub schemas_pruned: u32,
-    pub entries_spilled: u32,
     pub sections_reordered: u32,
     pub skipped: Vec<SkippedOptimization>,
 }
@@ -62,15 +49,11 @@ pub struct ContextOptimized {
     pub messages: Vec<Value>,
     pub tool_schemas: Vec<Value>,
     pub cache_markers: Vec<CacheMarker>,
-    pub spilled: Vec<SpilledEntry>,
     pub stats: OptimizeStats,
 }
 
-/// Execute the Optimize phase.
-///
-/// Transforms bound content into a cache-aligned, budget-fitted arrangement.
-/// All transformations are gated by `limits`. Closed gates produce trace
-/// entries in `stats.skipped`.
+/// Transform bound content into a cache-aligned, budget-fitted arrangement.
+/// Closed optimization gates produce trace entries in `stats.skipped`.
 pub fn optimize(
     plan: &ContextPlan,
     bound: ContextBound,
@@ -78,24 +61,6 @@ pub fn optimize(
     policy: &ProviderCachePolicy,
     limits: &OptimizeLimits,
     current_turn: u32,
-) -> ContextOptimized {
-    optimize_with_spill(plan, bound, latches, policy, limits, current_turn, None)
-}
-
-/// Same as [`optimize`] but accepts an optional spill backend. When the gate
-/// `allow_spill` is open and a backend is supplied, oversized non-anchor
-/// sections are persisted via the backend and replaced with
-/// `SectionArtifact::SpillReference`. Without a backend the optimizer keeps
-/// the conservative behaviour (preserve content + emit skipped-optimization
-/// trace entry).
-pub fn optimize_with_spill(
-    plan: &ContextPlan,
-    bound: ContextBound,
-    latches: &SessionLatches,
-    policy: &ProviderCachePolicy,
-    limits: &OptimizeLimits,
-    current_turn: u32,
-    spill_backend: Option<&dyn SpillBackend>,
 ) -> ContextOptimized {
     let ContextBound {
         mut sections,
@@ -176,18 +141,7 @@ pub fn optimize_with_spill(
         }
     }
 
-    // 3. SPILL: persist oversized sections to the spill backend
-    let spilled = if limits.allow_spill {
-        spill_oversized_sections(&mut sections, &mut stats, spill_backend, plan, current_turn)
-    } else {
-        stats.skipped.push(SkippedOptimization {
-            step: "spill".into(),
-            reason: "allow_spill gate is closed".into(),
-        });
-        Vec::new()
-    };
-
-    // 4. CACHE MARKERS: place based on provider protocol
+    // 3. CACHE MARKERS: place based on provider protocol
     let cache_markers = place_cache_markers(&sections, policy, latches, current_turn);
 
     ContextOptimized {
@@ -195,7 +149,6 @@ pub fn optimize_with_spill(
         messages,
         tool_schemas,
         cache_markers,
-        spilled,
         stats,
     }
 }
@@ -204,52 +157,6 @@ struct ClearResult {
     count: u32,
     tokens: u32,
     skipped_over_budget: bool,
-}
-
-/// Rehydrate previously-spilled sections in `sections` by replacing any
-/// `SectionArtifact::SpillReference` with the loaded original text
-/// (as `SystemText` / `RuntimeText` / `MemoryText` / `HistorySummary`
-/// depending on the section's kind).
-///
-/// This is the Phase-12 consumer side of spill: the optimizer *creates*
-/// `SpillReference` during `spill_oversized_sections`; this function
-/// *resolves* them back for downstream serialization or session-resume.
-///
-/// Behaviour:
-/// - Missing scheme / load error → fail-open with a placeholder string
-///   (`SectionArtifact::rehydrate` handles that) AND record a
-///   `SkippedOptimization` trace entry so explain UI can surface it.
-/// - `actual_tokens` is recomputed from the resolved text length so
-///   downstream budget accounting stays honest.
-/// - Inline artifacts are untouched (fast path).
-pub fn rehydrate_sections(
-    sections: &mut [BoundSection],
-    registry: &crate::spill_backend::SpillRegistry,
-) -> OptimizeStats {
-    let mut stats = OptimizeStats::default();
-    for section in sections.iter_mut() {
-        let Some((path, _)) = section.artifact.spill_locator() else {
-            continue;
-        };
-        let path = path.to_string();
-        // Route through registry + SectionArtifact::rehydrate so fail-open
-        // logic is in one place.
-        let resolved = section.artifact.rehydrate(registry).into_owned();
-        let is_placeholder = resolved.starts_with("[spilled content unavailable");
-        if is_placeholder {
-            stats.skipped.push(SkippedOptimization {
-                step: "rehydrate".into(),
-                reason: format!("failed to load spilled section from {path}"),
-            });
-            // Keep the spill reference intact — downstream consumers may
-            // choose to retry, and overwriting with a placeholder would
-            // permanently poison the section.
-            continue;
-        }
-        section.actual_tokens = crate::section_types::estimate_text_tokens(&resolved);
-        section.artifact = SectionArtifact::from_text(section.plan.kind, resolved);
-    }
-    stats
 }
 
 /// Prune tool schemas in-place using the shared 4-tier pruning strategy.
@@ -358,95 +265,6 @@ fn drop_oldest_rounds(messages: &mut Vec<Value>, pressure: f64) -> u32 {
         keep
     });
     tokens_dropped
-}
-
-/// Spill oversized sections: sections above `SPILL_THRESHOLD_TOKENS` are
-/// persisted via `backend` (if provided) and their in-prompt artifact is
-/// replaced with a `SpillReference`. `Identity` and `Constraints` sections
-/// are anchors and always preserved. Without a backend the function
-/// preserves content and records a skipped-optimization trace so operators
-/// can see that spill was attempted but had no sink.
-fn spill_oversized_sections(
-    sections: &mut [BoundSection],
-    stats: &mut OptimizeStats,
-    backend: Option<&dyn SpillBackend>,
-    plan: &ContextPlan,
-    current_turn: u32,
-) -> Vec<SpilledEntry> {
-    const SPILL_THRESHOLD_TOKENS: u32 = 10_000;
-    let mut spilled = Vec::new();
-    let mut saw_candidate_without_backend = false;
-
-    for (idx, section) in sections.iter_mut().enumerate() {
-        if section.actual_tokens <= SPILL_THRESHOLD_TOKENS {
-            continue;
-        }
-        // Semantic anchors and goal continuity must remain inline. A spill
-        // reference saves tokens but hides the very state needed to resume
-        // correctly after compaction.
-        if matches!(
-            section.plan.kind,
-            SectionKind::Identity | SectionKind::Constraints | SectionKind::WorkingMemory
-        ) {
-            if section.plan.kind == SectionKind::WorkingMemory {
-                stats.skipped.push(SkippedOptimization {
-                    step: "spill".into(),
-                    reason: "working memory carries goal continuity and must remain inline".into(),
-                });
-            }
-            continue;
-        }
-
-        let Some(backend) = backend else {
-            saw_candidate_without_backend = true;
-            continue;
-        };
-
-        // Only text-bearing artifacts can be spilled.
-        let Some(text) = section.artifact.text() else {
-            continue;
-        };
-        let original_tokens = section.actual_tokens;
-        let key_hint = format!(
-            "sec{idx}-turn{current_turn}-tier{tier:?}-{kind:?}",
-            kind = section.plan.kind,
-            tier = plan.compact_tier,
-        );
-
-        match backend.store(&key_hint, text.as_bytes()) {
-            Ok(path) => {
-                spilled.push(SpilledEntry {
-                    call_id: format!("section-{idx}"),
-                    tool_name: format!("{:?}", section.plan.kind),
-                    original_tokens,
-                    path: path.clone(),
-                });
-                section.artifact = SectionArtifact::SpillReference {
-                    path,
-                    original_tokens,
-                };
-                section.actual_tokens = 0;
-                stats.entries_spilled = stats.entries_spilled.saturating_add(1);
-                stats.tokens_cleared = stats.tokens_cleared.saturating_add(original_tokens);
-            }
-            Err(err) => {
-                stats.skipped.push(SkippedOptimization {
-                    step: "spill".into(),
-                    reason: format!("spill backend error for {:?}: {err}", section.plan.kind),
-                });
-            }
-        }
-    }
-
-    if saw_candidate_without_backend {
-        stats.skipped.push(SkippedOptimization {
-            step: "spill".into(),
-            reason: "oversized sections present but no spill backend configured; content preserved"
-                .into(),
-        });
-    }
-
-    spilled
 }
 
 /// `max_clear_tokens` caps total tokens cleared to prevent over-compaction.
@@ -621,12 +439,13 @@ mod tests {
     use crate::context_binder::bind_all;
     use crate::context_planner::{PlanInput, plan_turn};
     use crate::context_sources::*;
-    use crate::emergent_context::EmergentContext;
     use crate::microcompact::{CompactStrategy, ProviderCacheStrategy};
     use crate::pipeline_config::ProviderCachePolicy;
     use crate::pipeline_stats::PipelineStats;
     use crate::recovery_state::RecoveryState;
-    use crate::section_types::{CompressionPriority, PlannedSection, SectionSource};
+    use crate::section_types::{
+        CompressionPriority, PlannedSection, SectionArtifact, SectionSource,
+    };
     use crate::session_latches::SessionLatches;
     use crate::token_accounting::TokenAccounting;
 
@@ -662,10 +481,8 @@ mod tests {
         };
         let external = ExternalSources {
             memory_entries: Vec::new(),
-            spill_dir: None,
             ..Default::default()
         };
-        let emergent = EmergentContext::default();
         let stats = PipelineStats::default();
 
         let sources = ContextSources {
@@ -675,7 +492,6 @@ mod tests {
             session: &session,
             turn: &turn,
             external: &external,
-            emergent: &emergent,
             working_memory: None,
             stats: &stats,
         };
@@ -873,9 +689,7 @@ mod tests {
                 .stats
                 .skipped
                 .iter()
-                .any(|s| s.step == "tool_result_clearing"
-                    || s.step == "reorder"
-                    || s.step == "spill")
+                .any(|s| s.step == "tool_result_clearing" || s.step == "reorder")
         );
     }
 
@@ -1027,10 +841,6 @@ mod tests {
         assert!(
             skipped_steps.contains(&"reorder"),
             "should record skipped reorder"
-        );
-        assert!(
-            skipped_steps.contains(&"spill"),
-            "should record skipped spill"
         );
     }
 
@@ -1333,168 +1143,37 @@ mod tests {
     }
 
     #[test]
-    fn spill_preserves_large_sections_without_persistence() {
-        let (plan, bound, latches) = build_test_plan_and_bound();
-        let limits = OptimizeLimits {
-            allow_spill: true,
-            ..Default::default()
-        };
-        let policy = ProviderCachePolicy::default();
-
-        // Create a bound with a very large section
-        let mut bound = bound;
-        let large_text = "x".repeat(50_000); // ~12500 tokens
-        bound.sections.push(test_bound_section(
+    fn optimize_preserves_inline_oversized_sections() {
+        let (plan, mut bound, latches) = build_test_plan_and_bound();
+        let large_text = "x".repeat(50_000);
+        for kind in [
             SectionKind::ProjectContext,
-            CacheScope::Session,
-            &large_text,
-        ));
-
-        let result = optimize(&plan, bound, &latches, &policy, &limits, 1);
-
-        assert_eq!(result.stats.entries_spilled, 0);
-        assert!(result.spilled.is_empty());
-        let preserved = result
-            .sections
-            .iter()
-            .find(|section| section.text() == Some(large_text.as_str()))
-            .expect("oversized text must survive when no persistence boundary exists");
-        assert_eq!(preserved.actual_tokens, large_text.len() as u32);
-        assert!(
-            result
-                .stats
-                .skipped
-                .iter()
-                .any(|skipped| skipped.step == "spill"),
-            "preserving an oversized section should be explicit in optimizer trace"
-        );
-    }
-
-    #[test]
-    fn spill_offloads_oversized_section_when_backend_configured() {
-        use crate::spill_backend::FileSystemSpillBackend;
-        use tempfile::TempDir;
-
-        let (plan, bound, latches) = build_test_plan_and_bound();
-        let limits = OptimizeLimits {
-            allow_spill: true,
-            ..Default::default()
-        };
-        let policy = ProviderCachePolicy::default();
-
-        let mut bound = bound;
-        let large_text = "Y".repeat(50_000);
-        bound.sections.push(test_bound_section(
-            SectionKind::ProjectContext,
-            CacheScope::Session,
-            &large_text,
-        ));
-
-        let dir = TempDir::new().unwrap();
-        let backend = FileSystemSpillBackend::new(dir.path());
-        let result =
-            optimize_with_spill(&plan, bound, &latches, &policy, &limits, 1, Some(&backend));
-
-        assert_eq!(result.stats.entries_spilled, 1);
-        assert_eq!(result.spilled.len(), 1);
-        let entry = &result.spilled[0];
-        assert_eq!(entry.original_tokens, large_text.len() as u32);
-
-        // The offloaded section must no longer carry the text inline.
-        let offloaded = result
-            .sections
-            .iter()
-            .find(|s| {
-                matches!(
-                    s.artifact,
-                    crate::section_types::SectionArtifact::SpillReference { .. }
-                )
-            })
-            .expect("oversized section should be replaced with a SpillReference");
-        assert_eq!(offloaded.actual_tokens, 0);
-        assert_eq!(offloaded.text(), None);
-
-        // Tokens cleared accounting reflects the offload.
-        assert!(result.stats.tokens_cleared >= large_text.len() as u32);
-
-        // Persisted file contents match original text.
-        let persisted = std::fs::read_to_string(&entry.path).unwrap();
-        assert_eq!(persisted.len(), large_text.len());
-        assert!(persisted.starts_with("YYYYYY"));
-    }
-
-    #[test]
-    fn spill_never_offloads_identity_or_constraints_even_with_backend() {
-        use crate::spill_backend::FileSystemSpillBackend;
-        use tempfile::TempDir;
-
-        let (plan, bound, latches) = build_test_plan_and_bound();
-        let limits = OptimizeLimits {
-            allow_spill: true,
-            ..Default::default()
-        };
-        let policy = ProviderCachePolicy::default();
-
-        let mut bound = bound;
-        let large_text = "Z".repeat(50_000);
-        bound.sections.push(test_bound_section(
             SectionKind::Identity,
-            CacheScope::Global,
-            &large_text,
-        ));
-
-        let dir = TempDir::new().unwrap();
-        let backend = FileSystemSpillBackend::new(dir.path());
-        let result =
-            optimize_with_spill(&plan, bound, &latches, &policy, &limits, 1, Some(&backend));
-
-        assert_eq!(result.stats.entries_spilled, 0);
-        assert!(result.spilled.is_empty());
-        let preserved = result
+            SectionKind::Constraints,
+            SectionKind::WorkingMemory,
+        ] {
+            bound
+                .sections
+                .push(test_bound_section(kind, CacheScope::Session, &large_text));
+        }
+        let result = optimize(
+            &plan,
+            bound,
+            &latches,
+            &ProviderCachePolicy::default(),
+            &OptimizeLimits::default(),
+            1,
+        );
+        let preserved: Vec<_> = result
             .sections
             .iter()
-            .find(|s| s.plan.kind == SectionKind::Identity && s.text() == Some(large_text.as_str()))
-            .expect("Identity anchor must never be offloaded");
-        assert_eq!(preserved.actual_tokens, large_text.len() as u32);
-    }
-
-    #[test]
-    fn spill_never_offloads_working_memory_goal_state() {
-        use crate::spill_backend::FileSystemSpillBackend;
-        use tempfile::TempDir;
-
-        let (plan, bound, latches) = build_test_plan_and_bound();
-        let limits = OptimizeLimits {
-            allow_spill: true,
-            ..Default::default()
-        };
-        let policy = ProviderCachePolicy::default();
-
-        let mut bound = bound;
-        let large_goal_state = format!(
-            "## Working Memory\nGoal: keep the user objective visible\n{}",
-            "decision: preserve intent\n".repeat(20_000)
-        );
-        bound.sections.push(test_bound_section(
-            SectionKind::WorkingMemory,
-            CacheScope::None,
-            &large_goal_state,
-        ));
-
-        let dir = TempDir::new().unwrap();
-        let backend = FileSystemSpillBackend::new(dir.path());
-        let result =
-            optimize_with_spill(&plan, bound, &latches, &policy, &limits, 1, Some(&backend));
-
-        assert_eq!(result.stats.entries_spilled, 0);
-        assert!(result.spilled.is_empty());
+            .filter(|section| section.text() == Some(large_text.as_str()))
+            .collect();
+        assert_eq!(preserved.len(), 4);
         assert!(
-            result
-                .sections
+            preserved
                 .iter()
-                .any(|s| s.plan.kind == SectionKind::WorkingMemory
-                    && s.text() == Some(large_goal_state.as_str())),
-            "working memory carries goal continuity and must remain inline even under spill pressure"
+                .all(|section| section.actual_tokens == large_text.len() as u32)
         );
     }
 
@@ -1517,110 +1196,6 @@ mod tests {
         );
     }
 
-    // ── rehydrate_sections (Phase 12: consumer side) ───────────────────
-
-    #[test]
-    fn rehydrate_sections_restores_spilled_section_content() {
-        use crate::spill_backend::{
-            DEFAULT_SCHEME, FileSystemSpillBackend, SpillBackend, SpillRegistry,
-        };
-        use std::sync::Arc;
-        use tempfile::TempDir;
-
-        let dir = TempDir::new().unwrap();
-        let backend: Arc<dyn SpillBackend> = Arc::new(FileSystemSpillBackend::new(dir.path()));
-        let payload = b"ORIGINAL ProjectContext body".to_vec();
-        let locator = backend.store("ProjectContext", &payload).unwrap();
-
-        let mut sections = vec![BoundSection {
-            plan: PlannedSection {
-                kind: SectionKind::ProjectContext,
-                scope: CacheScope::None,
-                estimated_tokens: 100,
-                priority: CompressionPriority::Normal,
-                source: SectionSource::Static,
-            },
-            artifact: SectionArtifact::SpillReference {
-                path: locator,
-                original_tokens: 100,
-            },
-            actual_tokens: 0,
-            bind_latency: std::time::Duration::ZERO,
-        }];
-
-        let mut reg = SpillRegistry::new();
-        reg.register(DEFAULT_SCHEME, backend);
-
-        let stats = rehydrate_sections(&mut sections, &reg);
-        assert!(
-            stats.skipped.is_empty(),
-            "happy-path rehydrate must not record skipped entries"
-        );
-        assert!(matches!(
-            sections[0].artifact,
-            SectionArtifact::RuntimeText(_)
-        ));
-        assert_eq!(sections[0].text().unwrap(), "ORIGINAL ProjectContext body");
-        assert!(sections[0].actual_tokens > 0);
-    }
-
-    #[test]
-    fn rehydrate_sections_records_trace_on_load_error() {
-        use crate::spill_backend::SpillRegistry;
-
-        // Registry with NO backends registered → load will fail.
-        let reg = SpillRegistry::new();
-        let mut sections = vec![BoundSection {
-            plan: PlannedSection {
-                kind: SectionKind::Memory,
-                scope: CacheScope::Session,
-                estimated_tokens: 50,
-                priority: CompressionPriority::Normal,
-                source: SectionSource::Memory,
-            },
-            artifact: SectionArtifact::SpillReference {
-                path: "file:///missing".into(),
-                original_tokens: 50,
-            },
-            actual_tokens: 0,
-            bind_latency: std::time::Duration::ZERO,
-        }];
-
-        let stats = rehydrate_sections(&mut sections, &reg);
-        assert_eq!(stats.skipped.len(), 1);
-        assert_eq!(stats.skipped[0].step, "rehydrate");
-        // The section must REMAIN a SpillReference so callers can retry
-        // later instead of having a placeholder burned in.
-        assert!(matches!(
-            sections[0].artifact,
-            SectionArtifact::SpillReference { .. }
-        ));
-    }
-
-    #[test]
-    fn rehydrate_sections_is_noop_for_inline_artifacts() {
-        use crate::spill_backend::SpillRegistry;
-
-        let reg = SpillRegistry::new();
-        let mut sections = vec![BoundSection {
-            plan: PlannedSection {
-                kind: SectionKind::Identity,
-                scope: CacheScope::Global,
-                estimated_tokens: 10,
-                priority: CompressionPriority::Never,
-                source: SectionSource::Static,
-            },
-            artifact: SectionArtifact::SystemText("core rules".into()),
-            actual_tokens: 10,
-            bind_latency: std::time::Duration::ZERO,
-        }];
-
-        let stats = rehydrate_sections(&mut sections, &reg);
-        assert!(stats.skipped.is_empty());
-        assert_eq!(sections[0].text().unwrap(), "core rules");
-        assert_eq!(sections[0].actual_tokens, 10);
-    }
-
     // ── Optimizer invariant proptests ───────────────────────────────────
     //
     // These lock invariants that the optimizer MUST uphold for any input:
@@ -1628,8 +1203,6 @@ mod tests {
     //  2. After a successful reorder, scope order is non-decreasing within
     //     each contiguous reorderable run; anchors are barriers.
     //  3. `compact_tool_results_gated` never exceeds `max_clear_tokens`.
-    //  4. `spill_oversized_sections` never touches Identity / Constraints /
-    //     WorkingMemory, regardless of size.
     //
     // Example tests around these invariants exist above, but the single-
     // example form can only prove the invariant for the handful of cases the
@@ -1639,33 +1212,6 @@ mod tests {
     mod proptests {
         use super::*;
         use proptest::prelude::*;
-        use std::sync::Mutex;
-
-        /// In-memory spill backend for proptest — avoids touching the
-        /// filesystem inside a property-based test (the 256+ invocations
-        /// `proptest` will do against the `spill_never_touches_*` property
-        /// would otherwise hammer /tmp pointlessly). `store` always
-        /// succeeds; `load` is unused here because the property asserts
-        /// *which* sections were spilled, not round-trip correctness.
-        #[derive(Default)]
-        struct InMemorySpillBackend {
-            counter: Mutex<u64>,
-        }
-
-        impl InMemorySpillBackend {
-            fn new() -> Self {
-                Self::default()
-            }
-        }
-
-        impl crate::spill_backend::SpillBackend for InMemorySpillBackend {
-            fn store(&self, key_hint: &str, _bytes: &[u8]) -> std::io::Result<String> {
-                let mut n = astra_core::sync_poison::recover_mutex_lock(&self.counter);
-                *n += 1;
-                Ok(format!("memory://{key_hint}-{}", *n))
-            }
-        }
-
         fn scope_strategy() -> impl Strategy<Value = CacheScope> {
             prop_oneof![
                 Just(CacheScope::Global),
@@ -1689,9 +1235,6 @@ mod tests {
                 Just(SectionKind::Skills),
                 Just(SectionKind::RuntimeIdentity),
                 Just(SectionKind::RuntimeVolatile),
-                Just(SectionKind::EmergentSkills),
-                Just(SectionKind::EmergentMemory),
-                Just(SectionKind::EmergentSummary),
             ]
         }
 
@@ -1700,8 +1243,7 @@ mod tests {
             scope: CacheScope,
             tokens: u32,
         ) -> BoundSection {
-            // Pad text so `actual_tokens` is plausibly derived from it;
-            // spill thresholds are in tokens so content length matters.
+            // Keep content length consistent with the declared token estimate.
             let text = "x".repeat((tokens as usize).saturating_mul(4));
             BoundSection {
                 plan: PlannedSection {
@@ -1870,84 +1412,7 @@ mod tests {
                 }
             }
 
-            /// Invariant 4: `spill_oversized_sections` never replaces the
-            /// artifact of Identity / Constraints / WorkingMemory even when
-            /// they are oversized and a backend is available. Spilling these
-            /// would hide the state needed to resume correctly after
-            /// compaction and is explicitly prevented by the optimizer.
-            #[test]
-            fn spill_never_touches_anchor_or_working_memory(
-                oversized_tokens in 10_001u32..50_000,
-                include_identity in proptest::bool::ANY,
-                include_constraints in proptest::bool::ANY,
-                include_working in proptest::bool::ANY,
-                include_regular in proptest::bool::ANY,
-            ) {
-                let mut sections: Vec<BoundSection> = Vec::new();
-                if include_identity {
-                    sections.push(arbitrary_bound_section(
-                        SectionKind::Identity, CacheScope::Global, oversized_tokens));
-                }
-                if include_constraints {
-                    sections.push(arbitrary_bound_section(
-                        SectionKind::Constraints, CacheScope::Global, oversized_tokens));
-                }
-                if include_working {
-                    sections.push(arbitrary_bound_section(
-                        SectionKind::WorkingMemory, CacheScope::None, oversized_tokens));
-                }
-                if include_regular {
-                    sections.push(arbitrary_bound_section(
-                        SectionKind::Memory, CacheScope::None, oversized_tokens));
-                }
-                if sections.is_empty() { return Ok(()); }
-
-                // Snapshot anchor/working-memory artifacts before spill.
-                let protected_before: Vec<(usize, SectionKind, SectionArtifact)> = sections
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| matches!(
-                        s.plan.kind,
-                        SectionKind::Identity
-                            | SectionKind::Constraints
-                            | SectionKind::WorkingMemory
-                    ))
-                    .map(|(i, s)| (i, s.plan.kind, s.artifact.clone()))
-                    .collect();
-
-                let backend = InMemorySpillBackend::new();
-                let mut stats = OptimizeStats::default();
-                let plan = {
-                    let (plan, _, _) = build_test_plan_and_bound();
-                    plan
-                };
-                let _spilled = spill_oversized_sections(
-                    &mut sections,
-                    &mut stats,
-                    Some(&backend),
-                    &plan,
-                    1,
-                );
-
-                for (idx, kind, original_artifact) in protected_before {
-                    prop_assert!(
-                        !matches!(sections[idx].artifact, SectionArtifact::SpillReference { .. }),
-                        "{:?} at index {} was spilled despite being a protected section",
-                        kind,
-                        idx
-                    );
-                    // Protected sections must keep their original artifact bytes.
-                    prop_assert_eq!(
-                        sections[idx].artifact.text().map(String::from),
-                        original_artifact.text().map(String::from),
-                        "{:?} at index {} had its artifact text mutated by spill",
-                        kind,
-                        idx
-                    );
-                }
-            }
-
-            /// Invariant 5: `place_cache_markers` respects max_markers cap,
+            /// Invariant 4: `place_cache_markers` respects max_markers cap,
             /// never references out-of-bounds indices, always returns empty
             /// for Prefix protocol, and suppresses None-scope markers when
             /// a latch flipped this turn.

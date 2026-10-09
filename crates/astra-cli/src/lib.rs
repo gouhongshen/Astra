@@ -96,7 +96,7 @@ pub(crate) use crate::cli::stream::streaming_types::{
 };
 
 // Session state
-pub(crate) use cli::session::session_state::{ExplainMode, SessionState, SkillDevState};
+pub(crate) use cli::session::session_state::{ExplainMode, SessionState};
 
 // Cloud sync
 pub(crate) use cli::cloud_sync::post_auth_cloud_resync;
@@ -115,7 +115,6 @@ pub(crate) mod tests {
     pub(crate) use super::test_utils::test_temp_dir;
     pub(crate) use super::test_utils::wait_until;
 
-    pub(crate) use crate::cli::slash::slash_session::resolve_journal_target_session;
     pub(crate) use astra_services::session_journal;
     use axum::{Router, routing::get};
 
@@ -161,6 +160,4 @@ pub(crate) mod tests {
     mod preamble_tests;
     mod resume_tests;
     mod self_command_tests;
-    mod slash_command_tests;
-    mod stats_tools_tests;
 }

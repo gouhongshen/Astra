@@ -327,12 +327,12 @@ mod tests {
             Ok(ResolvedModelOffering {
                 offering_id: id,
                 model: ResolvedActiveLlmModel {
+                    price_snapshot: None,
                     model_name: "jev".into(),
                     wire_model_name: None,
                     api_key: self.key.clone(),
                     base_url: "http://unused.invalid".into(),
                     provider: "typesafe".into(),
-                    fallback_chain: vec![],
                     tags: vec![],
                     request_body_overrides: None,
                     fixed_temperature: None,
@@ -378,6 +378,7 @@ mod tests {
 
     fn jev_item(active: bool) -> ModelListItem {
         ModelListItem {
+            thinking_protocol: None,
             offering_id: "offer-jev".into(),
             access_id: "deployment".into(),
             access_kind: ModelAccessKind::SelfHosted,
@@ -391,6 +392,7 @@ mod tests {
             max_completion_tokens: None,
             architecture: None,
             thinking_capability: None,
+            pricing: None,
         }
     }
 

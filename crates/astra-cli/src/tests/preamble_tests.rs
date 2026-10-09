@@ -1,13 +1,9 @@
-use super::resolve_journal_target_session;
-use crate::cli::agent_runtime::initialize_multi_agent_runtime;
+use crate::cli::agent_runtime::initialize_agent_projection;
 use crate::cli::command_registry;
-use crate::cli::session::session_state::{ExplainMode, SessionState};
-use crate::cli::slash::slash_router::handle_slash_command;
+use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::stream_render::{
     RenderPolicy, StreamRenderState, TurnResult, dispatch_turn_event_block,
 };
-use astra_config::runtime_config::ExplainReportFormat;
-use astra_runtime::prompts;
 
 #[test]
 fn generic_explain_payload_does_not_create_explain_analyze_facts() {
@@ -162,95 +158,6 @@ fn resolve_review_command() {
 }
 
 #[test]
-fn resolve_journal_target_session_uses_active_session_without_argument() {
-    let state = SessionState {
-        session_id: Some("sess-123".to_string()),
-        ..Default::default()
-    };
-    let (resolved, from_prefix) =
-        resolve_journal_target_session("", &state, "missing").expect("should resolve");
-    assert_eq!(resolved, "sess-123");
-    assert!(!from_prefix);
-}
-
-#[tokio::test]
-async fn slash_explain_sets_an_explicit_mode_and_retries_are_idempotent() {
-    let api =
-        astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
-    let mut state = SessionState::default();
-    assert_eq!(state.explain, ExplainMode::Off);
-
-    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None)
-        .await
-        .expect("slash command should succeed");
-    assert!(!should_exit);
-    assert_eq!(state.explain, ExplainMode::On);
-
-    let should_exit = handle_slash_command("/explain", &api, None, &mut state, None)
-        .await
-        .expect("slash command should succeed");
-    assert!(!should_exit);
-    assert_eq!(state.explain, ExplainMode::On);
-
-    let should_exit = handle_slash_command("/explain verbose", &api, None, &mut state, None)
-        .await
-        .expect("slash command should succeed");
-    assert!(!should_exit);
-    assert_eq!(state.explain, ExplainMode::Verbose);
-
-    let should_exit = handle_slash_command("/explain off", &api, None, &mut state, None)
-        .await
-        .expect("slash command should succeed");
-    assert!(!should_exit);
-    assert_eq!(state.explain, ExplainMode::Off);
-}
-
-#[tokio::test]
-async fn slash_explain_rejects_invalid_mode_without_mutating_state() {
-    let api =
-        astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
-    let mut state = SessionState {
-        explain: ExplainMode::Verbose,
-        ..Default::default()
-    };
-
-    let should_exit = handle_slash_command("/explain maybe", &api, None, &mut state, None)
-        .await
-        .expect("slash command should report usage without failing the REPL");
-    assert!(!should_exit);
-    assert_eq!(state.explain, ExplainMode::Verbose);
-}
-
-#[tokio::test]
-async fn read_only_config_command_keeps_explain_format_override() {
-    let api =
-        astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
-    let mut state = SessionState::default();
-
-    handle_slash_command("/explain --format text", &api, None, &mut state, None)
-        .await
-        .expect("format-only explain command should succeed");
-    assert_eq!(
-        state.runtime_config.explain.effective_report_format(),
-        ExplainReportFormat::Text
-    );
-
-    handle_slash_command("/config show", &api, None, &mut state, None)
-        .await
-        .expect("read-only config command should succeed");
-
-    assert_eq!(
-        state.explain_report_format_override,
-        Some(ExplainReportFormat::Text)
-    );
-    assert_eq!(
-        state.runtime_config.explain.effective_report_format(),
-        ExplainReportFormat::Text,
-        "a read-only config view must not reset the next-turn report format"
-    );
-}
-
-#[test]
 fn quiet_dispatch_captures_text_without_output() {
     // In quiet mode, dispatch_turn_event_block should capture text but not print.
     // We can't easily test print suppression, but we verify text capture.
@@ -267,17 +174,13 @@ fn quiet_dispatch_captures_text_without_output() {
     assert_eq!(result.full_text, "hello world");
 }
 
-#[tokio::test]
-async fn initialize_multi_agent_runtime_wires_spawner_and_engine() {
-    let api =
-        astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None).expect("test API URL");
+#[test]
+fn initialize_agent_projection_does_not_install_a_local_executor() {
     let mut state = SessionState::default();
 
-    initialize_multi_agent_runtime(&mut state, &api, "fake-token".to_string(), None).await;
-
-    assert!(state.delegation_engine.is_some());
+    initialize_agent_projection(&mut state);
     let spawner = state.agent_spawner.expect("agent spawner should be wired");
-    assert!(spawner.has_executor());
+    assert!(!spawner.has_executor());
 }
 
 #[test]
@@ -314,51 +217,6 @@ fn compacted_history_skips_empty_user_messages() {
     );
     assert_eq!(messages[1]["role"], "user");
     assert_eq!(messages[2]["role"], "assistant");
-}
-
-#[test]
-fn compact_assistant_message_optional_session_memory_anchor() {
-    let with_anchor = crate::cli::session::session_compaction::compact_assistant_message(
-        3,
-        "Summary body",
-        Some("- [fact] one\n- [fact] two"),
-    );
-    assert!(with_anchor.contains("[Session memory anchor]"));
-    assert!(with_anchor.contains("[fact] one"));
-    assert!(with_anchor.contains("[Prior context — 3 turns compacted]"));
-    assert!(with_anchor.contains("Summary body"));
-
-    let no_anchor =
-        crate::cli::session::session_compaction::compact_assistant_message(2, "Only summary", None);
-    assert!(!no_anchor.contains("[Session memory anchor]"));
-    assert!(no_anchor.contains("[Prior context — 2 turns compacted]"));
-    assert!(no_anchor.contains("Only summary"));
-}
-
-#[test]
-fn system_skill_toggle_lifecycle() {
-    let available = prompts::builtin_system_skills();
-    let mut active: Vec<prompts::SystemSkill> = Vec::new();
-
-    // Activate markdown
-    let md = available.iter().find(|s| s.name == "markdown").unwrap();
-    active.push(md.clone());
-    assert_eq!(active.len(), 1);
-
-    // Deactivate markdown
-    active.retain(|s| s.name != "markdown");
-    assert!(active.is_empty());
-
-    // Activate both
-    for s in &available {
-        active.push(s.clone());
-    }
-    assert!(active.len() >= 2);
-
-    // Build instructions
-    let block = prompts::build_skill_instructions(&active);
-    assert!(block.contains("Markdown"));
-    assert!(block.contains("Concise"));
 }
 
 #[test]

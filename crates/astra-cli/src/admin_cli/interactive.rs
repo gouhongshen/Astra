@@ -14,10 +14,8 @@ use rustyline::{
 };
 
 use super::http_helpers::{map_thin_err, print_json_or_raw};
-use crate::cli::auth_flow::{parse_auth_tokens, save_refreshed_profile_tokens};
-use crate::cli::cli_config::cli_utils::{
-    credential_store, get_profile_and_token, load_credentials, profile_name,
-};
+use crate::cli::auth_flow::clear_profile_auth;
+use crate::cli::cli_config::cli_utils::{get_profile_and_token, load_credentials, profile_name};
 use crate::cli::session::session_runtime;
 
 const ADMIN_COMMANDS: &[(&str, &str)] = &[
@@ -33,7 +31,6 @@ const ADMIN_COMMANDS: &[(&str, &str)] = &[
         "prompt optimize",
         "Optimize agent prompt  (e.g. prompt optimize <agent_id>)",
     ),
-    ("feedback stats", "Show feedback statistics"),
     ("model list", "List available models"),
     (
         "model check",
@@ -41,7 +38,7 @@ const ADMIN_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "model update",
-        "Update model fields  (e.g. model update <name> --quirks '{\"fallback_chain\":[\"gpt-4o-mini\"]}')",
+        "Update model fields  (e.g. model update <name> --quirks '{\"fixed_temperature\":0.7}')",
     ),
     (
         "user grant-role",
@@ -208,15 +205,16 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("no profile '{name}'"))?;
-            let refresh_token = saved
-                .refresh_token
-                .ok_or_else(|| "no refresh token".to_string())?;
-            let body = api
-                .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
+            if saved
+                .account_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+            {
+                return Err("refresh requires a server-issued account_id; log in again".into());
+            }
+            session_runtime::try_refresh_token(api, &name, &saved, None)
                 .await
-                .map_err(map_thin_err)?;
-            let tokens = parse_auth_tokens(&body)?;
-            save_refreshed_profile_tokens(profile, &tokens)?;
+                .map_err(|error| format!("refresh failed: {error:?}"))?;
             eprintln!("{}", "✓ Token refreshed".green());
             Ok(())
         } else if line.eq("logout") {
@@ -233,15 +231,7 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
             let _ = api
                 .post_auth_logout_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await;
-            credential_store()
-                .mutate(|creds| {
-                    let name = profile_name(profile, creds);
-                    if let Some(entry) = creds.profiles.get_mut(&name) {
-                        entry.access_token = None;
-                        entry.refresh_token = None;
-                    }
-                })
-                .map_err(|e| e.to_string())?;
+            clear_profile_auth(profile)?;
             eprintln!("{}", "✓ Logged out".green());
             Ok(())
         } else if line.starts_with("audit") {
@@ -271,14 +261,6 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
             let q = vec![("limit", "50".to_string()), ("offset", "0".to_string())];
             let body = api
                 .get_skills_query_text(&token, &q)
-                .await
-                .map_err(map_thin_err)?;
-            print_json_or_raw(&body);
-            Ok(())
-        } else if line.eq("feedback stats") {
-            let (_, _, _, token) = get_profile_and_token(profile)?;
-            let body = api
-                .get_bearer_path_query_text(&token, paths::ADMIN_FEEDBACK_STATS, &[])
                 .await
                 .map_err(map_thin_err)?;
             print_json_or_raw(&body);

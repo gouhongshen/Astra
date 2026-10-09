@@ -76,7 +76,7 @@ pub(crate) fn build_external_sources(
     };
 
     let (mut tool_guidance_text, _signals) =
-        crate::prompts::tool_round_guidance_trace(&state.messages, state.llm_rounds_completed);
+        crate::prompts::tool_round_guidance_trace(&state.messages);
     if !state.suppress_execution_slice_guidance() {
         let slice_guidance = crate::prompts::execution_slice_guidance(
             state.remaining_turns,
@@ -94,18 +94,6 @@ pub(crate) fn build_external_sources(
 
     // ── Memory entries (structured, non-section) ──
     let memory_entries = build_memory_entries_from_edge_profile(edge_profile);
-
-    let spill_backend: Option<std::sync::Arc<dyn astra_turn_core::spill_backend::SpillBackend>> =
-        edge_profile
-            .get("spill_dir")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                std::sync::Arc::new(astra_turn_core::spill_backend::FileSystemSpillBackend::new(
-                    s,
-                ))
-                    as std::sync::Arc<dyn astra_turn_core::spill_backend::SpillBackend>
-            });
 
     // ── Framework+Policy: ContextChannelProvider assembly ──
     // Every prompt section is produced by a typed provider. The assembler
@@ -233,8 +221,6 @@ pub(crate) fn build_external_sources(
     ExternalSources {
         memory_entries,
         session_memory_entry: None,
-        spill_dir: None,
-        spill_backend,
         effort_hint,
         system_override,
         plan_context,
@@ -755,19 +741,21 @@ mod tests {
     #[test]
     fn session_context_saturates_oversized_model_limit() {
         let ep = serde_json::Map::new();
-        let ctx = build_session_context(
-            "sid",
-            None,
-            "gpt-4o",
-            u64::MAX,
-            &ep,
-            "openai",
-            None,
-            None,
-            "2026-05-25",
-            None,
-        );
-        assert_eq!(ctx.model_limit, u32::MAX);
+        for (limit, expected) in [(200_000, 200_000), (u64::MAX, u32::MAX)] {
+            let ctx = build_session_context(
+                "sid",
+                None,
+                "gpt-4o",
+                limit,
+                &ep,
+                "openai",
+                None,
+                None,
+                "2026-05-25",
+                None,
+            );
+            assert_eq!(ctx.model_limit, expected);
+        }
     }
 
     #[test]
@@ -990,7 +978,7 @@ mod tests {
         assert!(
             tool_section
                 .text
-                .contains("Call a structured tool only if it is visible")
+                .contains("Native calls must use current `tools[]`")
         );
         assert!(
             tool_section
@@ -1711,7 +1699,7 @@ mod tests {
         assert!(
             section
                 .text
-                .contains("Call a structured tool only if it is visible")
+                .contains("Native calls must use current `tools[]`")
         );
     }
 
@@ -2362,79 +2350,6 @@ mod tests {
                 .all(|section| !section.text.contains("\"mode\":\"single\"")),
             "the canonical multi-producer lane requires an array"
         );
-    }
-
-    #[test]
-    fn runtime_volatile_texts_do_not_churn_prompt_cache_stable_system_bytes() {
-        let _lock = astra_core::sync_poison::recover_mutex_lock(
-            &crate::turn::prompt_cache::CACHE_ENV_MUTEX,
-        );
-        let state = make_state();
-        let cache_cfg = crate::turn::prompt_cache::PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: false,
-        };
-        let assemble = |turn_context: &str| {
-            let mut ep = serde_json::Map::new();
-            ep.insert(
-                "system_prompt_override".into(),
-                Value::String("## Agent Binding Instruction\nStable session contract.".to_string()),
-            );
-            ep.insert(
-                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS
-                    .into(),
-                serde_json::json!([turn_context]),
-            );
-            let sources = build_external_sources(&ep, &state, &["bash"], None, None);
-            crate::turn::prompt_cache::assemble_ephemeral_pipeline_outcome(
-                &["bash"],
-                &[],
-                &sources.extra_stable_sections,
-                &sources.extra_dynamic_sections,
-                &[],
-                None,
-                sources.system_override.as_deref(),
-                &cache_cfg,
-                None,
-                "sid-runtime-volatile-cache",
-                "gpt-4o",
-                None,
-                "openai",
-                None,
-                None,
-                None,
-                "",
-                "",
-                "2026-07-08",
-            )
-        };
-
-        let first = assemble("## Runtime Turn Context\n{\"raw_advice\":\"first\"}");
-        let second = assemble("## Runtime Turn Context\n{\"raw_advice\":\"second\"}");
-        let first_primary = serde_json::to_string(&first.primary_system).expect("first primary");
-        let second_primary = serde_json::to_string(&second.primary_system).expect("second primary");
-        assert_eq!(
-            first_primary, second_primary,
-            "per-turn runtime context must not change stable prompt-cache material"
-        );
-
-        let first_dynamic = first
-            .dynamic_system
-            .as_ref()
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_str)
-            .expect("first dynamic system");
-        let second_dynamic = second
-            .dynamic_system
-            .as_ref()
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_str)
-            .expect("second dynamic system");
-        assert_ne!(first_dynamic, second_dynamic);
-        assert!(first_dynamic.contains("\"raw_advice\":\"first\""));
-        assert!(second_dynamic.contains("\"raw_advice\":\"second\""));
-        assert!(!first_primary.contains("raw_advice"));
-        assert!(!second_primary.contains("raw_advice"));
     }
 
     #[test]

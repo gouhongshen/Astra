@@ -92,6 +92,8 @@ pub enum WorkspaceRecordStoreError {
     WorkspaceOwnerConflict { workspace_id: String },
     #[error("workspace source '{source_key}' is already claimed by another workspace")]
     SourceOwnerConflict { source_key: String },
+    #[error("workspace '{workspace_id}' physical ownership cannot change through upsert")]
+    PhysicalIdentityConflict { workspace_id: String },
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("json error: {0}")]
@@ -211,6 +213,9 @@ impl WorkspaceRecordStore for InMemoryWorkspaceRecordStore {
             return Err(WorkspaceRecordStoreError::WorkspaceOwnerConflict {
                 workspace_id: entry.record.workspace_id,
             });
+        }
+        if let Some(existing) = records.get(&entry.record.workspace_id) {
+            validate_physical_identity(existing, &entry)?;
         }
         if let Some(source_key) = workspace_source_key(&entry.record)
             && records.values().any(|existing| {
@@ -496,20 +501,39 @@ impl WorkspaceRecordStore for DatabaseWorkspaceRecordStore {
             }
         }
 
-        // Existing record found — validate ownership.
-        let existing: Option<(String,)> =
-            sqlx::query_as("SELECT owner_id FROM workspace_records WHERE workspace_id = ?")
-                .bind(&entry.record.workspace_id)
-                .fetch_optional(self.pool.get())
-                .await?;
-
-        if let Some((existing_owner,)) = existing
-            && existing_owner != entry.owner_id
-        {
+        // Serialize physical binding changes under the same row lock as the
+        // update; an out-of-transaction comparison cannot fence a rebind.
+        let mut transaction = self.pool.get().begin().await?;
+        let existing = sqlx::query("SELECT owner_id, session_id, run_id, record_json FROM workspace_records WHERE workspace_id = ? FOR UPDATE")
+            .bind(&entry.record.workspace_id).fetch_optional(&mut *transaction).await?
+            ;
+        let Some(existing) = existing else {
+            if let Some(source_key) = source_key.as_ref() {
+                let conflict: Option<(String,)> = sqlx::query_as(
+                    "SELECT owner_id FROM workspace_records WHERE source_key = ? LIMIT 1 FOR UPDATE")
+                    .bind(source_key).fetch_optional(&mut *transaction).await?;
+                if conflict.is_some() {
+                    return Err(WorkspaceRecordStoreError::SourceOwnerConflict {
+                        source_key: source_key.clone(),
+                    });
+                }
+            }
+            return Err(WorkspaceRecordStoreError::WorkspaceOwnerConflict {
+                workspace_id: entry.record.workspace_id.clone(),
+            });
+        };
+        let existing = WorkspaceRecordEntry::new(
+            existing.try_get::<String, _>("owner_id")?,
+            existing.try_get::<Option<String>, _>("session_id")?,
+            existing.try_get::<Option<String>, _>("run_id")?,
+            serde_json::from_str(&existing.try_get::<String, _>("record_json")?)?,
+        );
+        if existing.owner_id != entry.owner_id {
             return Err(WorkspaceRecordStoreError::WorkspaceOwnerConflict {
                 workspace_id: entry.record.workspace_id,
             });
         }
+        validate_physical_identity(&existing, &entry)?;
 
         // Check source_key conflict before UPDATE so production behavior
         // matches the in-memory store and returns a domain error instead of a
@@ -521,7 +545,7 @@ impl WorkspaceRecordStore for DatabaseWorkspaceRecordStore {
             )
             .bind(source_key)
             .bind(&entry.record.workspace_id)
-            .fetch_optional(self.pool.get())
+            .fetch_optional(&mut *transaction)
             .await?;
             if conflict.is_some() {
                 return Err(WorkspaceRecordStoreError::SourceOwnerConflict {
@@ -530,10 +554,7 @@ impl WorkspaceRecordStore for DatabaseWorkspaceRecordStore {
             }
         }
 
-        // Guard the UPDATE with `owner_id = ?` so that a concurrent owner change
-        // between the SELECT above and this UPDATE cannot silently clobber the
-        // new owner. If `rows_affected == 0`, either the row was deleted or
-        // another owner now holds it — treat both as a conflict.
+        // Retain the owner predicate as well as the transaction-held row lock.
         let result = sqlx::query(
             "UPDATE workspace_records \
              SET owner_id = ?, session_id = ?, run_id = ?, kind = ?, authority = ?, \
@@ -555,7 +576,7 @@ impl WorkspaceRecordStore for DatabaseWorkspaceRecordStore {
         .bind(&record_json)
         .bind(&entry.record.workspace_id)
         .bind(&entry.owner_id)
-        .execute(self.pool.get())
+        .execute(&mut *transaction)
         .await?;
         if result.rows_affected() == 0 {
             // Row vanished or was re-owned concurrently — surface as conflict so
@@ -564,6 +585,7 @@ impl WorkspaceRecordStore for DatabaseWorkspaceRecordStore {
                 workspace_id: entry.record.workspace_id,
             });
         }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -771,8 +793,47 @@ impl WorkspaceCleanupDebtStore for DatabaseWorkspaceRecordStore {
     }
 }
 
+fn validate_physical_identity(
+    existing: &WorkspaceRecordEntry,
+    requested: &WorkspaceRecordEntry,
+) -> Result<(), WorkspaceRecordStoreError> {
+    if (matches!(
+        existing.record.source,
+        WorkspaceSource::ServerSandbox { .. }
+    ) || matches!(
+        requested.record.source,
+        WorkspaceSource::ServerSandbox { .. }
+    ) || existing.record.kind == astra_runtime_env::WorkspaceBindingKind::ServerSandbox
+        || requested.record.kind == astra_runtime_env::WorkspaceBindingKind::ServerSandbox)
+        && (existing.owner_id != requested.owner_id
+            || existing.session_id != requested.session_id
+            || existing.record.source != requested.record.source
+            || existing.record.root_or_volume_ref != requested.record.root_or_volume_ref
+            || existing.record.kind != requested.record.kind
+            || existing.record.owner_scope != requested.record.owner_scope
+            || existing.record.authority != requested.record.authority
+            || existing.record.persistence != requested.record.persistence)
+    {
+        return Err(WorkspaceRecordStoreError::PhysicalIdentityConflict {
+            workspace_id: requested.record.workspace_id.clone(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_entry(entry: &WorkspaceRecordEntry) -> Result<(), WorkspaceRecordStoreError> {
     validate_owner_id(&entry.owner_id)?;
+    if let WorkspaceSource::ServerSandbox { session_id, .. } = &entry.record.source
+        && entry.session_id.as_deref() != Some(session_id.as_str())
+    {
+        return Err(WorkspaceRecordStoreError::InvalidSessionId);
+    }
+
+    entry
+        .record
+        .source
+        .validate()
+        .map_err(|error| WorkspaceRecordStoreError::InvalidWorkspaceId(error.to_string()))?;
     validate_workspace_id(&entry.record.workspace_id)
         .map_err(|error| WorkspaceRecordStoreError::InvalidWorkspaceId(error.to_string()))?;
     if entry
@@ -1529,6 +1590,70 @@ mod tests {
         assert!(matches!(
             error,
             WorkspaceCleanupDebtStoreError::InvalidMessage
+        ));
+    }
+    #[tokio::test]
+    async fn server_workspace_physical_identity_is_immutable() {
+        let store = InMemoryWorkspaceRecordStore::new();
+        let mut workspace = record("session-a");
+        workspace.source = WorkspaceSource::ServerSandbox {
+            session_id: "session-a".into(),
+            executor_id: "executor-a".into(),
+        };
+        workspace.kind = WorkspaceBindingKind::ServerSandbox;
+        workspace.owner_scope = WorkspaceOwnerScope::ServerSession;
+        workspace.persistence = WorkspacePersistence::Session;
+        let original = WorkspaceRecordEntry::new(
+            "owner-a",
+            Some("session-a".into()),
+            Some("run-a".into()),
+            workspace,
+        );
+        store
+            .upsert_workspace_record(original.clone())
+            .await
+            .unwrap();
+        let mut mutable = original.clone();
+        mutable.run_id = Some("run-b".into());
+        mutable.record.revision = "revision-b".into();
+        store
+            .upsert_workspace_record(mutable.clone())
+            .await
+            .unwrap();
+        for modification in 0..4 {
+            let mut changed = mutable.clone();
+            match modification {
+                0 => {
+                    changed.record.source = WorkspaceSource::ServerSandbox {
+                        session_id: "session-a".into(),
+                        executor_id: "executor-b".into(),
+                    }
+                }
+                1 => changed.record.root_or_volume_ref = "/other-workspace".into(),
+                2 => {
+                    changed.record.source = WorkspaceSource::Scratch;
+                    changed.record.kind = WorkspaceBindingKind::LocalFilesystem;
+                }
+                _ => changed.record.authority = WorkspaceAuthority::ReadOnly,
+            }
+            assert!(matches!(
+                store.upsert_workspace_record(changed).await,
+                Err(WorkspaceRecordStoreError::PhysicalIdentityConflict { .. })
+            ));
+        }
+        assert_eq!(
+            store
+                .load_workspace_record("owner-a", "session-a")
+                .await
+                .unwrap()
+                .unwrap(),
+            mutable
+        );
+        let mut mismatch = original;
+        mismatch.session_id = Some("session-b".into());
+        assert!(matches!(
+            store.upsert_workspace_record(mismatch).await,
+            Err(WorkspaceRecordStoreError::InvalidSessionId)
         ));
     }
 }

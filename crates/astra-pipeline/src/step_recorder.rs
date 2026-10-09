@@ -19,22 +19,26 @@
 //! recorder.begin_tool(tool_name, &args);
 //!
 //! // After each tool result:
-//! recorder.complete_tool(tool_name, is_error, elapsed_ms);
+//! recorder.complete_tool(tool_name, is_error, elapsed_ms, false);
 //!
 //! // After turn_guard.evaluate():
 //! recorder.record_verdict(severity, stall, divergence, strong_advisory, injections);
 //!
 //! // After main loop:
-//! let summary = recorder.finalize();
+//! recorder.end_turn(true);
+//! let events = recorder.events();
 //! ```
 
-use crate::event::clip_output_preview;
 use crate::step_checkpoint::FileBackedEventStore;
 use crate::step_protocol::*;
 use astra_turn_types::InferencePurpose;
 use regex::Regex;
-use std::collections::HashMap;
 use std::sync::OnceLock;
+
+/// Bound persisted previews by Unicode scalar count without splitting UTF-8.
+fn clip_output_preview(text: &str) -> String {
+    astra_text_utils::str_preview::truncate_str(text, 500)
+}
 
 /// Redact common credential patterns from tool output before persisting to disk.
 /// Returns (redacted_text, redaction_count).
@@ -290,8 +294,33 @@ fn redact_pem_blocks(text: &mut String) -> usize {
     count
 }
 
-/// Records chat_stream execution as Step lifecycle events.
-/// Wraps the implicit state machine with explicit StepAction tracking.
+/// Recorder facts not already owned by the heavy checkpoint. A continuation
+/// carries neither historical events nor a second execution cursor.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettledRecorderContinuation {
+    user_id: String,
+    session_id: String,
+    run_id: String,
+    descriptor: StepDescriptor,
+    payload: StepPayload,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    result: Option<StepResult>,
+    status: StepStatus,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    started_at: Option<u64>,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    completed_at: Option<u64>,
+    idempotency_key: String,
+    turn_number: u32,
+    round_index: u32,
+    step_sequence: u32,
+    current_step_sequence: u32,
+    slot_counter: u32,
+    tail_event_id: String,
+}
+
+/// Records execution as Step lifecycle events.
 pub struct StepRecorder {
     user_id: String,
     session_id: String,
@@ -307,12 +336,6 @@ pub struct StepRecorder {
     step_sequence: u32,
     current_step_sequence: Option<u32>,
     slot_counter: u32,
-    /// Per-tool timing for lightweight profiling
-    tool_timings: HashMap<String, Vec<u64>>,
-    /// Phase transitions recorded for debugging
-    phase_log: Vec<(u32, StepAction, u64)>,
-    /// Light checkpoint after each tool, heavy after each turn
-    checkpoint_count: u32,
     /// Optional file-backed persistence (JSONL) for events
     file_store: Option<FileBackedEventStore>,
     /// A host explicitly requested persistence once an authoritative session
@@ -337,9 +360,6 @@ impl StepRecorder {
             step_sequence: 0,
             current_step_sequence: None,
             slot_counter: 0,
-            tool_timings: HashMap::new(),
-            phase_log: Vec::new(),
-            checkpoint_count: 0,
             file_store: None,
             attach_persistence_on_session_adoption: false,
             persistence_required: false,
@@ -350,8 +370,6 @@ impl StepRecorder {
 
     /// Create with file-backed persistence (events written to JSONL on disk).
     ///
-    /// Scans existing checkpoints so `checkpoint_count` starts after the
-    /// highest existing file number, preventing cross-turn overwrites.
     /// Create a recorder with an explicit server-owned invocation identity.
     /// `task_id` is only a local step label; it must never be inferred as the
     /// run identity for child/delegated executions.
@@ -361,25 +379,198 @@ impl StepRecorder {
         task_id: &str,
         run_id: &str,
     ) -> Self {
-        let file_store = FileBackedEventStore::empty(user_id, session_id);
         let persisted_summary = persisted_event_summary(user_id, session_id);
-        let existing_max = crate::step_checkpoint::list_checkpoints(user_id, session_id)
-            .unwrap_or_default()
-            .iter()
-            .map(|(n, _)| *n)
-            .max()
-            .unwrap_or(0);
+        Self::with_persistent_summary(user_id, session_id, task_id, run_id, persisted_summary)
+    }
+
+    fn with_persistent_summary(
+        user_id: &str,
+        session_id: &str,
+        task_id: &str,
+        run_id: &str,
+        persisted_summary: PersistedEventSummary,
+    ) -> Self {
         Self {
-            file_store: Some(file_store),
+            file_store: Some(FileBackedEventStore::empty(user_id, session_id)),
             attach_persistence_on_session_adoption: false,
             persistence_required: true,
             invocation_run_id: Some(run_id.to_string()),
             events: Vec::new(),
             step_sequence: persisted_summary.next_step_sequence,
-            checkpoint_count: existing_max.saturating_add(1),
             persisted_tail_event_id: persisted_summary.tail_event_id,
             ..Self::new(user_id, session_id, task_id)
         }
+    }
+
+    pub fn capture_settled_continuation(
+        &self,
+        light: &LightCheckpoint,
+    ) -> Result<SettledRecorderContinuation, &'static str> {
+        let step = self
+            .current_step
+            .as_ref()
+            .ok_or("recorder has no active step")?;
+        let run_id = self
+            .invocation_run_id
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .ok_or("recorder has no execution identity")?;
+        if !self.persistence_required
+            || self.file_store.is_none()
+            || self.persistence_error.is_some()
+        {
+            return Err("recorder persistence is not confirmed");
+        }
+        if light.protocol_version != PROTOCOL_VERSION
+            || light.step_id != step.descriptor.step_id
+            || light.task_id != self.task_id
+            || light.cursor != step.execution.cursor
+            || !light.cursor.all_slots_done()
+        {
+            return Err("recorder and settled checkpoint frontier differ");
+        }
+        Ok(SettledRecorderContinuation {
+            user_id: self.user_id.clone(),
+            session_id: self.session_id.clone(),
+            run_id: run_id.clone(),
+            descriptor: step.descriptor.clone(),
+            payload: step.execution.payload.clone(),
+            result: step.execution.result.clone(),
+            status: step.execution.status,
+            started_at: step.execution.started_at,
+            completed_at: step.execution.completed_at,
+            idempotency_key: step.idempotency_key.clone(),
+            turn_number: self.turn_number,
+            round_index: self.round_index,
+            step_sequence: self.step_sequence,
+            current_step_sequence: self
+                .current_step_sequence
+                .ok_or("recorder has no step sequence")?,
+            slot_counter: self.slot_counter,
+            tail_event_id: self
+                .events
+                .last()
+                .map(|event| event.event_id.clone())
+                .or_else(|| self.persisted_tail_event_id.clone())
+                .ok_or("recorder has no confirmed causal tail")?,
+        })
+    }
+
+    /// Rebuild observation state only; the caller must independently adopt the
+    /// checkpoint and authorize the current execution generation before dispatch.
+    pub fn restore_settled_continuation(
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        saved: SettledRecorderContinuation,
+        heavy: &HeavyCheckpoint,
+    ) -> Result<Self, &'static str> {
+        if saved.user_id != user_id || saved.session_id != session_id || saved.run_id != run_id {
+            return Err("recorder continuation belongs to another execution");
+        }
+        if heavy.light.protocol_version != PROTOCOL_VERSION
+            || saved.descriptor.protocol_version != PROTOCOL_VERSION
+            || saved.descriptor.step_id != heavy.light.step_id
+            || saved.descriptor.task_id != heavy.light.task_id
+            || saved.step_sequence <= saved.current_step_sequence
+            || saved.tail_event_id.is_empty()
+            || !heavy.light.cursor.all_slots_done()
+        {
+            return Err("recorder continuation has an invalid settled frontier");
+        }
+        let window = FileBackedEventStore::load_recent_events_bounded(
+            user_id,
+            session_id,
+            256 * 1024,
+            1_024,
+        )
+        .map_err(|_| "recorder successor evidence is unreadable")?;
+        let boundary = window
+            .events
+            .iter()
+            .position(|event| event.event_id == saved.tail_event_id);
+        let terminal_status = matches!(
+            saved.status,
+            StepStatus::Completed
+                | StepStatus::Failed
+                | StepStatus::TimedOut
+                | StepStatus::Cancelled
+        );
+        let terminal_event = boundary.is_some_and(|index| {
+            window.events[..=index].iter().any(|event| {
+                event.run_id == run_id
+                    && event.step_id == saved.descriptor.step_id
+                    && matches!(
+                        event.event_type,
+                        StepEventType::StepCompleted
+                            | StepEventType::StepIncomplete
+                            | StepEventType::StepFailed
+                    )
+            })
+        });
+        if saved.completed_at.is_none() && (terminal_status || terminal_event) {
+            return Err("terminal recorder continuation lacks its completion time");
+        }
+        if window.trailing_torn_line
+            || boundary.is_none()
+                && (!window.events.is_empty()
+                    || window.prefix_truncated
+                    || window.events_dropped > 0)
+            || boundary.is_some_and(|index| {
+                window.events[index + 1..]
+                    .iter()
+                    .any(|event| event.run_id == run_id)
+            })
+        {
+            return Err("recorder continuation is stale or its successor evidence is incomplete");
+        }
+        let mut recorder = Self::with_persistent_summary(
+            user_id,
+            session_id,
+            &heavy.light.task_id,
+            run_id,
+            PersistedEventSummary {
+                next_step_sequence: saved.step_sequence,
+                tail_event_id: Some(saved.tail_event_id.clone()),
+            },
+        );
+        recorder.current_step = Some(Step {
+            descriptor: saved.descriptor,
+            execution: StepExecution {
+                cursor: heavy.light.cursor.clone(),
+                payload: saved.payload,
+                result: saved.result,
+                status: saved.status,
+                memory_context: heavy.memory_context.clone(),
+                started_at: saved.started_at,
+                completed_at: saved.completed_at,
+            },
+            idempotency_key: saved.idempotency_key,
+            checkpoint: None,
+        });
+        recorder.turn_number = saved.turn_number;
+        recorder.round_index = saved.round_index;
+        recorder.step_sequence = saved.step_sequence;
+        recorder.current_step_sequence = Some(saved.current_step_sequence);
+        recorder.slot_counter = saved.slot_counter;
+        recorder.persisted_tail_event_id = Some(saved.tail_event_id);
+        Ok(recorder)
+    }
+
+    /// Pay for durability only at a handoff, never for every ordinary event.
+    pub async fn confirm_handoff_persistence(&self) -> Result<(), String> {
+        if !self.persistence_required
+            || self.file_store.is_none()
+            || self.persistence_error.is_some()
+        {
+            return Err("recorder persistence is not available for handoff".into());
+        }
+        let path = crate::step_checkpoint::events_path_for(&self.user_id, &self.session_id)
+            .map_err(|error| format!("recorder journal binding failed: {error}"))?;
+        tokio::task::spawn_blocking(move || FileBackedEventStore::sync_events(&path))
+            .await
+            .map_err(|error| format!("recorder durability task failed: {error}"))?
+            .map_err(|error| format!("recorder durability confirmation failed: {error}"))
     }
 
     /// Create an in-memory recorder whose events become durable once the
@@ -480,8 +671,6 @@ impl StepRecorder {
         self.events.clear();
         self.current_step = None;
         self.current_step_sequence = None;
-        self.phase_log.clear();
-        self.tool_timings.clear();
         self.invocation_run_id = None;
         self.attach_persistence_on_session_adoption = false;
         self.persistence_error = None;
@@ -498,14 +687,6 @@ impl StepRecorder {
         }
 
         self.rebind_session_id(session_id);
-
-        let existing_max = crate::step_checkpoint::list_checkpoints(&self.user_id, session_id)
-            .unwrap_or_default()
-            .iter()
-            .map(|(n, _)| *n)
-            .max()
-            .unwrap_or(0);
-        self.checkpoint_count = self.checkpoint_count.max(existing_max.saturating_add(1));
 
         let persisted_summary = persisted_event_summary(&self.user_id, session_id);
         self.step_sequence = self.step_sequence.max(persisted_summary.next_step_sequence);
@@ -559,8 +740,6 @@ impl StepRecorder {
         );
 
         self.emit(step.step_id(), StepEventType::StepCreated);
-        self.phase_log
-            .push((visible_turn, StepAction::Perceive, epoch_ms()));
         self.current_step = Some(step);
     }
 
@@ -875,7 +1054,6 @@ impl StepRecorder {
             payload["output"] = serde_json::json!(redacted);
         }
         self.emit_with_payload(StepEventType::ToolCallSkipped, payload);
-        self.checkpoint_count += 1;
     }
 
     /// Attach a cached result to the most recently completed slot.
@@ -1089,13 +1267,6 @@ impl StepRecorder {
         }
 
         self.emit_with_payload(event_type, payload);
-
-        self.tool_timings
-            .entry(tool_name.to_string())
-            .or_default()
-            .push(elapsed_ms);
-
-        self.checkpoint_count += 1;
     }
 
     fn active_call_id_for_tool(&self, tool_name: &str) -> Option<String> {
@@ -1315,8 +1486,6 @@ impl StepRecorder {
                 "injections": injections_count,
             }),
         );
-
-        self.checkpoint_count += 1;
     }
 
     /// Record LLM token usage for the turn.
@@ -1361,40 +1530,6 @@ impl StepRecorder {
         self.emit(&step_id, event_type);
     }
 
-    /// Get the execution summary after all turns complete.
-    pub fn summary(&self) -> RecorderSummary {
-        let total_tools: usize = self.tool_timings.values().map(|v| v.len()).sum();
-        let total_tool_time_ms: u64 = self.tool_timings.values().flatten().sum();
-
-        let mut slowest_tools: Vec<(String, u64)> = self
-            .tool_timings
-            .iter()
-            .map(|(name, times)| {
-                let avg = times.iter().sum::<u64>() / times.len().max(1) as u64;
-                (name.clone(), avg)
-            })
-            .collect();
-        slowest_tools.sort_by_key(|b| std::cmp::Reverse(b.1));
-        slowest_tools.truncate(5);
-
-        RecorderSummary {
-            user_id: self.user_id.clone(),
-            session_id: self.session_id.clone(),
-            task_id: self.task_id.clone(),
-            iterations: if self.events.is_empty() {
-                0
-            } else {
-                self.turn_number + 1
-            },
-            total_events: self.events.len(),
-            total_tools,
-            total_tool_time_ms,
-            slowest_tools,
-            checkpoints: self.checkpoint_count,
-            phase_log: self.phase_log.clone(),
-        }
-    }
-
     /// Get all recorded events (for persistence/audit).
     pub fn events(&self) -> &[StepEvent] {
         &self.events
@@ -1420,7 +1555,7 @@ impl StepRecorder {
     }
 
     /// Build a light checkpoint from current recorder state.
-    /// Light checkpoints capture cursor position only — fast, small, frequent.
+    /// Captures the cursor and metadata embedded in a heavy recovery checkpoint.
     pub fn build_light_checkpoint(&self) -> Option<LightCheckpoint> {
         let step = self.current_step.as_ref()?;
         Some(LightCheckpoint {
@@ -1512,7 +1647,6 @@ impl StepRecorder {
     // ── Internal helpers ──
 
     fn transition_phase(&mut self, action: StepAction) {
-        self.phase_log.push((self.turn_number, action, epoch_ms()));
         if let Some(ref mut step) = self.current_step {
             step.execution.cursor.phase = action;
         }
@@ -1726,21 +1860,6 @@ fn step_sequence_from_event(event: &StepEvent) -> Option<u32> {
                 .next()
                 .and_then(|seq| seq.parse::<u32>().ok())
         })
-}
-
-/// Summary of a recorded session for debugging/audit.
-#[derive(Debug, Clone)]
-pub struct RecorderSummary {
-    pub user_id: String,
-    pub session_id: String,
-    pub task_id: String,
-    pub iterations: u32,
-    pub total_events: usize,
-    pub total_tools: usize,
-    pub total_tool_time_ms: u64,
-    pub slowest_tools: Vec<(String, u64)>,
-    pub checkpoints: u32,
-    pub phase_log: Vec<(u32, StepAction, u64)>,
 }
 
 fn epoch_ms() -> u64 {
@@ -2356,37 +2475,6 @@ mod tests {
     }
 
     #[test]
-    fn recorder_summary() {
-        let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
-
-        // Turn 0: 2 tools
-        rec.begin_turn(0);
-        rec.begin_act(2);
-        rec.begin_tool("grep", "c1");
-        rec.complete_tool("grep", false, 100, false);
-        rec.begin_tool("read_file", "c2");
-        rec.complete_tool("read_file", false, 30, false);
-        rec.end_turn(false);
-
-        // Turn 1: 1 tool
-        rec.begin_turn(1);
-        rec.begin_act(1);
-        rec.begin_tool("grep", "c3");
-        rec.complete_tool("grep", false, 80, false);
-        rec.end_turn(true);
-
-        let summary = rec.summary();
-        assert_eq!(summary.user_id, TEST_USER_ID);
-        assert_eq!(summary.session_id, "sess-1");
-        assert_eq!(summary.task_id, "task-1");
-        assert_eq!(summary.iterations, 2);
-        assert_eq!(summary.total_tools, 3);
-        assert_eq!(summary.total_tool_time_ms, 210);
-        assert!(!summary.slowest_tools.is_empty());
-        assert_eq!(summary.slowest_tools[0].0, "grep"); // grep is slowest (avg 90ms)
-    }
-
-    #[test]
     fn recorder_events_form_causal_chain() {
         let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
@@ -2406,57 +2494,40 @@ mod tests {
     }
 
     #[test]
-    fn recorder_multi_turn_phase_log() {
+    fn recorder_multi_turn_phase_cursor() {
         let mut rec = StepRecorder::new(TEST_USER_ID, "sess-1", "task-1");
         rec.begin_turn(0);
-        rec.record_plan(&["grep".into()], 0.0, 4000);
-        rec.begin_act(1);
-        rec.record_verdict("Healthy", false, false, false, 0);
-        rec.end_turn(false);
-
-        rec.begin_turn(1);
-        rec.begin_act(1);
-        rec.end_turn(true);
-
-        // Phase log should capture all transitions
-        let phases: Vec<StepAction> = rec.summary().phase_log.iter().map(|(_, a, _)| *a).collect();
-        // Turn 0: Perceive, Plan, Act, Evaluate
-        // Turn 1: Perceive, Act
-        assert!(phases.contains(&StepAction::Perceive));
-        assert!(phases.contains(&StepAction::Plan));
-        assert!(phases.contains(&StepAction::Act));
-        assert!(phases.contains(&StepAction::Evaluate));
-    }
-
-    #[test]
-    fn with_persistence_starts_after_existing_checkpoints() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
-        let sid = "test-cp-resume";
-
-        let light = crate::step_protocol::StepCheckpoint::light(
-            "step-3".to_string(),
-            "task-1".to_string(),
-            sid.to_string(),
-            crate::step_protocol::ExecutionCursor::default(),
-        );
-        crate::step_checkpoint::write_step_checkpoint(TEST_USER_ID, sid, 3, &light).unwrap();
-        let heavy = crate::step_protocol::StepCheckpoint::heavy(
-            "step-5".to_string(),
-            "task-1".to_string(),
-            sid.to_string(),
-            crate::step_protocol::ExecutionCursor::default(),
-        );
-        crate::step_checkpoint::write_step_checkpoint(TEST_USER_ID, sid, 5, &heavy).unwrap();
-
-        let rec = StepRecorder::with_persistence_for_run(TEST_USER_ID, sid, "task-1", "test-run");
-        // checkpoint_count should be max(5,3) + 1 = 6
         assert_eq!(
-            rec.summary().checkpoints,
-            6,
-            "checkpoint_count must start after existing max"
+            rec.current_step().unwrap().execution.cursor.phase,
+            StepAction::Perceive
         );
-        // tmp is dropped here, cleaning up automatically
+        rec.record_plan(&["grep".into()], 0.0, 4000);
+        assert_eq!(
+            rec.current_step().unwrap().execution.cursor.phase,
+            StepAction::Plan
+        );
+        rec.begin_act(1);
+        assert_eq!(
+            rec.current_step().unwrap().execution.cursor.phase,
+            StepAction::Act
+        );
+        rec.record_verdict("Healthy", false, false, false, 0);
+        assert_eq!(
+            rec.current_step().unwrap().execution.cursor.phase,
+            StepAction::Evaluate
+        );
+        rec.end_turn(false);
+        rec.begin_turn(1);
+        assert_eq!(
+            rec.current_step().unwrap().execution.cursor.phase,
+            StepAction::Perceive
+        );
+        rec.begin_act(1);
+        assert_eq!(
+            rec.current_step().unwrap().execution.cursor.phase,
+            StepAction::Act
+        );
+        rec.end_turn(true);
     }
 
     #[test]
@@ -2470,8 +2541,6 @@ mod tests {
         rec.attach_persistence("sess-adopted");
         rec.end_turn(true);
 
-        assert_eq!(rec.summary().user_id, TEST_USER_ID);
-        assert_eq!(rec.summary().session_id, "sess-adopted");
         assert_eq!(
             rec.current_step().unwrap().step_id(),
             "sess-adopted-run-task-1-turn-0-step-0"
@@ -2673,6 +2742,141 @@ mod tests {
                 .get("step_sequence")
                 .and_then(serde_json::Value::as_u64),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn settled_continuation_restores_the_same_step_without_replaying_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let mut original =
+            StepRecorder::with_persistence_for_run(TEST_USER_ID, "restore-session", "task", "run");
+        original.begin_turn_with_context(7, 3);
+        original.begin_act_with_slots(vec![ExecutionSlotSpec {
+            tool_name: "read_file".into(),
+            call_id: "call-1".into(),
+            idempotency_key: None,
+            args_preview: None,
+        }]);
+        original.begin_tool_with_key("read_file", "call-1", None);
+        assert!(
+            original
+                .capture_settled_continuation(&original.build_light_checkpoint().unwrap())
+                .is_err()
+        );
+        original.complete_tool("read_file", false, 12, false);
+        original.record_verdict("continue", false, false, false, 0);
+        let unfinished_heavy = original
+            .build_heavy_checkpoint(&[], 100, 3, &[], &[])
+            .unwrap();
+        let unfinished = original
+            .capture_settled_continuation(&unfinished_heavy.light)
+            .unwrap();
+        assert!(unfinished.completed_at.is_none());
+        assert!(
+            StepRecorder::restore_settled_continuation(
+                TEST_USER_ID,
+                "restore-session",
+                "run",
+                unfinished,
+                &unfinished_heavy,
+            )
+            .is_ok(),
+            "settled tools do not imply the enclosing step has ended"
+        );
+        original.end_turn(false);
+        let heavy = original
+            .build_heavy_checkpoint(
+                &[serde_json::json!({"role":"user", "content":"Continue"})],
+                100,
+                3,
+                &[],
+                &[],
+            )
+            .unwrap();
+        let saved = original.capture_settled_continuation(&heavy.light).unwrap();
+        let serialized = serde_json::to_value(&saved).unwrap();
+        assert!(serialized.get("cursor").is_none());
+        assert!(serialized.get("events").is_none());
+        assert!(serialized.get("tool_timings").is_none());
+        assert!(serialized.get("phase_log").is_none());
+        for field in ["result", "started_at", "completed_at"] {
+            let mut missing = serialized.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<SettledRecorderContinuation>(missing).is_err());
+            let mut explicit_null = serialized.clone();
+            explicit_null[field] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<SettledRecorderContinuation>(explicit_null).is_ok());
+        }
+        let saved: SettledRecorderContinuation = serde_json::from_value(serialized).unwrap();
+        let tail = original.events().last().unwrap().event_id.clone();
+        let expected_step = serde_json::to_value(original.current_step()).unwrap();
+        for invalid in 0..4 {
+            let mut rejected = saved.clone();
+            match invalid {
+                0 => rejected.run_id = "another-run".into(),
+                1 => rejected.descriptor.step_id = "another-step".into(),
+                2 => rejected.step_sequence = rejected.current_step_sequence,
+                _ => rejected.completed_at = None,
+            }
+            assert!(
+                StepRecorder::restore_settled_continuation(
+                    TEST_USER_ID,
+                    "restore-session",
+                    "run",
+                    rejected,
+                    &heavy
+                )
+                .is_err()
+            );
+        }
+        let mut other = StepRecorder::with_persistence_for_run(
+            TEST_USER_ID,
+            "restore-session",
+            "other-task",
+            "other-run",
+        );
+        other.begin_turn(0);
+        other.end_turn(false);
+        let mut restored = StepRecorder::restore_settled_continuation(
+            TEST_USER_ID,
+            "restore-session",
+            "run",
+            saved.clone(),
+            &heavy,
+        )
+        .unwrap();
+        assert!(restored.events().is_empty());
+        assert_eq!(
+            serde_json::to_value(restored.current_step()).unwrap(),
+            expected_step
+        );
+        restored.end_turn(false);
+        assert!(
+            restored.events().is_empty(),
+            "already-settled step must not emit another terminal"
+        );
+        restored.begin_turn_with_context(7, 4);
+        let event = restored.events().last().unwrap();
+        assert_eq!(event.caused_by, vec![tail]);
+        assert_eq!(
+            event.payload.as_ref().unwrap()["trace_context"]["step_sequence"],
+            1
+        );
+        assert_ne!(
+            restored.current_step().unwrap().step_id(),
+            heavy.light.step_id
+        );
+        assert!(
+            StepRecorder::restore_settled_continuation(
+                TEST_USER_ID,
+                "restore-session",
+                "run",
+                saved,
+                &heavy,
+            )
+            .is_err(),
+            "same-run successor must make the old continuation stale"
         );
     }
 

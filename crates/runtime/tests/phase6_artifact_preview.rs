@@ -7,7 +7,8 @@ use astra_services::{
     DatabaseRunStateStore, DatabaseSessionArtifactStore, DatabaseSessionService,
     DatabaseStateProjectionStore, SessionArtifactContentChunkV1,
     SessionArtifactContentDescriptorV1, SessionArtifactContentStore, SessionArtifactJsonRecord,
-    SessionArtifactStoreError, SessionService, StateItemUpsert, build_presigned_artifact_download,
+    SessionArtifactJsonStore, SessionArtifactReference, SessionArtifactReferenceKind,
+    SessionArtifactStoreError, SessionService, build_presigned_artifact_download,
     runs::ToolOutputBatchItem,
 };
 use serde_json::json;
@@ -371,7 +372,7 @@ async fn l2_49_byte_artifact_round_trip_reservation_seal_load_and_gc() {
         )
         .await
         .unwrap();
-    assert_eq!(sealed.status.as_deref(), Some("active"));
+    assert_eq!(sealed.artifact.status.as_deref(), Some("active"));
     let upload_lease_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM session_artifact_content_upload_leases
          WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
@@ -584,6 +585,58 @@ async fn l2_49b_shared_chunk_seals_use_global_lock_order() {
 
 shared_db_test! {
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn byte_artifact_batch_reads_preserve_duplicates_and_reject_corrupt_sizes() {
+    let pool = setup_pool().await;
+    let (user_id, session_id, _) = ids();
+    insert_session(&pool, &user_id, &session_id).await;
+    let artifact_id = format!("batch-content-{}", Uuid::new_v4());
+    let mut payloads = (0..130).map(|index| format!("chunk-{index}").into_bytes()).collect::<Vec<_>>();
+    payloads.push(payloads[0].clone());
+    let all = payloads.concat();
+    let mut descriptor = SessionArtifactContentDescriptorV1::new(
+        astra_services::SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1, content_digest(&all), all.len() as u64,
+    );
+    descriptor.chunk_count = payloads.len() as u64;
+    let store = DatabaseSessionArtifactStore::new(pool.settings().clone()).with_pool(pool.clone());
+    store.begin_byte_artifact(SessionArtifactJsonRecord {
+        artifact_id: artifact_id.clone(), session_id: session_id.clone(), user_id: user_id.clone(),
+        artifact_kind: "bytes".into(), source: None, turn: None, round: None,
+        content: json!({"purpose":"batch-read-contract"}), metadata: None, references: Vec::new(),
+    }, descriptor).await.unwrap();
+    let mut refs = Vec::new();
+    for (index, bytes) in payloads.iter().enumerate() {
+        let digest = content_digest(bytes);
+        store.put_content_chunk(&user_id, &session_id, &artifact_id, &digest, bytes.clone()).await.unwrap();
+        refs.push(SessionArtifactContentChunkV1 { chunk_index: index as u64, digest, byte_size: bytes.len() as u64 });
+    }
+    let sealed = store.seal_byte_artifact(&user_id, &session_id, &artifact_id, refs.clone(), Vec::new()).await.unwrap();
+    let replay = store.seal_byte_artifact(&user_id, &session_id, &artifact_id, refs.clone(), Vec::new()).await.unwrap();
+    let loaded = store.load_byte_artifact(&user_id, &session_id, &artifact_id).await.unwrap().unwrap();
+    assert_eq!(sealed.descriptor, replay.descriptor);
+    assert_eq!(sealed.descriptor, loaded.descriptor);
+    for bundle in [&sealed, &replay, &loaded] {
+        assert_eq!(bundle.chunks.iter().map(|chunk| chunk.bytes.as_slice()).collect::<Vec<_>>(), payloads.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    }
+    let digest = content_digest(&payloads[0]);
+    let corrupt = vec![b'x'; 4096];
+    sqlx::query("UPDATE session_artifact_content_chunks SET byte_size = ?, content = ? WHERE user_id = ? AND content_digest = ?")
+        .bind(corrupt.len() as u64).bind(corrupt).bind(&user_id).bind(&digest).execute(pool.get()).await.unwrap();
+    assert!(matches!(store.seal_byte_artifact(&user_id, &session_id, &artifact_id, refs, Vec::new()).await,
+        Err(SessionArtifactStoreError::ContentChunkSizeMismatch { .. })));
+    assert!(matches!(store.load_byte_artifact(&user_id, &session_id, &artifact_id).await,
+        Err(SessionArtifactStoreError::ContentChunkSizeMismatch { .. })));
+    assert!(matches!(store.load_byte_artifact_chunk(&user_id, &session_id, &artifact_id, &digest).await,
+        Err(SessionArtifactStoreError::ContentChunkSizeMismatch { .. })));
+    sqlx::query("UPDATE session_artifact_content_chunks SET byte_size = ?, content = ? WHERE user_id = ? AND content_digest = ?")
+        .bind(payloads[0].len() as u64).bind(&payloads[0]).bind(&user_id).bind(&digest).execute(pool.get()).await.unwrap();
+    assert!(store.load_byte_artifact(&user_id, &session_id, &artifact_id).await.unwrap().is_some());
+    DatabaseSessionService::new(pool.settings().clone()).with_pool(pool)
+        .delete_session(session_id, user_id).await.unwrap();
+}
+}
+
+shared_db_test! {
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
 async fn l2_49c_sealed_expiry_and_session_delete_do_not_deadlock() {
     let pool = setup_pool().await;
     let (user_id, session_id, _) = ids();
@@ -705,7 +758,7 @@ async fn l2_49c_sealed_expiry_and_session_delete_do_not_deadlock() {
 shared_db_test! {
 
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_49d_state_projection_and_session_delete_are_fenced() {
+async fn l2_49d_personal_skill_activation_and_session_delete_are_fenced() {
     let pool = setup_pool().await;
     let (user_id, session_id, _) = ids();
     insert_session(&pool, &user_id, &session_id).await;
@@ -726,43 +779,37 @@ async fn l2_49d_state_projection_and_session_delete_are_fenced() {
     .await;
 
     let projection = DatabaseStateProjectionStore::new(pool.clone());
-    let item = StateItemUpsert {
-        item_id: Some(format!("state-race-{}", Uuid::new_v4())),
-        user_id: user_id.clone(),
-        session_id: session_id.clone(),
-        scope: "session".to_string(),
-        category: "finding".to_string(),
-        item_key: "artifact-race".to_string(),
-        status: "active".to_string(),
-        priority: 10,
-        source: "phase6-race".to_string(),
-        provenance_event_id: None,
-        run_id: None,
-        title: Some("state projection race".to_string()),
-        summary_text: Some("the writer and delete must settle cleanly".to_string()),
-        payload_json: json!({"artifact_id": artifact_id}),
-        token_estimate: 32,
-        mutation: "insert".to_string(),
-    };
+    let skill_name = format!("activation-race-{}", Uuid::new_v4());
+    let skills = astra_services::DatabasePersonalSkillStore::new(pool.clone());
+    let version = skills.submit_version(
+        &user_id,
+        &skill_name,
+        astra_services::SubmitUserSkillVersion {
+            version: "v1".to_string(),
+            manifest_json: json!({"name": skill_name, "description": "Review changes"}),
+            content_markdown: "## Instructions\n\nReview changes.\n".to_string(),
+            status: Some("published".to_string()),
+        },
+    ).await.unwrap();
     let service = DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
         .with_pool(pool.clone());
     let (write, deleted) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         async {
             tokio::join!(
-                projection.upsert_state_item(item),
+                projection.activate_personal_skill_from_ui(&user_id, &session_id, &skill_name, &version.version_id),
                 service.delete_session(session_id.clone(), user_id.clone()),
             )
         },
     )
     .await
-    .expect("state projection and Session delete must not deadlock");
+    .expect("skill activation and Session delete must not deadlock");
 
     deleted.expect("Session delete should succeed without saved Work");
     if let Err(error) = write {
         assert!(
             matches!(error, astra_services::StateProjectionError::SessionNotActive { .. }),
-            "a losing state writer should fail with an actionable lifecycle error: {error}"
+            "a losing skill activation should fail with an actionable lifecycle error: {error}"
         );
     }
 
@@ -771,8 +818,11 @@ async fn l2_49d_state_projection_and_session_delete_are_fenced() {
             (SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?) AS sessions,
             (SELECT COUNT(*) FROM session_state_items WHERE user_id = ? AND session_id = ?) AS state_items,
             (SELECT COUNT(*) FROM session_state_item_events WHERE user_id = ? AND session_id = ?) AS state_events,
-            (SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ?) AS artifacts",
+            (SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ?) AS artifacts,
+            (SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?) AS activation_events",
     )
+    .bind(&user_id)
+    .bind(&session_id)
     .bind(&user_id)
     .bind(&session_id)
     .bind(&user_id)
@@ -788,6 +838,12 @@ async fn l2_49d_state_projection_and_session_delete_are_fenced() {
     assert_eq!(row.try_get::<i64, _>("state_items").unwrap(), 0);
     assert_eq!(row.try_get::<i64, _>("state_events").unwrap(), 0);
     assert_eq!(row.try_get::<i64, _>("artifacts").unwrap(), 0);
+    assert_eq!(row.try_get::<i64, _>("activation_events").unwrap(), 0);
+    sqlx::query("DELETE FROM user_skill_versions WHERE owner_user_id = ? AND skill_name = ?")
+        .bind(&user_id).bind(&skill_name).execute(pool.get()).await.unwrap();
+    sqlx::query("DELETE FROM user_skill_sources WHERE owner_user_id = ? AND skill_name = ?")
+        .bind(&user_id).bind(&skill_name).execute(pool.get()).await.unwrap();
+
 }
 }
 
@@ -1247,5 +1303,136 @@ async fn l3_18_s12_14_day_review_retention() {
     assert_eq!(row.try_get::<i64, _>("long_term_extended").unwrap(), 10);
     assert_eq!(row.try_get::<i64, _>("default_processed").unwrap(), 240);
     assert_eq!(row.try_get::<i64, _>("default_still_active").unwrap(), 0);
+}
+}
+
+shared_db_test! {
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+async fn context_history_session_reference_survives_gc_and_owned_session_deletion_releases_it() {
+    let pool = setup_pool().await;
+    let (user_id, session_id, run_id) = ids();
+    insert_session(&pool, &user_id, &session_id).await;
+    let store = DatabaseSessionArtifactStore::new(astra_core::MatrixOneSettings::from_env())
+        .with_pool(pool.clone());
+    let id = Uuid::new_v4().to_string();
+    let reference = SessionArtifactReference {
+        kind: SessionArtifactReferenceKind::SessionTranscript,
+        reference_id: session_id.clone(),
+    };
+    let history = astra_turn_types::ContextHistoryArtifactV1::new(
+        &session_id,
+        &run_id,
+        1,
+        serde_json::to_string(&json!([{"role":"user","content":"exact historical request"}]))
+            .unwrap(),
+    )
+    .unwrap();
+    let record = SessionArtifactJsonRecord {
+        artifact_id: id.clone(),
+        session_id: session_id.clone(),
+        user_id: user_id.clone(),
+        artifact_kind: astra_turn_types::CONTEXT_HISTORY_ARTIFACT_KIND.into(),
+        source: None,
+        turn: None,
+        round: None,
+        content: serde_json::to_value(history).unwrap(),
+        metadata: None,
+        references: vec![reference.clone()],
+    };
+    store.persist_json_artifact(record.clone()).await.unwrap();
+    assert_eq!(
+        store
+            .list_json_artifact_references(&user_id, &session_id, &id, 10)
+            .await
+            .unwrap(),
+        vec![reference.clone()]
+    );
+    assert_eq!(
+        store
+            .list_json_artifacts_for_reference(&user_id, &session_id, &reference, 10)
+            .await
+            .unwrap(),
+        vec![id.clone()]
+    );
+    sqlx::query(
+        "UPDATE agent_sessions SET status = 'deleting' WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let mut late_record = record.clone();
+    late_record.artifact_id = Uuid::new_v4().to_string();
+    assert!(matches!(
+        store.persist_json_artifact(late_record.clone()).await,
+        Err(SessionArtifactStoreError::SessionNotOwned { .. })
+    ));
+    assert!(matches!(
+        store
+            .retain_json_artifact_reference(&user_id, &session_id, &id, &reference)
+            .await,
+        Err(SessionArtifactStoreError::SessionNotOwned { .. })
+    ));
+    sqlx::query("UPDATE agent_sessions SET status = 'active' WHERE user_id = ? AND session_id = ?")
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE session_artifacts SET retention_until = DATE_SUB(NOW(6), INTERVAL 1 DAY) WHERE user_id = ? AND session_id = ? AND artifact_id = ?")
+        .bind(&user_id).bind(&session_id).bind(&id).execute(pool.get()).await.unwrap();
+    run_artifact_retention_gc_once(pool.clone(), 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        artifact_status(&pool, &user_id, &session_id, &id).await.0,
+        "active"
+    );
+    let service = DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
+        .with_pool(pool.clone());
+    let denial = service
+        .delete_session(session_id.clone(), "foreign-owner".into())
+        .await
+        .unwrap_err();
+    assert_eq!(denial.0, axum::http::StatusCode::NOT_FOUND);
+    assert!(
+        store
+            .load_json_artifact(&user_id, &session_id, &id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    service
+        .delete_session(session_id.clone(), user_id.clone())
+        .await
+        .unwrap();
+    let references: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_artifact_references WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    let artifacts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_artifacts WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!((references, artifacts), (0, 0));
+    assert!(matches!(
+        store.persist_json_artifact(late_record).await,
+        Err(SessionArtifactStoreError::SessionNotOwned { .. })
+    ));
+    assert!(matches!(
+        store
+            .retain_json_artifact_reference(&user_id, &session_id, &id, &reference)
+            .await,
+        Err(SessionArtifactStoreError::SessionNotOwned { .. })
+    ));
 }
 }

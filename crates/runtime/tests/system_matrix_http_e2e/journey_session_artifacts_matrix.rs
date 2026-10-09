@@ -1,6 +1,7 @@
 //! Session artifact HTTP E2E: authenticated list/get routes align with `session_artifacts`,
 //! including kind filtering, session scoping, and cross-user isolation.
 
+use super::harness::{ProviderResponse, ProviderScript};
 use axum::http::StatusCode;
 use axum::{body, body::Body, http::Request};
 use serde_json::{Value, json};
@@ -339,7 +340,7 @@ async fn spawn_raw_partial_transport_server(
                     hits.record_stream(&req);
                     let partial = format!(
                         "data: {}\n\n",
-                        json!({"choices":[{"delta":{"content": partial_text}}]})
+                        json!({"choices":[{"delta":{"content": partial_text}}],"usage":{"prompt_tokens":17,"completion_tokens":3,"total_tokens":20}})
                     );
                     let chunk = format!("{:X}\r\n{}\r\n", partial.len(), partial);
                     let response = format!(
@@ -932,12 +933,15 @@ pub async fn run_published_session_artifact_round_trip() {
         "fresh session should not have llm_capture artifacts"
     );
 
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth,vec![ProviderScript::new("run_published_session_artifact_round_trip",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="publish llm capture and read it back")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Artifact publish verified.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let payload = json!({
         "message": "publish llm capture and read it back",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "session_id": &session_id,
         "model_selection": seeded_model_selection(ctx),
         "context": {
-            "test_llm_rounds": [{ "full_text": "Artifact publish verified." }]
+
         }
     });
     let (status, body) = stream_chat_full_server_owned(app, auth, payload).await;
@@ -1053,12 +1057,15 @@ pub async fn run_session_artifact_latest_and_download_routes() {
     assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
     let session_id = sess["session_id"].as_str().expect("session_id").to_string();
 
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(auth,vec![ProviderScript::new("run_session_artifact_latest_and_download_routes",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="publish llm capture for latest and download routes")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Artifact download verified.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let payload = json!({
         "message": "publish llm capture for latest and download routes",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "session_id": &session_id,
         "model_selection": seeded_model_selection(ctx),
         "context": {
-            "test_llm_rounds": [{ "full_text": "Artifact download verified." }]
+
         }
     });
     let (status, body) = stream_chat_full_server_owned(app, auth, payload).await;
@@ -1208,153 +1215,6 @@ pub async fn run_session_artifact_latest_and_download_routes() {
     );
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &other_session_id).await;
-    ctx.close().await;
-}
-
-pub async fn run_failed_session_artifact_latest_and_download_routes() {
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({ "title": "artifact failed latest download", "metadata": { "full_llm_capture": true, "suite": "artifact_failed_latest_download" } }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let failure_message = "Synthetic streamed failure for artifact latest/download.";
-    let partial_text = "half answer before failure";
-    let payload = json!({
-        "message": "publish failed llm capture for latest and download routes",
-        "session_id": &session_id,
-        "model_selection": seeded_model_selection(ctx),
-        "context": {
-            "test_llm_rounds": [{
-                "error": {
-                    "message": failure_message,
-                    "kind": "stream_transport",
-                    "details": {
-                        "partial_full_text": partial_text,
-                        "usage": { "prompt_tokens": 17, "completion_tokens": 3 }
-                    }
-                }
-            }]
-        }
-    });
-    let (status, body) = stream_chat_full_server_owned(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
-    assert!(
-        body.contains(failure_message),
-        "SSE body should surface the scripted failure: {body}"
-    );
-    assert!(
-        body.contains("\"status\":\"paused\""),
-        "a transport failure must leave the user a resumable paused run: {body}"
-    );
-    assert!(
-        body.contains("\"resumable\":true"),
-        "SSE body should tell the client the interrupted run can resume: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest failed llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["artifact_id"].as_str(), Some(artifact_id.as_str()));
-    assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        latest_j["content"]["response"]["error"].as_str(),
-        Some(failure_message)
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("stream_transport")
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-    // Artifacts carry the canonical token-usage schema
-    // (`input_tokens` / `output_tokens`) regardless of which wire dialect the
-    // upstream provider spoke. `llm_capture_error_response` is responsible
-    // for normalizing `ClassifiedError.details.usage` from OpenAI-style
-    // (`prompt_tokens`/`completion_tokens`) into the canonical form before
-    // flattening. If this assertion regresses, error artifacts have drifted
-    // away from the canonical schema shared by the server-owned SSE path.
-    assert_eq!(
-        latest_j["content"]["response"]["usage"]["input_tokens"].as_i64(),
-        Some(17)
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
-        Some(3)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    assert_eq!(
-        download_headers
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("application/json")
-    );
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(
-        download_j["artifact_id"].as_str(),
-        Some(artifact_id.as_str())
-    );
-    assert_eq!(download_j["artifact_kind"].as_str(), Some("llm_capture"));
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        download_j["content"]["response"]["error"].as_str(),
-        Some(failure_message)
-    );
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("stream_transport")
-    );
-    assert_eq!(
-        download_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-    // Same canonical-schema rationale as the `latest_j` assertion above.
-    assert_eq!(
-        download_j["content"]["response"]["usage"]["input_tokens"].as_i64(),
-        Some(17)
-    );
-    assert_eq!(
-        download_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
-        Some(3)
-    );
-    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     ctx.close().await;
 }
 
@@ -1594,23 +1454,19 @@ pub async fn run_server_loop_transport_preserves_partial_without_replay_routes()
         Some(partial_text)
     );
 
+    assert_eq!(latest_j["artifact_id"].as_str(), Some(artifact_id.as_str()));
+    assert_eq!(latest_j["content"]["response"]["usage"]["input_tokens"], 17);
+    assert_eq!(latest_j["content"]["response"]["usage"]["output_tokens"], 3);
     let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
+    let (st_download, download_headers, download_body) =
         get_bytes(app, &download_path, Some(auth), &[]).await;
     assert_eq!(st_download, StatusCode::OK, "artifact download");
+    assert_eq!(
+        download_headers.get("content-type").unwrap(),
+        "application/json"
+    );
     let _download_descriptor =
         assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("stream_transport")
-    );
-    assert_eq!(
-        download_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
     assert_eq!(
         hits.stream_hits.load(Ordering::SeqCst),
         1,

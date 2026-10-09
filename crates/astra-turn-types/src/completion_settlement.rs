@@ -24,25 +24,6 @@ pub struct CompletionSettlementState {
     /// Number of same-turn recovery calls made after the provider returned a
     /// successful response with neither tool calls nor user-visible text.
     pub textless_response_retries: u32,
-    /// Number of bounded terminal rewrites after a tool failure remained
-    /// unresolved across multiple policy observations.  The retry is
-    /// synthesis-only: it calibrates claims against retained evidence rather
-    /// than reopening exploration or hiding the failed outcome.
-    pub outcome_reconciliation_retries: u32,
-    /// A single provider-schema correction may replace a task-resolution
-    /// submission rejected by the runtime argument preflight. This is
-    /// independent of the one accepted assessment attempt and is initialized
-    /// only when a fresh reconciliation window is opened. Missing legacy
-    /// checkpoints default to zero so they never gain repair authority.
-    #[serde(default)]
-    pub outcome_reconciliation_schema_corrections_remaining: u8,
-    /// Structurally valid evidence-linked model interpretation observed for the
-    /// active boundary.  Executor evidence validation may still reject it;
-    /// retaining that candidate lets the terminal coverage reducer expose the
-    /// exact rejection instead of reporting a misleading missing assessment.
-    /// This does not replace execution facts or deterministic verifier receipts.
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub outcome_reconciliation_assessment: Option<crate::task_resolution::TaskResolutionAssessment>,
     /// Number of bounded same-turn retries after a task whose typed profile
     /// requires a workspace change attempted to finish without recording one.
     /// This is deliberately separate from the read-only escalation advisory:
@@ -140,7 +121,11 @@ pub struct CompletionSettlementState {
     #[serde(deserialize_with = "deserialize_required_option")]
     pub latest_provider_text: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
+    pub latest_provider_text_model_item_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
     pub deferred_candidate_text: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub deferred_candidate_model_item_id: Option<String>,
     /// Source of the active wrap-up boundary, if any.
     #[serde(deserialize_with = "deserialize_required_option")]
     pub wrapup_origin: Option<BudgetWrapupOrigin>,
@@ -163,10 +148,6 @@ pub struct ForegroundFanoutPagination {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum CompletionAction {
-    /// Submit an evidence-linked model assessment at this exact boundary.
-    /// Matching admission does not establish acceptance or verification success.
-    #[serde(rename = "outcome_reconciliation")]
-    OutcomeReconciliation { boundary_id: String },
     #[serde(rename = "required_workspace_mutation")]
     RequiredWorkspaceMutation,
     #[serde(rename = "required_external_effect")]
@@ -245,9 +226,6 @@ mod tests {
             canonical_work_establishment_retries: 1,
             output_cap_continuations: 1,
             textless_response_retries: 1,
-            outcome_reconciliation_retries: 2,
-            outcome_reconciliation_schema_corrections_remaining: 11,
-            outcome_reconciliation_assessment: None,
             workspace_mutation_retries: 3,
             external_effect_retries: 4,
             external_effect_recovery_paths: Some(vec!["artifact".into()]),
@@ -265,7 +243,9 @@ mod tests {
             }),
             preserve_final_synthesis_wire_surface: true,
             latest_provider_text: Some("latest".into()),
+            latest_provider_text_model_item_id: Some("latest-item".into()),
             deferred_candidate_text: Some("candidate".into()),
+            deferred_candidate_model_item_id: Some("candidate-item".into()),
             completion_action_window: Some(CompletionActionWindow {
                 action: CompletionAction::ExplicitVerification {
                     missing_labels: vec!["validator".into()],
@@ -290,21 +270,7 @@ mod tests {
             serde_json::from_value::<CompletionSettlementState>(wire.clone()).unwrap(),
             state
         );
-        let mut legacy_wire = wire.clone();
-        legacy_wire
-            .as_object_mut()
-            .unwrap()
-            .remove("outcome_reconciliation_schema_corrections_remaining");
-        let restored_legacy =
-            serde_json::from_value::<CompletionSettlementState>(legacy_wire).unwrap();
-        assert_eq!(
-            restored_legacy.outcome_reconciliation_schema_corrections_remaining, 0,
-            "legacy checkpoints gain no schema-correction authority"
-        );
         for field in wire.as_object().unwrap().keys() {
-            if field == "outcome_reconciliation_schema_corrections_remaining" {
-                continue;
-            }
             let mut incomplete = wire.clone();
             incomplete.as_object_mut().unwrap().remove(field);
             assert!(

@@ -5,12 +5,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use astra_core::{
-    ObservationActionHint, ObservationBudgetOmitted, ObservationBudgetResult,
-    ObservationConfidence, ObservationDataCoverage, ObservationEvidence, ObservationFailureCluster,
-    ObservationGraphEdgeKind, ObservationGraphLayer, ObservationGraphNode,
-    ObservationGraphNodeKind, ObservationGraphSlice, ObservationProviderCoverage,
-    ObservationRecord, ObservationView, SourcePolicy, Urn, classify_event_kind, push_graph_edge,
-    push_graph_node, truncate_graph_summary,
+    ObservationActionHint, ObservationBudgetResult, ObservationConfidence, ObservationDataCoverage,
+    ObservationEvidence, ObservationFailureCluster, ObservationGraphEdgeKind,
+    ObservationGraphLayer, ObservationGraphNode, ObservationGraphNodeKind, ObservationGraphSlice,
+    ObservationProviderCoverage, ObservationRecord, ObservationView, SourcePolicy, Urn,
+    classify_event_kind, push_graph_edge, push_graph_node, truncate_graph_summary,
 };
 
 use super::{
@@ -56,9 +55,6 @@ pub struct IntrospectReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_judgments:
         Option<astra_services::semantic_judgment_observation::SemanticJudgmentView>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_result_judgments:
-        Option<astra_services::tool_result_selection_observation::ToolResultJudgmentView>,
     pub view: ObservationView,
     #[serde(default)]
     pub observations: Vec<ObservationRecord>,
@@ -128,18 +124,6 @@ pub fn build_introspect_report(
         warnings.push(format!(
             "semantic judgment history coverage={:?}; whether it guided the run is not recorded",
             semantics.coverage
-        ));
-    }
-    let tool_result_judgments = super::tool_result_judgment_view(snapshot, request);
-    if let Some(judgments) = &tool_result_judgments
-        && (judgments.evaluation_coverage
-            != astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::NotObserved
-            || judgments.application_coverage
-                != astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::NotObserved)
-    {
-        warnings.push(format!(
-            "tool-result judgment evaluation coverage={:?}; application coverage={:?}",
-            judgments.evaluation_coverage, judgments.application_coverage
         ));
     }
     let data_coverage = introspect_data_coverage(snapshot, request, warnings);
@@ -245,23 +229,6 @@ pub fn build_introspect_report(
         // the structured observation carries the bounded detail separately.
         evidence[0].summary.push_str(&usage.render_compact());
     }
-    if let Some(judgments) = &tool_result_judgments
-        && (judgments.evaluation_coverage
-            != astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::NotObserved
-            || judgments.application_coverage
-                != astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::NotObserved)
-    {
-        observations.push(ObservationRecord {
-            ref_id: "urn:astra:observation:local:introspect:tool_result_judgments".into(),
-            topic: request.topic.as_str().into(),
-            facet: request.facet.as_str().into(),
-            kind: "tool_result_judgment".into(),
-            severity: "info".into(),
-            summary: judgments.render_for_depth(request.depth),
-            confidence: ObservationConfidence::evidence(1.0),
-            evidence_refs: vec![RUNTIME_SNAPSHOT_REF.into()],
-        });
-    }
     if let Some(lifecycle) = snapshot.invocation_lifecycle.as_ref() {
         evidence.push(ObservationEvidence {
             ref_id: INVOCATION_LIFECYCLE_REF.to_string(),
@@ -283,8 +250,13 @@ pub fn build_introspect_report(
     }
 
     let mut action_hints = build_introspect_action_hints(snapshot, &observations);
-    let budget_result =
-        apply_report_budget(request, &mut observations, &mut evidence, &mut action_hints);
+    let budget_result = astra_core::budget_observation_support(
+        request.depth,
+        &mut observations,
+        &mut evidence,
+        &mut action_hints,
+        &BTreeSet::new(),
+    );
     let covered_facets = delivered_covered_facets(request, &budget_result);
 
     let graph_slice =
@@ -306,7 +278,6 @@ pub fn build_introspect_report(
         runtime_feedback: snapshot.runtime_feedback.clone(),
         judgment_usage,
         semantic_judgments,
-        tool_result_judgments,
         view,
         observations,
         evidence,
@@ -405,7 +376,6 @@ fn build_edge_local_unavailable_report(request: &IntrospectRequest) -> Introspec
         runtime_feedback: None,
         judgment_usage: None,
         semantic_judgments: None,
-        tool_result_judgments: None,
         view,
         observations,
         evidence: Vec::new(),
@@ -533,7 +503,6 @@ fn auxiliary_evidence(snapshot: &IntrospectSnapshot, request: &IntrospectRequest
         return json!({
             "judgment_usage": snapshot.judgment_usage,
             "semantic_judgments": snapshot.semantic_judgments,
-            "tool_result_judgments": snapshot.tool_result_judgments,
         });
     }
     json!({
@@ -542,10 +511,6 @@ fn auxiliary_evidence(snapshot: &IntrospectSnapshot, request: &IntrospectRequest
             .semantic_judgments
             .as_ref()
             .map(stable_semantic_judgments),
-        "tool_result_judgments": snapshot
-            .tool_result_judgments
-            .as_ref()
-            .map(stable_tool_result_judgments),
     })
 }
 
@@ -580,22 +545,6 @@ fn stable_semantic_judgments(
         "counts": counts,
         "decisions": judgments.decision_summaries(),
         "capture_gaps": judgments.capture_gaps,
-    })
-}
-
-fn stable_tool_result_judgments(
-    judgments: &astra_services::tool_result_selection_observation::ToolResultJudgmentView,
-) -> Value {
-    json!({
-        "evaluation_coverage": judgments.evaluation_coverage,
-        "application_coverage": judgments.application_coverage,
-        "terminal_missing": judgments.terminal_missing,
-        "conflicting": judgments.conflicting,
-        "invalid_or_oversized": judgments.invalid_or_oversized,
-        "applications": {
-            "unknown": judgments.applications.unknown,
-            "invalid_or_conflicting": judgments.applications.invalid_or_conflicting,
-        },
     })
 }
 
@@ -760,41 +709,6 @@ fn introspect_data_coverage(
             },
         );
     }
-    if let Some(judgments) = super::tool_result_judgment_view(snapshot, request) {
-        use astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage as Coverage;
-        let missing = matches!(
-            judgments.evaluation_coverage,
-            Coverage::NotObserved | Coverage::SourceUnavailable | Coverage::SourceExcluded
-        ) && matches!(
-            judgments.application_coverage,
-            Coverage::NotObserved | Coverage::SourceUnavailable | Coverage::SourceExcluded
-        );
-        let partial = matches!(
-            judgments.evaluation_coverage,
-            Coverage::CaptureIncomplete | Coverage::CaptureTruncated
-        ) || matches!(
-            judgments.application_coverage,
-            Coverage::CaptureIncomplete | Coverage::CaptureTruncated
-        );
-        providers.insert(
-            "tool_result_judgment".into(),
-            ObservationProviderCoverage {
-                status: if missing {
-                    "missing"
-                } else if partial {
-                    "partial"
-                } else {
-                    "fresh"
-                }
-                .into(),
-                freshness_ms: None,
-                reason: Some(format!(
-                    "evaluation={:?};application={:?};recommendation_not_adoption",
-                    judgments.evaluation_coverage, judgments.application_coverage
-                )),
-            },
-        );
-    }
     if let Some(usage) = super::judgment_usage_view(snapshot, request) {
         providers.insert(
             "judgment_inference_ledger".into(),
@@ -843,76 +757,6 @@ fn introspect_data_coverage(
         providers,
         warnings,
     }
-}
-
-fn apply_report_budget(
-    request: &IntrospectRequest,
-    observations: &mut Vec<ObservationRecord>,
-    evidence: &mut Vec<ObservationEvidence>,
-    action_hints: &mut Vec<ObservationActionHint>,
-) -> ObservationBudgetResult {
-    let (max_observations, max_evidence, max_hints) = request.depth.report_limits();
-
-    // Sort by priority before truncation so high-value observations survive.
-    observations.sort_by_key(|o| std::cmp::Reverse(observation_priority_key(o)));
-
-    let omitted_observations = truncate_by_priority(observations, max_observations);
-    let retained_observation_refs = observations
-        .iter()
-        .map(|observation| observation.ref_id.as_str())
-        .collect::<BTreeSet<_>>();
-    let hints_before_ref_filter = action_hints.len();
-    action_hints.iter_mut().for_each(|hint| {
-        hint.observation_refs
-            .retain(|ref_id| retained_observation_refs.contains(ref_id.as_str()));
-    });
-    action_hints.retain(|hint| !hint.observation_refs.is_empty());
-    let omitted_dangling_hints = hints_before_ref_filter.saturating_sub(action_hints.len()) as i64;
-    let omitted_evidence = truncate_by_priority(evidence, max_evidence);
-    let omitted_hints = truncate_by_priority(action_hints, max_hints);
-    ObservationBudgetResult {
-        truncated: omitted_observations > 0
-            || omitted_evidence > 0
-            || omitted_hints > 0
-            || omitted_dangling_hints > 0,
-        next_cursor: None,
-        omitted: ObservationBudgetOmitted {
-            evidence_previews: omitted_evidence,
-            observations: omitted_observations,
-            action_hints: omitted_hints + omitted_dangling_hints,
-            ..Default::default()
-        },
-    }
-}
-
-/// Priority key for sorting observations before budget truncation.
-/// Higher = more important. warning > info; higher confidence > lower; system > detail.
-pub(super) fn observation_priority_key(o: &ObservationRecord) -> i64 {
-    let severity_score = match o.severity.as_str() {
-        "critical" => 1000,
-        "error" => 800,
-        "warning" => 600,
-        _ => 0,
-    };
-    let confidence_score = (o.confidence.evidence.unwrap_or(0.5)
-        + o.confidence.classification.unwrap_or(0.0)
-        + o.confidence.causal.unwrap_or(0.0))
-        * 100.0;
-    let kind_score =
-        if o.kind.contains("alert") || o.kind.contains("stall") || o.kind.contains("failure") {
-            200
-        } else if o.kind.contains("health") || o.kind.contains("error") {
-            100
-        } else {
-            0
-        };
-    severity_score + confidence_score as i64 + kind_score
-}
-
-fn truncate_by_priority<T>(items: &mut Vec<T>, max: usize) -> i64 {
-    let omitted = items.len().saturating_sub(max) as i64;
-    items.truncate(max);
-    omitted
 }
 
 fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest) -> String {
@@ -2016,51 +1860,6 @@ mod tests {
             usage_first,
             evidence_revision(&usage_more, &request),
             "judgment usage completeness loss is diagnostic evidence"
-        );
-
-        let mut selection = base.clone();
-        selection.tool_result_judgments = Some(
-            astra_services::tool_result_selection_observation::ToolResultJudgmentView {
-                evaluation_coverage:
-                    astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::Available,
-                application_coverage:
-                    astra_services::tool_result_selection_observation::ToolResultJudgmentCoverage::Available,
-                selected: 1,
-                applications:
-                    astra_services::tool_result_selection_observation::ToolResultApplicationCounts {
-                        included: 1,
-                        ..Default::default()
-                    },
-                ..Default::default()
-            },
-        );
-        let selection_first = evidence_revision(&selection, &request);
-        let mut selection_more = selection.clone();
-        selection_more
-            .tool_result_judgments
-            .as_mut()
-            .unwrap()
-            .selected = 2;
-        selection_more
-            .tool_result_judgments
-            .as_mut()
-            .unwrap()
-            .applications
-            .included = 2;
-        assert_eq!(
-            selection_first,
-            evidence_revision(&selection_more, &request),
-            "normal successful selection growth is auxiliary telemetry"
-        );
-        selection_more
-            .tool_result_judgments
-            .as_mut()
-            .unwrap()
-            .conflicting = 1;
-        assert_ne!(
-            selection_first,
-            evidence_revision(&selection_more, &request),
-            "a conflicting selection is diagnostic evidence"
         );
 
         let mut volatile = base.clone();

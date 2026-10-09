@@ -157,6 +157,27 @@ fn validate_payload_contract(raw: &str) -> Result<PayloadContract, WorkRepositor
     })
 }
 
+/// Revalidate immutable payload bytes at the execution boundary using the
+/// same contract as admission, including its line-count budget.
+pub(super) fn validated_operation_payload(
+    row: &sqlx::mysql::MySqlRow,
+) -> Result<Vec<u8>, WorkRepositoryError> {
+    let text = |field| row.try_get::<String, _>(field).map_err(repair);
+    if text("artifact_kind")? != "patch" || text("artifact_status")? != "active" {
+        return Err(repair("patch payload artifact is not active"));
+    }
+    let contract = validate_payload_contract(&text("content_json")?)?;
+    let persisted_bytes = u64::try_from(row.try_get::<i64, _>("payload_bytes").map_err(repair)?)
+        .map_err(|_| repair("patch payload byte count is negative"))?;
+    if persisted_bytes != contract.bytes
+        || text("payload_hash")? != contract.hash.as_str()
+        || text("operation_payload_hash")? != contract.hash.as_str()
+    {
+        return Err(repair("patch payload persisted basis is incoherent"));
+    }
+    Ok(contract.data.into_bytes())
+}
+
 pub(super) async fn record_patch_artifact(
     repository: &DatabaseWorkRepository,
     request: NewWorkPatchArtifact,

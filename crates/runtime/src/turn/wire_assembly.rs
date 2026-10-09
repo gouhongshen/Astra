@@ -433,17 +433,16 @@ pub(crate) fn compact_history_for_wire_budget(
             .checked_div(history_tokens)
             .unwrap_or(0)
     };
-    let before = history.clone();
-    let result = crate::turn::cloud::compaction_engine::CompactionEngine::compact_tiered(
+    let result = crate::turn::cloud::compaction::compact_tiered_impl(
         history,
         budget_chars,
         2_000,
         CompactionTier::AggressivePrune,
         4,
     );
-    let boundary = result.boundary;
+    let boundary = result.boundary?;
     *history = result.messages;
-    (*history != before).then_some(boundary).flatten()
+    Some(boundary)
 }
 
 /// Stable semantic identity for runtime-owned authority constructed outside
@@ -453,6 +452,7 @@ pub(crate) fn compact_history_for_wire_budget(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeAuthorityKind {
     EdgeRequiredContext,
+    AuthorizedModelCatalog,
     CompactedConversationSummary,
     ActiveWorkAttemptStart,
     PendingWorkGraphMutations,
@@ -490,6 +490,7 @@ impl RuntimeAuthorityKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::EdgeRequiredContext => "edge_required_context",
+            Self::AuthorizedModelCatalog => "authorized_model_catalog",
             Self::CompactedConversationSummary => "compacted_conversation_summary",
             Self::ActiveWorkAttemptStart => "active_work_attempt_start",
             Self::PendingWorkGraphMutations => "pending_work_graph_mutations",
@@ -616,10 +617,81 @@ pub(crate) fn decision_feedback_preamble_message(text: &str) -> Option<Value> {
 /// Keep the producer kind attached until provider-specific filtering. Folding
 /// typed edge-profile values into an untyped text blob would let a required-
 /// class `active_turn_frame` bypass the strict-history cache contract.
+pub(crate) fn runtime_volatile_preamble_messages(
+    injection: &astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection,
+) -> Result<Vec<Value>, AppendOnlyRuntimeAuthorityError> {
+    use crate::turn::agentic_loop::host::{DIRECT_CHILD_RESULT_SCHEMA, VolatileKind};
+    if injection.kind != VolatileKind::BackgroundTaskNotification.wire_kind()
+        || injection.payload["schema"] != DIRECT_CHILD_RESULT_SCHEMA
+    {
+        return Ok(runtime_volatile_preamble_message(injection)
+            .into_iter()
+            .collect());
+    }
+    let parent = injection.payload["parent_run_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(AppendOnlyRuntimeAuthorityError::InvalidSemanticInputIdentity)?;
+    let children = injection.payload["children"]
+        .as_array()
+        .ok_or(AppendOnlyRuntimeAuthorityError::InvalidSemanticInputIdentity)?;
+    let mut single = injection.clone();
+    single.payload["children"] = serde_json::json!([]);
+    let mut messages = Vec::with_capacity(children.len());
+    for child in children {
+        let run = child["run_id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or(AppendOnlyRuntimeAuthorityError::InvalidSemanticInputIdentity)?;
+        let agent = child["agent_id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or(AppendOnlyRuntimeAuthorityError::InvalidSemanticInputIdentity)?;
+        single.payload["children"] = serde_json::json!([child]);
+        let mut message = runtime_volatile_preamble_message(&single)
+            .ok_or(AppendOnlyRuntimeAuthorityError::InvalidSemanticInputIdentity)?;
+        // Outcome corrections must supersede only this child's prior fact,
+        // independently of batch shape, status and delivery bookkeeping.
+        let identity =
+            serde_json::json!([DIRECT_CHILD_RESULT_SCHEMA, parent, run, agent]).to_string();
+        message[RUNTIME_VOLATILE_KIND_MARKER] = Value::String(format!(
+            "{}:sha256:{:x}",
+            injection.kind,
+            Sha256::digest(identity.as_bytes())
+        ));
+        messages.push(message);
+    }
+    Ok(messages)
+}
+
 pub(crate) fn runtime_volatile_preamble_message(
     injection: &astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection,
 ) -> Option<Value> {
-    let text = if RuntimeAuthorityKind::instruction_field_for_wire_kind(&injection.kind)
+    let text = if injection.kind == "background_task_notification"
+        && injection.payload["schema"]
+            == crate::turn::agentic_loop::host::DIRECT_CHILD_RESULT_SCHEMA
+    {
+        // Delivery bookkeeping is control-plane state. Keeping it out of the
+        // rendered content makes the second bounded delivery byte-identical,
+        // so append-only providers can dedupe it against their canonical frame.
+        let mut display_injection = injection.clone();
+        // A terminal child outcome is one content-addressed fact, not a new
+        // round-specific observation. Its transport round must not change the
+        // append-only identity when the same fact is retried.
+        display_injection.round_index = 0;
+        if let Some(payload) = display_injection.payload.as_object_mut() {
+            payload.remove("delivery_count");
+            payload.remove("observed_by_provider");
+        }
+        display_injection.render_for_prompt()?
+    } else if injection.kind == "mailbox"
+        && injection.payload["schema"]
+            == crate::turn::agentic_loop::host::RETAINED_MAILBOX_CONTEXT_SCHEMA
+    {
+        let mut display_injection = injection.clone();
+        display_injection.payload = Value::String(injection.payload["display"].as_str()?.into());
+        display_injection.render_for_prompt()?
+    } else if RuntimeAuthorityKind::instruction_field_for_wire_kind(&injection.kind)
         == Some("/instruction")
     {
         match &injection.payload {
@@ -889,6 +961,7 @@ pub(crate) fn ensure_append_only_runtime_authority_policy(system_messages: &mut 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppendOnlyRuntimeAuthorityError {
+    InvalidSemanticInputIdentity,
     InvalidCacheCapability,
     MissingOrInvalidDelivery,
     InvalidProviderRole,
@@ -901,6 +974,9 @@ pub(crate) enum AppendOnlyRuntimeAuthorityError {
 impl std::fmt::Display for AppendOnlyRuntimeAuthorityError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let detail = match self {
+            Self::InvalidSemanticInputIdentity => {
+                "child context is missing its parent, run or agent identity"
+            }
             Self::InvalidCacheCapability => {
                 "append-only placement requires required-only volatile delivery"
             }
@@ -976,6 +1052,14 @@ fn into_append_only_runtime_authority(
     }
     astra_turn_types::mark_append_only_required_context(&mut message, &kind, lifetime);
     Ok(message)
+}
+
+fn is_semantic_input_authority_kind(kind: &str) -> bool {
+    kind.split_once(":sha256:").is_some_and(|(producer, _)| {
+        use crate::turn::agentic_loop::host::VolatileKind;
+        producer == VolatileKind::Mailbox.wire_kind()
+            || producer == VolatileKind::BackgroundTaskNotification.wire_kind()
+    })
 }
 
 pub(crate) fn required_append_only_runtime_authority_message(
@@ -1448,15 +1532,13 @@ impl<'a> MemoriaContext<'a> {
                     break;
                 }
 
-                let mut messages = std::mem::take(&mut result.messages);
-                let refined =
-                    crate::turn::cloud::compaction_engine::CompactionEngine::compact_tiered(
-                        &mut messages,
-                        refined_budget_chars,
-                        resolved.keep_chars,
-                        resolved.tier,
-                        resolved.keep_recent_turns,
-                    );
+                let refined = crate::turn::cloud::compaction::compact_tiered_impl(
+                    &result.messages,
+                    refined_budget_chars,
+                    resolved.keep_chars,
+                    resolved.tier,
+                    resolved.keep_recent_turns,
+                );
                 result.messages = refined.messages;
                 if refined.boundary.is_none() {
                     break;
@@ -1652,7 +1734,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
             .filter_map(runtime_system_context_from_message),
     );
     runtime_system_messages.extend(
-        render_drained_volatile_messages(&drained_volatile)
+        render_drained_volatile_messages(&drained_volatile)?
             .into_iter()
             .filter(|message| {
                 !suppress_optional_volatile
@@ -1701,6 +1783,25 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
     retain_latest_runtime_system_authority_by_kind(&mut runtime_system_messages);
 
     let mut new_append_only_runtime_messages = Vec::new();
+    let mut new_semantic_history = Vec::new();
+    if !matches!(
+        cache_cap.volatile_placement,
+        astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+    ) {
+        for message in &runtime_system_messages {
+            if message[RUNTIME_VOLATILE_KIND_MARKER]
+                .as_str()
+                .is_some_and(is_semantic_input_authority_kind)
+                && is_required_runtime_preamble(message)
+                && message[RUNTIME_AUTHORITY_LIFETIME_MARKER] == RUNTIME_AUTHORITY_CURRENT_USER_TURN
+                && astra_turn_types::runtime_message_delivery(message)
+                    != Some(astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext)
+            {
+                let frame = into_append_only_runtime_authority(message.clone())?;
+                new_semantic_history.push(frame);
+            }
+        }
+    }
     if matches!(
         cache_cap.volatile_placement,
         astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
@@ -1770,6 +1871,9 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
         astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
         &llm_messages,
     );
+    // These frames are canonical history, not additional wire input: their
+    // content was already delivered in the provider's required-system lane.
+    new_append_only_runtime_messages.extend(new_semantic_history);
     Ok(LlmMessageAssembly {
         messages: llm_messages,
         new_append_only_runtime_messages,
@@ -1821,29 +1925,312 @@ pub(crate) fn strip_runtime_context_from_tool_message(message: &mut Value) {
 
 fn render_drained_volatile_messages(
     drained: &[crate::turn::agentic_loop::host::VolatileInjection],
-) -> Vec<Value> {
+) -> Result<Vec<Value>, AppendOnlyRuntimeAuthorityError> {
     let mut out = Vec::new();
     for inj in drained {
-        let edge_injection = astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
-            kind: inj.kind.wire_kind(),
-            delivery_class: inj.kind.delivery_class(),
-            payload: inj.payload.clone(),
-            round_index: inj.round_index,
-            authority_lifetime: (inj.kind
-                == crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame)
-                .then_some(astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn),
-        };
-        if let Some(message) = runtime_volatile_preamble_message(&edge_injection) {
-            out.push(message);
-        }
+        let edge_injection = crate::turn::agentic_loop::host::volatile_injection_edge_profile(inj);
+        out.extend(runtime_volatile_preamble_messages(&edge_injection)?);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn semantic_input_survives_delivery_retirement_across_cache_placements() {
+        use crate::turn::agentic_loop::host::{
+            DIRECT_CHILD_RESULT_SCHEMA, RETAINED_MAILBOX_CONTEXT_SCHEMA, VolatileKind,
+        };
+        for (kind, payload, expected) in [
+            (
+                VolatileKind::Mailbox,
+                json!({
+                    "schema": crate::turn::agentic_loop::host::RETAINED_MAILBOX_CONTEXT_SCHEMA,
+                    "message_id": "question-1",
+                    "display": "📬 Message id=question-1 from child: Which format?",
+                }),
+                "Message id=question-1 from child: Which format?",
+            ),
+            (
+                VolatileKind::Mailbox,
+                json!({"schema": RETAINED_MAILBOX_CONTEXT_SCHEMA, "message_id":"answer-1", "message_kind":"response", "display":"Answer id=answer-1 to question-1 from parent: use JSON."}),
+                "Answer id=answer-1 to question-1 from parent: use JSON.",
+            ),
+            (
+                VolatileKind::BackgroundTaskNotification,
+                json!({"schema": DIRECT_CHILD_RESULT_SCHEMA, "parent_run_id":"parent-run", "children":[{"agent_id":"child-1", "run_id":"child-run", "status":"failed", "result":"verified child failure"}]}),
+                "verified child failure",
+            ),
+        ] {
+            let injection = crate::turn::agentic_loop::host::VolatileInjection {
+                kind,
+                payload,
+                round_index: 1,
+                attempt_leased: true,
+            };
+            let rendered =
+                render_drained_volatile_messages(std::slice::from_ref(&injection)).unwrap();
+            let edge_wire =
+                crate::turn::agentic_loop::host::runtime_volatile_injections_edge_profile_value(
+                    std::slice::from_ref(&injection),
+                )
+                .unwrap();
+            let edge: astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection =
+                serde_json::from_value(edge_wire[0].clone()).unwrap();
+            assert_eq!(runtime_volatile_preamble_messages(&edge).unwrap(), rendered);
+            assert_eq!(rendered.len(), 1);
+            assert_eq!(
+                rendered[0][RUNTIME_AUTHORITY_LIFETIME_MARKER],
+                "current_user_turn"
+            );
+            let content = rendered[0]["content"].as_str().unwrap();
+            assert!(content.contains("<runtime-required-context>"));
+            assert!(content.contains(expected));
+
+            for capability in [
+                append_only_required_capability(),
+                required_only_tail_capability(),
+                astra_turn_core::cache_placement::CacheCapability::for_provider("anthropic"),
+                astra_turn_core::cache_placement::CacheCapability::for_provider("deepseek"),
+            ] {
+                let system = vec![json!({"role": "system", "content": "stable rules"})];
+                let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+                state.messages = vec![json!({"role": "user", "content": "coordinate the child"})];
+                let first = assemble_llm_messages_with_cache_capability_output(
+                    system.clone(),
+                    rendered.clone(),
+                    Vec::new(),
+                    state.messages.clone(),
+                    &PostCompactAttachments::default(),
+                    "sid",
+                    "openai",
+                    "model",
+                    &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                    Some(capability),
+                    &cache_cfg(),
+                )
+                .unwrap();
+                assert_eq!(first.new_append_only_runtime_messages.len(), 1);
+                state
+                    .extend_append_only_runtime_messages(first.new_append_only_runtime_messages)
+                    .unwrap();
+                for round in 0..20 {
+                    state.messages.push(
+                        json!({"role": "assistant", "content": format!("tool round {round}")}),
+                    );
+                    state.messages.push(
+                json!({"role": "tool", "tool_call_id": format!("read-{round}"), "content": "ok"}),
+            );
+                    let mut projected_history = state.messages.clone();
+                    let mut preamble = if capability.volatile_placement
+                        == astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+                    {
+                        Vec::new()
+                    } else {
+                        rehome_append_only_runtime_authority(&mut projected_history).unwrap()
+                    };
+                    if round < 2 {
+                        preamble.extend(runtime_volatile_preamble_messages(&edge).unwrap());
+                    }
+                    let next = assemble_llm_messages_with_cache_capability_output(
+                        system.clone(),
+                        preamble,
+                        Vec::new(),
+                        projected_history,
+                        &PostCompactAttachments::default(),
+                        "sid",
+                        "openai",
+                        "model",
+                        &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                        Some(capability),
+                        &cache_cfg(),
+                    )
+                    .unwrap();
+                    state
+                        .extend_append_only_runtime_messages(next.new_append_only_runtime_messages)
+                        .unwrap();
+                    assert_eq!(
+                        state
+                            .messages
+                            .iter()
+                            .filter(|m| {
+                                astra_turn_types::runtime_message_delivery(m)
+                            == Some(
+                                astra_turn_types::RuntimeMessageDelivery::AppendOnlyRequiredContext
+                            )
+                            })
+                            .count(),
+                        1,
+                        "round {round}"
+                    );
+                    assert!(
+                        next.messages.iter().any(|message| {
+                            message["content"]
+                                .as_str()
+                                .is_some_and(|text| text.contains(expected))
+                        }),
+                        "semantic input lost at round {round}, placement {:?}",
+                        capability.volatile_placement
+                    );
+                    assert_eq!(
+                        state
+                            .messages
+                            .iter()
+                            .filter(|message| astra_turn_types::is_human_user_message(message))
+                            .count(),
+                        1
+                    );
+                }
+                // Checkpoint serialization preserves typed ownership and deduplication.
+                let mut recovered: Vec<Value> =
+                    serde_json::from_value(serde_json::to_value(&state.messages).unwrap()).unwrap();
+                recovered.push(json!({"role":"user", "content":"a later human turn"}));
+                let preamble = if capability.volatile_placement
+                    == astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+                {
+                    Vec::new()
+                } else {
+                    rehome_append_only_runtime_authority(&mut recovered).unwrap()
+                };
+                let next = assemble_llm_messages_with_cache_capability_output(
+                    system,
+                    preamble,
+                    Vec::new(),
+                    recovered,
+                    &PostCompactAttachments::default(),
+                    "sid",
+                    "openai",
+                    "model",
+                    &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                    Some(capability),
+                    &cache_cfg(),
+                )
+                .unwrap();
+                assert!(next.new_append_only_runtime_messages.is_empty());
+                if capability.volatile_placement
+                    != astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
+                {
+                    assert!(!next.messages.iter().any(|message| {
+                        message["content"]
+                            .as_str()
+                            .is_some_and(|text| text.contains(expected))
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn direct_child_result_wire_identity_is_stable_across_bounded_retry() {
+        let mut payload = json!({
+            "schema": crate::turn::agentic_loop::host::DIRECT_CHILD_RESULT_SCHEMA,
+            "parent_run_id":"parent-run",
+            "children": [{"agent_id": "child", "run_id":"child-run", "status": "completed"}],
+        });
+        let first = crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+            payload: payload.clone(),
+            round_index: 1,
+            attempt_leased: true,
+        };
+        payload["delivery_count"] = json!(1);
+        payload["observed_by_provider"] = json!(true);
+        let second = crate::turn::agentic_loop::host::VolatileInjection {
+            kind: crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
+            payload,
+            round_index: 2,
+            attempt_leased: true,
+        };
+        let first_wire = render_drained_volatile_messages(&[first]).unwrap();
+        let second_wire = render_drained_volatile_messages(&[second]).unwrap();
+        assert_eq!(first_wire, second_wire);
+        assert!(message_text(&second_wire[0]).contains("child"));
+    }
+
+    #[test]
+    fn child_authority_corrections_preserve_siblings_after_delivery_and_restore() {
+        use crate::turn::agentic_loop::host::{DIRECT_CHILD_RESULT_SCHEMA, VolatileKind};
+        let mut injection = crate::turn::agentic_loop::host::VolatileInjection {
+            kind: VolatileKind::BackgroundTaskNotification,
+            payload: json!({"schema": DIRECT_CHILD_RESULT_SCHEMA, "parent_run_id":"parent", "children":[
+                {"agent_id":"a", "run_id":"run-a", "status":"completed", "result":"old-a"},
+                {"agent_id":"b", "run_id":"run-b", "status":"completed", "result":"keep-b"}
+            ]}),
+            round_index: 1,
+            attempt_leased: true,
+        };
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = vec![json!({"role":"user", "content":"coordinate"})];
+        let frames = render_drained_volatile_messages(std::slice::from_ref(&injection))
+            .unwrap()
+            .into_iter()
+            .map(into_append_only_runtime_authority)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        state.extend_append_only_runtime_messages(frames).unwrap();
+        for round in 0..3 {
+            state.push_prompt_history_message(
+                json!({"role":"assistant", "content":format!("decision-{round}")}),
+            );
+        }
+        injection.payload["children"] =
+            json!([{"agent_id":"a", "run_id":"run-a", "status":"failed", "result":"corrected-a"}]);
+        let correction = render_drained_volatile_messages(std::slice::from_ref(&injection))
+            .unwrap()
+            .into_iter()
+            .map(into_append_only_runtime_authority)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        state
+            .extend_append_only_runtime_messages(correction.clone())
+            .unwrap();
+        let restored =
+            serde_json::from_value::<Vec<Value>>(serde_json::to_value(&state.messages).unwrap())
+                .unwrap();
+        state.messages = restored.clone();
+        state
+            .extend_append_only_runtime_messages(correction)
+            .unwrap();
+        assert_eq!(
+            state.messages, restored,
+            "replayed correction must not grow history"
+        );
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .filter(|m| astra_turn_types::runtime_authority_kind(m).is_some())
+                .count(),
+            3
+        );
+        let active = state
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                astra_turn_types::append_only_runtime_authority_is_active(&state.messages, *i)
+            })
+            .map(|(_, m)| m)
+            .collect::<Vec<_>>();
+        assert_eq!(active.len(), 2);
+        let mut projected = state.messages.clone();
+        let latest = rehome_append_only_runtime_authority(&mut projected).unwrap();
+        let text = latest
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("corrected-a") && text.contains("keep-b"));
+        assert!(!text.contains("old-a"));
+        injection.payload["children"][0]["run_id"] = Value::Null;
+        assert_eq!(
+            render_drained_volatile_messages(&[injection]).unwrap_err(),
+            AppendOnlyRuntimeAuthorityError::InvalidSemanticInputIdentity
+        );
+    }
 
     #[test]
     fn artifact_recovery_guidance_is_current_bound_and_byte_stable() {
@@ -1921,7 +2308,8 @@ mod tests {
                 round_index: 1,
                 attempt_leased: false,
             },
-        ]);
+        ])
+        .unwrap();
         let projected = project_runtime_roles(&injected);
         let policies = projected
             .iter()
@@ -2376,7 +2764,7 @@ mod tests {
             payload: json!({
                 "schema": "runtime_evidence_required.v1",
                 "reason": "runtime_or_session_retrospective_without_live_observation",
-                "instruction": "Before making runtime, session-state, trace, or tool-ledger claims, call introspect exactly once with facet=overview, depth=diagnostic, horizon=recent. Use reflect at most once only for persisted prior-turn causality. If observation is unavailable, explicitly limit the answer to visible conversation evidence; never claim that runtime records were inspected."
+                "instruction": "For current runtime-state claims, call ordinary introspect once with facet=overview, depth=summary, horizon=current_turn. For prior-session causality, use reflect at most once; it is session-scoped and does not identify an exact run or turn. For one exact historical execution, use Server Explain with its explicit run selector. Do not use an ordinary live introspect query as history. If observation is unavailable, explicitly limit the answer to visible conversation evidence; never claim that runtime records were inspected."
             }),
             round_index: 1,
             authority_lifetime: None,
@@ -2401,7 +2789,8 @@ mod tests {
         assert!(facts.contains("runtime_evidence_required.v1"));
         assert!(facts.contains("runtime_or_session_retrospective_without_live_observation"));
         assert!(facts.contains("boundary_instruction"));
-        assert!(facts.contains("call introspect exactly once"));
+        assert!(facts.contains("For prior-session causality, use reflect at most once"));
+        assert!(facts.contains("Do not use an ordinary live introspect query as history"));
     }
 
     #[test]
@@ -4714,12 +5103,12 @@ mod tests {
             )
         };
         let reconciliation = settlement(
-            "submit the bounded assessment now",
-            "outcome_reconciliation_required.v1",
+            "report the specific unmet obligation",
+            "completion_settlement.v2",
         );
         let assessed = settlement(
-            "report the accepted assessment accurately",
-            "task_resolution_assessed.v1",
+            "report the preserved partial answer",
+            "test_settlement_observation.v1",
         );
 
         assert!(!message_text(&baseline[0]).contains("completion_settlement.v2"));
@@ -4740,7 +5129,7 @@ mod tests {
             .iter()
             .position(|message| {
                 message.get("role").and_then(Value::as_str) == Some("user")
-                    && message_text(message).contains("outcome_reconciliation_required.v1")
+                    && message_text(message).contains("completion_settlement.v2")
             })
             .expect("required completion settlement facts remain provider-visible");
         assert!(settlement_index > 0);
@@ -4758,7 +5147,7 @@ mod tests {
         );
         let provider_instruction = message_text(&reconciliation[0]);
         assert!(provider_instruction.contains("boundary_instruction"));
-        assert!(!provider_instruction.contains("submit the bounded assessment now"));
+        assert!(!provider_instruction.contains("report the specific unmet obligation"));
         assert_eq!(
             reconciliation[0], assessed[0],
             "stage-specific guidance must stay in runtime context facts"
@@ -4774,12 +5163,12 @@ mod tests {
         );
         let provider_facts = message_text(&reconciliation[settlement_index]);
         assert!(provider_facts.contains("boundary_instruction"));
-        assert!(provider_facts.contains("submit the bounded assessment now"));
-        assert!(!provider_facts.contains("task_resolution_assessed.v1"));
+        assert!(provider_facts.contains("report the specific unmet obligation"));
+        assert!(!provider_facts.contains("test_settlement_observation.v1"));
         assert!(assessed.iter().any(|message| {
             message["role"] == "user"
-                && message_text(message).contains("task_resolution_assessed.v1")
-                && message_text(message).contains("report the accepted assessment accurately")
+                && message_text(message).contains("test_settlement_observation.v1")
+                && message_text(message).contains("report the preserved partial answer")
         }));
     }
 

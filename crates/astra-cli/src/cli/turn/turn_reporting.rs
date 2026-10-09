@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::{StreamResult, UsageAttribution};
 use astra_services::session_journal;
-use astra_turn_core::evaluation::TurnEvaluation;
 use crossterm::style::Stylize;
 
 /// Build a compact tool-call summary for cross-turn context continuity.
@@ -76,7 +75,6 @@ pub(crate) fn build_history_text(
 pub(crate) fn print_turn_status_line(
     state: &SessionState,
     result: &StreamResult,
-    evaluation: Option<&TurnEvaluation>,
     turn_start: Instant,
 ) {
     if state.tui_render_policy.is_some() {
@@ -99,9 +97,7 @@ pub(crate) fn print_turn_status_line(
     if let Some(notice) = interruption_status_notice(result) {
         eprintln!("{}", format!("  ⚠ {notice}").yellow());
     }
-    if let Some(notice) =
-        evaluation.and_then(|evaluation| evaluation_status_notice_for_result(result, evaluation))
-    {
+    if let Some(notice) = evaluation_status_notice_for_result(result) {
         eprintln!("{}", format!("  ⚠ {notice}").yellow());
     }
     print_context_window_warning(result.budget_pressure);
@@ -186,11 +182,8 @@ pub(crate) fn format_primary_usage_summary(
 
 /// Shared CLI/TUI cache presentation.
 ///
-/// A complete attribution can report the whole-turn cache rate. A partial
-/// attribution still has useful information when both fresh input and cache
-/// reads are known: show the rate over the observed input lanes and scope it
-/// explicitly to `known input`. This keeps the useful percentage visible
-/// without presenting an incomplete turn as an exact whole-turn measurement.
+/// Only a complete attribution can report a whole-turn cache rate. Partial
+/// counters remain useful as lower bounds, but their ratio is misleading.
 pub(crate) fn format_cache_usage_summary(
     fresh: Option<u64>,
     cache_read: Option<u64>,
@@ -198,6 +191,9 @@ pub(crate) fn format_cache_usage_summary(
     complete: bool,
 ) -> Option<String> {
     let cache_read = cache_read?;
+    if !complete && cache_read == 0 {
+        return None;
+    }
     let Some(fresh) = fresh else {
         return Some(format!(
             "{} cached",
@@ -208,16 +204,15 @@ pub(crate) fn format_cache_usage_summary(
     let known_input = u128::from(fresh)
         .saturating_add(u128::from(cache_read))
         .saturating_add(u128::from(cache_creation.unwrap_or(0)));
-    if let Some(percent) = (u128::from(cache_read) * 100).checked_div(known_input) {
-        if complete && cache_creation.is_some() {
-            return Some(format!("{percent}% cached"));
-        }
-        return Some(format!(
-            "{} cached · {percent}% of known input",
-            format_usage_count(cache_read, complete)
-        ));
+    if complete
+        && cache_creation.is_some()
+        && let Some(percent) = (u128::from(cache_read) * 100).checked_div(known_input)
+    {
+        return Some(format!("{percent}% cached"));
     }
-
+    if complete && cache_creation.is_some() && known_input == 0 {
+        return Some("0 cached".to_string());
+    }
     Some(format!(
         "{} cached",
         format_usage_count(cache_read, complete)
@@ -317,17 +312,17 @@ fn format_token_count(tokens: u64) -> String {
 /// assessment after runtime reconciliation has already accepted it.  When a
 /// turn is interrupted or explicitly marked unverified, use the semantic
 /// record-aware evaluator to explain the remaining obligation.
-fn evaluation_status_notice_for_result(
-    result: &StreamResult,
-    evaluation: &TurnEvaluation,
-) -> Option<String> {
+fn evaluation_status_notice_for_result(result: &StreamResult) -> Option<&str> {
     if result.final_state == "completed" && !result.server_terminal_unverified {
         return None;
     }
-    astra_turn_core::evaluation::turn_evaluation_status_notice_for_records(
-        evaluation,
-        &result.tool_call_records,
-    )
+    result
+        .turn_evaluation
+        .as_ref()?
+        .metadata
+        .as_ref()?
+        .get("status_notice")?
+        .as_str()
 }
 
 pub(crate) fn interruption_status_notice(result: &StreamResult) -> Option<String> {
@@ -338,17 +333,7 @@ pub(crate) fn interruption_status_notice(result: &StreamResult) -> Option<String
         .map(str::trim)
         .filter(|message| !message.is_empty())
     {
-        let has_distinct_answer =
-            !result.full_text.trim().is_empty() && result.full_text.trim() != user_message;
-        return Some(
-            if result.interruption_kind.as_deref() == Some("execution_incomplete")
-                && has_distinct_answer
-            {
-                format!("Partial answer shown. {user_message}")
-            } else {
-                user_message.to_string()
-            },
-        );
+        return Some(user_message.to_string());
     }
 
     let kind = result
@@ -404,9 +389,6 @@ mod tests {
         evaluation_status_notice_for_result, interruption_status_notice,
     };
     use astra_services::session_journal;
-    use astra_turn_core::evaluation::{
-        EvalSignal, EvaluationThresholds, TurnEvaluation, turn_evaluation_status_notice,
-    };
     use std::time::Duration;
 
     fn make_record(
@@ -423,86 +405,30 @@ mod tests {
     }
 
     #[test]
-    fn turn_evaluation_notice_reports_unresolved_outcome_failure() {
-        let eval = TurnEvaluation {
-            success: false,
-            quality: 0.2,
-            confidence: 0.9,
-            signals: vec![EvalSignal::ToolOutcomeFailure {
-                class: "test_failure".to_string(),
-                count: 1,
-            }],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        let notice = turn_evaluation_status_notice(&eval).expect("notice");
-        assert!(notice.contains("test_failure x1"));
-        assert!(notice.contains("incomplete"));
-    }
-
-    #[test]
-    fn turn_evaluation_notice_ignores_successful_turn() {
-        let eval = TurnEvaluation {
-            success: true,
-            quality: 0.8,
-            confidence: 0.7,
-            signals: vec![EvalSignal::AllToolsHealthy],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        assert!(turn_evaluation_status_notice(&eval).is_none());
-    }
-
-    #[test]
-    fn completed_typed_terminal_does_not_reopen_assessment_failure() {
-        let mut result = crate::tests::stub_stream_result("");
-        result.final_state = "completed".into();
-        result.server_terminal_unverified = false;
-        let mut failed = make_record("bash", false, None);
-        failed.args_full =
-            Some(serde_json::json!({"command": "cargo test --test artifact"}).to_string());
-        failed.result_class = Some("test_failure".into());
-        result.tool_call_records = vec![failed];
-        let eval = TurnEvaluation {
-            success: false,
-            quality: 0.2,
-            confidence: 0.9,
-            signals: vec![EvalSignal::ToolOutcomeFailure {
-                class: "test_failure".to_string(),
-                count: 1,
-            }],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        assert!(
-            evaluation_status_notice_for_result(&result, &eval).is_none(),
-            "accepted runtime settlement must not be reclassified from raw evidence"
-        );
-    }
-
-    #[test]
-    fn interrupted_unverified_terminal_keeps_validation_failure_visible() {
+    fn status_notice_consumes_server_fact_without_reinterpreting_partial_records() {
         let mut result = crate::tests::stub_stream_result("");
         result.final_state = "interrupted".into();
         result.server_terminal_unverified = true;
-        let mut failed = make_record("bash", false, None);
-        failed.args_full =
-            Some(serde_json::json!({"command": "cargo test --test artifact"}).to_string());
-        failed.result_class = Some("test_failure".into());
-        result.tool_call_records = vec![failed];
-        let eval = TurnEvaluation {
-            success: false,
-            quality: 0.2,
-            confidence: 0.9,
-            signals: vec![EvalSignal::ToolOutcomeFailure {
-                class: "test_failure".to_string(),
-                count: 1,
-            }],
-            thresholds: EvaluationThresholds::default(),
-        };
-
-        let notice = evaluation_status_notice_for_result(&result, &eval).expect("notice");
-        assert!(notice.contains("test_failure x1"));
+        assert!(evaluation_status_notice_for_result(&result).is_none());
+        let mut event = session_journal::JournalEvent::base_public(
+            session_journal::JournalEventType::TurnEvaluation,
+            Some("session"),
+        );
+        event.metadata =
+            Some(serde_json::json!({"status_notice":"Server validation remains incomplete"}));
+        result.turn_evaluation = Some(event);
+        assert_eq!(
+            evaluation_status_notice_for_result(&result),
+            Some("Server validation remains incomplete")
+        );
+        result.tool_call_records = vec![make_record("bash", true, None)];
+        assert_eq!(
+            evaluation_status_notice_for_result(&result),
+            Some("Server validation remains incomplete")
+        );
+        result.final_state = "completed".into();
+        result.server_terminal_unverified = false;
+        assert!(evaluation_status_notice_for_result(&result).is_none());
     }
 
     #[test]
@@ -544,7 +470,7 @@ mod tests {
         }));
 
         let notice = interruption_status_notice(&result).expect("notice");
-        assert!(notice.starts_with("Partial answer shown."));
+        assert!(!notice.starts_with("Partial answer shown."));
         assert!(notice.contains("verified terminal state"));
         assert_eq!(result.full_text, "partial answer");
     }
@@ -597,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_primary_metrics_show_a_scoped_cache_rate() {
+    fn incomplete_primary_metrics_do_not_claim_a_cache_rate() {
         let state = crate::cli::session::session_state::SessionState::default();
         let mut result = crate::tests::stub_stream_result("answer");
         result.usage_attribution.primary =
@@ -610,11 +536,11 @@ mod tests {
         result.usage_attribution.primary_complete = false;
 
         let parts = compact_completion_parts(&state, &result, Duration::from_millis(5_200));
-        assert!(parts.contains(&"≥1.0k tokens · ≥900 cached · 90% of known input".to_string()));
+        assert!(parts.contains(&"≥1.0k tokens · ≥900 cached".to_string()));
     }
 
     #[test]
-    fn observed_partial_usage_keeps_the_session_cache_rate_visible() {
+    fn observed_partial_usage_keeps_cache_count_without_rate() {
         assert_eq!(
             super::format_primary_usage_summary(
                 Some(10_392),
@@ -626,7 +552,7 @@ mod tests {
                 false,
             )
             .as_deref(),
-            Some("≥46.2k tokens · ≥34.9k cached · 77% of known input")
+            Some("≥46.2k tokens · ≥34.9k cached")
         );
     }
 
@@ -690,21 +616,9 @@ mod tests {
         assert_eq!(super::format_usage_count(19_999, true), "20.0k");
         for (fresh, read, write, complete, expected) in [
             (Some(100), None, None, false, None),
-            (
-                Some(100),
-                Some(0),
-                None,
-                false,
-                Some("≥0 cached · 0% of known input"),
-            ),
+            (Some(100), Some(0), None, false, None),
             (None, Some(900), None, false, Some("≥900 cached")),
-            (
-                Some(100),
-                Some(900),
-                Some(1000),
-                false,
-                Some("≥900 cached · 45% of known input"),
-            ),
+            (Some(100), Some(900), Some(1000), false, Some("≥900 cached")),
             (Some(100), Some(900), Some(1000), true, Some("45% cached")),
             (Some(0), Some(0), Some(0), true, Some("0 cached")),
             (

@@ -243,7 +243,6 @@ pub(super) async fn completions_handler(
                 route: crate::turn::llm::client::LlmExecutionRoute::from_admitted(&admitted),
                 max_output_tokens: Some(request.max_tokens as usize),
                 temperature: Some(request.temperature),
-                has_fallback: false,
                 thinking: &thinking,
             },
             provider_timeout,
@@ -492,12 +491,12 @@ mod tests {
             Ok(ResolvedModelOffering {
                 offering_id,
                 model: ResolvedActiveLlmModel {
+                    price_snapshot: None,
                     model_name: "catalog-display-model".into(),
                     wire_model_name: Some("provider-wire-model".into()),
                     api_key: "provider-secret".into(),
                     base_url: self.base_url.clone(),
                     provider: self.provider.into(),
-                    fallback_chain: Vec::new(),
                     tags: Vec::new(),
                     request_body_overrides: None,
                     fixed_temperature: None,

@@ -182,3 +182,95 @@ pub async fn cleanup_work_owner(pool: &SharedPool, owner_id: &str) {
             .unwrap_or_else(|error| panic!("clean {table}: {error}"));
     }
 }
+
+/// Builds an acceptance using the exact identity and basis returned by the real proposal entrypoint.
+pub fn criteria_acceptance(
+    proposed: &astra_services::work::RecordedWorkCriteriaProposal,
+    resolution_ref: &str,
+) -> astra_services::work::WorkCriteriaProposalAcceptance {
+    use astra_services::work::{WorkChangeRef, WorkCriteriaProposalAcceptance};
+    WorkCriteriaProposalAcceptance {
+        owner_id: proposed.proposal.owner_id.clone(),
+        work_id: proposed.proposal.work_id.clone(),
+        branch_id: proposed.proposal.branch_id.clone(),
+        proposal_id: proposed.proposal.proposal_id.clone(),
+        payload_hash: proposed.payload_hash.clone(),
+        expected_work_revision: proposed.proposal.expected_work_revision,
+        expected_goal_revision: proposed.proposal.expected_goal_revision,
+        expected_criteria_set_revision: proposed.proposal.expected_criteria_set_revision,
+        expected_branch_revision: proposed.proposal.expected_branch_revision,
+        expected_graph_revision: proposed.proposal.expected_graph_revision,
+        resolution_ref: WorkChangeRef::parse(resolution_ref).expect("resolution"),
+    }
+}
+
+/// Repeats the immutable identity and basis of a recorded graph proposal.
+pub fn plan_acceptance(
+    recorded: &astra_services::work::RecordedWorkPlanProposal,
+    resolution_ref: &str,
+) -> astra_services::work::WorkPlanProposalAcceptance {
+    use astra_services::work::{WorkChangeRef, WorkPlanProposalAcceptance};
+    WorkPlanProposalAcceptance {
+        owner_id: recorded.proposal.owner_id.clone(),
+        work_id: recorded.proposal.work_id.clone(),
+        branch_id: recorded.proposal.branch_id.clone(),
+        proposal_id: recorded.proposal.proposal_id.clone(),
+        payload_hash: recorded.payload_hash.clone(),
+        expected_work_revision: recorded.proposal.expected_work_revision,
+        expected_goal_revision: recorded.proposal.expected_goal_revision,
+        expected_criteria_set_revision: recorded.proposal.expected_criteria_set_revision,
+        expected_branch_revision: recorded.proposal.expected_branch_revision,
+        expected_graph_revision: recorded.proposal.expected_graph_revision,
+        resolution_ref: WorkChangeRef::parse(resolution_ref).expect("resolution"),
+    }
+}
+
+use astra_turn_types::{
+    ActorContextV1, SESSION_ATTACHMENT_SCHEMA_VERSION, SessionAttachmentModeV1,
+    SessionAttachmentV1, SessionKeyV1, SessionPlacementV1,
+};
+use uuid::Uuid;
+
+pub async fn controller_attachment(
+    pool: &astra_core::SharedPool,
+    key: &SessionKeyV1,
+    actor: ActorContextV1,
+) -> SessionAttachmentV1 {
+    let attachment = SessionAttachmentV1 {
+        schema_version: SESSION_ATTACHMENT_SCHEMA_VERSION,
+        attachment_id: Uuid::new_v4().to_string(),
+        attachment_epoch: 1,
+        key: key.clone(),
+        actor,
+        mode: SessionAttachmentModeV1::Controller,
+        placement: SessionPlacementV1::Server,
+        observed_cursor: None,
+        observed_manifest_root: None,
+        workspace: None,
+        attached_at_unix_ms: 1,
+        expires_at_unix_ms: i64::MAX,
+    };
+    sqlx::query(
+        "INSERT INTO session_attachments
+         (isolation_domain, owner_user_id, session_id, branch_id, attachment_id,
+          attachment_epoch, idempotency_hash, request_hash, actor_id, mode,
+          placement, attachment_json, expires_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'controller', 'server', ?, ?)",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .bind(&attachment.attachment_id)
+    .bind(attachment.attachment_epoch as i64)
+    .bind("a".repeat(64))
+    .bind("b".repeat(64))
+    .bind(&attachment.actor.actor_id)
+    .bind(serde_json::to_string(&attachment).expect("encode attachment"))
+    .bind(attachment.expires_at_unix_ms)
+    .execute(pool.get())
+    .await
+    .expect("insert controller attachment");
+
+    attachment
+}

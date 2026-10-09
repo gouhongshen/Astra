@@ -1,6 +1,8 @@
 //! Bounded verification evidence carried by an unfinished execution handoff.
-//! Decoding these facts does not authorize execution: references must still be
-//! resolved against the invocation ledger under the recovered run's authority.
+//! Decoding these facts does not authorize execution. A raw snapshot still
+//! requires exact invocation-ledger validation; an atomically adopted
+//! execution handoff may use its exact locked checkpoint as provenance for the
+//! historical prefix, while current execution authority remains separate.
 
 use crate::{DispatchCertainty, StopHook, ToolInvocationCompletionRef, ToolInvocationState};
 use serde::{Deserialize, Serialize};
@@ -233,7 +235,7 @@ mod tests {
             working_dir: None,
             depends_on: vec![],
             timeout_secs: None,
-            cache_key: None,
+
             authoritative: true,
         };
         BoundVerificationFrontier {

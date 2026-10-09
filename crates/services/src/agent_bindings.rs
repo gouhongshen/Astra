@@ -826,6 +826,7 @@ mod tests {
                     display_name: None,
                 },
                 session_id: None,
+                execution_continuation: None,
                 origin: crate::AuthPrincipalOrigin::ProviderAuthorizedRequest(
                     crate::AuthProviderAuthorizedRequestContext {
                         provider_id: "provider-a".to_string(),

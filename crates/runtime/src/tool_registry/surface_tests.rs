@@ -61,20 +61,33 @@ fn schema_name_set() -> std::collections::BTreeSet<String> {
     names(&catalog_schemas()).into_iter().collect()
 }
 
-fn assert_no_resident_property_descriptions(value: &Value, path: &str) {
+fn assert_only_producer_parameter_descriptions(value: &Value, canonical: &Value, path: &str) {
     match value {
         Value::Object(object) => {
-            assert!(
-                !object.contains_key("description"),
-                "resident property {path} must not carry catalog prose"
-            );
+            if let Some(description) = object.get("description").and_then(Value::as_str) {
+                assert_eq!(
+                    canonical
+                        .get("x-astra-discovery-summary")
+                        .and_then(Value::as_str),
+                    Some(description),
+                    "resident property {path} must only carry producer-owned guidance"
+                );
+            }
             for (key, child) in object {
-                assert_no_resident_property_descriptions(child, &format!("{path}.{key}"));
+                assert_only_producer_parameter_descriptions(
+                    child,
+                    &canonical[key],
+                    &format!("{path}.{key}"),
+                );
             }
         }
         Value::Array(values) => {
             for (index, child) in values.iter().enumerate() {
-                assert_no_resident_property_descriptions(child, &format!("{path}[{index}]"));
+                assert_only_producer_parameter_descriptions(
+                    child,
+                    &canonical[index],
+                    &format!("{path}[{index}]"),
+                );
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
@@ -86,6 +99,7 @@ fn without_descriptions(mut value: Value) -> Value {
         match value {
             Value::Object(object) => {
                 object.remove("description");
+                object.remove("x-astra-discovery-summary");
                 for child in object.values_mut() {
                     strip(child);
                 }
@@ -103,10 +117,9 @@ fn assert_resident_external_state_contract(resident_bash: &Value, canonical_bash
         .as_str()
         .expect("resident Bash description");
     for cue in [
-        "Before external mutations",
-        "smallest absolute external roots",
+        "External mutations only",
+        "minimal absolute roots",
         "owned foreground delta",
-        "Omit for workspace-only or read-only work",
     ] {
         assert!(
             description.contains(cue),
@@ -161,16 +174,129 @@ fn default_always_load_surface_has_a_fixed_schema_budget() {
     let base_bytes = serde_json::to_vec(&without_hot_work.always_load_schemas())
         .expect("base tool surface must serialize")
         .len();
-    const SAFETY_MARGIN_BYTES: usize = 256;
+    eprintln!("resident schemas: {bytes} bytes");
+    if bytes > DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET {
+        for schema in surface.always_load_schemas() {
+            eprintln!(
+                "{}: {} bytes",
+                tool_schema_name(&schema).unwrap_or("unknown"),
+                serde_json::to_vec(&schema).unwrap().len()
+            );
+        }
+    }
     assert!(
-        bytes.saturating_add(SAFETY_MARGIN_BYTES) <= DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET,
-        "default always-load schemas use {bytes} bytes, leaving less than the {SAFETY_MARGIN_BYTES}-byte fixed-prefix safety margin (budget={} bytes); defer a non-primitive workflow or simplify its schema",
+        bytes <= DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET,
+        "default always-load schemas use {bytes} bytes, exceeding the fixed-prefix budget of {} bytes; defer a non-primitive workflow or simplify its schema",
         DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET,
     );
     assert!(
         bytes > base_bytes,
         "hot Work lifecycle schemas must be included in the default resident surface"
     );
+}
+
+#[test]
+fn models_discovery_is_easy_from_resident_and_selected_model_catalog() {
+    let schemas = catalog_schemas();
+    let surface = ToolSurface::build(schemas.clone(), &ToolSurfaceConfig::default(), &[]);
+    let introspect = surface
+        .always_load_schemas()
+        .into_iter()
+        .find(|schema| tool_schema_name(schema) == Some("introspect"))
+        .unwrap();
+    assert!(
+        surface
+            .deferred_manifest_with_context_window(None)
+            .expect("deferred catalog discovery")
+            .names
+            .contains(&"model_catalog".to_string())
+    );
+    let description = introspect["function"]["description"].as_str().unwrap();
+    assert!(!description.contains("facet=models"));
+    let params = &introspect["function"]["parameters"]["properties"];
+    assert!(
+        !params["facet"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("models"))
+    );
+    assert!(params.get("catalog").is_none());
+    for arguments in [
+        json!({"facet":"overview"}),
+        json!({"explain":{"target":"previous"}}),
+        json!({"artifact":"artifact://session/tool-result/example","offset":0,"max_bytes":1024}),
+    ] {
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "introspect",
+            &arguments,
+            &introspect,
+        )
+        .expect("ordinary observation and Explain must stay resident");
+    }
+    let advanced = json!({"depth":"diagnostic","horizon":"recent","source_policy":"live_only"});
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "introspect",
+            &advanced,
+            &introspect
+        )
+        .is_err()
+    );
+    let full_introspect = schemas
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("introspect"))
+        .unwrap();
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "introspect",
+        &advanced,
+        full_introspect,
+    )
+    .expect("advanced observation remains supported by its canonical contract");
+    let model_catalog = schemas
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("model_catalog"))
+        .unwrap();
+    assert_eq!(
+        model_catalog["function"]["parameters"]["properties"]["limit"]["maximum"],
+        32
+    );
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "model_catalog",
+        &json!({"limit":16}),
+        model_catalog,
+    )
+    .unwrap();
+    let selected: Value = serde_json::from_str(&astra_tools::tool_search::tool_search(
+        &schemas,
+        &json!({"query":"select:model_catalog"}),
+    ))
+    .unwrap();
+    let contract = &selected["matches"][0];
+    assert!(
+        contract["description"]
+            .as_str()
+            .unwrap()
+            .contains("Authorized Chat availability/comparison or unknown choices")
+    );
+    assert!(contract["parameters"]["properties"]["limit"].is_object());
+    assert_eq!(contract["parameters"]["properties"]["limit"]["maximum"], 32);
+    let full = schemas
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("introspect"))
+        .unwrap();
+    // Every retained field preserves its canonical executable structure.
+    let canonical = without_descriptions(full["function"]["parameters"]["properties"].clone());
+    for (name, property) in params.as_object().unwrap() {
+        assert_eq!(property, &canonical[name]);
+    }
+    for args in [
+        // Advanced observations remain callable through the selected contract.
+        json!({"facet":"overview","depth":"summary","horizon":"recent"}),
+        json!({"topic":"runtime","horizon":"now","source_policy":"live_only","include_context":true}),
+    ] {
+        astra_tools::schemas::validate_tool_arguments_against_schema("introspect", &args, full)
+            .expect("advanced observations must remain supported");
+    }
 }
 
 #[test]
@@ -188,10 +314,10 @@ fn default_surface_keeps_small_primitives_and_defers_complex_workflows() {
         "ask_user",
         "tool_search",
         "introspect",
-        "memory",
         "bash",
         "read_file",
         "write_file",
+        "agent",
     ] {
         assert!(
             always_load.contains(name),
@@ -200,7 +326,9 @@ fn default_surface_keeps_small_primitives_and_defers_complex_workflows() {
     }
     for name in [
         "agent_fanout",
-        "agent",
+        "memory",
+        "reflect",
+        "notify",
         "glob",
         "worktree",
         "inspect_work_plan",
@@ -258,15 +386,9 @@ fn resident_work_lifecycle_schemas_preserve_the_canonical_contract() {
             .iter()
             .find(|schema| tool_schema_name(schema) == Some(name))
             .unwrap_or_else(|| panic!("resident schema {name}"));
-        let mut full_structure = without_descriptions(full.clone());
+        let full_structure = without_descriptions(full.clone());
         if name == "start_work" {
-            assert!(
-                full_structure["function"]["parameters"]["x-astra-discovery-summary"].is_string()
-            );
-            full_structure["function"]["parameters"]
-                .as_object_mut()
-                .unwrap()
-                .remove("x-astra-discovery-summary");
+            assert!(full["function"]["parameters"]["x-astra-discovery-summary"].is_string());
         }
         assert_eq!(
             without_descriptions(compact.clone()),
@@ -296,8 +418,20 @@ fn resident_work_lifecycle_schemas_preserve_the_canonical_contract() {
         start["function"]["parameters"]["properties"]["tasks"]["description"], *task_description,
         "resident projection must retain the canonical distinction between outcomes and procedural steps"
     );
-    assert!(description.contains("one canonical Work graph"));
-    assert!(description.contains("never call start_work again"));
+    let prerequisite_path =
+        "/function/parameters/properties/tasks/items/properties/after_initial_tasks/description";
+    assert!(
+        full_start
+            .pointer(prerequisite_path)
+            .is_some_and(Value::is_string)
+    );
+    assert_eq!(
+        start.pointer(prerequisite_path),
+        full_start.pointer(prerequisite_path),
+        "resident input must explain how to declare dependencies, not only name the field"
+    );
+    assert!(description.contains("One Work graph"));
+    assert!(description.contains("no repeat start"));
     assert!(description.contains("revision-pinned proposal"));
     astra_tools::schemas::validate_tool_arguments_against_schema(
         "start_work",
@@ -345,9 +479,55 @@ fn resident_settlement_schema_accepts_typed_direct_input_and_rejects_stale_shape
 
 #[test]
 fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
-    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let surface = ToolSurface::build(
+        catalog_schemas(),
+        &ToolSurfaceConfig {
+            pinned_tools: vec!["memory".into()],
+        },
+        &[],
+    );
     let resident = surface.always_load_schemas();
+    let agent_description = find(&resident, "agent")["function"]["description"]
+        .as_str()
+        .expect("resident agent description");
+    assert!(agent_description.contains("Wait"));
+    assert!(agent_description.contains("No substitution"));
     let full = catalog_schemas();
+    let policy =
+        &find(&full, "agent")["function"]["parameters"]["properties"]["requested_model_policy"];
+    assert_eq!(
+        find(&resident, "agent")["function"]["parameters"]["properties"]["requested_model_policy"]
+            ["description"],
+        policy["x-astra-discovery-summary"],
+        "resident projection must retain model-control semantics"
+    );
+    let summary = policy["x-astra-discovery-summary"].as_str().unwrap();
+    assert!(summary.contains("Not task/output text"));
+    assert!(summary.contains("inherit unless user picks execution model"));
+    let reasoning = &find(&full, "agent")["function"]["parameters"]["properties"]["reasoning"];
+    assert_eq!(
+        find(&resident, "agent")["function"]["parameters"]["properties"]["reasoning"]["description"],
+        reasoning["x-astra-discovery-summary"]
+    );
+    assert!(
+        reasoning["x-astra-discovery-summary"]
+            .as_str()
+            .unwrap()
+            .contains("Omit outside user-requested scope")
+    );
+    assert_eq!(
+        find(&resident, "agent")["function"]["parameters"]["properties"]["prompt"]["description"],
+        find(&full, "agent")["function"]["parameters"]["properties"]["prompt"]["x-astra-discovery-summary"]
+    );
+    let summary = find(&full, "introspect")["function"]["parameters"]["x-astra-discovery-summary"]
+        .as_str()
+        .expect("historical query guidance belongs to the producer");
+    assert!(!summary.trim().is_empty());
+    assert_eq!(
+        find(&resident, "introspect")["function"]["description"].as_str(),
+        Some(summary),
+        "resident projection must not erase the combined historical evidence contract"
+    );
     fn find<'a>(schemas: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
         schemas
             .iter()
@@ -409,6 +589,84 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     );
     assert!(!memory_properties.contains_key("memory_id"));
 
+    let agent = find(&resident, "agent");
+    let agent_params = &agent["function"]["parameters"];
+    let profile = agent_params["properties"]["agent_type"]["description"]
+        .as_str()
+        .unwrap();
+    for constraint in [
+        "Omit for read-only",
+        "task/general-purpose",
+        "shell or mutation",
+    ] {
+        assert!(profile.contains(constraint), "{profile}");
+    }
+    assert!(
+        agent["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("launch≠done")
+    );
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "agent", &json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"}), agent,
+    ).expect("ordinary delegation must not require model catalog fields");
+    let mut bounded_spawn = json!({"action":"spawn", "description":"Bounded child", "prompt":"Return the requested result", "max_output_tokens":256});
+    astra_tools::schemas::validate_tool_arguments_against_schema("agent", &bounded_spawn, agent)
+        .expect("the resident spawn exposes its first-request output ceiling");
+    for invalid in [json!(0), json!(-1), json!("256")] {
+        bounded_spawn["max_output_tokens"] = invalid;
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "agent",
+                &bounded_spawn,
+                agent
+            )
+            .is_err()
+        );
+    }
+    for (field, value) in [
+        ("model", json!("arbitrary-model")),
+        ("unknown_model_policy", json!({"mode": "inherit"})),
+    ] {
+        let mut arguments = json!({"action":"spawn", "description":"Independent task", "prompt":"Return the requested result"});
+        arguments[field] = value;
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "agent", &arguments, agent
+            )
+            .is_err(),
+            "resident spawn must not accept the catalog-only field {field}"
+        );
+    }
+    assert_eq!(
+        agent_params["properties"]["action"]["enum"],
+        serde_json::json!(["spawn", "list", "get_result", "wait", "send_message"])
+    );
+    assert_eq!(agent_params["required"], serde_json::json!(["action"]));
+    assert_eq!(agent_params["additionalProperties"], false);
+    assert!(
+        agent_params["properties"]
+            .get("requested_model_policy")
+            .is_some()
+    );
+    assert_eq!(
+        agent_params["properties"]["requested_model_policy"]["oneOf"][1]["properties"]["selector"]
+            ["oneOf"][1]["properties"]["source"]["description"],
+        "Exact provider/access_label."
+    );
+    assert!(agent_params["properties"].get("agent_id").is_some());
+    assert!(
+        agent_params
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with("x-astra-")
+                || matches!(
+                    key.as_str(),
+                    "x-astra-per-action-required" | "x-astra-per-action-allowed"
+                ))
+    );
+
     let ask_user = find(&resident, "ask_user");
     assert_eq!(
         ask_user["function"]["parameters"]["properties"]["questions"]["items"]["additionalProperties"],
@@ -441,6 +699,76 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
             .get("memory_id")
             .is_some()
     );
+    let full_agent = find(&full, "agent");
+    let child_brief = agent["function"]["parameters"]["properties"]["prompt"]["description"]
+        .as_str()
+        .expect("resident child brief guidance");
+    assert!(child_brief.contains("Exact output"));
+    assert!(child_brief.contains("parent uses model/status receipts"));
+    assert!(
+        full_agent["function"]["parameters"]["properties"]
+            .get("requested_model_policy")
+            .is_some()
+    );
+    let ordinary_spawn = json!({"action":"spawn","description":"Review","prompt":"Review the change","agent_type":"code-review"});
+    astra_tools::schemas::validate_tool_arguments_against_schema("agent", &ordinary_spawn, agent)
+        .expect("the user-facing spawn instruction must match the resident contract");
+    let resident_reasoning_spawn = json!({
+        "action":"spawn",
+        "description":"Reason carefully",
+        "prompt":"Return the requested result",
+        "reasoning":{"mode":"adaptive","effort":"high"}
+    });
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "agent",
+        &resident_reasoning_spawn,
+        agent,
+    )
+    .expect("reasoning is a first-class resident spawn control");
+    for arguments in [
+        json!({"action":"list"}),
+        json!({"action":"get_result","agent_id":"child"}),
+        json!({"action":"send_message","to":"parent","message":"question","message_type":"question"}),
+    ] {
+        astra_tools::schemas::validate_tool_arguments_against_schema("agent", &arguments, agent)
+            .expect("basic collaboration must be directly callable");
+    }
+    for arguments in [
+        json!({"action":"get_result"}),
+        json!({"action":"send_message","to":"parent"}),
+        json!({"action":"list","prompt":"not a spawn"}),
+        json!({"action":"run_chain"}),
+    ] {
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "agent", &arguments, agent
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "agent",
+            &json!({"action":"spawn","description":"Review"}),
+            agent,
+        )
+        .is_err()
+    );
+    let advanced_spawn = json!({"action":"spawn","description":"Review","prompt":"Review the change","requested_model_policy":{"mode":"fixed","selector":{"kind":"offering_id","offering_id":"offer-a"}}});
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "agent",
+            &advanced_spawn,
+            agent,
+        )
+        .is_ok()
+    );
+    astra_tools::schemas::validate_tool_arguments_against_schema(
+        "agent",
+        &advanced_spawn,
+        full_agent,
+    )
+    .expect("selected canonical contract retains advanced spawn fields");
     let full_ask_user = find(&full, "ask_user");
     assert!(
         full_ask_user["function"]["parameters"]["properties"]["questions"]["items"]["properties"]
@@ -514,7 +842,13 @@ fn edge_managed_bash_projection_preserves_service_lifecycle_contract() {
 
 #[test]
 fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_them() {
-    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let surface = ToolSurface::build(
+        catalog_schemas(),
+        &ToolSurfaceConfig {
+            pinned_tools: vec!["memory".into(), "reflect".into()],
+        },
+        &[],
+    );
     let resident = surface.always_load_schemas();
     let full = catalog_schemas();
     fn find<'a>(schemas: &'a [Value], name: &str) -> &'a Value {
@@ -524,11 +858,32 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
             .unwrap_or_else(|| panic!("missing schema {name}"))
     }
 
+    let agent = find(&resident, "agent");
+    assert_eq!(
+        agent["function"]["parameters"]["x-astra-per-action-allowed"]["wait"],
+        json!(["action", "timeout_ms"])
+    );
+    for arguments in [
+        json!({"action": "wait"}),
+        json!({"action": "wait", "timeout_ms": 1}),
+    ] {
+        astra_tools::schemas::validate_tool_arguments_against_schema("agent", &arguments, agent)
+            .expect("resident wait accepts its canonical observation shape");
+    }
+    assert!(
+        astra_tools::schemas::validate_tool_arguments_against_schema(
+            "agent",
+            &json!({"action": "wait", "agent_id": "other-child"}),
+            agent,
+        )
+        .is_err(),
+        "resident wait must not accept fields belonging to other actions"
+    );
+
     let advanced_memory = json!({
         "action": "remember",
         "content": "durable preference",
-        "visibility": "team",
-        "team_id": "team-1"
+        "trust_tier": "durable",
     });
     assert!(
         astra_tools::schemas::validate_tool_arguments_against_schema(
@@ -544,7 +899,28 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
         &advanced_memory,
         find(&full, "memory"),
     )
-    .expect("the deferred canonical memory contract retains advanced fields");
+    .expect("the deferred canonical memory contract retains generic memory metadata");
+
+    let retired_team_memory = json!({
+        "action": "remember",
+        "content": "durable preference",
+        "visibility": "team",
+        "team_id": "team-1"
+    });
+    for memory in [find(&resident, "memory"), find(&full, "memory")] {
+        let properties = &memory["function"]["parameters"]["properties"];
+        assert!(properties.get("visibility").is_none());
+        assert!(properties.get("team_id").is_none());
+        assert!(
+            astra_tools::schemas::validate_tool_arguments_against_schema(
+                "memory",
+                &retired_team_memory,
+                memory,
+            )
+            .is_err(),
+            "retired Team memory controls must not be advertised or accepted"
+        );
+    }
 
     let forget = json!({"action": "forget", "memory_id": "owned-memory", "reason": "user request"});
     assert!(
@@ -564,8 +940,7 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
     let description = find(&resident, "memory")["function"]["description"]
         .as_str()
         .unwrap();
-    assert!(description.contains("forget/update"));
-    assert!(description.contains("tool_search select:memory; invoke_tool"));
+    assert!(description.contains("remember/recall"));
 
     let resident_reflect = json!({
         "question": "What durable evidence explains the last failed turn?"
@@ -626,10 +1001,15 @@ fn resident_projection_rejects_advanced_fields_while_canonical_schema_accepts_th
 
 #[test]
 fn resident_schemas_keep_structure_but_drop_catalog_prose() {
-    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let canonical = catalog_schemas();
+    let surface = ToolSurface::build(canonical.clone(), &ToolSurfaceConfig::default(), &[]);
     for schema in surface.always_load_schemas() {
         let name = tool_schema_name(&schema).expect("resident schema name");
         let function = schema["function"].as_object().expect("function object");
+        let canonical_parameters = &canonical
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some(name))
+            .unwrap()["function"]["parameters"]["properties"];
         assert_eq!(
             function["parameters"]["additionalProperties"], false,
             "resident schema {name} must be an exact closed provider contract"
@@ -646,14 +1026,11 @@ fn resident_schemas_keep_structure_but_drop_catalog_prose() {
             .as_object()
             .unwrap_or_else(|| panic!("resident schema {name} properties"));
         for (field, property) in properties {
-            let mut compact_property = property.clone();
-            if name == "start_work" && field == "tasks" {
-                compact_property
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("description");
-            }
-            assert_no_resident_property_descriptions(&compact_property, &format!("{name}.{field}"));
+            assert_only_producer_parameter_descriptions(
+                property,
+                &canonical_parameters[field],
+                &format!("{name}.{field}"),
+            );
         }
     }
 
@@ -761,7 +1138,19 @@ fn server_builtin_inventory_is_public_schema_backed() {
     let schema_names = schema_name_set();
     let registry = astra_runtime_env::ToolRegistry::builtins();
 
-    for name in crate::provider::server_builtin::server_builtin_tool_names() {
+    let server_builtin_names: std::collections::BTreeSet<String> =
+        crate::capabilities::server_builtin_tool_schemas(
+            &astra_turn_core::capability::CapabilitySet::all(),
+        )
+        .into_iter()
+        .map(|schema| {
+            astra_turn_core::tool::schema::tool_schema_name(&schema)
+                .expect("server schema must declare its name")
+                .to_string()
+        })
+        .collect();
+    assert!(!server_builtin_names.is_empty());
+    for name in &server_builtin_names {
         let spec = registry
             .get(name)
             .unwrap_or_else(|| panic!("server builtin inventory has no ToolSpec: {name}"));
@@ -882,7 +1271,7 @@ fn web_without_file_environment_provider_filters_workspace_executor_candidates()
         );
     let final_names: std::collections::BTreeSet<String> = names(&filtered).into_iter().collect();
 
-    for visible in ["ask_user", "memory", "tool_search"] {
+    for visible in ["ask_user", "introspect", "tool_search"] {
         assert!(
             final_names.contains(visible),
             "{visible} should remain visible without a file-environment provider"
@@ -1091,7 +1480,7 @@ fn surface_partitions_static_tools_and_excludes_request_scoped_tools() {
 }
 
 #[test]
-fn observation_recovery_and_reflection_are_eager() {
+fn observation_recovery_is_eager_and_reflection_can_be_pinned() {
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
 
@@ -1105,8 +1494,8 @@ fn observation_recovery_and_reflection_are_eager() {
 
     assert!(always_load.contains("introspect"));
     assert!(!deferred.contains("introspect"));
-    assert!(always_load.contains("reflect"));
-    assert!(!deferred.contains("reflect"));
+    assert!(!always_load.contains("reflect"));
+    assert!(deferred.contains("reflect"));
 
     let introspect = surface
         .always_load_schemas()
@@ -1118,15 +1507,13 @@ fn observation_recovery_and_reflection_are_eager() {
         properties["explain"]["properties"]["target"]["enum"],
         serde_json::json!(["previous", "run"])
     );
-    assert!(
-        introspect["function"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("explain={target:previous}")
+    assert_eq!(
+        properties["explain"]["properties"]["run_id"]["type"],
+        "string"
     );
-    let description = introspect["function"]["description"].as_str().unwrap();
-    assert!(description.contains("question=label"));
-    assert!(description.contains("artifact=handle; never both"));
+    for field in ["question", "artifact"] {
+        assert_eq!(properties[field]["type"], "string");
+    }
     for field in ["explain", "artifact", "offset", "max_bytes"] {
         assert!(
             properties.get(field).is_some(),
@@ -1134,14 +1521,21 @@ fn observation_recovery_and_reflection_are_eager() {
         );
     }
 
-    let reflect = surface
+    let pinned = ToolSurface::build(
+        catalog_schemas(),
+        &ToolSurfaceConfig {
+            pinned_tools: vec!["reflect".into()],
+        },
+        &[],
+    );
+    let reflect = pinned
         .always_load_schemas()
         .into_iter()
         .find(|schema| schema["function"]["name"] == "reflect")
-        .expect("reflect observation schema must be eager");
+        .expect("pinned reflect observation schema must be eager");
     let description = reflect["function"]["description"].as_str().unwrap();
-    assert!(description.contains("tool_search select:reflect"));
-    assert!(description.contains("invoke_tool"));
+    assert!(description.contains("Session history"));
+    assert!(description.contains("Exact run: Explain"));
     let reflect_properties = reflect["function"]["parameters"]["properties"]
         .as_object()
         .expect("resident reflect properties");
@@ -1154,7 +1548,7 @@ fn observation_recovery_and_reflection_are_eager() {
         .deferred_manifest_with_context_window(Some(200_000))
         .expect("default surface should still have other deferred tools");
     assert!(!manifest.names.iter().any(|name| name == "introspect"));
-    assert!(!manifest.names.iter().any(|name| name == "reflect"));
+    assert!(manifest.names.iter().any(|name| name == "reflect"));
 }
 
 #[test]

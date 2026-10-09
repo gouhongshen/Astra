@@ -1,7 +1,7 @@
 //! Server-side skill fork (sub-run) executor.
 //!
 //! Enables skills with `execution_context: Fork` to run in isolated sub-agent
-//! loops on the server, matching the CLI's `CliSkillSubRunExecutor` behavior.
+//! loops owned by the Server, including for CLI-originated admissions.
 //!
 //! Each sub-run creates a fresh [`ServerAgenticLoopHost`] +
 //! [`AgenticLoopState`] pair and runs [`run_agentic_loop_with_host`] to
@@ -28,9 +28,8 @@ use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::turn::agentic_loop::host::{
     AgenticLoopHost as _, AgenticLoopState, CancellationState, RequestConstraints, SkillState,
-    StopHookState, TurnInteractionPolicy, project_skill_subrun_outcome, run_agentic_loop_with_host,
+    StopHookState, project_skill_subrun_outcome, run_agentic_loop_with_host,
 };
-use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunOutcome, SubRunResult};
 use astra_text_utils::semantic_dedup::SemanticDedup;
@@ -148,6 +147,10 @@ impl Drop for OuterSkillDispatchGuard {
 /// Creates a [`ServerAgenticLoopHost`] for each sub-run with isolated context
 /// but shared LLM credentials and skill resolver.
 pub struct ServerSkillSubRunExecutor {
+    #[cfg(any(test, feature = "e2e-hooks"))]
+    pub(crate) test_inference_ledger:
+        Option<crate::turn::llm::durable::TestInferenceLedgerPersistence>,
+    model_catalog_reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
     model_service: Option<Arc<dyn astra_services::ModelService>>,
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
@@ -155,8 +158,11 @@ pub struct ServerSkillSubRunExecutor {
     user_id: String,
     /// Default model to use when the skill manifest doesn't specify one.
     default_model: Option<String>,
+    run_engine: Option<crate::server::run::engine::RunEngine>,
     /// Normalized execution material inherited from the admitted parent run.
     admitted_model_execution: Option<AdmittedModelExecution>,
+    /// Frozen parent completion obligations; absence never grants an empty contract.
+    completion_checks: Option<astra_turn_types::StopHookObligations>,
     /// Edge tools available to sub-runs (inherited from parent host).
     edge_tools: Vec<Value>,
     /// Edge profile (cwd, git_branch, etc.) inherited from parent.
@@ -196,12 +202,6 @@ pub struct ServerSkillSubRunExecutor {
     /// Durable Edge registry used when the selected executor is connected to
     /// another Astra replica.
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
-    /// Shared tool_call dedup state from the parent host. When set, the sub-run
-    /// host will observe the same emitted_tool_call_ids HashSet as the parent,
-    /// preventing duplicate `tool_call` events across host instances within the
-    /// same chat turn. Plumbed only under `e2e-hooks` (test observability).
-    #[cfg(feature = "e2e-hooks")]
-    dedup_state: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     /// Parent session's harness snapshot sink for observe-only sub-run
     /// observation. When set, the sub-run creates a sink-only HarnessSlot
     /// so sub-run snapshots appear in the parent's history.
@@ -226,6 +226,56 @@ pub struct ServerSkillSubRunExecutor {
 }
 
 impl ServerSkillSubRunExecutor {
+    async fn inherited_model_execution(
+        &self,
+        parent_run_id: &str,
+    ) -> Result<Option<AdmittedModelExecution>, String> {
+        let Some(engine) = &self.run_engine else {
+            return Ok(self.admitted_model_execution.clone());
+        };
+        crate::server::model_execution_admission::inherit_routed_execution(
+            engine,
+            &self.user_id,
+            &self.session_id,
+            parent_run_id,
+            self.admitted_model_execution.as_ref(),
+            |id| async move {
+                if let Some(service) = &self.model_service {
+                    service
+                        .admit_model_offering(self.user_id.clone(), id)
+                        .await
+                        .map_err(|(status, body)| {
+                            crate::server::run::lifecycle::safe_model_service_error_with_code(
+                                status,
+                                body.0.error_code.as_deref(),
+                            )
+                            .to_string()
+                        })
+                } else {
+                    astra_services::revalidate_admitted_model_execution(
+                        &self.matrixone,
+                        self.encryptor.as_ref(),
+                        &self.user_id,
+                        &id,
+                        self.shared_pool.as_ref().map(SharedPool::get),
+                    )
+                    .await
+                    .map_err(|error| {
+                        crate::server::run::lifecycle::safe_model_offering_error_with_code(error)
+                    })
+                }
+            },
+        )
+        .await
+    }
+
+    pub fn with_model_catalog_reader(
+        mut self,
+        reader: Option<astra_services::models::AuthorizedModelCatalogReader>,
+    ) -> Self {
+        self.model_catalog_reader = reader;
+        self
+    }
     pub fn with_model_service(
         mut self,
         service: Option<Arc<dyn astra_services::ModelService>>,
@@ -240,13 +290,18 @@ impl ServerSkillSubRunExecutor {
         session_id: String,
     ) -> Self {
         Self {
+            #[cfg(any(test, feature = "e2e-hooks"))]
+            test_inference_ledger: None,
             model_service: None,
+            model_catalog_reader: None,
             matrixone,
             encryptor,
             shared_pool: None,
             user_id,
             default_model: None,
+            run_engine: None,
             admitted_model_execution: None,
+            completion_checks: None,
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
             execution_binding_snapshot: None,
@@ -266,8 +321,6 @@ impl ServerSkillSubRunExecutor {
             edge_connection_pool: None,
             edge_dispatch_service: None,
             edge_registry_service: None,
-            #[cfg(feature = "e2e-hooks")]
-            dedup_state: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
             memory_extraction_service: None,
@@ -291,20 +344,21 @@ impl ServerSkillSubRunExecutor {
         self
     }
 
-    /// Share the parent host's `emitted_tool_call_ids` HashSet so that sub-run
-    /// hosts dedupe `tool_call` events against the parent's already-emitted
-    /// ids. See `ServerAgenticLoopHostBuilder::with_dedup_state`.
-    #[cfg(feature = "e2e-hooks")]
-    pub fn with_dedup_state(
-        mut self,
-        shared: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    ) -> Self {
-        self.dedup_state = Some(shared);
+    pub fn with_pool(mut self, pool: Option<SharedPool>) -> Self {
+        self.shared_pool = pool;
         self
     }
 
-    pub fn with_pool(mut self, pool: Option<SharedPool>) -> Self {
-        self.shared_pool = pool;
+    pub(crate) fn with_completion_checks(
+        mut self,
+        checks: astra_turn_types::StopHookObligations,
+    ) -> Self {
+        self.completion_checks = Some(checks);
+        self
+    }
+
+    pub(crate) fn with_run_engine(mut self, engine: crate::server::run::engine::RunEngine) -> Self {
+        self.run_engine = Some(engine);
         self
     }
 
@@ -508,7 +562,29 @@ impl ServerSkillSubRunExecutor {
         presentation_session_id: &str,
         invocation_ledger: crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger,
     ) -> Result<super::runtime_tool_executor::RuntimeToolExecutor, String> {
-        let workspace = self.provision_skill_workspace(skill_name, presentation_session_id)?;
+        let workspace = match self.execution_binding_snapshot.as_ref() {
+            Some(snapshot)
+                if snapshot.workspace.kind
+                    == astra_runtime_env::WorkspaceBindingKind::ServerSandbox =>
+            {
+                let root = snapshot
+                    .workspace
+                    .cwd
+                    .as_deref()
+                    .filter(|root| !root.is_empty() && root.trim() == *root)
+                    .ok_or_else(|| {
+                        "skill fork selected Server sandbox is missing its root".to_string()
+                    })?;
+                let root = std::path::PathBuf::from(root);
+                if !root.is_absolute() {
+                    return Err(
+                        "skill fork selected Server sandbox root must be absolute".to_string()
+                    );
+                }
+                root
+            }
+            _ => self.provision_skill_workspace(skill_name, presentation_session_id)?,
+        };
         let memoria_base = None;
         let mut builder = ToolExecutionService::builder();
         if let Some(pool) = &self.edge_connection_pool {
@@ -531,6 +607,7 @@ impl ServerSkillSubRunExecutor {
             None,
         )
         .with_reflect_service(Arc::clone(&self.reflect_service))
+        .with_model_catalog_reader(self.model_catalog_reader.clone())
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             self.shared_pool.is_some(),
             self.reflect_service.is_configured(),
@@ -728,6 +805,7 @@ impl ServerSkillSubRunExecutor {
         task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
         runtime_ceiling: Option<std::num::NonZeroUsize>,
         effective_model: Option<&str>,
+        admitted_model_execution: Option<&AdmittedModelExecution>,
     ) -> Result<
         (
             astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
@@ -741,8 +819,7 @@ impl ServerSkillSubRunExecutor {
                 task_profile,
                 runtime_ceiling,
             );
-        let admitted_context_window = self
-            .admitted_model_execution
+        let admitted_context_window = admitted_model_execution
             .as_ref()
             .and_then(|execution| execution.context_window);
         let max_turn_input_tokens =
@@ -803,6 +880,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             .ok_or_else(|| {
                 "forked skill execution is missing its parent turn-chain authority".to_string()
             })?;
+        let completion_checks = self.completion_checks.as_ref().ok_or_else(|| {
+            "forked skill execution is missing its frozen parent completion contract".to_string()
+        })?;
         let outer_identity = ToolInvocationIdentity::new(
             &self.user_id,
             &self.session_id,
@@ -894,9 +974,10 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         };
 
         let execution_result: Result<SubRunResult, String> = async {
-        let effective_model = self.default_model.clone();
-        let compact_strategy = self
-            .admitted_model_execution
+        let admitted_model_execution = self.inherited_model_execution(parent_run_id).await?;
+        let effective_model = admitted_model_execution.as_ref()
+            .map(|execution| execution.model_name.clone()).or_else(|| self.default_model.clone());
+        let compact_strategy = admitted_model_execution
             .as_ref()
             .map(|execution| {
                 crate::turn::llm::context::compact_strategy_from_model_metadata(
@@ -929,11 +1010,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             parent_recursion_depth,
         );
 
-        // Resolve per-model workflow-guard policy before `effective_model` is
-        // consumed by `.with_model(...)` below.
-        let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
-            .tool_selection
-            .resolve_for_model(effective_model.as_deref());
+        // Select the policy once for this skill execution.
+        let admitted_tool_policy = astra_config::RuntimeConfig::load().tool_policy;
 
         // Build the host for the sub-run.
         let mut builder = ServerAgenticLoopHostBuilder::new(
@@ -947,7 +1025,11 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         )
         .with_model(effective_model.clone())
         .with_model_service(self.model_service.clone())
-        .with_admitted_model_execution(self.admitted_model_execution.clone())
+        .with_model_catalog_reader(self.model_catalog_reader.clone())
+        .with_provider_scope_bound(admitted_model_execution.as_ref().is_some_and(|execution| {
+            execution.execution_placement == astra_services::models::ModelExecutionPlacement::Edge
+        }))
+        .with_admitted_model_execution(admitted_model_execution.clone())
         .with_inference_owner_pod_id(Some(parent_owner_pod_id.to_string()))
         .with_edge_tools(self.edge_tools.clone())
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
@@ -958,23 +1040,16 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         .with_edge_callback_ledger(Arc::new(TokioMutex::new(HashMap::new())))
         .with_interaction_mode(Some(self.interaction_mode));
 
+        #[cfg(any(test, feature = "e2e-hooks"))]
+        if let Some(ledger) = self.test_inference_ledger.as_ref() {
+            builder = builder.with_test_inference_ledger(ledger.clone());
+        }
         if let Some(snapshot) = &self.execution_binding_snapshot {
             builder = builder.with_execution_binding_snapshot(snapshot.clone());
         }
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
-        }
-
-        // Wire shared dedup state from the parent host so that tool_call events
-        // emitted by this sub-run host are deduplicated against the parent's
-        // already-emitted ids. Without this, the same `tool_call` id would be
-        // emitted once per host instance within the same chat turn.
-        // See `ServerAgenticLoopHostBuilder::with_dedup_state` and
-        // `ServerSkillSubRunExecutor::with_dedup_state`.
-        #[cfg(feature = "e2e-hooks")]
-        if let Some(dedup) = &self.dedup_state {
-            builder = builder.with_dedup_state(dedup.clone());
         }
 
         builder = builder.with_memoria_client(self.memory_extraction_service.as_ref()
@@ -1020,16 +1095,20 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         let task_profile = infer_task_execution_profile(task_context);
         let (agentic_turn_budget, max_turn_input_tokens) =
-            self.resolve_execution_policy(task_profile, runtime_ceiling, effective_model.as_deref())?;
+            self.resolve_execution_policy(task_profile, runtime_ceiling, effective_model.as_deref(), admitted_model_execution.as_ref())?;
         let initial_turns = agentic_turn_budget.initial_turns;
-        let workspace_root_hint = self
-            .edge_profile
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(String::from);
-
-        let (tool_event_hooks, session_event_hooks) = workspace_root_hint
+        let stop_hooks = completion_checks.declarations.clone().into_selected(
+            completion_checks.phase == astra_turn_types::CompletionCheckPhase::TaskCompleted,
+            task_profile.verification_required,
+        );
+        let workspace_root_hint = self.execution_binding_snapshot
+            .as_ref().and_then(|bindings| bindings.workspace.cwd.clone());
+        let (tool_event_hooks, session_event_hooks) = self.execution_binding_snapshot
             .as_ref()
+            .filter(|bindings| bindings.workspace.kind == crate::server::tool_execution_binding::WorkspaceBindingKind::ServerSandbox
+                && bindings.executor.kind == crate::server::tool_execution_binding::ExecutorBindingKind::ServerLocal
+                && bindings.executor.transport == crate::server::tool_execution_binding::ToolTransportKind::ServerLocal)
+            .and_then(|bindings| bindings.workspace.cwd.as_deref())
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
 
@@ -1038,66 +1117,26 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         let mut state = AgenticLoopState {
             messages,
-            run_transcript_capture: None,
-            volatile_pending: Vec::new(),
-            recent_rounds: Vec::new(),
-            tool_results: Vec::new(),
             current_session_id: Some(self.session_id.clone()),
             current_run_id: Some(parent_run_id.to_string()),
             current_run_owner_generation: Some(parent_owner_generation),
-            applied_permission_mode: None,
-            inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
-            context_manifest_pool: None,
             context_manifest_user_id: Some(self.user_id.clone()),
             context_manifest_model_name: effective_model.clone(),
-            runtime_manifest: None,
             recursion_depth: child_recursion_depth,
-            final_text: String::new(),
-            final_text_streamed: false,
-            final_output_ready_notified: false,
-            total_prompt: 0,
-            total_completion: 0,
-            total_cache_read: 0,
-            total_cache_creation: 0,
-            total_tool_calls: 0,
-            total_observation_tool_calls: 0,
-            tool_ledger_receipt: Default::default(),
-            has_any_usage: false,
-            qualified_usage: None,
-            last_request_usage: None,
-            last_finish_reason: None,
             max_turns: initial_turns,
             remaining_turns: initial_turns,
-            charged_iterations: 0,
-            agentic_turn_budget,
             budget_is_explicit: true,
-            budget_policy: None,
-            loop_entry: Default::default(),
-            current_round_index: 0,
-            llm_rounds_completed: 0,
-            last_request_message_count: None,
             turn_guard: TurnGuard::with_profile(task_profile),
             restricted_tools,
-            boosted_tools: HashSet::new(),
-            widen_selection_pending: false,
-            step_recorder,
-            idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(
                 astra_text_utils::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
             ),
-            call_counts: HashMap::new(),
-            max_identical_tool_calls: resolved_tool_policy.max_identical_tool_calls,
-            max_tools_per_turn: resolved_tool_policy.max_tools_per_turn,
-            max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
-            stall: Default::default(),
-            telemetry: Default::default(),
             skills: SkillState {
                 // Inherit resolver for nested inline skills, but NO executor
                 // to prevent Fork→Fork recursion (same as CLI design).
                 resolver: self.skill_resolver.clone(),
                 request_constraints: self.request_constraints.clone(),
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-                improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
                 tool_event_hooks,
                 session_event_hooks,
                 // Skill-level effort/agent_type from manifest
@@ -1109,9 +1148,12 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 ..Default::default()
             },
             hooks: StopHookState {
+                declarations: completion_checks.declarations.clone(),
+                phase: completion_checks.phase,
+                stop_hooks,
                 workspace_root_hint,
                 forward_headers: self.forward_headers.clone(),
-                admitted_model_execution: self.admitted_model_execution.clone(),
+                admitted_model_execution: admitted_model_execution.clone(),
                 ..Default::default()
             },
             cancellation: CancellationState {
@@ -1121,15 +1163,11 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 execution_lease_lost: self.execution_lease_lost.clone(),
                 resolved_origin: None,
             },
-            messaging: Default::default(),
             user_intents: {
                 let mut user_intents = crate::turn::agentic_loop::host::UserIntentState::default();
                 user_intents.commit_observed_cursor(inherited_user_intent_cursor);
                 user_intents
             },
-            error_recovery: Default::default(),
-            provider_adaptation: Default::default(),
-            run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
                     astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -1141,61 +1179,12 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             ),
             message: task_context.to_string(),
             user_intent: task_context.to_string(),
-            recent_tools: Vec::new(),
-            deferred_tool_activations: Vec::new(),
-            has_prior_assistant_turn: false,
-            turn_intent: None,
             task_profile: infer_task_execution_profile(task_context),
-            last_turn_policy: TurnInteractionPolicy::default(),
-            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
-                .expect("valid dummy URL"),
-            api_token: String::new(),
-            delegation_engine: None,
-            delegations_this_turn: 0,
-            delegation_chain: Vec::new(),
-            self_agent_id: "main".to_string(),
-            project_context: None,
-            checkpoint_gate: None,
-            last_llm_context_manifest_trace: None,
-            rate_limit_cooldown: Default::default(),
-            data_snapshot_provider: None,
-            last_composite_snapshot: None,
-            last_measured_prompt_tokens: None,
-            consecutive_context_window_errors: 0,
-            compaction_effectiveness: Default::default(),
-            pinned_tool_schema_tokens: 0,
-            sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens,
-            budget_wrapup_injected: false,
-            context_compression_triggered: false,
-            canonical_rewrite_state: Default::default(),
-            provider_canonical_wal_base: None,
-            provider_canonical_wal_head: None,
-            budget_wrapup_ignored_rounds: 0,
-            compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
-            skill_produced_output: false,
-            thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
             permission_context: Some(permission_context),
-            permission_handler: None,
-            tactical_adapter: None,
-            step_signal_collector: None,
-            recent_tactical_actions: Vec::new(),
-            runtime_tool_executor: None,
-            interruption: None,
-            session_facts: Default::default(),
             memory_extraction_service: self.memory_extraction_service.clone(),
-            observation_journal: Default::default(),
-            session_memory_state: Default::default(),
             compact_strategy,
-            approval_overrides: None,
-            confidence_trend: Default::default(),
-            last_confidence_diagnosis: None,
-            session_turn: 0,
             canonical_turn_chain_id: Some(child_turn_chain_id),
-            root_user_query_event_id: None,
-            turn_event_buffer: None,
-            canonical_turn_started_at: Default::default(),
-            canonical_trace_time_bounds: Default::default(),
             harness: {
                 #[cfg(feature = "harness")]
                 {
@@ -1211,6 +1200,14 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                     crate::turn::harness_adapter::HarnessSlot::empty()
                 }
             },
+            ..AgenticLoopState::fresh(
+                step_recorder,
+                agentic_turn_budget,
+                admitted_tool_policy,
+                effective_model.as_deref(),
+                astra_turn_types::InferencePurpose::SubAgent,
+                astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            )
         };
 
         // ── Wire RuntimeToolExecutor for skill sub-run tool execution ────
@@ -1358,6 +1355,542 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    async fn distinct_skill_forks_share_parent_authority_without_aliasing_inference() {
+        use crate::server::model_execution_admission::inheritance_test_support::{
+            SESSION_ID, ServiceBackedOffering, USER_ID, auto_parent_run, genesis_execution,
+        };
+        use crate::server::provider_test_support::{
+            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+        };
+        const SECRET: &str = "FIRST_FORK_ONLY_FILE_EVIDENCE";
+        const TASK: &str = "Explain the supplied facts without making changes.";
+        let workspace = tempfile::TempDir::new().unwrap();
+        // Exceed the retired selection policy's 15-call cap through actual execution.
+        let reads: Vec<_> = (0..16)
+            .map(|index| {
+                let path = format!("facts-{index}.txt");
+                std::fs::write(workspace.path().join(&path), format!("{SECRET}-{index}")).unwrap();
+                let id = if index == 0 {
+                    "first-fork-read".to_string()
+                } else {
+                    format!("first-fork-read-{index}")
+                };
+                json!({"id":id,"type":"function","function":{"name":"read_file",
+                "arguments":json!({"path":path}).to_string()}})
+            })
+            .collect();
+        let allowed_tools = vec!["read_file".to_string(), "bash".to_string()];
+        let verification_call = |id: &str| {
+            json!({"id":id,"type":"function","function":{
+                "name":"bash","arguments":json!({"command":"true"}).to_string()
+            }})
+        };
+        let mut first_calls = reads.clone();
+        first_calls.push(verification_call("first-fork-check"));
+        let read = ProviderResponse::OpenAi(json!({
+            "id":"fork-first-read","model":"genesis-wire-model",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":first_calls},"finish_reason":"tool_calls"}],
+            "usage":{"prompt_tokens":17,"completion_tokens":5,"total_tokens":22}
+        }));
+        let gateway = ProviderGateway::start(vec![ProviderScript::new(
+            "two actual skill forks", |request| request.path == "/v1/chat/completions"
+                && request.body["model"] == "genesis-wire-model",
+            vec![read,
+                ProviderResponse::OpenAi(json!({
+                    "id":"fork-first","model":"genesis-wire-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"first explanation is complete."},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":17,"completion_tokens":5,"total_tokens":22}
+                })),
+                ProviderResponse::OpenAi(json!({
+                    "id":"fork-second-check","model":"genesis-wire-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[verification_call("second-fork-check")]},"finish_reason":"tool_calls"}],
+                    "usage":{"prompt_tokens":17,"completion_tokens":5,"total_tokens":22}
+                })),
+                ProviderResponse::OpenAi(json!({
+                    "id":"fork-second","model":"genesis-wire-model",
+                    "choices":[{"index":0,"message":{"role":"assistant","content":"second explanation is complete."},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":17,"completion_tokens":5,"total_tokens":22}
+                })),
+            ],
+        )]).await;
+        let mut execution = genesis_execution();
+        execution.base_url = format!("{}/v1", gateway.base_url);
+        let service = Arc::new(ServiceBackedOffering::new(execution.clone()));
+        let parent = "two-forks-parent";
+        let engine = auto_parent_run(parent, &execution).await;
+        let parent_record = engine.load_run(USER_ID, parent).await.unwrap().unwrap();
+        let invocation_ledger =
+            crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
+                engine.clone(),
+            )
+            .unwrap();
+        let inference = InferenceLedgerFixture::default();
+        let mut executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            USER_ID.into(),
+            SESSION_ID.into(),
+        )
+        .with_model_service(Some(service))
+        .with_run_engine(engine.clone())
+        .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::server_sandbox(workspace.path()),
+            ExecutorBinding::server_local(),
+        ))
+        .with_edge_tools(vec![json!({"type":"function","function":{
+            "name":"read_file","description":"Read facts from the selected sandbox.",
+            "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+        }}), json!({"type":"function","function":{
+            "name":"bash","description":"Run an admitted command in the selected sandbox.",
+            "parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}
+        }})])
+        .with_admitted_model_execution(Some(execution))
+        .with_completion_checks(astra_turn_types::StopHookObligations {
+            declarations: astra_turn_types::CompletionCheckDeclarations {
+                stop: vec![astra_turn_types::StopHook {
+                    label: "wrong-parent-phase".into(), command: "false".into(),
+                    working_dir: None, depends_on: Vec::new(), timeout_secs: None,
+                    authoritative: true,
+                }],
+                task_completed: vec![
+                    astra_turn_types::StopHook {
+                        label: "child-completion".into(), command: "true".into(),
+                        working_dir: None, depends_on: Vec::new(), timeout_secs: None,
+                        authoritative: true,
+                    },
+                    astra_turn_types::StopHook {
+                        label: "advisory-for-work-profile".into(), command: "printf work-advisory".into(),
+                        working_dir: None, depends_on: Vec::new(), timeout_secs: None,
+                        authoritative: false,
+                    },
+                ],
+            },
+            phase: astra_turn_types::CompletionCheckPhase::TaskCompleted,
+        })
+        .with_parent_invocation_authority(
+            parent.into(),
+            parent_record.run_generation,
+            "fork-parent-owner".into(),
+            invocation_ledger,
+        );
+        executor.test_inference_ledger = Some(inference.persistence.clone());
+        for (invocation, chain, reason) in [
+            (
+                None,
+                Some("parent-chain"),
+                "parent tool invocation identity",
+            ),
+            (
+                Some("missing-chain-call"),
+                None,
+                "parent turn-chain authority",
+            ),
+            (
+                Some(" invalid-call"),
+                Some("parent-chain"),
+                "parent tool invocation identity",
+            ),
+            (
+                Some("invalid-chain-call"),
+                Some(" "),
+                "parent turn-chain authority",
+            ),
+        ] {
+            let error = executor
+                .execute_skill_subrun(
+                    "explanation",
+                    "Explain only; do not modify files.",
+                    TASK,
+                    Some(4096),
+                    &allowed_tools,
+                    0,
+                    None,
+                    None,
+                    invocation,
+                    Some(parent_record.last_event_idx),
+                    chain,
+                )
+                .await
+                .expect_err("fork identity must be validated at the real executor entrypoint");
+            assert!(error.contains(reason), "{error}");
+        }
+        let frozen = executor.completion_checks.take();
+        let record = engine.load_run(USER_ID, parent).await.unwrap().unwrap();
+        let error = executor
+            .execute_skill_subrun(
+                "explanation",
+                "Explain only; do not modify files.",
+                TASK,
+                Some(4096),
+                &allowed_tools,
+                0,
+                None,
+                None,
+                Some("missing-contract"),
+                Some(record.last_event_idx),
+                Some("parent-chain"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("frozen parent completion contract"));
+        executor.completion_checks = frozen;
+        assert!(gateway.requests.lock().await.is_empty());
+        assert!(inference.admissions().is_empty());
+        assert_eq!(inference.attempt_count(), 0);
+        let mut expected_epochs = std::collections::HashSet::new();
+        for (name, invocation) in [
+            ("first", "first-outer-call"),
+            ("second", "second-outer-call"),
+        ] {
+            let record = engine.load_run(USER_ID, parent).await.unwrap().unwrap();
+            expected_epochs.insert(record.last_event_idx);
+            let result = executor
+                .execute_skill_subrun(
+                    "explanation",
+                    "Explain only; do not modify files.",
+                    TASK,
+                    Some(4096),
+                    &allowed_tools,
+                    0,
+                    None,
+                    None,
+                    Some(invocation),
+                    Some(record.last_event_idx),
+                    Some("parent-chain"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result.outcome,
+                SubRunOutcome::Completed,
+                "{name}: {:?}",
+                result.outcome
+            );
+            assert_eq!(result.output, format!("{name} explanation is complete."));
+            assert_eq!(result.tokens_used, 44);
+        }
+        let record = engine.load_run(USER_ID, parent).await.unwrap().unwrap();
+        let replay = executor
+            .execute_skill_subrun(
+                "explanation",
+                "Explain only; do not modify files.",
+                TASK,
+                Some(4096),
+                &allowed_tools,
+                0,
+                None,
+                None,
+                Some("first-outer-call"),
+                Some(record.last_event_idx),
+                Some("parent-chain"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.outcome, SubRunOutcome::Completed);
+        assert_eq!(replay.output, "first explanation is complete.");
+        assert_eq!(replay.tokens_used, 44);
+        gateway.assert_complete();
+        inference.assert_quiescent();
+        assert_eq!(inference.attempt_count(), 4);
+        let admissions = inference.admissions();
+        assert_eq!(admissions.len(), 4);
+        let operations: std::collections::HashSet<_> = admissions
+            .iter()
+            .map(|(scope, _)| scope.operation_id())
+            .collect();
+        assert_eq!(
+            operations.len(),
+            2,
+            "distinct forks cannot share inference identity"
+        );
+        for (scope, authority) in admissions {
+            assert_eq!(scope.run_id(), Some(parent));
+            assert_eq!(scope.session_id(), Some(SESSION_ID));
+            let authority = authority.unwrap();
+            assert_eq!(authority.expected_owner_pod_id, "fork-parent-owner");
+            assert!(expected_epochs.contains(&authority.expected_control_epoch));
+            assert_eq!(
+                authority.expected_owner_generation,
+                parent_record.run_generation
+            );
+        }
+        let requests = gateway.requests.lock().await;
+        assert_eq!(requests.len(), 4);
+        let first_followup = requests[1].body["messages"].as_array().unwrap();
+        for call in &reads {
+            assert!(
+                first_followup.iter().any(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"] == call["id"]
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains(SECRET))
+                }),
+                "every admitted read must reach the next provider request: {}",
+                call["id"]
+            );
+        }
+        assert!(first_followup.iter().any(|message| {
+            message["role"] == "assistant"
+                && message["tool_calls"]
+                    .as_array()
+                    .is_some_and(|calls| calls.iter().any(|call| call["id"] == "first-fork-read"))
+        }));
+        let second_messages = requests[2].body["messages"].as_array().unwrap();
+        assert!(
+            second_messages
+                .iter()
+                .all(|message| message["role"] != "tool")
+        );
+        let second_wire = requests[2].body["messages"].to_string();
+        assert!(
+            second_wire.contains(TASK),
+            "second fork must retain its own task anchor"
+        );
+        assert!(!second_wire.contains("first-fork-read"));
+        assert!(!second_wire.contains(SECRET));
+        for (index, invocation) in [(1, "first-fork-check"), (3, "second-fork-check")] {
+            assert!(
+                requests[index].body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| message["role"] == "tool"
+                        && message["tool_call_id"] == invocation
+                        && !message["content"].as_str().unwrap().contains("Error")),
+                "the declared check must execute through the selected tool boundary: {:?}",
+                requests[index].body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|message| message["tool_call_id"] == invocation)
+                    .map(|message| &message["content"])
+            );
+        }
+        for request in requests.iter() {
+            let wire = request.body["messages"].to_string();
+            assert!(
+                wire.contains("child-completion"),
+                "fork must preserve the parent phase"
+            );
+            assert!(!wire.contains("wrong-parent-phase"));
+            assert!(
+                !wire.contains("advisory-for-work-profile"),
+                "child profile filters advisory checks"
+            );
+            assert!(!request.body.to_string().contains("first-outer-call"));
+            assert!(!request.body.to_string().contains("parent-chain"));
+        }
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    async fn restored_root_session_deny_reaches_skill_execution_boundary() {
+        use crate::server::model_execution_admission::inheritance_test_support::{
+            SESSION_ID, ServiceBackedOffering, USER_ID, auto_parent_run, genesis_execution,
+        };
+        use crate::server::provider_test_support::{
+            InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+        };
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let gateway = ProviderGateway::start(vec![ProviderScript::new(
+            "restored session deny reaches skill subrun",
+            |request| {
+                request.path == "/v1/chat/completions"
+                    && request.body["model"] == "genesis-wire-model"
+            },
+            vec![
+                ProviderResponse::OpenAi(json!({
+                    "id": "permission-denied-write",
+                    "model": "genesis-wire-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": "blocked-write",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json!({
+                                        "path": "blocked.txt",
+                                        "content": "must not be written"
+                                    }).to_string()
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": {"prompt_tokens": 17, "completion_tokens": 5, "total_tokens": 22}
+                })),
+                ProviderResponse::OpenAi(json!({
+                    "id": "permission-denied-write-followup",
+                    "model": "genesis-wire-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "The write was denied and no file was created."
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 22, "completion_tokens": 9, "total_tokens": 31}
+                })),
+            ],
+        )])
+        .await;
+
+        let mut execution = genesis_execution();
+        execution.base_url = format!("{}/v1", gateway.base_url);
+        let service = Arc::new(ServiceBackedOffering::new(execution.clone()));
+        let parent = "restored-permission-parent";
+        let engine = auto_parent_run(parent, &execution).await;
+        let parent_record = engine.load_run(USER_ID, parent).await.unwrap().unwrap();
+        let invocation_ledger =
+            crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
+                engine.clone(),
+            )
+            .unwrap();
+        let inference = InferenceLedgerFixture::default();
+
+        // Model the real root restore path: session-only state is restored on
+        // the root owner, then projected through the existing child boundary.
+        let mut restored_root = crate::orchestration::PermissionSyncContext::root(
+            crate::orchestration::PermissionMode::Auto,
+        );
+        restored_root.apply_update(&crate::orchestration::PermissionUpdate::deny(
+            crate::orchestration::PermissionRule::tool("write_file"),
+        ));
+        let continuation = restored_root.capture_continuation().unwrap();
+        let mut current_root = crate::orchestration::PermissionSyncContext::root(
+            crate::orchestration::PermissionMode::Auto,
+        );
+        current_root.restore_continuation(&continuation).unwrap();
+        let inherited_permissions = current_root.for_child(false);
+        assert!(inherited_permissions.is_denied("write_file", None));
+
+        let mut executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            USER_ID.into(),
+            SESSION_ID.into(),
+        )
+        .with_model_service(Some(service))
+        .with_run_engine(engine.clone())
+        .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::server_sandbox(workspace.path()),
+            ExecutorBinding::server_local(),
+        ))
+        .with_edge_tools(vec![json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write a file in the selected sandbox.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        })])
+        .with_admitted_model_execution(Some(execution))
+        .with_inherited_permissions(inherited_permissions)
+        .with_completion_checks(Default::default())
+        .with_parent_invocation_authority(
+            parent.into(),
+            parent_record.run_generation,
+            "permission-parent-owner".into(),
+            invocation_ledger,
+        );
+        executor.test_inference_ledger = Some(inference.persistence.clone());
+
+        let allowed_tools = vec!["write_file".to_string()];
+        let result = executor
+            .execute_skill_subrun(
+                "permission-check",
+                "Use the available tool only when permitted.",
+                "Attempt the requested write, then report the result.",
+                Some(4096),
+                &allowed_tools,
+                0,
+                None,
+                None,
+                Some("permission-denied-call"),
+                Some(parent_record.last_event_idx),
+                Some("parent-chain"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.output,
+            "The write was denied and no file was created."
+        );
+        assert!(!workspace.path().join("blocked.txt").exists());
+
+        let requests = gateway.requests.lock().await;
+        assert_eq!(requests.len(), 2);
+        let followup = requests[1].body["messages"]
+            .as_array()
+            .expect("permission-denied follow-up messages");
+        let denial = followup
+            .iter()
+            .find(|message| message["role"] == "tool" && message["tool_call_id"] == "blocked-write")
+            .and_then(|message| message["content"].as_str())
+            .expect("production tool boundary must return the denied result to the model");
+        assert!(denial.to_ascii_lowercase().contains("denied"), "{denial}");
+        gateway.assert_complete();
+        inference.assert_quiescent();
+        assert_eq!(inference.attempt_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn auto_skill_fork_reauthorizes_service_backed_genesis_offering() {
+        use crate::server::model_execution_admission::inheritance_test_support::{
+            OFFERING_ID, SESSION_ID, ServiceBackedOffering, USER_ID, auto_parent_run,
+            genesis_execution,
+        };
+
+        let execution = genesis_execution();
+        let service = Arc::new(ServiceBackedOffering::new(execution.clone()));
+        let engine = auto_parent_run("auto-skill-parent", &execution).await;
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            USER_ID.into(),
+            SESSION_ID.into(),
+        )
+        .with_model_service(Some(service.clone()))
+        .with_run_engine(engine)
+        .with_admitted_model_execution(Some(execution.clone()));
+
+        let inherited = executor
+            .inherited_model_execution("auto-skill-parent")
+            .await
+            .unwrap();
+        assert_eq!(inherited, Some(execution));
+        assert_eq!(service.calls(), vec![(USER_ID.into(), OFFERING_ID.into())]);
+
+        service.revoke();
+        let error = executor
+            .inherited_model_execution("auto-skill-parent")
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("[model_offering_not_found]")
+                || error.contains("[model_offering_unavailable]"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn server_skill_subrun_executor_with_builders() {
         let executor = ServerSkillSubRunExecutor::new(
@@ -1423,19 +1956,21 @@ mod tests {
             )
             .with_admitted_model_execution(Some(execution))
         };
-        let server = build(server_execution)
+        let server = build(server_execution.clone())
             .resolve_execution_policy(
                 astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
                 None,
                 Some("test-model"),
+                Some(&server_execution),
             )
             .expect("Server execution policy");
-        let edge = build(edge_execution)
+        let edge = build(edge_execution.clone())
             .with_execution_binding_snapshot(edge_runtime_snapshot())
             .resolve_execution_policy(
                 astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
                 None,
                 Some("test-model"),
+                Some(&edge_execution),
             )
             .expect("Edge+Server execution policy");
 
@@ -1452,6 +1987,7 @@ mod tests {
             astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
             None,
             Some("test-model"),
+            None,
         );
         assert!(
             missing.is_err(),
@@ -1491,6 +2027,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fork_sandbox_requires_an_explicit_absolute_execution_root() {
+        let engine = crate::server::run::engine::RunEngine::new(Arc::new(
+            astra_services::InMemoryRunStateStore::new(),
+        ));
+        let ledger =
+            crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
+                engine,
+            )
+            .unwrap();
+        let root = tempfile::TempDir::new().unwrap();
+        for cwd in [None, Some(""), Some(" "), Some("relative-root")] {
+            let mut binding = WorkspaceBinding::server_sandbox(root.path());
+            binding.cwd = cwd.map(str::to_owned);
+            let executor = ServerSkillSubRunExecutor::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "test-user".into(),
+                "test-session".into(),
+            )
+            .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+                binding,
+                ExecutorBinding::server_local(),
+            ));
+            let error = executor
+                .build_runtime_tool_executor("read-facts", "presentation-session", ledger.clone())
+                .err()
+                .expect("invalid selected sandbox root must not provision an alternative");
+            assert!(
+                error.contains("sandbox")
+                    && (error.contains("missing") || error.contains("absolute")),
+                "{error}"
+            );
+        }
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "test-user".into(),
+            "test-session".into(),
+        )
+        .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::server_sandbox(root.path()),
+            ExecutorBinding::server_local(),
+        ));
+        let runtime = executor
+            .build_runtime_tool_executor("read-facts", "presentation-session", ledger)
+            .unwrap();
+        assert_eq!(runtime.workspace_root(), root.path());
+    }
+
     #[test]
     fn server_skill_subrun_executor_keeps_execution_binding_snapshot() {
         let snapshot = edge_runtime_snapshot();
@@ -1528,6 +2114,12 @@ mod tests {
             None,
         );
         executor.apply_execution_binding_snapshot(&mut runtime_executor);
+        assert_eq!(runtime_executor.workspace_root(), workspace.path());
+        assert_ne!(
+            runtime_executor.workspace_root().to_str(),
+            snapshot.workspace.cwd.as_deref(),
+            "remote cwd must not become the Server filesystem root"
+        );
         let binding = runtime_executor.binding_metadata();
         assert_eq!(binding["workspace"]["kind"], "edge_workspace");
         assert_eq!(binding["executor"]["executor_id"], "edge-1");
@@ -1557,13 +2149,8 @@ mod tests {
         );
     }
 
-    /// Server-side symmetric to `cli_skill_subrun_rejects_when_recursion_depth_limit_reached`:
-    /// the fork sub-run executor must refuse to spawn once the agent recursion
-    /// cap is reached. Without this guard, a fork-context skill could recurse
-    /// into itself indefinitely. The CLI has had this test; the server did not
-    /// — so this closes an asymmetric coverage gap where a misbehaving
-    /// resolver on the server path could recurse without a fast-fail at the
-    /// depth boundary.
+    /// Fork-skill execution must reject excessive recursion before model or
+    /// tool admission, preventing a resolver from recursively spawning itself.
     #[tokio::test]
     async fn server_skill_subrun_rejects_when_recursion_depth_limit_reached() {
         let executor = ServerSkillSubRunExecutor::new(
@@ -1709,6 +2296,7 @@ mod tests {
             "test-user".to_string(),
             "test-session".to_string(),
         )
+        .with_completion_checks(Default::default())
         .with_parent_invocation_authority(
             "fork-parent-run".to_string(),
             0,
@@ -1743,6 +2331,7 @@ mod tests {
                         expected_execution_binding_generation: None,
                     },
                 ),
+                None,
                 None,
             )
             .await;
@@ -1785,6 +2374,7 @@ mod tests {
                         expected_execution_binding_generation: None,
                     },
                 ),
+                None,
                 None,
             )
             .await;

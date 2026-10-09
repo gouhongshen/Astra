@@ -21,7 +21,8 @@ slow-timeout = { period = "15s", terminate-after = 1 }
 # because the live MatrixOne database is a shared external bottleneck.
 test-threads = 2
 
-# CI and strict profiles use a 30s per-test-case hard budget. TIMEOUT = FAIL;
+# Offline CI and strict profiles use a 30s per-test-case hard budget.
+# Online profiles allow 60s for live MatrixOne setup and queries. TIMEOUT = FAIL;
 # no per-test/per-binary carve-outs. The default local profile stays at 15s.
 # Tighten later when known contention such as the `session_sync_log` prune hot
 # path is fixed — ideally back toward 1–2s per case.
@@ -32,6 +33,9 @@ failure-output = "immediate"
 # Hosted runners are intentionally small. Shards provide workflow-level
 # parallelism, so keep each runner's test process fan-out bounded.
 test-threads = 2
+
+[profile.ci.junit]
+path = "junit.xml"
 
 [profile.strict]
 fail-fast = false
@@ -49,13 +53,13 @@ test-threads = "num-cpus"
 [profile.strict-online]
 fail-fast = false
 failure-output = "immediate"
-slow-timeout = { period = "30s", terminate-after = 1 }
+slow-timeout = { period = "60s", terminate-after = 1 }
 test-threads = 2
 
 [profile.strict-online-ci]
 fail-fast = false
 failure-output = "immediate"
-slow-timeout = { period = "30s", terminate-after = 1 }
+slow-timeout = { period = "60s", terminate-after = 1 }
 # Direct invocations retain bounded two-way concurrency. The CI workflow sets
 # ASTRA_TEST_DB_IT_TEST_THREADS=1, and test-online translates that into `-j 1`
 # for both lanes so shared-DB pressure cannot turn healthy tests into failures.
@@ -86,8 +90,6 @@ test(/stress_multi_turn_state_continuity_50_turns/)
  or test(/two_hosts_same_input_same_outcome_shape/)
  or test(/e2e_delegation_round_trip_through_loop/)
  or test(/rollback_session_state_current_turn_restores_server_self_mod_and_tasks/)
- or package(astra-runtime) and binary(team_delegation_integration)
- or package(astra-runtime) and binary(team_execute_http_integration)
  or package(astra-runtime) and binary(phase_f_nested_cancel)
  or package(astra-runtime) and binary(web_agent_e2e)
  or package(astra-runtime) and binary(edge_5_5_http_e2e)

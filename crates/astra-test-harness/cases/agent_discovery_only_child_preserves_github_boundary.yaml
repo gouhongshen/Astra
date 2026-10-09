@@ -5,7 +5,12 @@ description: |
   **Pass means**: One child discovers GitHub as missing, performs no GitHub call, and returns the exact negative result.
   **Fail means**: No child executes the probe, GitHub becomes executable, or the parent fabricates the child's result.
 prompt: |
-  Spawn exactly one foreground child with:
+  First select the full canonical agent contract with
+  tool_search(query="select:agent"). Use invoke_tool(name="agent", arguments=...)
+  for the selected contract; do not send selected-only arguments through the
+  smaller native agent schema.
+
+  Invoke the selected agent contract exactly once with:
     action: "spawn"
     name: "github-boundary-child"
     description: "Probe child GitHub boundary"
@@ -22,6 +27,18 @@ criteria:
   - type: exit_code
     code: 0
   - type: journal_tool_call_count
+    name: tool_search
+    min: 1
+    max: 1
+    document: arguments
+    path: /query
+    equals: select:agent
+  - type: journal_tool_json
+    name: tool_search
+    document: result
+    path: /matches/0/name
+    equals: agent
+  - type: journal_tool_call_count
     name: agent
     min: 1
     max: 1
@@ -37,12 +54,28 @@ criteria:
     name: agent
     document: result
     path: /status
-    equals: completed
+    equals: launched
   - type: journal_tool_json
     name: agent
     document: result
-    path: /result
-    equals: CHILD_GITHUB_UNAVAILABLE
+    path: /result_family
+    equals: control_receipt
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/status
+      equals: completed
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: session_child_result_adopted
+    expected_result: "CHILD_GITHUB_UNAVAILABLE"
   - type: journal_tool_call_count
     name: tool_search
     min: 1

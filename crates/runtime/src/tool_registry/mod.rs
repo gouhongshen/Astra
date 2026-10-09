@@ -73,12 +73,12 @@ mod tests {
             .map(String::as_str)
             .collect();
         // Runtime default catalog core — file, edit, search, artifact recovery,
-        // persistent memory, and explicit deferred activation.
+        // explicit deferred activation, and immediate execution observation.
         assert!(always_load.contains(&"bash"));
         assert!(always_load.contains(&"read_file"));
         assert!(always_load.contains(&"str_replace"));
         assert!(always_load.contains(&"list_dir"));
-        assert!(always_load.contains(&"memory"));
+        assert!(!always_load.contains(&"memory"));
         assert!(
             always_load.contains(&"write_file"),
             "write_file completes the read/edit/write triad"
@@ -93,8 +93,8 @@ mod tests {
             "the consolidated Git action union must remain deferred; shell covers ordinary inspection and explicit selection keeps its large schema out of the stable prefix"
         );
         assert!(
-            always_load.contains(&"introspect") && always_load.contains(&"reflect"),
-            "the observation plane's introspect and reflect entrypoints must be eager"
+            always_load.contains(&"introspect") && !always_load.contains(&"reflect"),
+            "immediate execution recovery is eager; history reflection is deferred"
         );
         assert!(
             !always_load.contains(&"web_fetch") && !always_load.contains(&"session"),
@@ -114,13 +114,21 @@ mod tests {
     // ── Tool surface contract ──
 
     #[test]
-    fn core_memory_operations_are_always_load() {
-        assert!(
-            surface::default_always_load_names()
-                .iter()
-                .any(|name| name == "memory"),
-            "ordinary remember/recall must not require a probabilistic discovery round"
+    fn utility_operations_remain_available_without_taxing_every_request() {
+        let surface = surface::ToolSurface::build(
+            astra_tools::schemas::all_tool_schemas(),
+            &astra_config::ToolSurfaceConfig::default(),
+            &[],
         );
+        for name in ["memory", "reflect", "notify"] {
+            assert!(surface.deferred().iter().any(|entry| entry.name == name));
+            let selected: Value = serde_json::from_str(&astra_tools::tool_search::tool_search(
+                &astra_tools::schemas::all_tool_schemas(),
+                &json!({"query":format!("select:{name}")}),
+            ))
+            .unwrap();
+            assert_eq!(selected["matches"][0]["name"], name);
+        }
     }
 
     #[test]

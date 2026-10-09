@@ -3,6 +3,12 @@
 //! This crate provides foundational types used during turn execution,
 //! extracted from the monolithic runtime crate for better modularity.
 
+mod context_history_artifact;
+pub use context_history_artifact::{
+    CONTEXT_HISTORY_ARTIFACT_KIND, CONTEXT_HISTORY_ARTIFACT_URI_PREFIX, ContextHistoryArtifactV1,
+    MAX_CONTEXT_HISTORY_BYTES,
+};
+
 mod agent_communication;
 mod agent_transcript_evidence;
 mod agent_transcript_location;
@@ -27,7 +33,12 @@ pub use completion_settlement::deserialize_required_option;
 mod context_identity;
 mod context_window;
 mod deferred_tool;
+mod delegation_model_admission;
+mod execution_time_budget;
 mod explain_analyze;
+pub use execution_time_budget::{
+    ExecutionTimeRemaining, FINAL_SYNTHESIS_TIME_CAP, final_synthesis_reserve,
+};
 mod memory_selection;
 pub use memory_selection::*;
 mod explain_analyze_projection;
@@ -38,9 +49,11 @@ mod memory_ranking;
 mod memory_structure;
 mod permission_mode;
 pub use permission_mode::{ChildPermissionMode, ManualApprovalPolicy, PermissionMode};
+pub mod model_routing;
 mod provider_canonical_transition;
 mod provider_contract;
 mod recovery_point;
+mod reply_obligations;
 mod result_quality;
 mod resume;
 mod runtime_scaffolding;
@@ -57,8 +70,6 @@ pub mod task_resolution;
 pub mod token_estimate;
 mod tool_idempotency;
 mod tool_invocation;
-mod tool_result_projection;
-mod tool_result_selection_observation;
 mod turn_provenance;
 mod user_intent;
 mod verification_frontier;
@@ -82,6 +93,14 @@ pub use context_identity::{
 };
 pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
 pub use deferred_tool::DeferredToolActivation;
+pub use delegation_model_admission::{
+    DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY, DelegationCatalogResolutionFailure,
+    DelegationIntentRequirement, DelegationIntentRequirements, DelegationModelAdmission,
+    DelegationModelAdmissionOutcome, DelegationModelInstructionSource,
+    DelegationModelSlotConstraint, DelegationReasoningEffort, DelegationReasoningRequirement,
+    DelegationRequirementPropagation, DelegationRequirementStrength,
+    DelegationUserRequirementSource, MAX_MODEL_ADMISSION_SLOTS,
+};
 pub use explain_analyze::{
     EXPLAIN_ANALYZE_EVENT_TYPE, EXPLAIN_ANALYZE_MAX_SAFE_INTEGER, EXPLAIN_ANALYZE_SCHEMA_VERSION,
     ExplainAnalyzeAdmissionSettlementReasonV1, ExplainAnalyzeAdmissionSettlementStatusV1,
@@ -91,9 +110,9 @@ pub use explain_analyze::{
     ExplainAnalyzeContextAssemblyBasisV1, ExplainAnalyzeContextAssemblyV1,
     ExplainAnalyzeContextBudgetBasisV1, ExplainAnalyzeContextBudgetV1,
     ExplainAnalyzeContextMetricsV1, ExplainAnalyzeContextSourceKindV1,
-    ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1, ExplainAnalyzeEventV1,
-    ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1, ExplainAnalyzeTokenUsageV1,
-    ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
+    ExplainAnalyzeContextSourceV1, ExplainAnalyzeCoverageGapV1, ExplainAnalyzeDecisionDetailV1,
+    ExplainAnalyzeEventV1, ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1,
+    ExplainAnalyzeTokenUsageV1, ExplainAnalyzeTransitionV1, ExplainAnalyzeUsageBasisV1,
 };
 pub use explain_analyze_projection::{
     ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeGraphV1, ExplainAnalyzeProjectedNodeV1,
@@ -102,8 +121,10 @@ pub use explain_analyze_projection::{
     ExplainAnalyzeScopeCoverageV1,
 };
 pub use inference::{
-    CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose, ModelSelection,
-    client_direct_execution_field,
+    AutoModelStrategy, CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose,
+    ModelSelection, ModelSelector, RequestedModelPolicy, RequestedModelPolicyError,
+    client_direct_execution_field, resolve_requested_model_selection,
+    resolve_requested_model_selector,
 };
 pub use memory_ranking::{
     MemoryRetrievalOutcome, PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE,
@@ -145,6 +166,7 @@ pub use recovery_point::{
     RecoveryPointRunFrontierV1, RecoveryPointRunStateV1, RecoveryPointValidationError,
     RecoveryPointWorkspaceReferenceV1,
 };
+pub use reply_obligations::{MAX_PENDING_REPLIES, PendingReply, ReplyObligationsSnapshotV1};
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
 pub use resume::{
     CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION, CausalProjectionEnvelopeV1, CursorRelationV1,
@@ -189,7 +211,8 @@ pub use session_cursor::{
     ConversationCommitV1, ConversationDeltaV1, ConversationReplaceReason,
     DEFAULT_CONVERSATION_BRANCH_ID, SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION,
     SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1, canonical_conversation_identity,
-    canonical_conversation_root, canonical_conversation_serialized_len, json_serialized_len,
+    canonical_conversation_root, canonical_conversation_serialized_len, json_serialized_fits,
+    json_serialized_len,
 };
 pub use session_fork::{
     ForkBasisDimensionV1, ForkDimensionDispositionV1, ForkDimensionEvidenceV1,
@@ -204,7 +227,11 @@ pub use session_handoff::{
     SessionHandoffValidationError, SessionPlacementV1, WorkspaceHandoffEvidenceV1,
     valid_transition,
 };
-pub use stop_hooks::{StopHook, StopHookObligations};
+pub use stop_hooks::{
+    CompletionCheckDeclarations, CompletionCheckPhase, MAX_COMPLETION_CHECKS,
+    MAX_COMPLETION_DECLARATION_BYTES, StopHook, StopHookObligations, build_execution_layers,
+    validate_completion_check_declarations,
+};
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{
     DispatchCertainty, DurableToolReference, TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION,
@@ -219,23 +246,17 @@ pub use tool_invocation::{
     ToolInvocationResultPayload, ToolInvocationState, ToolInvocationTerminalOutcome,
     canonical_public_arguments_hash, canonical_public_tool_arguments,
 };
-pub use tool_result_projection::{
-    TOOL_RESULT_PROJECTION_POLICY_VERSION, TOOL_RESULT_PROJECTION_RENDERER_VERSION,
-    ToolResultProjectionBindingV1, ToolResultProjectionDecisionV1,
-    ToolResultProjectionDispositionV1, ToolResultProjectionFallbackV1, ToolResultProjectionRangeV1,
-    ToolResultProjectionReceiptV1, ToolResultProjectionWireStateV1,
-    tool_result_projection_freeze_key,
-};
-pub use tool_result_selection_observation::*;
 pub use turn_provenance::{
-    TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
+    MODEL_ITEM_ID_FIELD, TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
     TurnMessageProvenanceError, TurnMessageProvenanceV1, clear_turn_message_provenance,
-    mark_turn_message, turn_message_provenance,
+    mark_model_message, mark_turn_message, model_item_id, turn_message_provenance,
 };
 pub use user_intent::{
-    ObjectiveRelation, USER_TURN_SEMANTICS_FIELD, USER_TURN_SEMANTICS_SCHEMA_VERSION, UserFeedback,
-    UserFeedbackKind, UserFeedbackTarget, UserIntentDelivery, UserIntentStatus, UserTurnSemantics,
-    UserTurnSemanticsError, mark_user_turn_semantics, user_turn_semantics,
+    AssessmentConfidence, FeedbackResponseReference, FeedbackResponseRelation, ObjectiveRelation,
+    ResponseSatisfaction, TaskDifficulty, TaskUrgency, TurnAssessment, USER_TURN_SEMANTICS_FIELD,
+    USER_TURN_SEMANTICS_SCHEMA_VERSION, UserFeedback, UserFeedbackKind, UserFeedbackTarget,
+    UserIntentDelivery, UserIntentStatus, UserTurnSemantics, UserTurnSemanticsError,
+    mark_user_turn_semantics, user_turn_semantics,
 };
 pub use verification_frontier::{
     BoundVerificationFrontier, BoundWorkspaceObservation, VerificationEvidence,

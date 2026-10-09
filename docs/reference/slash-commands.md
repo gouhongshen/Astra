@@ -13,9 +13,9 @@ interaction. The canonical metadata lives in
   Select an entry to insert it into the composer.
 - Run `/help keys` for the current workbench keyboard shortcuts.
 
-Commands that only work in line mode are intentionally omitted from TUI
-completion. Typing one in the workbench shows an unavailable message; Astra
-never switches to a second terminal interface to complete it.
+Commands without a native workbench action are omitted from TUI completion.
+Typing one shows an unavailable message. There is no separate console slash
+frontend; non-interactive commands use the [CLI routes](cli-commands.md).
 
 ## Common
 
@@ -30,6 +30,12 @@ never switches to a second terminal interface to complete it.
 current model, `/model clear` to clear the selection, or `/model <name>` to
 switch directly. `/model list` remains accepted as an alias for the picker,
 but the bare command is the suggested form.
+
+The selected model name, Offering identity and catalog pricing form one session
+selection. Switching or clearing it replaces that selection; unknown catalog
+prices stay unknown, while explicit zero prices remain zero. `/model info <name>`
+shows that model's catalog prices. `/cost` evaluates usage at the current model's
+rates; it is not a historical invoice across model switches.
 
 Without an explicit model, Astra loads the server's configured default. Model
 catalog requests allow up to 30 seconds per page. If that lookup fails, the turn
@@ -60,14 +66,14 @@ dispatch; a rejected native token never falls back to legacy profile refresh.
 `/session analyze [id]` opens a concise session summary; `/session history [id]`
 opens that transcript; and `/session export [id]` writes it as Markdown in the
 current working directory. `/session list` remains accepted as an alias for
-`/resume`. `/session fork` is a line-mode command and is not available in the
-TUI.
+`/resume`. `/session fork` is not supported by the workbench.
 
-If a new session targets a checkout already owned by another session, admission
-stops before model or tool work. The TUI keeps the new session attached and
-returns the draft to its composer; use `/resume` and choose a session explicitly
-to continue existing work, or switch to another worktree for the new session.
-Astra never resumes or takes over a session implicitly.
+Starting a new session in a directory already used by another session is
+allowed when the new session has no unresolved execution debt. Sessions keep
+their own binding and history; they do not take over one another. Physical
+workspace operations are serialized by the executor-owned lease, and a
+temporarily unavailable lease returns a typed retryable result. Use `/resume`
+only when you intend to continue the existing session.
 
 ## Work
 
@@ -88,8 +94,9 @@ for the board. If you press Enter with a normal message while that first Work
 action is still starting, the message is shown in the queue and sent after the
 same Session is attached. A deliberate Session switch leaves the message in
 the composer for review instead of sending it to the wrong conversation. `/tasks`
-opens the live shell and local-agent task panel used by Shift+Down/Ctrl+B; it
-reuses the same session-bound registry and controls.
+opens the live shell and local-agent task panel. Shift+Down/Ctrl+B detaches
+foreground shell work; agents already run asynchronously. The panel reuses the
+same session-bound registry and controls.
 
 Selecting an agent in `/agent` opens its conversation and work record, where
 you can inspect, guide, pause, resume, or stop the run. `/agent list` remains
@@ -184,5 +191,6 @@ redundant completion rows:
 | `/skill` | `/skill browse`, `/skill list` |
 | `/resume` | `/session list` |
 
-Line-mode-only commands such as `/grep`, `/diff`, and `/review` are not TUI
-commands. Use `/` to see every root command that the workbench can complete.
+Workspace commands such as `astra grep`, `astra diff`, and `astra review`
+use non-interactive CLI routes, not a console slash loop. Use `/` to see every
+root command that the workbench can complete.

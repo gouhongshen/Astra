@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -23,6 +24,20 @@ SPEC.loader.exec_module(live)
 
 
 class WorkSurfaceLiveContracts(unittest.TestCase):
+    def test_unsupported_platform_stops_before_any_fixture_or_process(self) -> None:
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.object(sys, "argv", [str(SCRIPT), "--reuse-web", "--web-url", "http://127.0.0.1:1"]),
+            patch.object(live.Path, "is_file", side_effect=AssertionError("binary inspected")),
+            patch.object(live, "Api", side_effect=AssertionError("API started")),
+            patch.object(live, "PtyTui", side_effect=AssertionError("PTY started")),
+            patch.object(live, "start_supervised_process", side_effect=AssertionError("supervisor started")),
+            patch.object(live.tempfile, "mkdtemp", side_effect=AssertionError("fixture created")),
+            patch("builtins.print") as output,
+        ):
+            self.assertEqual(live.main(), 2)
+        self.assertEqual(json.loads(output.call_args.args[0])["status"], "not_tested")
+
     def test_screen_is_current_viewport_and_handles_clear(self) -> None:
         screen = live.Screen(rows=4, columns=20)
         screen.feed(b"old output")
@@ -94,6 +109,8 @@ class WorkSurfaceLiveContracts(unittest.TestCase):
             stub.write_text(
                 """#!/usr/bin/env python3
 import fcntl
+import json
+from pathlib import Path
 import os
 import struct
 import sys
@@ -105,6 +122,9 @@ rows, columns, _, _ = struct.unpack(
     'HHHH', fcntl.ioctl(0, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0))
 )
 signal.signal(signal.SIGHUP, lambda _signum, _frame: sys.exit(0))
+ledger = json.loads((Path(os.environ['ASTRA_LOCAL_STATE_ROOT']) / 'trusted_workspaces.json').read_text())
+assert ledger['workspaces'][Path.cwd().resolve().as_posix()]['trust'] == 'trusted'
+os.write(1, b'TRUSTED\\n')
 os.write(1, f'SIZE {rows}x{columns}\\nWork started '.encode())
 os.write(1, b'\\xc2')
 time.sleep(0.02)
@@ -117,8 +137,7 @@ time.sleep(30)
             stub.chmod(0o755)
             workspace = root / "workspace"
             home = root / "home"
-            workspace.mkdir()
-            home.mkdir()
+            live.seed_workspace(home, workspace)
             tui = live.PtyTui(
                 binary=stub,
                 api_url="http://127.0.0.1:1",
@@ -130,7 +149,9 @@ time.sleep(30)
                 log=root / "tui.log",
             )
             try:
-                tui.start()
+                with patch.dict(os.environ, {"ASTRA_LOCAL_STATE_ROOT": str(root / "ambient-user-state")}):
+                    tui.start()
+                tui.wait_for_text("TRUSTED", live.utc_seconds() + 3)
                 tui.wait_for_text("SIZE 30x100", live.utc_seconds() + 3)
                 match = tui.wait_for_regex(r"Work started · (work-1)", live.utc_seconds() + 3)
                 self.assertEqual(match.group(1), "work-1")

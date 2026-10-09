@@ -570,12 +570,14 @@ mod tests {
 
     fn invocation(call_id: &str) -> ToolInvocationMetadata<'_> {
         ToolInvocationMetadata {
+            admission_deadline: None,
             run_id: Some("run-1"),
             turn_chain_id: Some("turn-1"),
             tool_call_id: Some(call_id),
             admission_source: Some(astra_tools::tool_engine::ToolInvocationAdmissionSource::Policy),
             expected_control_epoch: None,
-            task_resolution_authority: None,
+            command_timeout_cap_ms: None,
+            delegation_model_admission: None,
         }
     }
 

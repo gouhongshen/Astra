@@ -30,8 +30,7 @@ use astra_turn_types::{
 };
 
 use crate::interaction_contract::{
-    InteractionContract, InteractionIdentity, InteractionKind, InteractionStatus,
-    approval_decision_status, ask_user_response_status,
+    InteractionContract, InteractionIdentity, InteractionKind, approval_decision_status,
 };
 use crate::{OwnerScope, SessionArtifactStore};
 
@@ -293,7 +292,7 @@ fn event_type_tiebreak_rank(event_type: &JournalEventType) -> u8 {
     }
 }
 
-fn stabilize_event_order(events: &mut [JournalEvent]) {
+pub fn stabilize_event_order(events: &mut [JournalEvent]) {
     // Fast path: already chronological by file layout, no same-timestamp
     // boundary tiebreak inversion, no leading SessionStart that needs to be
     // lifted.  `read_journal` is in the steady-state hot path — re-sorting
@@ -634,6 +633,16 @@ fn open_unlocked_journal_file_with_creation(path: &Path) -> std::io::Result<Open
 fn serialize_journal_events(events: &[JournalEvent]) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     for event in events {
+        let redacted_event = if matches!(&event.event_type, JournalEventType::AgentTerminated)
+            && journal_content_redact_enabled()
+        {
+            let mut redacted = event.clone();
+            redact_agent_terminated_content(&mut redacted);
+            Some(redacted)
+        } else {
+            None
+        };
+        let event = redacted_event.as_ref().unwrap_or(event);
         let mut line = serde_json::to_vec(event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         line.push(b'\n');
@@ -652,6 +661,48 @@ fn serialize_journal_events(events: &[JournalEvent]) -> std::io::Result<Vec<u8>>
         buf.extend(line);
     }
     Ok(buf)
+}
+
+fn redact_agent_terminated_content(event: &mut JournalEvent) {
+    let Some(metadata) = event
+        .metadata
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    if let Some(full_text) = metadata.get_mut("full_text") {
+        redact_journal_value(full_text);
+    }
+    if let Some(intents) = metadata.get_mut("applied_user_intents") {
+        match intents {
+            serde_json::Value::Array(intents) => {
+                for intent in intents {
+                    if let Some(content) = intent
+                        .as_object_mut()
+                        .and_then(|fields| fields.get_mut("content"))
+                    {
+                        redact_journal_value(content);
+                    } else if !intent.is_object() {
+                        redact_journal_value(intent);
+                    }
+                }
+            }
+            intents => redact_journal_value(intents),
+        }
+    }
+}
+
+fn redact_journal_value(value: &mut serde_json::Value) {
+    if let Some(raw) = value.as_str() {
+        if !is_journal_content_marker(raw) {
+            *value = serde_json::Value::String(journal_content_marker(raw));
+        }
+    } else {
+        let raw = value.to_string();
+        *value = serde_json::Value::String(journal_content_marker(&raw));
+    }
 }
 
 fn sync_directory(path: &Path) -> std::io::Result<()> {
@@ -766,315 +817,6 @@ impl Drop for ProcessJournalDirGuard {
     }
 }
 
-/// Session state change tracking for edge-cloud sync.
-/// Records mutations as deltas instead of overwriting full state.
-pub mod state_delta {
-    use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
-
-    /// Change operation type for session state mutations.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum StateChangeOp {
-        Create,
-        Update,
-        Delete,
-    }
-
-    /// A single state change entry for session mutations.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct StateChange {
-        /// Monotonic version number within the session.
-        pub version: u64,
-        /// Timestamp in milliseconds.
-        pub timestamp_ms: u64,
-        /// The state key being mutated.
-        pub key: String,
-        /// The operation type.
-        pub op: StateChangeOp,
-        /// The value (None for Delete).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub value: Option<serde_json::Value>,
-        /// Turn number when the change occurred.
-        pub turn: u32,
-    }
-
-    /// Accumulates session state changes for delta sync.
-    pub struct SessionStateAccumulator {
-        version_counter: u64,
-        entries: Vec<StateChange>,
-        current_state: HashMap<String, serde_json::Value>,
-    }
-
-    impl Default for SessionStateAccumulator {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl SessionStateAccumulator {
-        /// Create a new state accumulator starting at version 1.
-        pub fn new() -> Self {
-            Self {
-                version_counter: 1,
-                entries: Vec::new(),
-                current_state: HashMap::new(),
-            }
-        }
-
-        fn next_version(&mut self) -> u64 {
-            let v = self.version_counter;
-            self.version_counter += 1;
-            v
-        }
-
-        fn now_ms() -> u64 {
-            use std::time::SystemTime;
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64
-        }
-
-        /// Record a state creation.
-        pub fn create(
-            &mut self,
-            key: impl Into<String>,
-            value: impl Serialize,
-            turn: u32,
-        ) -> Result<u64, String> {
-            let key = key.into();
-            if self.current_state.contains_key(&key) {
-                return Err(format!("Key '{}' already exists", key));
-            }
-
-            let version = self.next_version();
-            let json_value = serde_json::to_value(value).map_err(|e| e.to_string())?;
-
-            self.current_state.insert(key.clone(), json_value.clone());
-            self.entries.push(StateChange {
-                version,
-                timestamp_ms: Self::now_ms(),
-                key,
-                op: StateChangeOp::Create,
-                value: Some(json_value),
-                turn,
-            });
-
-            Ok(version)
-        }
-
-        /// Record a state update.
-        pub fn update(
-            &mut self,
-            key: impl Into<String>,
-            value: impl Serialize,
-            turn: u32,
-        ) -> Result<u64, String> {
-            let key = key.into();
-            if !self.current_state.contains_key(&key) {
-                return Err(format!("Key '{}' not found", key));
-            }
-
-            let version = self.next_version();
-            let json_value = serde_json::to_value(value).map_err(|e| e.to_string())?;
-
-            self.current_state.insert(key.clone(), json_value.clone());
-            self.entries.push(StateChange {
-                version,
-                timestamp_ms: Self::now_ms(),
-                key,
-                op: StateChangeOp::Update,
-                value: Some(json_value),
-                turn,
-            });
-
-            Ok(version)
-        }
-
-        /// Record a state deletion.
-        pub fn delete(&mut self, key: impl Into<String>, turn: u32) -> Result<u64, String> {
-            let key = key.into();
-            if !self.current_state.contains_key(&key) {
-                return Err(format!("Key '{}' not found", key));
-            }
-
-            let version = self.next_version();
-            self.current_state.remove(&key);
-            self.entries.push(StateChange {
-                version,
-                timestamp_ms: Self::now_ms(),
-                key,
-                op: StateChangeOp::Delete,
-                value: None,
-                turn,
-            });
-
-            Ok(version)
-        }
-
-        /// Get the current value for a key.
-        pub fn get(&self, key: &str) -> Option<&serde_json::Value> {
-            self.current_state.get(key)
-        }
-
-        /// Get all changes since a version (exclusive).
-        pub fn changes_since(&self, since_version: u64) -> Vec<&StateChange> {
-            self.entries
-                .iter()
-                .filter(|e| e.version > since_version)
-                .collect()
-        }
-        /// Get current state snapshot.
-        pub fn snapshot(&self) -> &HashMap<String, serde_json::Value> {
-            &self.current_state
-        }
-
-        /// Get the latest version number.
-        pub fn latest_version(&self) -> u64 {
-            self.version_counter.saturating_sub(1)
-        }
-
-        /// Get the number of change entries.
-        pub fn change_count(&self) -> usize {
-            self.entries.len()
-        }
-        /// Compact by keeping only latest change per key.
-        pub fn compact(&mut self) {
-            let mut latest: HashMap<String, StateChange> = HashMap::new();
-
-            for entry in &self.entries {
-                if entry.op == StateChangeOp::Delete {
-                    latest.remove(&entry.key);
-                } else {
-                    latest.insert(entry.key.clone(), entry.clone());
-                }
-            }
-
-            let mut new_entries: Vec<StateChange> = latest.into_values().collect();
-            new_entries.sort_by_key(|e| e.version);
-            self.entries = new_entries;
-        }
-
-        /// Calculate memory overhead of changes vs full state.
-        pub fn overhead_percentage(&self) -> f64 {
-            let changes_bytes: usize = self
-                .entries
-                .iter()
-                .map(|e| {
-                    let base = e.key.len() + std::mem::size_of::<StateChange>();
-                    let val_bytes = e
-                        .value
-                        .as_ref()
-                        .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
-                        .unwrap_or(0);
-                    base + val_bytes
-                })
-                .sum();
-
-            let state_bytes: usize = self
-                .current_state
-                .iter()
-                .map(|(k, v)| k.len() + serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
-                .sum();
-
-            if state_bytes == 0 {
-                0.0
-            } else {
-                (changes_bytes as f64 / state_bytes as f64) * 100.0
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn test_create_and_get() {
-            let mut acc = SessionStateAccumulator::new();
-            let v = acc.create("key1", "value1", 1).unwrap();
-
-            assert_eq!(v, 1);
-            assert_eq!(acc.get("key1"), Some(&serde_json::json!("value1")));
-            assert_eq!(acc.change_count(), 1);
-        }
-
-        #[test]
-        fn test_update_existing() {
-            let mut acc = SessionStateAccumulator::new();
-            acc.create("key1", "value1", 1).unwrap();
-            let v = acc.update("key1", "value2", 2).unwrap();
-
-            assert_eq!(v, 2);
-            assert_eq!(acc.get("key1"), Some(&serde_json::json!("value2")));
-            assert_eq!(acc.change_count(), 2);
-        }
-
-        #[test]
-        fn test_delete_existing() {
-            let mut acc = SessionStateAccumulator::new();
-            acc.create("key1", "value1", 1).unwrap();
-            let v = acc.delete("key1", 2).unwrap();
-
-            assert_eq!(v, 2);
-            assert_eq!(acc.get("key1"), None);
-            assert_eq!(acc.change_count(), 2);
-        }
-
-        #[test]
-        fn test_changes_since_version() {
-            let mut acc = SessionStateAccumulator::new();
-            acc.create("a", 1, 1).unwrap();
-            acc.create("b", 2, 1).unwrap();
-            acc.update("a", 3, 2).unwrap();
-
-            let changes = acc.changes_since(1);
-            assert_eq!(changes.len(), 2); // b, a-update
-        }
-
-        #[test]
-        fn test_compact_reduces_entries() {
-            let mut acc = SessionStateAccumulator::new();
-            acc.create("key", "v1", 1).unwrap();
-            acc.update("key", "v2", 1).unwrap();
-            acc.update("key", "v3", 1).unwrap();
-
-            assert_eq!(acc.change_count(), 3);
-            acc.compact();
-            assert_eq!(acc.change_count(), 1);
-            assert_eq!(acc.get("key"), Some(&serde_json::json!("v3")));
-        }
-
-        #[test]
-        fn test_overhead_with_updates() {
-            let mut acc = SessionStateAccumulator::new();
-
-            // Create many entries
-            for i in 0..100 {
-                acc.create(format!("key{}", i), "x".repeat(100), 1).unwrap();
-            }
-
-            // Update many times
-            for _ in 0..5 {
-                for i in 0..50 {
-                    acc.update(format!("key{}", i), "y".repeat(100), 1).unwrap();
-                }
-            }
-
-            let overhead = acc.overhead_percentage();
-            // After many updates, overhead will be high until compaction
-            // This verifies the measurement works
-            assert!(overhead > 0.0, "Should have overhead after updates");
-
-            // After compaction, overhead should be reduced
-            acc.compact();
-            let after = acc.overhead_percentage();
-            assert!(after < overhead, "Compaction should reduce overhead");
-        }
-    }
-}
-
 /// Parent session linkage when forking or branching a session (edge-local audit + cloud sync).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionLineage {
@@ -1109,6 +851,8 @@ pub struct CoordinationMeta {
 /// and pagination; consumers must never use message text as an identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JournalTranscriptItem {
+    /// The accepted model item, distinct from this journal receipt's identity.
+    pub model_item_id: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_event_id: String,
     pub run_id: String,
@@ -1161,6 +905,17 @@ pub struct ToolResultArtifactDescriptor {
     pub run_id: String,
     pub byte_len: u64,
     pub content_sha256: String,
+}
+
+/// Runtime-only semantic receipt for the lifecycle decision made by
+/// `start_work`. It is captured before the model/journal presentation can be
+/// replaced by an artifact reference; the provider call id remains the
+/// invocation identity on [`ToolCallRecord`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeWorkEstablishmentReceipt {
+    Started,
+    Continued,
+    Deferred { operation_id: String },
 }
 
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
@@ -1250,6 +1005,12 @@ pub struct ToolCallRecord {
     /// feedback.
     #[serde(skip)]
     pub runtime_model_result_full: Option<String>,
+    /// Semantic `start_work` outcome captured before artifact presentation.
+    /// This is live reconciliation authority, not journal data or model
+    /// context; the exact call identity and executed disposition are checked
+    /// separately before it can settle an establishment.
+    #[serde(skip)]
+    pub runtime_work_establishment_receipt: Option<RuntimeWorkEstablishmentReceipt>,
     /// Full tool result text (untruncated, after per-tool output limit).
     /// Enables debugging tool failures without re-execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1384,6 +1145,17 @@ pub enum ToolPreDispatchRejection {
 }
 
 impl ToolCallDisposition {
+    pub fn terminal_event_type(self, ok: bool) -> &'static str {
+        match self {
+            Self::Executed if ok => "tool_call_completed",
+            Self::Executed => "tool_call_failed",
+            Self::Rejected => "tool_call_rejected",
+            Self::Reused => "tool_call_reused",
+            Self::Suppressed => "tool_call_suppressed",
+            Self::Deferred => "tool_call_deferred",
+        }
+    }
+
     /// Shared projection of executor-owned metadata. A route dispatch is not
     /// proof that the requested operation started; explicit non-execution must
     /// not be promoted to execution by a caller's fallback.
@@ -1489,14 +1261,7 @@ impl ToolCallRecord {
     /// trace persistence, transcripts, and audit analytics from inventing
     /// incompatible interpretations of the same disposition.
     pub fn canonical_terminal_event_type(&self) -> &'static str {
-        match self.effective_disposition() {
-            ToolCallDisposition::Executed if self.ok => "tool_call_completed",
-            ToolCallDisposition::Executed => "tool_call_failed",
-            ToolCallDisposition::Rejected => "tool_call_rejected",
-            ToolCallDisposition::Reused => "tool_call_reused",
-            ToolCallDisposition::Suppressed => "tool_call_suppressed",
-            ToolCallDisposition::Deferred => "tool_call_deferred",
-        }
+        self.effective_disposition().terminal_event_type(self.ok)
     }
 
     pub fn effective_disposition(&self) -> ToolCallDisposition {
@@ -2477,6 +2242,31 @@ impl JournalWriter {
         // Ensure durability: flush to disk so a crash doesn't lose the event.
         file.sync_data()?;
         update_cached_session_start_state_from_events(&self.path, events.as_ref());
+        Ok(())
+    }
+
+    /// Commit an end boundary. A retry after an ambiguous fsync failure syncs
+    /// the existing end instead of appending a duplicate (or a new start).
+    pub fn append_session_end(&self, turn: u32) -> std::io::Result<()> {
+        self.append_session_end_with_sync(turn, std::fs::File::sync_data)
+    }
+
+    fn append_session_end_with_sync(
+        &self,
+        turn: u32,
+        sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = open_locked_journal_file(&self.path)?;
+        if read_last_event_type(&self.path)? != Some(JournalEventType::SessionEnd) {
+            let event = JournalEvent::session_end(Some(&self.session_id), turn);
+            let events = prepend_session_start_if_needed(&self.path, std::slice::from_ref(&event))?;
+            file.write_all(&serialize_journal_events(events.as_ref())?)?;
+            sync(&file)?;
+            update_cached_session_start_state_from_events(&self.path, events.as_ref());
+        } else {
+            sync(&file)?;
+        }
         Ok(())
     }
 
@@ -4323,257 +4113,6 @@ fn find_latest_approval_required_impl(
     Ok(None)
 }
 
-fn ask_user_metadata_str(metadata: &serde_json::Value, field: &str) -> Option<String> {
-    metadata
-        .get("ask_user")
-        .and_then(|ask_user| ask_user.get(field))
-        .and_then(|value| value.as_str())
-        .map(ToString::to_string)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct AskUserJournalResponse {
-    pub request_id: String,
-    pub run_id: Option<String>,
-    pub status: String,
-    pub answers: Option<serde_json::Value>,
-}
-
-/// Canonical durable ask-user request.  Responses must be bound to one of
-/// these records before they can affect a run; a bearer token alone does not
-/// authorize a caller to invent a questionnaire request id.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AskUserJournalRequest {
-    pub request_id: String,
-    pub run_id: Option<String>,
-    pub turn: Option<u32>,
-    pub prompt: serde_json::Value,
-}
-
-/// Result of atomically recording the terminal answer for an ask-user
-/// request.  This mirrors approval decisions: retrying the exact callback is
-/// safe, but a conflicting late answer never overwrites the first outcome.
-#[derive(Debug, Clone, PartialEq)]
-pub enum AskUserResponseAppendOutcome {
-    Appended,
-    Idempotent,
-    Conflict(AskUserJournalResponse),
-}
-
-impl AskUserJournalResponse {
-    pub fn interaction_contract(
-        &self,
-        session_id: &str,
-        user_id: Option<&str>,
-    ) -> Option<InteractionContract> {
-        let run_id = self.run_id.as_deref()?;
-        let identity =
-            InteractionIdentity::new(user_id, session_id, run_id, self.request_id.as_str());
-        if !identity.is_run_scoped() {
-            return None;
-        }
-        Some(InteractionContract::new(
-            InteractionKind::UserPrompt,
-            identity,
-            ask_user_response_status(&self.status),
-            Some("session_journal.ask_user_response".to_string()),
-        ))
-    }
-}
-
-pub fn find_latest_ask_user_response(
-    session_id: &str,
-    request_id: &str,
-) -> std::io::Result<Option<AskUserJournalResponse>> {
-    find_latest_ask_user_response_impl(session_id, request_id, None)
-}
-
-pub fn find_latest_ask_user_response_for_run(
-    session_id: &str,
-    request_id: &str,
-    run_id: &str,
-) -> std::io::Result<Option<AskUserJournalResponse>> {
-    find_latest_ask_user_response_impl(session_id, request_id, Some(run_id))
-}
-
-pub fn find_latest_ask_user_prompted_for_run(
-    session_id: &str,
-    request_id: &str,
-    run_id: &str,
-) -> std::io::Result<Option<AskUserJournalRequest>> {
-    validate_session_id(session_id)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let events = read_journal(session_id)?;
-    for event in events.into_iter().rev() {
-        if event.event_type != JournalEventType::AskUserPrompted {
-            continue;
-        }
-        let Some(metadata) = event.metadata.as_ref() else {
-            continue;
-        };
-        let Some(found_request_id) = ask_user_metadata_str(metadata, "request_id") else {
-            continue;
-        };
-        if found_request_id != request_id {
-            continue;
-        }
-        let found_run_id = ask_user_metadata_str(metadata, "run_id");
-        if found_run_id.as_deref() != Some(run_id) {
-            continue;
-        }
-        let Some(prompt) = metadata
-            .get("ask_user")
-            .and_then(|ask_user| ask_user.get("prompt"))
-            .cloned()
-        else {
-            continue;
-        };
-        return Ok(Some(AskUserJournalRequest {
-            request_id: found_request_id,
-            run_id: found_run_id,
-            turn: event.turn,
-            prompt,
-        }));
-    }
-    Ok(None)
-}
-
-fn ask_user_response_from_event(
-    event: &JournalEvent,
-    request_id: &str,
-    run_id: &str,
-) -> Option<AskUserJournalResponse> {
-    if event.event_type != JournalEventType::AskUserResponse {
-        return None;
-    }
-    let metadata = event.metadata.as_ref()?;
-    let found_request_id = ask_user_metadata_str(metadata, "request_id")?;
-    if found_request_id != request_id {
-        return None;
-    }
-    let found_run_id = ask_user_metadata_str(metadata, "run_id");
-    if found_run_id.as_deref() != Some(run_id) {
-        return None;
-    }
-    let status = ask_user_metadata_str(metadata, "status")?;
-    let answers = metadata
-        .get("ask_user")
-        .and_then(|ask_user| ask_user.get("answers"))
-        .filter(|answers| !answers.is_null())
-        .cloned();
-    Some(AskUserJournalResponse {
-        request_id: found_request_id,
-        run_id: found_run_id,
-        status,
-        answers,
-    })
-}
-
-/// Append a terminal ask-user response while holding the journal lock.
-///
-/// This is intentionally not `find + JournalWriter::append`: responses may
-/// be retried across pods or race the timeout closer, and that split protocol
-/// would leave two contradictory answers in durable history.
-pub fn append_ask_user_response_for_run_if_absent(
-    session_id: &str,
-    turn: Option<u32>,
-    request_id: &str,
-    run_id: &str,
-    status: &str,
-    answers: Option<serde_json::Value>,
-) -> std::io::Result<AskUserResponseAppendOutcome> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-
-    validate_session_id(session_id)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    if run_id.trim().is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "run_id required",
-        ));
-    }
-
-    let path = journal_file_path(session_id);
-    let mut file = open_locked_journal_file(&path)?;
-    let mut content = String::new();
-    file.seek(SeekFrom::Start(0))?;
-    file.read_to_string(&mut content)?;
-    let events = parse_journal_text(&content).0;
-    for event in events.iter().rev() {
-        let Some(existing) = ask_user_response_from_event(event, request_id, run_id) else {
-            continue;
-        };
-        if ask_user_response_status(&existing.status) == InteractionStatus::Pending {
-            continue;
-        }
-        return if existing.status == status && existing.answers == answers {
-            Ok(AskUserResponseAppendOutcome::Idempotent)
-        } else {
-            Ok(AskUserResponseAppendOutcome::Conflict(existing))
-        };
-    }
-
-    let event = JournalEvent::ask_user_response(
-        Some(session_id),
-        turn,
-        request_id,
-        Some(run_id),
-        status,
-        answers,
-    );
-    let events = prepend_session_start_if_needed(&path, std::slice::from_ref(&event))?;
-    let buf = serialize_journal_events(events.as_ref())?;
-    file.write_all(&buf)?;
-    file.sync_data()?;
-    update_cached_session_start_state_from_events(&path, events.as_ref());
-    Ok(AskUserResponseAppendOutcome::Appended)
-}
-
-fn find_latest_ask_user_response_impl(
-    session_id: &str,
-    request_id: &str,
-    run_id: Option<&str>,
-) -> std::io::Result<Option<AskUserJournalResponse>> {
-    validate_session_id(session_id)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let events = read_journal(session_id)?;
-    for event in events.into_iter().rev() {
-        if event.event_type != JournalEventType::AskUserResponse {
-            continue;
-        }
-        let Some(metadata) = event.metadata.as_ref() else {
-            continue;
-        };
-        let Some(found_request_id) = ask_user_metadata_str(metadata, "request_id") else {
-            continue;
-        };
-        if found_request_id != request_id {
-            continue;
-        }
-        let found_run_id = ask_user_metadata_str(metadata, "run_id");
-        if let Some(expected_run_id) = run_id
-            && found_run_id.as_deref() != Some(expected_run_id)
-        {
-            continue;
-        }
-        let Some(status) = ask_user_metadata_str(metadata, "status") else {
-            continue;
-        };
-        let answers = metadata
-            .get("ask_user")
-            .and_then(|ask_user| ask_user.get("answers"))
-            .filter(|answers| !answers.is_null())
-            .cloned();
-        return Ok(Some(AskUserJournalResponse {
-            request_id: found_request_id,
-            run_id: found_run_id,
-            status,
-            answers,
-        }));
-    }
-    Ok(None)
-}
-
 /// Read journal for offline analysis tools. Returns an error if the JSONL file is missing.
 ///
 /// Second element: non-empty physical lines; third: lines that failed JSON parse.
@@ -4597,6 +4136,23 @@ pub fn read_journal_for_digest_for_user(
 fn read_journal_digest_from_path(
     path: &Path,
 ) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
+    let (mut events, lines, malformed) = read_journal_source_from_path(path)?;
+    stabilize_event_order(&mut events);
+    Ok((events, lines, malformed))
+}
+
+/// Raw owner-scoped diagnostic source in physical append order, with non-empty
+/// and malformed line counts. Missing files return NotFound, distinct from empty files.
+pub fn read_journal_source_for_owner(
+    owner: &OwnerScope,
+    session_id: &str,
+) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
+    read_journal_source_from_path(&journal_file_path_for_owner(owner, session_id)?)
+}
+
+fn read_journal_source_from_path(
+    path: &Path,
+) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
     if !path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -4604,7 +4160,7 @@ fn read_journal_digest_from_path(
         ));
     }
     let content = std::fs::read_to_string(path)?;
-    let parsed = parse_journal_text(&content);
+    let parsed = parse_journal_text_in_append_order(&content);
     record_journal_read(
         astra_core::history_work::HistoryWorkSite::SessionJournalDigestRead,
         content.len(),
@@ -5119,8 +4675,8 @@ pub fn classify_session_end_state(session_id: &str) -> std::io::Result<SessionEn
 
     // Gate "Completed" results on plan state: if a plan is still mid-flight
     // (execution_started with no matching terminal event), treat the session
-    // as Interrupted(plan_mid_flight) so find_stale_sessions / the reaper
-    // notices. Computed up-front so the early returns below can consult it.
+    // as Interrupted(plan_mid_flight) so session resume and listing expose the
+    // unfinished plan. Computed up-front for the early returns below.
     let mid_flight = mid_flight_plan_id(&tail_lines);
     let completed_or_mid_flight = || {
         if mid_flight.is_some() {
@@ -5186,74 +4742,7 @@ fn extract_json_str(line: &str, needle: &str) -> Option<String> {
     Some(rest[..end].replace("\\\"", "\"").replace("\\n", " "))
 }
 
-// ── Session listing with metadata ────────────────────────────────────────────
-
 // ── Session cleanup / lifecycle ──────────────────────────────────────────────
-
-/// Metadata about a session that's a candidate for cleanup.
-#[derive(Debug, Clone)]
-pub struct StaleSessionInfo {
-    pub session_id: String,
-    /// File modification time of the journal.
-    pub last_modified: std::time::SystemTime,
-    /// Journal file size in bytes.
-    pub journal_bytes: u64,
-    /// Turn count (fast count, not full parse).
-    pub turns: u32,
-    /// Total disk usage: journal + workspace dir (recursive).
-    pub total_bytes: u64,
-}
-
-/// Find sessions whose journal file hasn't been modified in `max_age`.
-///
-/// `exclude_id` — the currently active session (never returned).
-pub fn find_stale_sessions(
-    max_age: std::time::Duration,
-    exclude_id: Option<&str>,
-) -> std::io::Result<Vec<StaleSessionInfo>> {
-    let dir = journal_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(max_age)
-        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-
-    let mut stale = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Some(sid) = name.strip_suffix(".jsonl") else {
-            continue;
-        };
-        if sid.starts_with("test-") || sid.starts_with("new-sess-") {
-            continue;
-        }
-        if exclude_id == Some(sid) {
-            continue;
-        }
-        let meta = entry.metadata()?;
-        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        if mtime >= cutoff {
-            continue; // still fresh
-        }
-        let journal_bytes = meta.len();
-        let turns = count_turns(sid);
-        let ws_dir = crate::session_workspace::workspace_dir_for(sid);
-        let ws_bytes = dir_size_recursive(&ws_dir);
-        stale.push(StaleSessionInfo {
-            session_id: sid.to_string(),
-            last_modified: mtime,
-            journal_bytes,
-            turns,
-            total_bytes: journal_bytes + ws_bytes,
-        });
-    }
-    // Sort oldest first
-    stale.sort_by_key(|s| s.last_modified);
-    Ok(stale)
-}
 
 /// Delete a session's journal file and workspace directory.
 ///
@@ -5325,89 +4814,6 @@ fn walkdir_bounded(path: &std::path::Path, depth: u32) -> u64 {
         }
     }
     total
-}
-
-/// Compress a session's `.jsonl` journal to `.jsonl.gz` and remove the original.
-///
-/// Returns `Ok((original_bytes, compressed_bytes))` on success.
-/// Only archives if the session has a `session_end` event (i.e., completed).
-pub fn archive_journal(session_id: &str) -> std::io::Result<(u64, u64)> {
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
-    use std::io::Write;
-
-    validate_session_id(session_id)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let src = journal_file_path(session_id);
-    if !src.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("journal file not found for {session_id}"),
-        ));
-    }
-    // Check the journal has a session_end (don't archive active sessions)
-    let content = std::fs::read(&src)?;
-    if !content
-        .windows(b"\"session_end\"".len())
-        .any(|w| w == b"\"session_end\"")
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "session has no session_end event — still active?",
-        ));
-    }
-    let original_bytes = content.len() as u64;
-    let dst = src.with_extension("jsonl.gz");
-    let out_file = std::fs::File::create(&dst)?;
-    let mut encoder = GzEncoder::new(out_file, Compression::default());
-    encoder.write_all(&content)?;
-    let out_file = encoder.finish()?;
-    // Ensure compressed data is durable before deleting the original.
-    out_file.sync_all()?;
-    let compressed_bytes = std::fs::metadata(&dst)?.len();
-    std::fs::remove_file(&src)?;
-    Ok((original_bytes, compressed_bytes))
-}
-
-/// Find completed sessions eligible for archival (have session_end, not yet compressed).
-///
-/// `exclude_id` — the currently active session.
-pub fn find_archivable_sessions(exclude_id: Option<&str>) -> std::io::Result<Vec<(String, u64)>> {
-    let dir = journal_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut result = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Some(sid) = name.strip_suffix(".jsonl") else {
-            continue;
-        };
-        // Skip already-compressed (.jsonl.gz would not match .jsonl suffix)
-        if sid.ends_with(".jsonl") {
-            continue; // double extension guard
-        }
-        if sid.starts_with("test-") || sid.starts_with("new-sess-") {
-            continue;
-        }
-        if exclude_id == Some(sid) {
-            continue;
-        }
-        let meta = entry.metadata()?;
-        let bytes = meta.len();
-        // Quick check: has session_end?
-        let path = entry.path();
-        let has_end = std::fs::read_to_string(&path)
-            .map(|c| c.contains("\"session_end\""))
-            .unwrap_or(false);
-        if has_end {
-            result.push((sid.to_string(), bytes));
-        }
-    }
-    result.sort_by_key(|b| std::cmp::Reverse(b.1)); // largest first
-    Ok(result)
 }
 
 /// Resolve a session id to an exact journal filename stem.
@@ -5776,8 +5182,11 @@ impl JournalEvent {
         } else {
             message.clone()
         };
+        // Redacted projections retain receipt identity, not model coverage.
+        let model_item_id = astra_turn_types::model_item_id(&message).map(str::to_string);
         let mut event = Self::base(JournalEventType::TranscriptItem, Some(session_id));
         event.transcript_item = Some(JournalTranscriptItem {
+            model_item_id,
             source_event_id: local_transcript_source_event_id(
                 session_id, run_id, agent_id, item_seq,
             ),
@@ -7165,77 +6574,6 @@ impl JournalEvent {
         evt.metadata = Some(metadata);
         evt
     }
-    /// Focus drift detected — emitted when drift analysis finds significant drift.
-    pub fn drift_detected(
-        session_id: Option<&str>,
-        turn: u32,
-        severity: f64,
-        cause: astra_core::DriftCause,
-        evidence: Vec<astra_core::DriftEvidence>,
-        recovery_suggestion: &str,
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::DriftDetected, session_id);
-        evt.turn = Some(turn);
-        evt.metadata = Some(serde_json::json!({
-            "severity": severity,
-            "cause": cause,
-            "evidence_count": evidence.len(),
-            "evidence": evidence,
-            "recovery_suggestion": recovery_suggestion,
-        }));
-        evt
-    }
-
-    /// Adaptive scenario applied — emitted once per session when the adaptive
-    /// profile selects a scenario and applies config adjustments.
-    #[allow(clippy::too_many_arguments)]
-    pub fn adaptive_scenario_applied(
-        session_id: Option<&str>,
-        turn: u32,
-        scenario: &str,
-        confidence: f64,
-        config_changes: Vec<(String, String, String)>, // (key, from, to)
-        experiment_id: Option<&str>,
-        variant_id: Option<&str>,
-        baseline_applied: bool,
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::AdaptiveScenarioApplied, session_id);
-        evt.turn = Some(turn);
-        let changes: Vec<serde_json::Value> = config_changes
-            .iter()
-            .map(|(k, from, to)| serde_json::json!({"key": k, "from": from, "to": to}))
-            .collect();
-        evt.metadata = Some(serde_json::json!({
-            "scenario": scenario,
-            "confidence": confidence,
-            "config_changes": changes,
-            "experiment_id": experiment_id,
-            "variant_id": variant_id,
-            "baseline_applied": baseline_applied,
-        }));
-        evt
-    }
-
-    /// Per-turn micro-adaptation applied — emitted when per-turn adaptation
-    /// modifies runtime config based on immediate signals.
-    pub fn adaptive_per_turn_applied(
-        session_id: Option<&str>,
-        turn: u32,
-        changes: Vec<(String, String, String)>, // (key, from, to)
-        triggers: Vec<String>,                  // reason strings
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::AdaptivePerTurnApplied, session_id);
-        evt.turn = Some(turn);
-        let change_vals: Vec<serde_json::Value> = changes
-            .iter()
-            .map(|(k, from, to)| serde_json::json!({"key": k, "from": from, "to": to}))
-            .collect();
-        evt.metadata = Some(serde_json::json!({
-            "changes": change_vals,
-            "triggers": triggers,
-        }));
-        evt
-    }
 
     /// Record a structured interruption (budget exhaustion, rate limit, cancel, etc.).
     pub fn interruption_recorded(
@@ -7448,6 +6786,27 @@ pub fn journal_content_marker(raw: &str) -> String {
     format!("<redacted: len={} sha={:016x}>", raw.len(), h.finish())
 }
 
+/// Returns true only for the exact privacy marker emitted by
+/// [`journal_content_marker`]. A marker is evidence that source content was
+/// deliberately omitted, not a recoverable transcript value.
+pub fn is_journal_content_marker(value: &str) -> bool {
+    let Some(payload) = value
+        .strip_prefix("<redacted: len=")
+        .and_then(|value| value.strip_suffix('>'))
+    else {
+        return false;
+    };
+    let Some((length, digest)) = payload.split_once(" sha=") else {
+        return false;
+    };
+    !length.is_empty()
+        && length.bytes().all(|byte| byte.is_ascii_digit())
+        && digest.len() == 16
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 // ═══════════════════════════ Session Lifecycle ════════════════════════════
 
 /// Result of a single session lifecycle maintenance run.
@@ -7470,15 +6829,22 @@ pub struct SessionMaintenanceResult {
 ///
 /// Both thresholds use the journal file's modification time. This function is
 /// idempotent and safe to call at every REPL startup.
-pub fn run_session_maintenance(
+pub fn run_session_maintenance_for_owner(
+    owner: &OwnerScope,
+    protected_session_id: Option<&str>,
     ttl_days: u64,
     compress_after_days: u64,
-) -> SessionMaintenanceResult {
-    let dir = journal_dir();
+) -> std::io::Result<SessionMaintenanceResult> {
+    let dir = journal_dir_for_owner(owner)?;
     if !dir.exists() {
-        return SessionMaintenanceResult::default();
+        return Ok(SessionMaintenanceResult::default());
     }
-    run_session_maintenance_in(dir, ttl_days, compress_after_days)
+    Ok(run_session_maintenance_in(
+        dir,
+        ttl_days,
+        compress_after_days,
+        protected_session_id,
+    ))
 }
 
 #[cfg(test)]
@@ -8185,202 +7551,6 @@ mod approval_tests {
     }
 
     #[test]
-    fn find_latest_ask_user_response_reads_latest_matching_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let writer = JournalWriter::new("sess-ask-user").unwrap();
-
-        writer
-            .append(&JournalEvent::ask_user_prompted(
-                Some("sess-ask-user"),
-                Some(5),
-                "ask-1",
-                Some("run-1"),
-                serde_json::json!({"questions": []}),
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::ask_user_response(
-                Some("sess-ask-user"),
-                Some(5),
-                "ask-1",
-                Some("run-1"),
-                "submitted",
-                Some(serde_json::json!({
-                    "answers": [{
-                        "question": "Continue?",
-                        "answers": ["yes"],
-                        "multi_select": false
-                    }]
-                })),
-            ))
-            .unwrap();
-
-        let found = find_latest_ask_user_response("sess-ask-user", "ask-1")
-            .unwrap()
-            .expect("ask_user response");
-        assert_eq!(found.request_id, "ask-1");
-        assert_eq!(found.run_id.as_deref(), Some("run-1"));
-        assert_eq!(found.status, "submitted");
-        assert_eq!(
-            found.answers.unwrap()["answers"][0]["answers"][0].as_str(),
-            Some("yes")
-        );
-    }
-
-    #[test]
-    fn ask_user_prompt_lookup_and_terminal_append_are_run_scoped_and_atomic() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let writer = JournalWriter::new("sess-ask-user-atomic").unwrap();
-        let prompt = serde_json::json!({
-            "questions": [{"question": "Continue?", "options": []}]
-        });
-        writer
-            .append(&JournalEvent::ask_user_prompted(
-                Some("sess-ask-user-atomic"),
-                Some(7),
-                "ask-atomic",
-                Some("run-a"),
-                prompt.clone(),
-            ))
-            .unwrap();
-
-        let required =
-            find_latest_ask_user_prompted_for_run("sess-ask-user-atomic", "ask-atomic", "run-a")
-                .unwrap()
-                .expect("canonical ask_user request");
-        assert_eq!(required.turn, Some(7));
-        assert_eq!(required.prompt, prompt);
-        assert!(
-            find_latest_ask_user_prompted_for_run("sess-ask-user-atomic", "ask-atomic", "run-b",)
-                .unwrap()
-                .is_none(),
-            "a request id may not cross run boundaries"
-        );
-
-        let answers = serde_json::json!({"answers": []});
-        assert_eq!(
-            append_ask_user_response_for_run_if_absent(
-                "sess-ask-user-atomic",
-                required.turn,
-                "ask-atomic",
-                "run-a",
-                "submitted",
-                Some(answers.clone()),
-            )
-            .unwrap(),
-            AskUserResponseAppendOutcome::Appended
-        );
-        assert_eq!(
-            append_ask_user_response_for_run_if_absent(
-                "sess-ask-user-atomic",
-                required.turn,
-                "ask-atomic",
-                "run-a",
-                "submitted",
-                Some(answers),
-            )
-            .unwrap(),
-            AskUserResponseAppendOutcome::Idempotent
-        );
-        let conflict = append_ask_user_response_for_run_if_absent(
-            "sess-ask-user-atomic",
-            required.turn,
-            "ask-atomic",
-            "run-a",
-            "timeout",
-            None,
-        )
-        .unwrap();
-        assert!(matches!(
-            conflict,
-            AskUserResponseAppendOutcome::Conflict(AskUserJournalResponse { status, .. })
-                if status == "submitted"
-        ));
-
-        let terminal_events = read_journal("sess-ask-user-atomic")
-            .unwrap()
-            .into_iter()
-            .filter(|event| event.event_type == JournalEventType::AskUserResponse)
-            .count();
-        assert_eq!(terminal_events, 1);
-    }
-
-    #[test]
-    fn ask_user_response_projects_to_run_scoped_interaction_contract() {
-        let response = AskUserJournalResponse {
-            request_id: "ask-contract".into(),
-            run_id: Some("run-contract".into()),
-            status: "cancelled".into(),
-            answers: None,
-        };
-
-        let contract = response
-            .interaction_contract("sess-contract", Some("user-contract"))
-            .expect("run-scoped ask_user response should become an interaction contract");
-
-        assert_eq!(contract.kind, InteractionKind::UserPrompt);
-        assert_eq!(
-            contract.durable_store,
-            InteractionDurableStore::SessionJournal
-        );
-        assert_eq!(contract.status, InteractionStatus::Cancelled);
-        assert_eq!(contract.identity.user_id.as_deref(), Some("user-contract"));
-        assert_eq!(contract.identity.session_id, "sess-contract");
-        assert_eq!(contract.identity.run_id, "run-contract");
-        assert_eq!(contract.identity.request_id, "ask-contract");
-        assert!(contract.is_wait_satisfied());
-    }
-
-    #[test]
-    fn ask_user_response_lookup_for_run_ignores_other_run_same_request_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(tmp.path());
-        let writer = JournalWriter::new("sess-ask-user-run").unwrap();
-
-        writer
-            .append(&JournalEvent::ask_user_response(
-                Some("sess-ask-user-run"),
-                Some(1),
-                "ask-shared",
-                Some("run-a"),
-                "submitted",
-                Some(serde_json::json!({"answers": [{"question": "A?", "answers": ["a"]}]})),
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::ask_user_response(
-                Some("sess-ask-user-run"),
-                Some(2),
-                "ask-shared",
-                Some("run-b"),
-                "cancelled",
-                None,
-            ))
-            .unwrap();
-
-        let found =
-            find_latest_ask_user_response_for_run("sess-ask-user-run", "ask-shared", "run-a")
-                .unwrap()
-                .expect("run-a ask_user response");
-        assert_eq!(found.run_id.as_deref(), Some("run-a"));
-        assert_eq!(found.status, "submitted");
-        assert_eq!(
-            found.answers.unwrap()["answers"][0]["answers"][0].as_str(),
-            Some("a")
-        );
-
-        let cancelled =
-            find_latest_ask_user_response_for_run("sess-ask-user-run", "ask-shared", "run-b")
-                .unwrap()
-                .expect("run-b ask_user response");
-        assert_eq!(cancelled.run_id.as_deref(), Some("run-b"));
-        assert_eq!(cancelled.status, "cancelled");
-        assert!(cancelled.answers.is_none());
-    }
-
-    #[test]
     fn permission_audit_event_round_trips_metadata() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
@@ -8537,6 +7707,7 @@ fn run_session_maintenance_in(
     dir: PathBuf,
     ttl_days: u64,
     compress_after_days: u64,
+    protected_session_id: Option<&str>,
 ) -> SessionMaintenanceResult {
     use std::time::{Duration, SystemTime};
 
@@ -8567,6 +7738,9 @@ fn run_session_maintenance_in(
             Some(sid) => sid.to_string(),
             None => continue,
         };
+        if protected_session_id == Some(session_id.as_str()) {
+            continue;
+        }
         // Skip .jsonl.gz — already compressed
         if name_str.ends_with(".jsonl.gz") {
             continue;
@@ -8597,6 +7771,9 @@ fn run_session_maintenance_in(
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if let Some(sid) = name_str.strip_suffix(".jsonl.gz") {
+                if protected_session_id == Some(sid) {
+                    continue;
+                }
                 let mtime = match entry.metadata().and_then(|m| m.modified()) {
                     Ok(t) => t,
                     Err(_) => continue,
@@ -8694,7 +7871,6 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_core::{DriftCause, DriftEvidence, EvidenceType};
     use tempfile::tempdir;
 
     #[test]
@@ -9009,22 +8185,11 @@ mod tests {
 
     #[test]
     fn journal_event_drift_detected_round_trips_structured_cause_and_evidence() {
-        let evt = JournalEvent::drift_detected(
-            Some("sid-drift"),
-            7,
-            0.75,
-            DriftCause::MemoryMiss {
-                expected_but_not_retrieved: vec!["session history".into(), "repo context".into()],
-                query_used: "debug repeated session start".into(),
-            },
-            vec![DriftEvidence {
-                turn: 6,
-                evidence_type: EvidenceType::MemoryMismatch,
-                description: "Retrieved unrelated CI memories instead of resume context".into(),
-                confidence: 0.9.into(),
-            }],
-            "Re-query with explicit session-resume terms",
-        );
+        let evt: JournalEvent = serde_json::from_value(serde_json::json!({
+            "type": "drift_detected", "ts": "2026-10-03T00:00:00Z", "session_id": "sid-drift", "turn": 7,
+            "metadata": {"severity": 0.75, "cause": {"type": "MemoryMiss", "expected_but_not_retrieved": ["session history", "repo context"], "query_used": "debug repeated session start"}, "evidence_count": 1,
+             "evidence": [{"turn": 6, "evidence_type": "MemoryMismatch", "description": "Retrieved unrelated CI memories instead of resume context", "confidence": 0.9}], "recovery_suggestion": "Re-query with explicit session-resume terms"}
+        })).unwrap();
 
         assert_eq!(evt.event_type, JournalEventType::DriftDetected);
         assert_eq!(evt.turn, Some(7));
@@ -10625,6 +9790,69 @@ mod tests {
     }
 
     #[test]
+    fn session_end_retry_after_sync_failure_commits_only_once() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let journal = JournalWriter::new("end-sync-retry").unwrap();
+        assert!(
+            journal
+                .append_session_end_with_sync(1, |_| Err(std::io::Error::other("sync fault")))
+                .is_err()
+        );
+        journal.append_session_end(1).unwrap();
+        let events = read_journal("end-sync-retry").unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == JournalEventType::SessionEnd)
+                .count(),
+            1
+        );
+        journal
+            .append(&JournalEvent::turn(
+                Some("end-sync-retry"),
+                2,
+                None,
+                "continue",
+                "done",
+                1,
+                1,
+                1,
+                1,
+            ))
+            .unwrap();
+        journal.append_session_end(2).unwrap();
+        assert_eq!(
+            read_journal("end-sync-retry")
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == JournalEventType::SessionEnd)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn maintenance_preserves_resume_target_and_workspace_for_both_journal_formats() {
+        for suffix in ["jsonl", "jsonl.gz"] {
+            let tmp = tempdir().unwrap();
+            let path = tmp.path().join(format!("resume.{suffix}"));
+            std::fs::write(&path, "journal").unwrap();
+            let mtime = filetime::FileTime::from_system_time(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400),
+            );
+            filetime::set_file_mtime(&path, mtime).unwrap();
+            std::fs::create_dir(tmp.path().join("resume")).unwrap();
+            let result =
+                run_session_maintenance_in(tmp.path().to_path_buf(), 30, 7, Some("resume"));
+            assert_eq!(result.sessions_deleted, 0);
+            assert_eq!(result.journals_compressed, 0);
+            assert!(path.exists());
+            assert!(tmp.path().join("resume").exists());
+        }
+    }
+
+    #[test]
     fn session_maintenance_all_scenarios() {
         let tmp = tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -10646,7 +9874,7 @@ mod tests {
         std::fs::create_dir_all(session_dir.join("step_checkpoints")).unwrap();
         std::fs::write(session_dir.join("workspace.yaml"), "session_id: test").unwrap();
         create_aged_journal(&dir, "new-session", 1);
-        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        let result = run_session_maintenance_in(dir.clone(), 30, 7, None);
         assert_eq!(result.sessions_deleted, 1);
         assert!(!dir.join("old-session.jsonl").exists());
         assert!(!dir.join("old-session").exists());
@@ -10654,14 +9882,14 @@ mod tests {
 
         // Compress old journals (10 days, compress_after=7)
         create_aged_journal(&dir, "mid-session", 10);
-        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        let result = run_session_maintenance_in(dir.clone(), 30, 7, None);
         assert_eq!(result.journals_compressed, 1);
         assert!(!dir.join("mid-session.jsonl").exists());
         assert!(dir.join("mid-session.jsonl.gz").exists());
 
         // Skip recent sessions (fresh, 0 days)
         std::fs::write(dir.join("fresh.jsonl"), r#"{"type":"session_start"}"#).unwrap();
-        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        let result = run_session_maintenance_in(dir.clone(), 30, 7, None);
         assert_eq!(result.sessions_deleted, 0);
         assert_eq!(result.journals_compressed, 0);
         assert!(dir.join("fresh.jsonl").exists());
@@ -10673,13 +9901,13 @@ mod tests {
             std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400 + 3600),
         );
         filetime::set_file_mtime(&gz_path, mtime).unwrap();
-        let result = run_session_maintenance_in(dir.clone(), 30, 7);
+        let result = run_session_maintenance_in(dir.clone(), 30, 7, None);
         assert_eq!(result.sessions_deleted, 1);
         assert!(!gz_path.exists());
 
         // Empty dir returns defaults
         let tmp2 = tempdir().unwrap();
-        let result = run_session_maintenance_in(tmp2.path().to_path_buf(), 30, 7);
+        let result = run_session_maintenance_in(tmp2.path().to_path_buf(), 30, 7, None);
         assert_eq!(result.sessions_deleted, 0);
         assert_eq!(result.journals_compressed, 0);
         assert_eq!(result.bytes_freed, 0);
@@ -10692,9 +9920,17 @@ mod tests {
         let a = journal_content_marker("hello world");
         let b = journal_content_marker("hello world");
         assert_eq!(a, b);
+        assert!(is_journal_content_marker(&a));
         assert!(a.starts_with("<redacted: len=11 sha="));
         assert!(a.ends_with('>'));
         assert!(!a.contains("hello"));
+        for not_marker in [
+            "<redacted: len=11 sha=123>",
+            "<redacted: len=11 sha=0123456789ABCDEF>",
+            "assistant output",
+        ] {
+            assert!(!is_journal_content_marker(not_marker));
+        }
         assert_ne!(
             journal_content_marker("hello"),
             journal_content_marker("world")
@@ -10731,8 +9967,23 @@ mod tests {
         assert!(user.starts_with("<redacted:"));
         assert!(asst.starts_with("<redacted:"));
 
+        let mut message = serde_json::json!({"role":"assistant", "content":"secret answer"});
+        astra_turn_types::mark_model_message(&mut message, Some("model-A"));
+        let redacted = JournalEvent::transcript_item("s1", "r1", "a1", 1, &message)
+            .unwrap()
+            .transcript_item
+            .unwrap();
+        assert!(redacted.model_item_id.is_none());
+        assert!(!redacted.message.to_string().contains("secret answer"));
+
         // ── Turn event keeps content when env unset ──
         unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
+        let visible = JournalEvent::transcript_item("s1", "r1", "a1", 1, &message)
+            .unwrap()
+            .transcript_item
+            .unwrap();
+        assert_eq!(visible.model_item_id.as_deref(), Some("model-A"));
+        assert_eq!(visible.source_event_id, redacted.source_event_id);
         let evt = JournalEvent::turn(
             Some("s1"),
             1,
@@ -10751,6 +10002,7 @@ mod tests {
         let message = serde_json::json!({
             "role": "assistant",
             "content": "child answer",
+            "model_item_id": "accepted-A",
             "reasoning_content": "checked the invariant",
         });
         let evt =
@@ -10767,6 +10019,7 @@ mod tests {
         assert_eq!(payload.run_id, "local-run");
         assert_eq!(payload.agent_id, "reviewer");
         assert_eq!(payload.item_seq, 7);
+        assert_eq!(payload.model_item_id.as_deref(), Some("accepted-A"));
         assert_eq!(payload.message, message);
         let retry = JournalEvent::transcript_item(
             "parent-session",
@@ -10811,6 +10064,57 @@ mod tests {
         assert!(!user.contains("secret query"));
         assert!(user.starts_with("<redacted:"));
         assert_eq!(evt.error.as_deref(), Some("boom"));
+
+        // The terminal producer appends these fields after constructing the
+        // typed event. The journal writer is the storage boundary, so raw
+        // child output and applied guidance must still be redacted there.
+        let tmp = tempdir().unwrap();
+        let _journal_dir = JournalDirGuard::new(tmp.path());
+        let session_id = "redacted-child-terminal";
+        let writer = JournalWriter::new(session_id).unwrap();
+        let mut terminal = JournalEvent::agent_terminated(
+            Some(session_id),
+            "child-1",
+            "run-1",
+            "task",
+            "completed",
+            Some("normal"),
+            Some(1),
+            2,
+            100,
+            20,
+            300,
+            None,
+        );
+        terminal.metadata.as_mut().unwrap()["full_text"] =
+            serde_json::json!("private child result");
+        terminal.metadata.as_mut().unwrap()["applied_user_intents"] = serde_json::json!([{
+            "intent_id": "intent-1",
+            "delivery": "guide_current_run",
+            "status": "applied",
+            "event_index": 3,
+            "content": "private user guidance"
+        }]);
+        writer.append(&terminal).unwrap();
+        let persisted = std::fs::read_to_string(writer.path()).unwrap();
+        assert!(!persisted.contains("private child result"));
+        assert!(!persisted.contains("private user guidance"));
+        let terminal = read_journal_append_order(session_id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == JournalEventType::AgentTerminated)
+            .expect("terminal event is durably readable");
+        let metadata = terminal.metadata.unwrap();
+        assert!(is_journal_content_marker(
+            metadata["full_text"].as_str().unwrap()
+        ));
+        assert!(is_journal_content_marker(
+            metadata["applied_user_intents"][0]["content"]
+                .as_str()
+                .unwrap()
+        ));
+        assert_eq!(metadata["run_id"], "run-1");
+        assert_eq!(metadata["status"], "completed");
 
         unsafe { std::env::remove_var("ASTRA_JOURNAL_CONTENT_REDACT") };
     }

@@ -554,6 +554,10 @@ impl std::fmt::Display for PermissionRule {
 pub struct InheritedPermissions {
     /// Permission mode inherited from parent.
     pub mode: PermissionMode,
+    /// An immutable child execution ceiling. Approval and allow rules cannot
+    /// authorize a tool call whose arguments are not provably read-only.
+    #[serde(default)]
+    pub read_only_execution: bool,
     /// Tools explicitly allowed by parent (child can use without asking).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_rules: Vec<PermissionRule>,
@@ -839,6 +843,195 @@ impl PermissionUpdate {
     }
 }
 
+/// The session-only part of a permission context that may cross a bounded
+/// continuation boundary.
+///
+/// This intentionally does not contain inherited policy, telemetry, or a
+/// shared handle. The receiver must already have the current inherited
+/// authorization; restoring this value never refreshes or widens that policy.
+/// Rules stay in the existing explicit permission grammar at the boundary so
+/// restoration cannot silently change matching semantics.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionSyncContinuation {
+    #[serde(
+        serialize_with = "serialize_continuation_rules",
+        deserialize_with = "deserialize_continuation_rules"
+    )]
+    session_allow: Vec<PermissionRule>,
+    #[serde(
+        serialize_with = "serialize_continuation_rules",
+        deserialize_with = "deserialize_continuation_rules"
+    )]
+    session_deny: Vec<PermissionRule>,
+}
+
+/// A continuation was rejected before it could affect a live permission
+/// owner. Error messages deliberately contain no rule text: rule patterns may
+/// contain credentials or other sensitive values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermissionSyncContinuationError {
+    /// A rule is not valid under the current explicit permission grammar.
+    InvalidRule,
+    /// A rule contains a credential detected by the existing redaction
+    /// contract. Redaction is not acceptable here because it would change the
+    /// rule's meaning.
+    SecretBearingRule,
+    /// A display or executor redaction marker is not a persistable rule value.
+    RedactionMarker,
+    /// Restoring would replace session overrides already owned by this live
+    /// context.
+    LiveOverridesPresent,
+}
+
+impl std::fmt::Display for PermissionSyncContinuationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::InvalidRule => "permission continuation contains an invalid rule",
+            Self::SecretBearingRule => "permission continuation contains a credential-bearing rule",
+            Self::RedactionMarker => "permission continuation contains a redaction marker",
+            Self::LiveOverridesPresent => {
+                "permission continuation cannot replace live session overrides"
+            }
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for PermissionSyncContinuationError {}
+
+const MAX_CONTINUATION_RULES_PER_LIST: usize = 256;
+const MAX_CONTINUATION_RULE_BYTES_PER_LIST: usize = 64 * 1024;
+
+impl PermissionSyncContinuation {
+    fn from_rules(
+        session_allow: &[PermissionRule],
+        session_deny: &[PermissionRule],
+    ) -> Result<Self, PermissionSyncContinuationError> {
+        for rules in [session_allow, session_deny] {
+            validate_continuation_rule_budget(rules)?;
+            for rule in rules {
+                validate_continuation_permission_rule(rule)?;
+            }
+        }
+        Ok(Self {
+            session_allow: session_allow.to_vec(),
+            session_deny: session_deny.to_vec(),
+        })
+    }
+}
+
+fn validate_continuation_rule_budget(
+    rules: &[PermissionRule],
+) -> Result<(), PermissionSyncContinuationError> {
+    let mut bytes = 0usize;
+    if rules.len() > MAX_CONTINUATION_RULES_PER_LIST {
+        return Err(PermissionSyncContinuationError::InvalidRule);
+    }
+    for rule in rules {
+        bytes = bytes.saturating_add(rule.to_string().len());
+        if bytes > MAX_CONTINUATION_RULE_BYTES_PER_LIST {
+            return Err(PermissionSyncContinuationError::InvalidRule);
+        }
+    }
+    Ok(())
+}
+
+fn serialize_continuation_rules<S>(
+    rules: &[PermissionRule],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    validate_continuation_rule_budget(rules).map_err(serde::ser::Error::custom)?;
+    let encoded = rules
+        .iter()
+        .map(|rule| {
+            validate_continuation_permission_rule(rule)?;
+            Ok(rule.to_string())
+        })
+        .collect::<Result<Vec<_>, PermissionSyncContinuationError>>()
+        .map_err(serde::ser::Error::custom)?;
+    encoded.serialize(serializer)
+}
+
+fn deserialize_continuation_rules<'de, D>(deserializer: D) -> Result<Vec<PermissionRule>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Rules;
+    impl<'de> serde::de::Visitor<'de> for Rules {
+        type Value = Vec<PermissionRule>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a bounded permission rule list")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut rules = Vec::new();
+            let mut input_bytes = 0usize;
+            loop {
+                if rules.len() == MAX_CONTINUATION_RULES_PER_LIST {
+                    if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                        return Err(serde::de::Error::custom(
+                            PermissionSyncContinuationError::InvalidRule,
+                        ));
+                    }
+                    break;
+                }
+                let Some(encoded) = seq.next_element::<String>()? else {
+                    break;
+                };
+                input_bytes = input_bytes.saturating_add(encoded.len());
+                if input_bytes > MAX_CONTINUATION_RULE_BYTES_PER_LIST {
+                    return Err(serde::de::Error::custom(
+                        PermissionSyncContinuationError::InvalidRule,
+                    ));
+                }
+                rules.push(parse_continuation_rule(&encoded).map_err(serde::de::Error::custom)?);
+            }
+            validate_continuation_rule_budget(&rules).map_err(serde::de::Error::custom)?;
+            Ok(rules)
+        }
+    }
+    deserializer
+        .deserialize_seq(Rules)
+        .map_err(|_| serde::de::Error::custom(PermissionSyncContinuationError::InvalidRule))
+}
+
+fn parse_continuation_rule(rule: &str) -> Result<PermissionRule, PermissionSyncContinuationError> {
+    let (_, credential_count) =
+        astra_text_utils::credential_redaction::redact_credentials_in_text(rule);
+    if credential_count != 0 {
+        return Err(PermissionSyncContinuationError::SecretBearingRule);
+    }
+    if astra_text_utils::credential_redaction::redaction_marker_status(rule).1 {
+        return Err(PermissionSyncContinuationError::RedactionMarker);
+    }
+    let parsed = PermissionRule::try_parse(rule)
+        .map_err(|_| PermissionSyncContinuationError::InvalidRule)?;
+    if parsed.tool == "__invalid_permission_rule__" {
+        return Err(PermissionSyncContinuationError::InvalidRule);
+    }
+    Ok(parsed)
+}
+
+fn validate_continuation_permission_rule(
+    rule: &PermissionRule,
+) -> Result<(), PermissionSyncContinuationError> {
+    if rule.tool == "__invalid_permission_rule__" {
+        return Err(PermissionSyncContinuationError::InvalidRule);
+    }
+    let encoded = rule.to_string();
+    let parsed = parse_continuation_rule(&encoded)?;
+    if parsed != *rule {
+        return Err(PermissionSyncContinuationError::InvalidRule);
+    }
+    Ok(())
+}
+
 // ─── Sync Context ───────────────────────────────────────────────────────────
 
 /// Context for managing permission synchronization during an agent's execution.
@@ -983,6 +1176,46 @@ impl PermissionSyncContext {
             self.apply_update(update);
         }
     }
+
+    /// Capture only the current session overrides for a continuation.
+    ///
+    /// The inherited envelope and telemetry remain owned by the current
+    /// execution and are deliberately excluded. A rule is encoded with the
+    /// existing `PermissionRule` grammar and rejected if it cannot round-trip
+    /// without changing its matching behavior or if the credential-redaction
+    /// contract marks its text as sensitive.
+    pub fn capture_continuation(
+        &self,
+    ) -> Result<PermissionSyncContinuation, PermissionSyncContinuationError> {
+        PermissionSyncContinuation::from_rules(&self.session_allow, &self.session_deny)
+    }
+
+    /// Restore session overrides onto a context that already carries the
+    /// current, independently authorized inherited envelope.
+    ///
+    /// This is intentionally an initialization operation: a live owner with
+    /// session overrides is never overwritten by an older continuation. The
+    /// inherited mode, deny rules, read-only ceiling, tool allowlist, and
+    /// telemetry are not replaced. Updates are applied through the existing
+    /// `apply_update` semantics only after every rule has been validated, so a
+    /// malformed continuation cannot partially change the owner.
+    pub fn restore_continuation(
+        &mut self,
+        continuation: &PermissionSyncContinuation,
+    ) -> Result<(), PermissionSyncContinuationError> {
+        if !self.session_allow.is_empty() || !self.session_deny.is_empty() {
+            return Err(PermissionSyncContinuationError::LiveOverridesPresent);
+        }
+
+        for rule in &continuation.session_allow {
+            self.apply_update(&PermissionUpdate::allow(rule.clone()));
+        }
+        for rule in &continuation.session_deny {
+            self.apply_update(&PermissionUpdate::deny(rule.clone()));
+        }
+        Ok(())
+    }
+
     /// Refresh inherited (policy) state from a fresher context while
     /// preserving this handle's own runtime telemetry and session overrides.
     ///
@@ -992,7 +1225,9 @@ impl PermissionSyncContext {
     /// user already made this turn. Only the policy half (`inherited`) is
     /// replaced; runtime accumulators stay.
     pub fn merge_policy_from(&mut self, fresh: &PermissionSyncContext) {
+        let read_only_execution = self.inherited.read_only_execution;
         self.inherited = fresh.inherited.clone();
+        self.inherited.read_only_execution |= read_only_execution;
         // session_allow / session_deny / telemetry are intentionally
         // preserved — they belong to this handle's runtime, not the policy.
     }
@@ -1474,6 +1709,220 @@ mod tests {
 
         assert_eq!(child_perms.mode, PermissionMode::Auto);
         assert!(child_perms.is_background);
+    }
+
+    #[test]
+    fn read_only_child_ceiling_survives_permission_refresh_and_nested_child() {
+        let mut child = PermissionSyncContext::new(InheritedPermissions {
+            read_only_execution: true,
+            ..InheritedPermissions::auto_approve()
+        });
+        child.merge_policy_from(&PermissionSyncContext::root(PermissionMode::Auto));
+        assert!(child.inherited.read_only_execution);
+        assert!(child.for_child(false).read_only_execution);
+    }
+
+    #[test]
+    fn permission_sync_continuation_restores_session_rules_on_current_policy() {
+        let mut source = PermissionSyncContext::root(PermissionMode::Prompt);
+        source.apply_update(&PermissionUpdate::allow(
+            PermissionRule::try_parse(r#"Bash(argv_prefix="git status")"#).unwrap(),
+        ));
+        source.apply_update(&PermissionUpdate::deny(
+            PermissionRule::try_parse(r#"Bash(argv_prefix="rm -rf")"#).unwrap(),
+        ));
+        let continuation = source.capture_continuation().unwrap();
+        let serialized = serde_json::to_value(&continuation).unwrap();
+        assert!(serialized.get("telemetry").is_none());
+        let continuation =
+            serde_json::from_value::<PermissionSyncContinuation>(serialized).unwrap();
+
+        let mut current = PermissionSyncContext::new(InheritedPermissions {
+            read_only_execution: true,
+            deny_rules: vec![
+                PermissionRule::try_parse(r#"Bash(argv_prefix="git status")"#).unwrap(),
+            ],
+            allowed_tools: Some(["read_file".to_string()].into_iter().collect()),
+            ..Default::default()
+        });
+        current.record_permission_request();
+        current.record_permission_approved();
+        current.record_blocked_tool_with_reason("bash", Some("inherited deny"));
+        let telemetry_before = current.telemetry();
+
+        current.restore_continuation(&continuation).unwrap();
+
+        // Session continuity is restored, but the current inherited policy is
+        // still authoritative and independently rechecked by the evaluator.
+        assert!(current.is_allowed("bash", Some("git status --short")));
+        assert!(current.is_denied("bash", Some("git status --short")));
+        assert!(current.is_denied("bash", Some("rm -rf /tmp")));
+        let decision = crate::permission::engine::evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": "git status --short"}),
+            &current,
+        );
+        assert!(matches!(
+            decision.decision,
+            crate::permission::engine::HardDecision::Deny { .. }
+        ));
+        assert!(current.inherited.read_only_execution);
+        assert_eq!(
+            current.inherited.allowed_tools,
+            Some(["read_file".to_string()].into_iter().collect())
+        );
+        let child = current.for_child(false);
+        assert!(child.read_only_execution);
+        assert!(child.is_denied("bash", Some("git status --short")));
+        assert_eq!(
+            child.allowed_tools,
+            Some(["read_file".to_string()].into_iter().collect())
+        );
+
+        let telemetry_after = current.telemetry();
+        assert_eq!(
+            telemetry_after.permission_requests,
+            telemetry_before.permission_requests
+        );
+        assert_eq!(
+            telemetry_after.permission_requests_approved,
+            telemetry_before.permission_requests_approved
+        );
+        assert_eq!(
+            telemetry_after.tools_blocked,
+            telemetry_before.tools_blocked
+        );
+        assert_eq!(
+            telemetry_after.recent_denials,
+            telemetry_before.recent_denials
+        );
+        assert_eq!(
+            telemetry_after.recent_denials_with_reasons,
+            telemetry_before.recent_denials_with_reasons
+        );
+    }
+
+    #[test]
+    fn permission_sync_continuation_refuses_to_replace_live_overrides() {
+        let mut live = PermissionSyncContext::root(PermissionMode::Prompt);
+        live.apply_update(&PermissionUpdate::allow(PermissionRule::tool("read_file")));
+
+        let mut stale = PermissionSyncContext::root(PermissionMode::Prompt);
+        stale.apply_update(&PermissionUpdate::deny(PermissionRule::tool("bash")));
+        let continuation = stale.capture_continuation().unwrap();
+
+        assert_eq!(
+            live.restore_continuation(&continuation),
+            Err(PermissionSyncContinuationError::LiveOverridesPresent)
+        );
+        assert!(live.is_allowed("read_file", None));
+        assert!(!live.is_denied("bash", None));
+    }
+
+    #[test]
+    fn permission_sync_continuation_rejects_invalid_or_unbounded_input() {
+        let malformed = r#"{
+            "session_allow": ["Bash(argv_prefix=broken"],
+            "session_deny": []
+        }"#;
+        assert!(serde_json::from_str::<PermissionSyncContinuation>(malformed).is_err());
+        let valid = r#"{"session_allow":["Bash(argv_prefix=broken)"],"session_deny":[]}"#;
+        assert!(serde_json::from_str::<PermissionSyncContinuation>(valid).is_ok());
+
+        let unknown = r#"{
+            "session_allow": [],
+            "session_deny": [],
+            "telemetry": {}
+        }"#;
+        assert!(serde_json::from_str::<PermissionSyncContinuation>(unknown).is_err());
+
+        let marker = serde_json::json!({
+            "session_allow": [r#"bash(argv_prefix="[REDACTED:C6]")"#],
+            "session_deny": []
+        });
+        assert!(serde_json::from_value::<PermissionSyncContinuation>(marker).is_err());
+        for malformed_rules in [
+            serde_json::json!("synthetic_private_value"),
+            serde_json::json!([false, "synthetic_private_value"]),
+        ] {
+            let error = serde_json::from_value::<PermissionSyncContinuation>(serde_json::json!({
+                "session_allow": malformed_rules,
+                "session_deny": [],
+            }))
+            .unwrap_err();
+            assert!(!error.to_string().contains("synthetic_private_value"));
+        }
+        for rules in [
+            vec!["read_file()".to_owned(); MAX_CONTINUATION_RULES_PER_LIST + 1],
+            vec![format!(
+                "Bash(argv_prefix=\"{}\")",
+                "x".repeat(MAX_CONTINUATION_RULE_BYTES_PER_LIST)
+            )],
+        ] {
+            assert!(
+                serde_json::from_value::<PermissionSyncContinuation>(serde_json::json!({
+                    "session_allow": rules, "session_deny": [],
+                }))
+                .is_err()
+            );
+        }
+        assert!(
+            serde_json::from_value::<PermissionSyncContinuation>(serde_json::json!({
+                "session_allow": vec!["read_file()"; MAX_CONTINUATION_RULES_PER_LIST],
+                "session_deny": [],
+            }))
+            .is_ok()
+        );
+        let mut context = PermissionSyncContext::root(PermissionMode::Prompt);
+        for index in 0..=MAX_CONTINUATION_RULES_PER_LIST {
+            context.apply_update(&PermissionUpdate::deny(PermissionRule::tool(format!(
+                "tool{index}"
+            ))));
+        }
+        assert!(context.capture_continuation().is_err());
+        let overhead = "Bash(argv_prefix=)".len();
+        let boundary = format!(
+            "Bash(argv_prefix={})",
+            "x".repeat(MAX_CONTINUATION_RULE_BYTES_PER_LIST - overhead),
+        );
+        let canonical = PermissionRule::try_parse(&boundary).unwrap();
+        assert!(canonical.to_string().len() > MAX_CONTINUATION_RULE_BYTES_PER_LIST);
+        assert!(
+            serde_json::from_value::<PermissionSyncContinuation>(serde_json::json!({
+                "session_allow": [boundary], "session_deny": [],
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::to_string(&PermissionSyncContinuation {
+                session_allow: vec![canonical],
+                session_deny: Vec::new(),
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn permission_sync_continuation_rejects_secret_bearing_rules_without_redacting() {
+        let mut context = PermissionSyncContext::root(PermissionMode::Prompt);
+        context.apply_update(&PermissionUpdate::allow(
+            PermissionRule::try_parse(r#"Bash(argv_prefix="password = super_secret_123456")"#)
+                .unwrap(),
+        ));
+
+        assert_eq!(
+            context.capture_continuation(),
+            Err(PermissionSyncContinuationError::SecretBearingRule)
+        );
+
+        let serialized = serde_json::json!({
+            "session_allow": [r#"bash(argv_prefix="password = super_secret_123456")"#],
+            "session_deny": []
+        });
+        let error = serde_json::from_value::<PermissionSyncContinuation>(serialized)
+            .expect_err("secret-bearing continuation must be rejected");
+        assert!(error.to_string().contains("permission continuation"));
+        assert!(!error.to_string().contains("super_secret_123456"));
     }
 
     #[tokio::test]

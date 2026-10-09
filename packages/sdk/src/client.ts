@@ -60,7 +60,6 @@ import type {
   SkillRecord,
   StreamEvent,
   ConnectionState,
-  TaskLeaseMutationRequestBody,
   ToolResultRequestBody,
   UserInfo,
   WorkCreateInput,
@@ -193,10 +192,6 @@ import {
   sessionTranscriptPath,
   skillPath,
   skillUnpublishPath,
-  taskLeaseClaimPath,
-  taskLeasePath,
-  taskLeaseReleasePath,
-  taskLeaseRenewPath,
   workPath,
   workArchivedBranchesPath,
   workBranchesPath,
@@ -560,9 +555,16 @@ function normalizeReflectReport(
 export function chatRequestToWire(req: ChatRequest): Record<string, unknown> {
   const body: Record<string, unknown> = {
     message: req.message,
-    model_selection: modelSelectionToWire(req.modelSelection),
   };
+  if (req.modelSelection === "auto") {
+    body.execution_policy = { model_routing: "auto" };
+  } else {
+    body.model_selection = modelSelectionToWire(req.modelSelection);
+  }
   if (req.parts) body.parts = req.parts;
+  if (req.completionChecks !== undefined) {
+    body.completion_checks = req.completionChecks;
+  }
   if (req.attachments) body.attachments = req.attachments;
   if (req.executionBudget) {
     body.execution_budget = {
@@ -2849,7 +2851,7 @@ export class AstraClient {
     if (
       raw.session_id !== sessionId ||
       typeof raw.execution_settled !== "boolean" ||
-      (raw.workspace_blocker != null && typeof raw.workspace_blocker !== "string") ||
+      (raw.execution_blocker != null && typeof raw.execution_blocker !== "string") ||
       raw.status !== (raw.execution_settled ? "cancelled" : "cancellation_requested") ||
       !Array.isArray(raw.runs) ||
       raw.runs.some((run) =>
@@ -2867,7 +2869,7 @@ export class AstraClient {
     return {
       ...normalizeSession(raw),
       executionSettled: raw.execution_settled,
-      workspaceBlocker: raw.workspace_blocker,
+      executionBlocker: raw.execution_blocker,
       runs: raw.runs.map((run) => ({
         runId: run.run_id,
         status: run.status,
@@ -3469,65 +3471,6 @@ export class AstraClient {
       headers[ASTRA_EDGE_ID_HEADER] = options.edgeTransportId;
     }
     return this.fetch(PATH_AGENTS_EDGE_HEARTBEAT, {
-      method: "POST",
-      body: JSON.stringify(body),
-      headers,
-    });
-  }
-
-  /**
-   * @deprecated Legacy compatibility path. The current Astra runtime does
-   * not register `/tasks/{id}/lease`; this only works against older servers.
-   */
-  async getTaskLease(taskId: string): Promise<unknown> {
-    return this.fetch(taskLeasePath(taskId));
-  }
-
-  /** @deprecated Legacy compatibility path; not registered by the current runtime. */
-  async postTaskLeaseClaim(
-    taskId: string,
-    body: TaskLeaseMutationRequestBody,
-    options?: { edgeTransportId?: string },
-  ): Promise<unknown> {
-    const headers: Record<string, string> = {};
-    if (options?.edgeTransportId) {
-      headers[ASTRA_EDGE_ID_HEADER] = options.edgeTransportId;
-    }
-    return this.fetch(taskLeaseClaimPath(taskId), {
-      method: "POST",
-      body: JSON.stringify(body),
-      headers,
-    });
-  }
-
-  /** @deprecated Legacy compatibility path; not registered by the current runtime. */
-  async postTaskLeaseRelease(
-    taskId: string,
-    body: TaskLeaseMutationRequestBody,
-    options?: { edgeTransportId?: string },
-  ): Promise<unknown> {
-    const headers: Record<string, string> = {};
-    if (options?.edgeTransportId) {
-      headers[ASTRA_EDGE_ID_HEADER] = options.edgeTransportId;
-    }
-    return this.fetch(taskLeaseReleasePath(taskId), {
-      method: "POST",
-      body: JSON.stringify(body),
-      headers,
-    });
-  }
-
-  /** @deprecated Legacy compatibility path; not registered by the current runtime. */
-  async postTaskLeaseRenew(
-    taskId: string,
-    body: TaskLeaseMutationRequestBody,
-    options?: { edgeTransportId?: string },
-  ): Promise<unknown> {
-    const headers: Record<string, string> = {};
-    if (options?.edgeTransportId) {
-      headers[ASTRA_EDGE_ID_HEADER] = options.edgeTransportId;
-    }
-    return this.fetch(taskLeaseRenewPath(taskId), {
       method: "POST",
       body: JSON.stringify(body),
       headers,

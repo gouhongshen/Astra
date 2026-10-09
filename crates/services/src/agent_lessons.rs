@@ -293,8 +293,7 @@ fn make_compact(action: &str) -> Option<String> {
 /// - Word joiners and invisible separators (U+2060–U+2064)
 /// - BOM (U+FEFF)
 ///
-/// Public so `SkillDiagnosis::render_prompt_block` can reuse it for
-/// LLM-generated findings/headlines.
+/// Shared by prompt renderers for externally derived advice.
 pub fn sanitize_for_prompt(s: &str) -> String {
     s.chars()
         .filter(|c| {

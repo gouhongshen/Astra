@@ -94,6 +94,7 @@ fn open_repo(project_root: &Path) -> Result<gix::Repository, String> {
 /// metadata paths after exec. Concurrent replacement in that window is governed
 /// by the selected provider's isolation. A detected post-start change is an
 /// error with possible effects, never evidence of a successful mutation.
+#[derive(Clone)]
 pub struct BoundGitCommand {
     #[cfg(not(unix))]
     root: std::path::PathBuf,
@@ -246,6 +247,16 @@ fn clear_git_location(command: &mut std::process::Command) {
 }
 
 impl BoundGitCommand {
+    /// Check the already-acquired repository identity without resolving a new
+    /// repository. Filesystem owners use this before observing absent resources.
+    pub fn validate_repository_binding(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        if !self.binding.unchanged() {
+            return Err("repository binding changed; refusing workspace cleanup".into());
+        }
+        Ok(())
+    }
+
     pub fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>) -> &mut Self {
         // All existing tool argument contracts are UTF-8. Preserve invalid OS
         // paths as a rejected command, never silently execute a lossy spelling.
@@ -295,13 +306,38 @@ impl BoundGitCommand {
         Ok(())
     }
     pub fn output(&mut self) -> Result<std::process::Output, astra_sandbox::SyncProcessError> {
-        let result = astra_sandbox::run_sync_process(
+        self.output_with_cancel(None)
+    }
+    pub fn output_with_cancel(
+        &mut self,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<std::process::Output, astra_sandbox::SyncProcessError> {
+        self.run_sync(&self.args, true, 16 * 1024 * 1024, cancel)
+            .map(|out| out.output)
+    }
+
+    fn run_sync(
+        &self,
+        args: &[String],
+        force_worktree: bool,
+        output_limit: usize,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<astra_sandbox::SyncProcessOutput, astra_sandbox::SyncProcessError> {
+        let result = astra_sandbox::run_sync_process_with_cancel(
             "git",
-            &self.args,
+            args,
             GIT_SUBPROCESS_TIMEOUT,
-            16 * 1024 * 1024,
-            |cmd| self.configure(cmd, true),
+            output_limit,
+            cancel,
+            |cmd| self.configure(cmd, force_worktree),
         );
+        self.finish_sync_result(result)
+    }
+
+    fn finish_sync_result(
+        &self,
+        result: Result<astra_sandbox::SyncProcessOutput, astra_sandbox::SyncProcessError>,
+    ) -> Result<astra_sandbox::SyncProcessOutput, astra_sandbox::SyncProcessError> {
         let (started, ownership) = match &result {
             Ok(out) => (true, out.ownership),
             Err(err) => (err.started, err.ownership),
@@ -322,7 +358,7 @@ impl BoundGitCommand {
             }
             return Err(astra_sandbox::SyncProcessError { phase: "repository binding", detail: "repository identity changed during execution; effects may have occurred; no mutation receipt is valid".into(), started: true, ownership });
         }
-        result.map(|out| out.output)
+        result
     }
     pub fn status(&mut self) -> Result<std::process::ExitStatus, astra_sandbox::SyncProcessError> {
         self.output().map(|out| out.status)
@@ -358,6 +394,7 @@ impl DerefMut for BoundTokioGitCommand {
 #[cfg(unix)]
 fn prepare_bound_git_command_with_pin_hook(
     project_root: &Path,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
     after_pin_before_validation: impl FnOnce(),
 ) -> Result<BoundGitCommand, String> {
     let root = project_root
@@ -439,10 +476,8 @@ fn prepare_bound_git_command_with_pin_hook(
         "--show-toplevel",
     ]
     .map(str::to_owned);
-    let output =
-        astra_sandbox::run_sync_process("git", &args, GIT_SUBPROCESS_TIMEOUT, 65536, |cmd| {
-            command.configure(cmd, false)
-        })
+    let output = command
+        .run_sync(&args, false, 65536, cancel)
         .map_err(|e| format!("Error: cannot validate bound git repository: {e}"))?
         .output;
     if !output.status.success() {
@@ -478,9 +513,19 @@ fn prepare_bound_git_command_with_pin_hook(
 }
 
 pub fn prepare_bound_git_command(project_root: &Path) -> Result<BoundGitCommand, String> {
+    prepare_bound_git_command_with_cancel(project_root, None)
+}
+
+pub fn prepare_bound_git_command_with_cancel(
+    project_root: &Path,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<BoundGitCommand, String> {
+    if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Err("Git repository preparation cancelled before launch".into());
+    }
     #[cfg(unix)]
     {
-        prepare_bound_git_command_with_pin_hook(project_root, || {})
+        prepare_bound_git_command_with_pin_hook(project_root, cancel, || {})
     }
     #[cfg(not(unix))]
     {
@@ -596,9 +641,55 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn bound_git_unconfirmed_process_outcomes_fence_workspace_completion() {
+        use std::os::unix::process::ExitStatusExt;
+        for (started, succeeds) in [(false, false), (true, false), (true, true)] {
+            let repo = init_temp_repo();
+            let command = prepare_bound_git_command(repo.path()).unwrap();
+            let result = if succeeds {
+                Ok(astra_sandbox::SyncProcessOutput {
+                    output: std::process::Output {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    },
+                    ownership: None,
+                })
+            } else {
+                Err(astra_sandbox::SyncProcessError {
+                    phase: "fixture ownership",
+                    detail: "no settled scope receipt".into(),
+                    started,
+                    ownership: None,
+                })
+            };
+            let _ = command.finish_sync_result(result);
+            assert_eq!(
+                crate::workspace_observation::workspace_ownership_is_unsettled(repo.path()),
+                Some(started)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_git_validation_observes_cancellation_before_process_launch() {
+        let repo = init_temp_repo();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result =
+            prepare_bound_git_command_with_pin_hook(repo.path(), Some(&cancel), || cancel.cancel());
+        assert!(matches!(result, Err(error) if error.contains("cancel")));
+        assert_ne!(
+            crate::workspace_observation::workspace_ownership_is_unsettled(repo.path()),
+            Some(true)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bound_git_command_rejects_observed_metadata_replacement_before_launch() {
         let repo = init_temp_repo();
-        let result = prepare_bound_git_command_with_pin_hook(repo.path(), || {
+        let result = prepare_bound_git_command_with_pin_hook(repo.path(), None, || {
             std::fs::rename(repo.path().join(".git"), repo.path().join(".git-original")).unwrap();
             run_git(repo.path(), &["init"]);
         });

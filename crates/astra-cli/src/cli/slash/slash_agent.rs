@@ -337,14 +337,6 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
                 eprintln!("  {} {}", "Address:".bold(), addr.to_string().green());
             }
 
-            if let Some(ref path) = state.worktree_path {
-                eprintln!(
-                    "  {} {}",
-                    "Worktree:".bold(),
-                    path.display().to_string().dim()
-                );
-            }
-
             let elapsed = state
                 .started_at
                 .elapsed()
@@ -922,7 +914,7 @@ fn show_help() {
     eprintln!();
     eprintln!(
         "  {}",
-        "Spawned agents come from `agent(action='spawn', ...)`; delegations come from the delegate tool.".dim()
+        "Spawned agents come from `agent(action='spawn', ...)`; delegations come from the Run delegation API.".dim()
     );
     eprintln!(
         "  {}",
@@ -951,7 +943,7 @@ fn status_icon(status: &AgentStatus) -> &'static str {
         AgentStatus::Completed { .. } => "✅",
         AgentStatus::Interrupted { .. } => "⚠️",
         AgentStatus::Failed { .. } => "❌",
-        AgentStatus::Waiting { .. } => "⏸",
+        AgentStatus::Waiting { .. } | AgentStatus::Paused { .. } => "⏸",
         AgentStatus::Cancelled { .. } => "🛑",
     }
 }
@@ -986,6 +978,7 @@ fn format_status(status: &AgentStatus) -> String {
         }
         AgentStatus::Failed { error, .. } => format!("failed: {error}"),
         AgentStatus::Waiting { reason } => format!("waiting: {reason}"),
+        AgentStatus::Paused { reason } => format!("paused: {reason}"),
         AgentStatus::Cancelled { by_user, reason } => {
             if reason.is_empty() {
                 if *by_user {
@@ -1949,6 +1942,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl astra_runtime::orchestration::SpawnAgentExecutor for PendingWatchExecutor {
+        async fn cancel_spawned_run_durably(
+            &self,
+            run: &str,
+            binding: Option<&str>,
+            user: Option<&str>,
+            reason: &str,
+            origin: astra_runtime::orchestration::CancellationOrigin,
+        ) -> Result<astra_runtime::orchestration::SpawnRunCancellationDurability, String> {
+            let _ = (run, binding, user, reason, origin);
+            Ok(astra_runtime::orchestration::SpawnRunCancellationDurability::LocalExecution)
+        }
+
         async fn execute(
             &self,
             _config: astra_runtime::orchestration::SpawnRunConfig,
@@ -1971,7 +1976,6 @@ mod tests {
             ended_at,
             metrics: SpawnedAgentMetrics::default(),
             has_permission_issues: false,
-            run_in_background: false,
             spawn_tool_call_id: None,
             fanout_slot: None,
         }
@@ -2549,9 +2553,12 @@ mod tests {
         let mut rx = Some(spawner.subscribe_progress());
         let last_snapshot = build_watch_snapshot(&[], &[]);
         let context = SpawnContext {
+            parent_delegation_authority: astra_runtime::orchestration::DelegationAuthority::Allowed,
             parent_run_id: "root-run".to_string(),
             parent_agent_id: "main".to_string(),
             resolved_model_name: None,
+            delegation_model_admission: None,
+            parent_model_reasoning: None,
             recursion_depth: 0,
             parent_is_fork_child: false,
             inherited_permissions: astra_runtime::orchestration::InheritedPermissions::auto_approve(
@@ -2570,14 +2577,12 @@ mod tests {
             description: "watch test agent".to_string(),
             prompt: "do nothing".to_string(),
             agent_type: "task".to_string(),
-            run_in_background: true,
             ..Default::default()
         };
 
         let output = spawner.spawn(input, &context).await.unwrap();
         let agent_id = match output {
             astra_runtime::orchestration::SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
-            other => panic!("expected launched output, got {other:?}"),
         };
 
         let snapshot = tokio::time::timeout(

@@ -10,23 +10,19 @@ pub(super) async fn build_runtime_wiring(
     let run_store = Arc::new(astra_services::runs::DatabaseRunStateStore::new(
         shared_pool.clone(),
     ));
-    let state_projection_store = Arc::new(astra_services::DatabaseStateProjectionStore::new(
-        shared_pool.clone(),
-    ));
     let run_engine = crate::server::run::engine::RunEngine::new(run_store)
-        .with_projection_store(Arc::clone(&state_projection_store))
         .with_metrics_registry(state.metrics_registry());
-    let recovered_runs = recover_active_runs(&run_engine).await;
-
+    let selected_workspace_provider = run_engine.execution_owner_pod_id().map(|owner| {
+        crate::server::run::workspace_provisioning::ServerWorkspaceProvisioner::from_env(
+            owner.to_owned(),
+        )
+    });
     let profile_registry = Arc::new(default_agent_profile_registry());
     let progress_broadcaster = Arc::new(crate::orchestration::ProgressBroadcaster::default());
     let delegation_tracker = Arc::new(
         crate::server::delegation::engine::DelegationTracker::new()
             .with_progress_broadcaster(Arc::clone(&progress_broadcaster)),
     );
-    delegation_tracker
-        .load_from_run_records(&recovered_runs)
-        .await;
     astra_messaging::db_transport::ensure_schema(shared_pool.get()).await?;
     let agent_mailbox_router = Arc::new(astra_messaging::AgentMailboxRouter::new(
         Arc::new(astra_messaging::DatabaseTransport::new(
@@ -62,6 +58,10 @@ pub(super) async fn build_runtime_wiring(
             state.edge_callback_ledger.clone(),
         )
         .with_run_engine(run_engine.clone())
+        .with_workspace_capacity(
+            selected_workspace_provider.clone(),
+            Some(Arc::clone(&workspace_record_store)),
+        )
         .with_trace_ingestion(matrix_rt.clone_ingestion_sender())
         .with_model_service(Some(state.model_service.clone()))
         .with_pool(shared_pool.clone())
@@ -77,17 +77,13 @@ pub(super) async fn build_runtime_wiring(
         crate::server::delegation::engine::DelegationEngine::with_executor(
             Arc::new(tokio::sync::RwLock::new((*profile_registry).clone())),
             Arc::new(run_engine.clone()),
-            delegation_tracker,
+            Arc::clone(&delegation_tracker),
             sub_run_executor,
         )
-        .with_mailbox_router(Arc::clone(&agent_mailbox_router))
-        .with_projection_store(Arc::clone(&state_projection_store)),
+        .with_mailbox_router(Arc::clone(&agent_mailbox_router)),
     );
 
     astra_turn_core::parallel_tool_exec::set_tool_execution_metrics_registry(
-        state.metrics_registry(),
-    );
-    astra_turn_core::ws_user_prompt_gate::set_ws_user_prompt_metrics_registry(
         state.metrics_registry(),
     );
     crate::llm_provider_admission::set_llm_provider_admission_metrics_registry(
@@ -122,7 +118,7 @@ pub(super) async fn build_runtime_wiring(
         settings.matrixone.clone(),
         Arc::clone(run_encryptor),
         state.edge_callback_ledger.clone(),
-        run_engine,
+        run_engine.clone(),
     )
     .with_admission_limits(admission_limits)
     .with_trace_ingestion(matrix_rt.clone_ingestion_sender())
@@ -133,9 +129,12 @@ pub(super) async fn build_runtime_wiring(
     .with_edge_dispatch_service(state.execution.edge_dispatch_service.clone())
     .with_edge_registry_service(state.execution.edge_registry_service.clone())
     .with_workspace_record_store(workspace_record_store)
+    .with_selected_workspace_provider(selected_workspace_provider)
     .with_resource_governor(resource_governor.clone())
     .with_skill_service(state.skill_service.clone())
     .with_model_service(state.model_service.clone())
+    .with_auth_service(state.auth_service.clone())
+    .with_model_catalog_cache(state.model_catalog_cache.clone())
     .with_mcp_registry_service(state.mcp_registry_service.clone())
     .with_agent_binding_service(state.agent_binding_service.clone())
     .with_reflect_service(state.reflect_service.clone())
@@ -152,13 +151,17 @@ pub(super) async fn build_runtime_wiring(
     #[cfg(feature = "harness")]
     let run_lifecycle = run_lifecycle.with_harness_registry(state.harness_registry.clone());
 
-    let team_store = initialize_team_store(shared_pool);
+    // Reconciliation must follow complete service composition. A checkpoint
+    // cannot be dispatched while model, policy, mailbox or tool owners are
+    // still absent; classification itself does not establish dispatch readiness.
+    let recovered_runs = recover_active_runs(&run_engine).await;
+    delegation_tracker
+        .load_from_run_records(&recovered_runs)
+        .await;
     Ok(RuntimeWiring {
         matrix_rt,
         run_lifecycle,
-        profile_registry,
         delegation_engine,
-        team_store,
         resource_governor,
     })
 }
@@ -172,7 +175,22 @@ async fn recover_active_runs(
                 let continuation_ready = recovered_runs
                     .iter()
                     .filter(|run| {
-                        run.status == astra_core::STATUS_PAUSED && run.waiting_for.is_none()
+                        run.status == astra_core::STATUS_PAUSED
+                            && run.waiting_for.is_none()
+                            && run.checkpoint_version.as_deref() != Some("execution_handoff_v1")
+                    })
+                    .count();
+                let handoffs_preserved = recovered_runs
+                    .iter()
+                    .filter(|run| {
+                        run.checkpoint_version.as_deref() == Some("execution_handoff_v1")
+                            && !matches!(
+                                run.status.as_str(),
+                                astra_core::STATUS_COMPLETED
+                                    | astra_core::STATUS_DELEGATED
+                                    | astra_core::STATUS_FAILED
+                                    | astra_core::STATUS_CANCELLED
+                            )
                     })
                     .count();
                 let failed = recovered_runs
@@ -183,6 +201,7 @@ async fn recover_active_runs(
                     target: "astra_runtime::state_builder",
                     recovered_total = recovered_runs.len(),
                     recovered_for_session_continuation = continuation_ready,
+                    execution_handoffs_preserved = handoffs_preserved,
                     recovered_failed = failed,
                     "classified orphaned durable runs during startup"
                 );
@@ -209,20 +228,13 @@ async fn initialize_resource_governor(
     Ok(std::sync::Arc::new(resource_governor))
 }
 
-fn initialize_team_store(
-    shared_pool: &SharedPool,
-) -> Arc<dyn astra_services::team_persistence::TeamPersistenceService> {
-    Arc::new(astra_services::team_persistence::MatrixOneTeamStore::new(
-        shared_pool.get().clone(),
-    ))
-}
-
 pub(super) fn default_agent_profile_registry() -> astra_services::AgentProfileRegistry {
     use astra_services::coordination::{AgentProfile, AgentTier};
 
     let mut profile_registry = astra_services::AgentProfileRegistry::new();
 
     let mut orch = AgentProfile::new("orchestrator", "Orchestrator", AgentTier::Orchestrator);
+    orch.delegate_to = vec!["coder".into(), "reviewer".into(), "writer".into()];
     orch.system_prompt = Some(
         "You are the orchestrator agent. Coordinate sub-agents to complete complex tasks."
             .to_string(),
@@ -230,23 +242,25 @@ pub(super) fn default_agent_profile_registry() -> astra_services::AgentProfileRe
     let _ = profile_registry.register(orch);
 
     let mut coder = AgentProfile::new("coder", "Coder", AgentTier::System);
+    coder.delegate_to = vec!["writer".into()];
     coder.system_prompt =
         Some("You are a coding agent. Write, edit, and debug code to complete tasks.".to_string());
-    coder.skill_filter = vec![
+    coder.allow_tools = Some(vec![
         "bash".into(),
         "read_file".into(),
         "write_file".into(),
         "str_replace".into(),
         "git".into(),
-    ];
+    ]);
     let _ = profile_registry.register(coder);
 
     let mut reviewer = AgentProfile::new("reviewer", "Reviewer", AgentTier::System);
+    reviewer.delegate_to = vec!["writer".into()];
     reviewer.system_prompt = Some(
         "You are a code review agent. Review code for bugs, security, and best practices."
             .to_string(),
     );
-    reviewer.skill_filter = vec!["read_file".into(), "bash".into()];
+    reviewer.allow_tools = Some(vec!["read_file".into(), "bash".into()]);
     let _ = profile_registry.register(reviewer);
 
     let mut writer = AgentProfile::new("writer", "Writer", AgentTier::User);

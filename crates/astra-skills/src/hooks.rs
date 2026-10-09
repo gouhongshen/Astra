@@ -5,7 +5,7 @@
 //! 1. **Skill lifecycle hooks** (`SkillHooks`) — pre/post invocation of a skill itself.
 //! 2. **Tool event hooks** (`ToolEventHook`) — fire on any tool call matching a pattern.
 //! 3. **Session event hooks** (`SessionEventHook`) — fire on session lifecycle events
-//!    (SessionStart, SessionEnd, UserPromptSubmit, SubagentStart).
+//!    (SessionStart, SessionEnd, UserPromptSubmit).
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -407,6 +407,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 pub struct ToolEventHookRegistry {
     hooks: Vec<ToolEventHook>,
     execution: Arc<Mutex<ToolHookExecution>>,
+    execution_disabled: bool,
 }
 
 #[derive(Debug, Default)]
@@ -478,7 +479,12 @@ impl ToolEventHookRegistry {
         Self {
             hooks,
             execution: Arc::default(),
+            execution_disabled: false,
         }
+    }
+
+    pub fn disable_execution(&mut self) {
+        self.execution_disabled = true;
     }
 
     pub fn capture_continuation(&self) -> Result<ToolHookContinuation, HookContinuationError> {
@@ -553,6 +559,9 @@ impl ToolEventHookRegistry {
         event: ToolEventKind,
         tool_name: &str,
     ) -> Vec<(usize, &ToolEventHook)> {
+        if self.execution_disabled {
+            return Vec::new();
+        }
         let mut execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
         let mut result: Vec<(usize, &ToolEventHook)> = self
             .hooks
@@ -595,11 +604,15 @@ impl ToolEventHookRegistry {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.hooks.is_empty()
+        self.execution_disabled || self.hooks.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.hooks.len()
+        if self.execution_disabled {
+            0
+        } else {
+            self.hooks.len()
+        }
     }
 
     fn note_hook_success(&self, index: usize) {
@@ -1491,35 +1504,6 @@ async fn run_hook_action_fire_and_forget(
     }
 }
 
-/// Events emitted during the skill lifecycle.
-///
-/// Can be consumed by telemetry, logging, or debugging systems.
-#[derive(Clone, Debug)]
-pub enum SkillLifecycleEvent {
-    /// A skill was discovered from a source.
-    Discovered {
-        name: String,
-        source: super::manifest::SkillSourceKind,
-    },
-    /// A skill's instructions were fully loaded.
-    Loaded { name: String },
-    /// A conditional skill was activated by a path match.
-    Activated { name: String, trigger: String },
-    /// A skill invocation started.
-    Invoked {
-        name: String,
-        context: super::manifest::ExecutionContext,
-    },
-    /// A skill invocation completed successfully.
-    Completed {
-        name: String,
-        tokens_used: u32,
-        turns: u32,
-    },
-    /// A skill invocation failed.
-    Failed { name: String, error: String },
-}
-
 // ── Session event hooks (CC-compatible) ─────────────────────────────────
 
 /// Session lifecycle events that can trigger hooks.
@@ -1532,10 +1516,6 @@ pub enum SessionEvent {
     SessionEnd,
     /// Fires after the user submits a prompt, before tool surface / LLM call.
     UserPromptSubmit,
-    /// Fires when a sub-agent (delegation) is spawned.
-    SubagentStart,
-    /// Fires when a sub-agent completes (either success or failure).
-    SubagentStop,
     /// Fires before context compaction begins.
     PreCompact,
     /// Fires after context compaction completes.
@@ -1590,6 +1570,7 @@ pub struct SessionHookOutput {
 pub struct SessionEventHookRegistry {
     hooks: Vec<SessionEventHook>,
     execution: Mutex<SessionHookExecution>,
+    execution_disabled: bool,
 }
 
 #[derive(Debug, Default)]
@@ -1659,7 +1640,12 @@ impl SessionEventHookRegistry {
         Self {
             hooks,
             execution: Mutex::default(),
+            execution_disabled: false,
         }
+    }
+
+    pub fn disable_execution(&mut self) {
+        self.execution_disabled = true;
     }
 
     /// Call only after the environment output has actually been applied.
@@ -1704,6 +1690,9 @@ impl SessionEventHookRegistry {
 
     /// Return all hooks matching the given event, sorted by priority and filtered by `once`.
     pub fn matching(&self, event: SessionEvent) -> Vec<&SessionEventHook> {
+        if self.execution_disabled {
+            return Vec::new();
+        }
         let execution = astra_core::sync_poison::recover_mutex_lock(&self.execution);
         let mut result: Vec<(usize, &SessionEventHook)> = self
             .hooks
@@ -1731,15 +1720,19 @@ impl SessionEventHookRegistry {
 
     /// Check if any hooks exist for the given event (no allocation).
     pub fn has_event(&self, event: SessionEvent) -> bool {
-        self.hooks.iter().any(|h| h.event == event)
+        !self.execution_disabled && self.hooks.iter().any(|h| h.event == event)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.hooks.is_empty()
+        self.execution_disabled || self.hooks.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.hooks.len()
+        if self.execution_disabled {
+            0
+        } else {
+            self.hooks.len()
+        }
     }
 }
 
@@ -2385,37 +2378,6 @@ mod tests {
         let yaml = serde_yaml_ng::to_string(&hooks).unwrap();
         let parsed: SkillHooks = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(hooks, parsed);
-    }
-
-    #[test]
-    fn lifecycle_event_variants_constructible() {
-        let events = [
-            SkillLifecycleEvent::Discovered {
-                name: "test".into(),
-                source: super::super::manifest::SkillSourceKind::Local,
-            },
-            SkillLifecycleEvent::Loaded {
-                name: "test".into(),
-            },
-            SkillLifecycleEvent::Activated {
-                name: "test".into(),
-                trigger: "src/main.rs".into(),
-            },
-            SkillLifecycleEvent::Invoked {
-                name: "test".into(),
-                context: super::super::manifest::ExecutionContext::Inline,
-            },
-            SkillLifecycleEvent::Completed {
-                name: "test".into(),
-                tokens_used: 1000,
-                turns: 3,
-            },
-            SkillLifecycleEvent::Failed {
-                name: "test".into(),
-                error: "timeout".into(),
-            },
-        ];
-        assert_eq!(events.len(), 6);
     }
 
     // ── Glob matching tests ─────────────────────────────────────────────
@@ -3409,7 +3371,6 @@ mod tests {
             ("session_start", SessionEvent::SessionStart),
             ("session_end", SessionEvent::SessionEnd),
             ("user_prompt_submit", SessionEvent::UserPromptSubmit),
-            ("subagent_start", SessionEvent::SubagentStart),
         ] {
             let json = format!(
                 r#"{{"event":"{}","action":{{"type":"shell","command":"x"}}}}"#,
@@ -3417,6 +3378,9 @@ mod tests {
             );
             let hook: SessionEventHook = serde_json::from_str(&json).unwrap();
             assert_eq!(hook.event, expected);
+        }
+        for retired in ["subagent_start", "subagent_stop"] {
+            assert!(serde_json::from_value::<SessionEvent>(serde_json::json!(retired)).is_err());
         }
     }
 
@@ -3605,6 +3569,45 @@ mod tests {
         )
         .await;
         assert_eq!(output.context.as_deref(), Some("Welcome back, user!"));
+    }
+
+    #[tokio::test]
+    async fn disabled_registries_never_execute_project_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("hook-ran");
+        let command = format!("touch '{}'", marker.display());
+        let mut tools = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PreToolUse,
+            matcher: "read_file".into(),
+            action: HookAction::Shell {
+                command: command.clone(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+        let mut sessions = SessionEventHookRegistry::new(vec![SessionEventHook {
+            event: SessionEvent::SessionStart,
+            action: HookAction::Shell { command },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+        tools.disable_execution();
+        sessions.disable_execution();
+        assert!(tools.is_empty());
+        assert!(sessions.is_empty());
+        assert_eq!(
+            evaluate_pre_tool_hooks(&tools, "read_file", &serde_json::json!({})).await,
+            PreToolDecision::Allow
+        );
+        let output = evaluate_session_hooks(&sessions, SessionEvent::SessionStart, "s", None).await;
+        assert!(output.context.is_none());
+        assert!(!marker.exists());
     }
 
     #[tokio::test]

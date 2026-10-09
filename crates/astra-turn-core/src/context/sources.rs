@@ -7,11 +7,8 @@
 //! 8 tiers ordered by volatility (most stable first). The Plan phase reads
 //! only what it needs; the Bind phase fetches from all tiers Plan selected.
 
-use std::path::PathBuf;
-
 use serde_json::Value;
 
-use crate::emergent_context::EmergentContext;
 use crate::microcompact::ProviderCacheStrategy;
 use crate::pipeline_config::ProviderCachePolicy;
 use crate::pipeline_stats::PipelineStats;
@@ -228,7 +225,6 @@ pub struct ContextSources<'a> {
     pub session: &'a SessionContext,
     pub turn: &'a TurnState,
     pub external: &'a ExternalSources,
-    pub emergent: &'a EmergentContext,
     pub working_memory: Option<&'a WorkingMemoryState>,
     pub stats: &'a PipelineStats,
 }
@@ -336,11 +332,6 @@ pub struct ExternalSources {
     /// Current-session recovery state, carried as a dedicated typed source
     /// instead of being flattened into synthetic compacted-history messages.
     pub session_memory_entry: Option<MemoryEntry>,
-    pub spill_dir: Option<PathBuf>,
-    /// Optional spill backend for offloading oversized sections to disk.
-    /// When set, the optimizer will persist section content and replace it
-    /// with a lightweight `SpillReference` to free token budget.
-    pub spill_backend: Option<std::sync::Arc<dyn crate::spill_backend::SpillBackend>>,
     /// Delegation system override (injected by orchestrator).
     pub system_override: Option<String>,
     /// Plan-in-progress reminder ("You are executing step 3 of 5...").

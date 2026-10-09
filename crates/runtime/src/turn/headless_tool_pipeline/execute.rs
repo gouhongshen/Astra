@@ -50,8 +50,8 @@ pub(crate) async fn execute_tool_pure(
     durable_dispatch_admission: Option<
         crate::server::tool_invocation_runtime::DurableDispatchAdmission,
     >,
-    task_resolution_authority: Option<
-        &astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority,
+    delegation_model_admission: Option<
+        &crate::turn::agentic_loop::host::PreparedDelegationModelAdmission,
     >,
     resolved_provider_policy: Option<
         &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
@@ -59,6 +59,9 @@ pub(crate) async fn execute_tool_pure(
     permission_grant: Option<&crate::server::tool_execution_binding::ToolPermissionGrantSnapshot>,
     session_turn: u32,
     edge_round_present: bool,
+    runtime_control_kind: Option<
+        astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind,
+    >,
 ) -> crate::server::runtime_tool_executor::RuntimeToolDispatchControl {
     let mut dispatch_control =
         crate::server::runtime_tool_executor::RuntimeToolDispatchControl::Continue;
@@ -82,12 +85,14 @@ pub(crate) async fn execute_tool_pure(
                             resolved_provider_policy,
                             permission_grant,
                             durable_dispatch_admission,
-                            task_resolution_authority,
+                            delegation_model_admission,
+                            runtime_control_kind,
                         )
                         .await;
                     dispatch_control = deferred.dispatch_control;
                     execution.pending_runtime_completion = deferred.pending;
                     execution.confirmed_invocation = deferred.confirmed_invocation;
+                    execution.accepted_send = deferred.accepted_send;
                     deferred.result
                 }
                 HeadlessInvocationScope::Incomplete => astra_tools::ToolResult::error(
@@ -173,6 +178,7 @@ mod runtime_tool_result_tests {
             tool_result_fields: None,
             authoritative_is_error: None,
             pending_runtime_completion: None,
+            accepted_send: None,
             confirmed_invocation: None,
             edge_duration_ms: 0,
             is_edge_tool: false,
@@ -370,7 +376,7 @@ fn parse_execution_error_kind_tag(tag: &str) -> Option<astra_core::ErrorKind> {
 mod tests {
     use super::*;
 
-    use serde_json::{Map, Value};
+    use serde_json::{Map, Value, json};
 
     #[test]
     fn invocation_scope_rejects_partial_or_blank_identity() {
@@ -455,7 +461,7 @@ mod tests {
     #[test]
     fn typed_execution_failure_remains_authoritative() {
         let fields = Map::from_iter([
-            ("status".to_string(), Value::String("failed".to_string())),
+            ("status".to_string(), Value::String("completed".to_string())),
             (
                 "exit_semantics".to_string(),
                 Value::String("execution_error".to_string()),
@@ -466,7 +472,7 @@ mod tests {
             ),
         ]);
 
-        assert!(execution_result_is_error(Some(&fields), Some(true),));
+        assert!(execution_result_is_error(Some(&fields), Some(false),));
     }
 
     #[test]
@@ -537,6 +543,68 @@ mod tests {
             vec![astra_core::ToolRecoveryAction::SelectAvailableCapability]
         );
     }
+
+    #[test]
+    fn uncertain_mcp_result_projects_reconciliation_guidance_to_model() {
+        let fields = Map::from_iter([
+            ("error_kind".to_string(), json!("tool_outcome_unknown")),
+            ("dispatch_certainty".to_string(), json!("unknown")),
+            ("side_effects_maybe".to_string(), json!(true)),
+            ("retryable".to_string(), json!(false)),
+        ]);
+        let kind = execution_error_kind(Some(&fields)).expect("shared error kind");
+        let evidence = execution_recovery_evidence(Some(&fields)).expect("typed recovery evidence");
+        assert_eq!(kind, astra_core::ErrorKind::ToolOutcomeUnknown);
+        assert_eq!(evidence.cause, astra_core::ToolFailureCause::OutcomeUnknown);
+        assert!(!evidence.retryable);
+
+        let mut turn_guard = TurnGuard::new();
+        let mut advisories = Vec::new();
+        let mut is_err = true;
+        enrich_headless_tool_output_for_errors_and_limits(
+            HeadlessOutputEnrichRequest {
+                name: "mcp__lost_ack__apply_then_drop_ack",
+                result_str: "Error: MCP tool has an unknown outcome",
+                is_err: &mut is_err,
+                source_error_kind: Some(kind),
+                source_recovery_evidence: Some(&evidence),
+                tool_already_restricted: false,
+                execution_disposition: HeadlessExecutionDisposition::Executed,
+            },
+            &mut HeadlessOutputEnrichCtx {
+                turn_guard: &mut turn_guard,
+                advisories: &mut advisories,
+            },
+            |_| {},
+        );
+        let mut model_message = json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "Error: MCP tool has an unknown outcome"
+        });
+        astra_turn_core::tool::result::advisory::set_advisories(
+            model_message.as_object_mut().expect("tool message"),
+            &advisories,
+        );
+        astra_turn_core::tool::result::advisory::project_advisories(&mut model_message);
+        let content = model_message["content"]
+            .as_str()
+            .expect("model tool content");
+        assert!(
+            content.contains("First reconcile the provider's state"),
+            "{content}"
+        );
+        assert!(content.contains("Do NOT retry this operation"), "{content}");
+        assert!(
+            content.contains("switch tools to repeat its effect"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("retry only with corrected arguments"),
+            "{content}"
+        );
+        assert!(!content.contains("capability-equivalent tool"), "{content}");
+    }
 }
 
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
@@ -557,6 +625,15 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
         self.begin_execution_trace(&execution, idem_key.as_ref());
         let tool_start = Instant::now();
+        let delegation_model_admission = self
+            .ctx
+            .delegation_model_admissions
+            .and_then(|admissions| admissions.get(&execution.id));
+        let runtime_control_kind = self
+            .ctx
+            .runtime_control_calls_by_id
+            .get(&execution.id)
+            .copied();
         let dispatch_control = execute_tool_pure(
             &mut execution,
             self.ctx.runtime_tool_executor,
@@ -566,11 +643,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             self.ctx.current_run_id,
             self.ctx.current_turn_chain_id,
             self.ctx.durable_dispatch_admission,
-            self.ctx.task_resolution_authority,
+            delegation_model_admission,
             resolved_provider_policy.as_ref(),
             permission_grant.as_ref(),
             self.ctx.session_turn,
             !self.ctx.edge_tool_round.is_empty(),
+            runtime_control_kind,
         )
         .await;
 
@@ -613,7 +691,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // survive as a guessable health oracle even when the displayed text
         // is redacted later.
         let (redacted_result, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(
+            astra_text_utils::credential_redaction::redact_credentials_for_display(
                 &execution.result_str,
             );
         execution.result_str = redacted_result;

@@ -52,7 +52,6 @@
 //! - Capture from a live turn (that's PR 3).
 //! - Store prefixes keyed by run_id (that's PR 2).
 //! - Reconstruct wire requests in a provider adapter (that's PR 4+).
-//! - Emit `ForkCacheEvent` telemetry (that's PR 5).
 
 use std::sync::Arc;
 
@@ -252,8 +251,7 @@ pub struct SystemBlock {
 /// rather than vaguely "tools changed".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSchemaEntry {
-    /// Tool name as the provider sees it. Used for attribution in
-    /// `ForkCacheEvent::drift`.
+    /// Tool name as the provider sees it.
     pub name: String,
     /// Canonical serialized schema bytes.
     pub canonical_bytes: Vec<u8>,
@@ -290,6 +288,8 @@ pub enum ForkValidationError {
         child_max: u32,
         child_effective: u32,
     },
+    #[error("thinking configuration mismatch between captured prefix and child")]
+    ThinkingMismatch,
     /// Prefix's canonical bytes exceed the configured soft cap. Not a
     /// hard failure — callers decide (some will downgrade, some will
     /// reject) — but the primitive flags it so the telemetry layer can
@@ -317,9 +317,7 @@ pub const PREFIX_SOFT_CAP_BYTES: usize = 2 * 1024 * 1024;
 /// cheaply even when callers clone the outer `ForkPrefix` by value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForkPrefix {
-    /// Unique id for this captured prefix. Enables diagnostics to
-    /// cross-reference a `ForkCacheEvent` back to the capture that
-    /// produced it.
+    /// Unique id for this captured prefix.
     pub prefix_id: String,
     /// Wall-clock seconds since UNIX epoch at capture time. Used for
     /// soft-TTL eviction (PR 2) and stale-prefix detection.
@@ -513,6 +511,11 @@ impl ForkPrefix {
                 child: ctx.child_model_id.clone(),
             });
         }
+        if let Some(child_thinking) = &ctx.child_thinking
+            && &self.thinking != child_thinking
+        {
+            return Err(ForkValidationError::ThinkingMismatch);
+        }
         if let Some(prefix_thinking) = &self.thinking {
             if let Some(child_max) = ctx.child_max_output_tokens {
                 // Provider-neutral clamp rule: effective budget is
@@ -540,6 +543,10 @@ impl ForkPrefix {
 pub struct SpawnValidationContext {
     pub child_provider: ProviderKind,
     pub child_model_id: String,
+    /// Outer `None` means no explicit reasoning control. `Some(None)` is an
+    /// explicit wire state with no thinking block (for example `off` or
+    /// `model_default`) and must still be compared with the captured prefix.
+    pub child_thinking: Option<Option<ThinkingConfigSlice>>,
     /// `None` means the child did not request an output cap. In that
     /// case the clamp rule does not fire.
     pub child_max_output_tokens: Option<u32>,
@@ -576,8 +583,7 @@ pub fn hash_tool_schema(value: &serde_json::Value) -> (Vec<u8>, ContentHash) {
 /// same helper when populating [`crate::fork_capture::CaptureRequest`].
 ///
 /// Nameless schemas are dropped: a schema with no detectable name
-/// cannot be attributed in `ForkCacheEvent::drift`, so inventing a
-/// placeholder would produce a misleading telemetry event. The order
+/// cannot identify a tool, so no placeholder is invented. The order
 /// of returned entries preserves input order.
 pub fn build_tool_schema_entries(schemas: &[serde_json::Value]) -> Vec<ToolSchemaEntry> {
     schemas
@@ -831,6 +837,7 @@ mod tests {
         let ctx = SpawnValidationContext {
             child_provider: ProviderKind::Anthropic,
             child_model_id: "claude-opus-4-6".into(),
+            child_thinking: None,
             child_max_output_tokens: None,
         };
         assert!(p.validate_spawn(&ctx).is_ok());
@@ -842,6 +849,7 @@ mod tests {
         let ctx = SpawnValidationContext {
             child_provider: ProviderKind::OpenAi,
             child_model_id: "claude-opus-4-6".into(),
+            child_thinking: None,
             child_max_output_tokens: None,
         };
         assert!(matches!(
@@ -856,6 +864,7 @@ mod tests {
         let ctx = SpawnValidationContext {
             child_provider: ProviderKind::Anthropic,
             child_model_id: "claude-sonnet-4-6".into(),
+            child_thinking: None,
             child_max_output_tokens: None,
         };
         assert!(matches!(
@@ -879,6 +888,7 @@ mod tests {
         let ctx = SpawnValidationContext {
             child_provider: ProviderKind::Anthropic,
             child_model_id: "claude-opus-4-6".into(),
+            child_thinking: None,
             child_max_output_tokens: Some(8_000),
         };
         let err = p.validate_spawn(&ctx).unwrap_err();
@@ -909,9 +919,58 @@ mod tests {
         let ctx = SpawnValidationContext {
             child_provider: ProviderKind::Anthropic,
             child_model_id: "claude-opus-4-6".into(),
+            child_thinking: None,
             child_max_output_tokens: Some(32_000),
         };
         assert!(p.validate_spawn(&ctx).is_ok());
+    }
+
+    #[test]
+    fn validate_spawn_rejects_explicit_reasoning_drift() {
+        let p = sample_prefix(|args| {
+            args.thinking = Some(ThinkingConfigSlice {
+                enabled: true,
+                budget_tokens: 0,
+                kind: "adaptive:high".into(),
+            });
+        });
+        let ctx = SpawnValidationContext {
+            child_provider: ProviderKind::Anthropic,
+            child_model_id: "claude-opus-4-6".into(),
+            child_thinking: Some(Some(ThinkingConfigSlice {
+                enabled: true,
+                budget_tokens: 0,
+                kind: "adaptive:low".into(),
+            })),
+            child_max_output_tokens: None,
+        };
+
+        assert_eq!(
+            p.validate_spawn(&ctx),
+            Err(ForkValidationError::ThinkingMismatch)
+        );
+    }
+
+    #[test]
+    fn validate_spawn_rejects_explicit_no_thinking_against_reasoning_prefix() {
+        let p = sample_prefix(|args| {
+            args.thinking = Some(ThinkingConfigSlice {
+                enabled: true,
+                budget_tokens: 0,
+                kind: "adaptive:high".into(),
+            });
+        });
+        let ctx = SpawnValidationContext {
+            child_provider: ProviderKind::Anthropic,
+            child_model_id: "claude-opus-4-6".into(),
+            child_thinking: Some(None),
+            child_max_output_tokens: None,
+        };
+
+        assert_eq!(
+            p.validate_spawn(&ctx),
+            Err(ForkValidationError::ThinkingMismatch)
+        );
     }
 
     #[test]
@@ -923,6 +982,7 @@ mod tests {
         let ctx = SpawnValidationContext {
             child_provider: ProviderKind::Anthropic,
             child_model_id: "claude-opus-4-6".into(),
+            child_thinking: None,
             child_max_output_tokens: None,
         };
         assert!(matches!(
@@ -950,6 +1010,7 @@ mod tests {
             // Everything else is mismatched too.
             child_provider: ProviderKind::OpenAi,
             child_model_id: "gpt-4o".into(),
+            child_thinking: None,
             child_max_output_tokens: None,
         };
         assert!(
@@ -1247,7 +1308,7 @@ mod tests {
     fn build_tool_schema_entries_is_key_order_independent() {
         // Critical: cache identity depends on canonical_bytes being
         // stable across key reorderings. If this test ever fails,
-        // `fork-cache` events stop attributing correctly.
+        // prefix diagnostics lose tool identity.
         let a = serde_json::json!({
             "function": {"name": "X", "parameters": {"a": 1, "b": 2}}
         });

@@ -23,8 +23,8 @@ use std::collections::HashMap;
 
 use crate::step_checkpoint::{FileBackedEventStore, read_latest_heavy_checkpoint};
 use crate::step_protocol::{
-    HeavyCheckpoint, PROTOCOL_VERSION, SlotState, StepEvent, StepEventType, VersionPolicy,
-    check_protocol_version_with_policy, persisted_cache_key_is_context_bound,
+    HeavyCheckpoint, PROTOCOL_VERSION, StepEventType, check_protocol_version,
+    persisted_cache_key_is_context_bound,
 };
 
 pub const CACHE_RESTORE_REPORT_VERSION: u32 = 2;
@@ -159,15 +159,6 @@ pub fn restore_session(
     user_id: &str,
     session_id: &str,
 ) -> Result<Option<RestoredSession>, RestoreError> {
-    restore_session_with_policy(user_id, session_id, VersionPolicy::Compatible)
-}
-
-/// Restore with explicit version policy.
-pub fn restore_session_with_policy(
-    user_id: &str,
-    session_id: &str,
-    policy: VersionPolicy,
-) -> Result<Option<RestoredSession>, RestoreError> {
     // Step 1: Load latest heavy checkpoint
     let heavy = match read_latest_heavy_checkpoint(user_id, session_id) {
         Ok(Some(h)) => h,
@@ -175,19 +166,31 @@ pub fn restore_session_with_policy(
         Err(e) => return Err(RestoreError::IoError(e.to_string())),
     };
 
-    // Step 2: Validate protocol version
-    validate_checkpoint_version(&heavy, policy)?;
-
-    // Step 3: Extract resume turn and completed-tool audit history.
-    build_restored_session(user_id, session_id, heavy)
+    let mut restored = restore_checkpoint(session_id, heavy)?;
+    let (completed_results, report) = recover_completed_tool_audit_from_events(user_id, session_id);
+    restored.completed_tool_results = completed_results;
+    restored.cache_restore_report = report;
+    Ok(Some(restored))
 }
 
-/// Shared: build RestoredSession from a validated checkpoint.
-fn build_restored_session(
-    user_id: &str,
+/// Validate and consume the checkpoint once. Each recovery entrypoint owns
+/// its journal completeness policy and adds only non-executable audit results.
+pub(crate) fn restore_checkpoint(
     session_id: &str,
     heavy: HeavyCheckpoint,
-) -> Result<Option<RestoredSession>, RestoreError> {
+) -> Result<RestoredSession, RestoreError> {
+    validate_checkpoint_version(&heavy)?;
+    crate::step_protocol::StepCheckpoint::Light(heavy.light.clone())
+        .validate()
+        .map_err(|error| RestoreError::InvalidCheckpoint(error.to_string()))?;
+    if let Some(control) = &heavy.run_execution_control {
+        let budget = heavy.run_execution_budget.as_ref().ok_or_else(|| {
+            RestoreError::InvalidCheckpoint("execution control has no paired run budget".into())
+        })?;
+        control
+            .validate_budget(budget)
+            .map_err(|error| RestoreError::InvalidCheckpoint(error.into()))?;
+    }
     if let Some(quarantine) = heavy.workspace_observation_quarantine.as_ref()
         && !quarantine.is_valid()
     {
@@ -218,10 +221,7 @@ fn build_restored_session(
         }
     }
     let resume_turn = extract_resume_turn(&heavy);
-    let (completed_results, cache_restore_report) =
-        recover_completed_tool_audit_from_events(user_id, session_id);
-
-    Ok(Some(RestoredSession {
+    Ok(RestoredSession {
         conversation_cursor: heavy.conversation_cursor,
         messages: heavy.messages,
         budget_remaining_tokens: heavy.budget_remaining_tokens,
@@ -233,22 +233,19 @@ fn build_restored_session(
         deferred_tool_activations: heavy.deferred_tool_activations,
         resume_turn,
         protocol_version: heavy.light.protocol_version,
-        completed_tool_results: completed_results,
+        completed_tool_results: HashMap::new(),
         interruption: heavy.interruption,
         approval_overrides: heavy.approval_overrides,
         consecutive_context_window_errors: heavy.consecutive_context_window_errors,
         compaction_state: heavy.compaction_state,
         pipeline_state: heavy.pipeline_state,
         workspace_observation_quarantine: heavy.workspace_observation_quarantine,
-        cache_restore_report,
-    }))
+        cache_restore_report: CacheRestoreReport::default(),
+    })
 }
 
-/// Validate that the checkpoint's protocol version is compatible.
-fn validate_checkpoint_version(
-    heavy: &HeavyCheckpoint,
-    policy: VersionPolicy,
-) -> Result<(), RestoreError> {
+/// Require the exact current checkpoint protocol.
+fn validate_checkpoint_version(heavy: &HeavyCheckpoint) -> Result<(), RestoreError> {
     let cp_version = heavy.light.protocol_version;
 
     if cp_version == 0 {
@@ -257,7 +254,7 @@ fn validate_checkpoint_version(
         ));
     }
 
-    match check_protocol_version_with_policy(cp_version, policy) {
+    match check_protocol_version(cp_version) {
         Ok(_verdict) => Ok(()),
         Err(_) => Err(RestoreError::VersionMismatch {
             checkpoint_version: cp_version,
@@ -389,21 +386,6 @@ fn recover_completed_tool_audit_from_events_with_bounds(
     (completed_results, cache_restore_report)
 }
 
-/// Determine which execution slots are already complete and can be skipped.
-///
-/// Returns a set of slot indices that were Completed in the checkpoint cursor.
-pub fn completed_slots(heavy: &HeavyCheckpoint) -> Vec<usize> {
-    heavy
-        .light
-        .cursor
-        .slots
-        .iter()
-        .enumerate()
-        .filter(|(_, slot)| slot.state == SlotState::Completed)
-        .map(|(i, _)| i)
-        .collect()
-}
-
 /// Build a summary of what was recovered (for logging/explain mode).
 pub fn restore_summary(restored: &RestoredSession) -> String {
     let tool_count: usize = restored
@@ -438,76 +420,10 @@ pub fn restore_summary(restored: &RestoredSession) -> String {
     s
 }
 
-/// Validate and convert raw event payloads into structured tool completion records.
-/// Used for post-mortem analysis and debugging.
-pub fn extract_tool_timeline(events: &[StepEvent]) -> Vec<ToolTimelineEntry> {
-    let mut timeline = Vec::new();
-    let mut pending_starts: HashMap<String, u64> = HashMap::new();
-
-    for event in events {
-        match event.event_type {
-            StepEventType::ToolCallStarted => {
-                if let Some(payload) = &event.payload {
-                    let tool_name = payload
-                        .get("tool_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if !tool_name.is_empty() {
-                        pending_starts.insert(tool_name, event.created_at);
-                    }
-                }
-            }
-            StepEventType::ToolCallCompleted | StepEventType::ToolCallFailed => {
-                if let Some(payload) = &event.payload {
-                    let tool_name = payload
-                        .get("tool_name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let is_error = event.event_type == StepEventType::ToolCallFailed
-                        || payload
-                            .get("is_error")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                    let started_at = pending_starts.remove(&tool_name).unwrap_or(0);
-                    let duration_ms = if started_at > 0 {
-                        event.created_at.saturating_sub(started_at)
-                    } else {
-                        0
-                    };
-
-                    timeline.push(ToolTimelineEntry {
-                        tool_name,
-                        started_at,
-                        completed_at: event.created_at,
-                        duration_ms,
-                        is_error,
-                        step_id: event.step_id.clone(),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    timeline
-}
-
-/// A single entry in the tool execution timeline.
-#[derive(Debug, Clone)]
-pub struct ToolTimelineEntry {
-    pub tool_name: String,
-    pub started_at: u64,
-    pub completed_at: u64,
-    pub duration_ms: u64,
-    pub is_error: bool,
-    pub step_id: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::step_protocol::StepEvent;
     use crate::step_protocol::{
         ExecutionCursor, IdempotencyKey, LightCheckpoint, StepEventStore, epoch_ms,
     };
@@ -560,7 +476,7 @@ mod tests {
     #[test]
     fn validate_version_accepts_current() {
         let heavy = make_heavy_checkpoint(3, vec![], vec![]);
-        let result = validate_checkpoint_version(&heavy, VersionPolicy::Strict);
+        let result = validate_checkpoint_version(&heavy);
         assert!(result.is_ok());
     }
 
@@ -568,7 +484,7 @@ mod tests {
     fn validate_version_rejects_zero() {
         let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
         heavy.light.protocol_version = 0;
-        let result = validate_checkpoint_version(&heavy, VersionPolicy::Strict);
+        let result = validate_checkpoint_version(&heavy);
         assert!(matches!(result, Err(RestoreError::InvalidCheckpoint(_))));
     }
 
@@ -576,25 +492,18 @@ mod tests {
     fn validate_version_strict_rejects_mismatch() {
         let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
         heavy.light.protocol_version = 999; // different version
-        let result = validate_checkpoint_version(&heavy, VersionPolicy::Strict);
+        let result = validate_checkpoint_version(&heavy);
         assert!(matches!(result, Err(RestoreError::VersionMismatch { .. })));
     }
 
     #[test]
-    fn validate_version_compatible_accepts_same_major() {
+    fn validate_version_rejects_same_major_mismatch() {
         let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
-        // Same major (2xxx), different minor
         heavy.light.protocol_version = PROTOCOL_VERSION + 1;
-        let result = validate_checkpoint_version(&heavy, VersionPolicy::Compatible);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn validate_version_compatible_rejects_different_major() {
-        let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
-        heavy.light.protocol_version = 1000; // major 1, current is major 2
-        let result = validate_checkpoint_version(&heavy, VersionPolicy::Compatible);
-        assert!(matches!(result, Err(RestoreError::VersionMismatch { .. })));
+        assert!(matches!(
+            validate_checkpoint_version(&heavy),
+            Err(RestoreError::VersionMismatch { .. })
+        ));
     }
 
     #[test]
@@ -615,7 +524,7 @@ mod tests {
             config_version_id: None,
         });
 
-        let error = build_restored_session(TEST_USER_ID, "session-1", heavy).unwrap_err();
+        let error = restore_checkpoint("session-1", heavy).unwrap_err();
         assert!(
             matches!(error, RestoreError::InvalidCheckpoint(ref detail)
                 if detail.contains("cursor root")),
@@ -637,7 +546,7 @@ mod tests {
                 source_tool_call_id: None,
             });
 
-        let error = build_restored_session(TEST_USER_ID, "session-1", heavy).unwrap_err();
+        let error = restore_checkpoint("session-1", heavy).unwrap_err();
         assert!(
             matches!(error, RestoreError::InvalidCheckpoint(detail) if detail.contains("quarantine"))
         );
@@ -664,26 +573,6 @@ mod tests {
         heavy.light.step_id = "no-turn-info".to_string();
         // "info" isn't a number, so it should default to 0
         assert_eq!(extract_resume_turn(&heavy), 0);
-    }
-
-    // ── Completed slots ──
-
-    #[test]
-    fn completed_slots_empty_cursor() {
-        let heavy = make_heavy_checkpoint(3, vec![], vec![]);
-        assert!(completed_slots(&heavy).is_empty());
-    }
-
-    #[test]
-    fn completed_slots_with_mixed_states() {
-        let mut heavy = make_heavy_checkpoint(3, vec![], vec![]);
-        heavy.light.cursor = ExecutionCursor::for_act(3);
-        heavy.light.cursor.slots[0].state = SlotState::Completed;
-        heavy.light.cursor.slots[1].state = SlotState::Failed;
-        heavy.light.cursor.slots[2].state = SlotState::Completed;
-
-        let done = completed_slots(&heavy);
-        assert_eq!(done, vec![0, 2]);
     }
 
     // ── Restore summary ──
@@ -858,147 +747,6 @@ mod tests {
             crate::step_checkpoint::session_dir_for(TEST_USER_ID, &session_id)
                 .expect("valid session id for test cleanup"),
         );
-    }
-
-    // ── Tool timeline extraction ──
-
-    #[test]
-    fn extract_timeline_from_start_complete_pairs() {
-        let events = vec![
-            StepEvent {
-                event_id: "e1".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallStarted,
-                agent_id: None,
-                caused_by: vec![],
-                payload: Some(serde_json::json!({"tool_name": "read_file"})),
-                created_at: 1000,
-            },
-            StepEvent {
-                event_id: "e2".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallCompleted,
-                agent_id: None,
-                caused_by: vec!["e1".to_string()],
-                payload: Some(serde_json::json!({
-                    "tool_name": "read_file",
-                    "output": "file contents"
-                })),
-                created_at: 1050,
-            },
-        ];
-
-        let timeline = extract_tool_timeline(&events);
-        assert_eq!(timeline.len(), 1);
-        assert_eq!(timeline[0].tool_name, "read_file");
-        assert_eq!(timeline[0].duration_ms, 50);
-        assert!(!timeline[0].is_error);
-    }
-
-    #[test]
-    fn extract_timeline_handles_failures() {
-        let events = vec![
-            StepEvent {
-                event_id: "e1".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallStarted,
-                agent_id: None,
-                caused_by: vec![],
-                payload: Some(serde_json::json!({"tool_name": "bash"})),
-                created_at: 2000,
-            },
-            StepEvent {
-                event_id: "e2".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallFailed,
-                agent_id: None,
-                caused_by: vec!["e1".to_string()],
-                payload: Some(serde_json::json!({
-                    "tool_name": "bash",
-                    "output": "command not found"
-                })),
-                created_at: 2100,
-            },
-        ];
-
-        let timeline = extract_tool_timeline(&events);
-        assert_eq!(timeline.len(), 1);
-        assert_eq!(timeline[0].tool_name, "bash");
-        assert_eq!(timeline[0].duration_ms, 100);
-        assert!(timeline[0].is_error);
-    }
-
-    #[test]
-    fn extract_timeline_interleaved_tools() {
-        let events = vec![
-            StepEvent {
-                event_id: "e1".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallStarted,
-                agent_id: None,
-                caused_by: vec![],
-                payload: Some(serde_json::json!({"tool_name": "read_file"})),
-                created_at: 1000,
-            },
-            StepEvent {
-                event_id: "e2".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallStarted,
-                agent_id: None,
-                caused_by: vec![],
-                payload: Some(serde_json::json!({"tool_name": "grep"})),
-                created_at: 1010,
-            },
-            StepEvent {
-                event_id: "e3".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallCompleted,
-                agent_id: None,
-                caused_by: vec!["e2".to_string()],
-                payload: Some(serde_json::json!({
-                    "tool_name": "grep",
-                    "output": "match found"
-                })),
-                created_at: 1030,
-            },
-            StepEvent {
-                event_id: "e4".to_string(),
-                run_id: "test-run".into(),
-                canonical_event_id: None,
-                step_id: "s1".to_string(),
-                event_type: StepEventType::ToolCallCompleted,
-                agent_id: None,
-                caused_by: vec!["e1".to_string()],
-                payload: Some(serde_json::json!({
-                    "tool_name": "read_file",
-                    "output": "file data"
-                })),
-                created_at: 1050,
-            },
-        ];
-
-        let timeline = extract_tool_timeline(&events);
-        assert_eq!(timeline.len(), 2);
-        // grep completes first
-        assert_eq!(timeline[0].tool_name, "grep");
-        assert_eq!(timeline[0].duration_ms, 20);
-        // read_file completes second
-        assert_eq!(timeline[1].tool_name, "read_file");
-        assert_eq!(timeline[1].duration_ms, 50);
     }
 
     // ── RestoreError display ──

@@ -216,3 +216,71 @@ async fn removed_learning_routes_are_not_public_contracts() {
         );
     }
 }
+
+#[tokio::test]
+async fn retired_database_mutation_routes_cannot_execute_through_http() {
+    let app = build_test_app(true);
+    let payload = serde_json::json!({"name":"fixture_branch","source":"fixture_source","target":"fixture_target","operation":"merge","model":"fixture_model","session_count":2,"checkpoint_name":"fixture_checkpoint"});
+    for (method, path) in [
+        ("POST", "/branches"),
+        ("DELETE", "/branches"),
+        ("POST", "/branches/diff"),
+        ("POST", "/branches/merge"),
+        ("POST", "/branches/cost-estimate"),
+        ("POST", "/data-versioning/sandbox/fixture/restore"),
+    ] {
+        for authenticated in [false, true] {
+            let headers = if authenticated {
+                vec![
+                    ("authorization", "Bearer fixture-user"),
+                    ("content-type", "application/json"),
+                ]
+            } else {
+                vec![("content-type", "application/json")]
+            };
+            let response = app
+                .clone()
+                .oneshot(build_request(
+                    method,
+                    path,
+                    &headers,
+                    body::Body::from(payload.to_string()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "retired {method} {path}, authenticated={authenticated}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn retired_unimplemented_routes_cannot_claim_execution() {
+    let app = build_test_app(true);
+    for (method, path) in [
+        ("POST", "/triggers"),
+        ("GET", "/triggers"),
+        ("DELETE", "/triggers/fixture"),
+        ("POST", "/triggers/fixture/fire"),
+        ("POST", "/sessions/fixture/replay"),
+        ("GET", "/sessions/fixture/replay/compare"),
+    ] {
+        for authenticated in [false, true] {
+            let mut headers = vec![("content-type", "application/json")];
+            if authenticated {
+                headers.push(("authorization", "Bearer fixture-user"));
+            }
+            let response = app.clone().oneshot(build_request(method, path, &headers,
+                body::Body::from(r#"{"trigger_type":"schedule","cron_expr":"* * * * *","secret":"fixture-secret","user_input":"fixture"}"#)))
+                .await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "retired {method} {path}, authenticated={authenticated}"
+            );
+        }
+    }
+}

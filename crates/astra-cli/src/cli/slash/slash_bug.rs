@@ -11,7 +11,7 @@ pub(crate) fn handle_bug_command(arg: &str, state: &SessionState) {
     let report = build_bug_report(state);
 
     match arg.trim() {
-        "copy" => match crate::cli::slash::slash_info::copy_to_clipboard(&report) {
+        "copy" => match crate::cli::clipboard::copy_to_clipboard(&report) {
             Ok(()) => cli_ok!("Bug report copied to clipboard."),
             Err(error) => {
                 cli_warn!("Could not copy to clipboard: {}", error);
@@ -90,7 +90,7 @@ fn build_bug_report(state: &SessionState) -> String {
     if let Some(cost) = state.total_session_cost {
         lines.push(format!(
             "- **Cost**: {}",
-            crate::cli::slash::slash_stats::format_cost(cost)
+            crate::cli::session::session_stats_scan::format_cost(cost)
         ));
     }
     lines.push(String::new());
@@ -109,18 +109,6 @@ fn build_bug_report(state: &SessionState) -> String {
     lines.push(String::new());
     // We can't easily get MCP servers synchronously from the RwLock, so list what we can.
     lines.push("(Use `/mcp status` for detailed MCP server info)".to_string());
-    lines.push(String::new());
-
-    // ── Active skills ──
-    lines.push("## Active Skills".to_string());
-    lines.push(String::new());
-    if state.active_system_skills.is_empty() {
-        lines.push("- (none)".to_string());
-    } else {
-        for skill in &state.active_system_skills {
-            lines.push(format!("- {}", skill.name));
-        }
-    }
     lines.push(String::new());
 
     // ── Last response (truncated) ──

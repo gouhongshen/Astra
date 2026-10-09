@@ -7,7 +7,6 @@
 //! Or via: `make test-online`
 
 use astra_services::auth::session::{DatabaseSessionService, SessionService};
-use astra_services::config_version_cloud::{CONFIG_VERSIONS_SELECT_TOML_SQL, ConfigVersionPayload};
 use astra_services::event_ingestion::{EventIngestionWorker, IngestionConfig, IngestionEvent};
 use astra_services::events::{
     DatabaseEventService, EventCreateRequestData, EventIngestionSource, EventService,
@@ -500,14 +499,6 @@ async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_
     .await;
 }
 
-async fn cleanup_config_version(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, version_id: &str) {
-    let _ = sqlx::query("DELETE FROM config_versions WHERE user_id = ? AND version_id = ?")
-        .bind(user_id)
-        .bind(version_id)
-        .execute(pool)
-        .await;
-}
-
 /// Verifies that inserting the same event_id twice does not surface a
 /// duplicate key error. This guards against the MySQL 1062 error that
 /// occurred when INSERT IGNORE was not properly handling idempotent retries.
@@ -526,14 +517,14 @@ async fn event_ingest_idempotent_duplicate_key_no_error() {
     // Spawn worker, send event, shutdown — first insert
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(event.clone()).await;
+    sender.enqueue(event.clone());
     shutdown.signal();
     handle.await.unwrap();
 
     // Spawn worker again, send same event — INSERT IGNORE should make it idempotent
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(event.clone()).await;
+    sender.enqueue(event.clone());
     shutdown.signal();
     handle.await.unwrap();
 
@@ -583,22 +574,18 @@ async fn blocked_session_fence_does_not_delay_an_unrelated_session() {
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender
-        .enqueue_async(test_event_for_user(
-            &user_id,
-            &blocked_event,
-            &blocked_session,
-            "blocked_trace",
-        ))
-        .await;
-    sender
-        .enqueue_async(test_event_for_user(
-            &user_id,
-            &healthy_event,
-            &healthy_session,
-            "healthy_trace",
-        ))
-        .await;
+    sender.enqueue(test_event_for_user(
+        &user_id,
+        &blocked_event,
+        &blocked_session,
+        "blocked_trace",
+    ));
+    sender.enqueue(test_event_for_user(
+        &user_id,
+        &healthy_event,
+        &healthy_session,
+        "healthy_trace",
+    ));
 
     wait_for_event(
         &pool,
@@ -658,14 +645,12 @@ async fn late_arriving_session_commits_while_an_earlier_transaction_is_blocked()
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender
-        .enqueue_async(test_event_for_user(
-            &user_id,
-            &blocked_event,
-            &blocked_session,
-            "blocked_first",
-        ))
-        .await;
+    sender.enqueue(test_event_for_user(
+        &user_id,
+        &blocked_event,
+        &blocked_session,
+        "blocked_first",
+    ));
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if astra_core::sync_poison::recover_mutex_lock(&stats).events_received == 1 {
@@ -678,14 +663,12 @@ async fn late_arriving_session_commits_while_an_earlier_transaction_is_blocked()
     .expect("worker must receive the first event before the late arrival");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    sender
-        .enqueue_async(test_event_for_user(
-            &user_id,
-            &late_event,
-            &late_session,
-            "late_healthy",
-        ))
-        .await;
+    sender.enqueue(test_event_for_user(
+        &user_id,
+        &late_event,
+        &late_session,
+        "late_healthy",
+    ));
     wait_for_event(
         &pool,
         &user_id,
@@ -752,14 +735,12 @@ async fn session_flush_concurrency_is_bounded_to_two_transactions() {
         (&event_b, &session_b),
         (&event_c, &session_c),
     ] {
-        sender
-            .enqueue_async(test_event_for_user(
-                &user_id,
-                event_id,
-                session_id,
-                "bounded_trace",
-            ))
-            .await;
+        sender.enqueue(test_event_for_user(
+            &user_id,
+            event_id,
+            session_id,
+            "bounded_trace",
+        ));
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -831,14 +812,12 @@ async fn all_ingestion_slots_timeout_without_starving_a_healthy_session_or_leaki
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
     for (event_id, session_id) in [(&event_a, &blocked_a), (&event_b, &blocked_b)] {
-        sender
-            .enqueue_async(test_event_for_user(
-                &user_id,
-                event_id,
-                session_id,
-                "timeout_blocked",
-            ))
-            .await;
+        sender.enqueue(test_event_for_user(
+            &user_id,
+            event_id,
+            session_id,
+            "timeout_blocked",
+        ));
     }
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -853,14 +832,12 @@ async fn all_ingestion_slots_timeout_without_starving_a_healthy_session_or_leaki
     .await
     .expect("both ingestion attempt slots must be occupied by held fences");
 
-    sender
-        .enqueue_async(test_event_for_user(
-            &user_id,
-            &healthy_event,
-            &healthy,
-            "timeout_healthy",
-        ))
-        .await;
+    sender.enqueue(test_event_for_user(
+        &user_id,
+        &healthy_event,
+        &healthy,
+        "timeout_healthy",
+    ));
     wait_for_event(
         &pool,
         &user_id,
@@ -929,14 +906,12 @@ async fn queued_ingestion_cannot_resurrect_a_hard_deleted_session() {
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender
-        .enqueue_async(test_event_for_user(
-            &user_id,
-            &event_id,
-            &session_id,
-            "queued_before_delete",
-        ))
-        .await;
+    sender.enqueue(test_event_for_user(
+        &user_id,
+        &event_id,
+        &session_id,
+        "queued_before_delete",
+    ));
 
     let session_service = DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
         .with_pool(shared.clone());
@@ -1093,7 +1068,7 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
     let b1 = barrier.clone();
     let handle1 = tokio::spawn(async move {
         let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool1, config);
-        sender.enqueue_async(event1).await;
+        sender.enqueue(event1);
         b1.wait().await;
         shutdown.signal();
         handle.await.unwrap();
@@ -1106,7 +1081,7 @@ async fn event_ingest_concurrent_duplicate_key_no_error() {
     let b2 = barrier.clone();
     let handle2 = tokio::spawn(async move {
         let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool2, config);
-        sender.enqueue_async(event2).await;
+        sender.enqueue(event2);
         b2.wait().await;
         shutdown.signal();
         handle.await.unwrap();
@@ -1159,22 +1134,18 @@ async fn event_ingest_same_event_id_isolated_by_user() {
 
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender
-        .enqueue_async(test_event_for_user(
-            user_a,
-            &event_id,
-            &session_a,
-            "test_cross_user",
-        ))
-        .await;
-    sender
-        .enqueue_async(test_event_for_user(
-            user_b,
-            &event_id,
-            &session_b,
-            "test_cross_user",
-        ))
-        .await;
+    sender.enqueue(test_event_for_user(
+        user_a,
+        &event_id,
+        &session_a,
+        "test_cross_user",
+    ));
+    sender.enqueue(test_event_for_user(
+        user_b,
+        &event_id,
+        &session_b,
+        "test_cross_user",
+    ));
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1223,15 +1194,15 @@ async fn event_ingest_batch_partial_duplicate_no_error() {
     // Insert batch of 2
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(event1.clone()).await;
-    sender.enqueue_async(event2.clone()).await;
+    sender.enqueue(event1.clone());
+    sender.enqueue(event2.clone());
     shutdown.signal();
     handle.await.unwrap();
 
     // Re-insert subset (event1 only) — should not error
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(event1.clone()).await;
+    sender.enqueue(event1.clone());
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1268,7 +1239,7 @@ async fn event_ingest_closes_session_only_for_inserted_session_end() {
     let existing = test_event(&duplicate_event_id, &session_id, "ordinary_event");
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(existing).await;
+    sender.enqueue(existing);
     shutdown.signal();
     handle.await.unwrap();
     assert_session_event_count(&pool, TEST_USER_ID, &session_id, 1).await;
@@ -1276,7 +1247,7 @@ async fn event_ingest_closes_session_only_for_inserted_session_end() {
     let ignored_session_end = test_event(&duplicate_event_id, &session_id, "session_end");
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(ignored_session_end).await;
+    sender.enqueue(ignored_session_end);
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1301,7 +1272,7 @@ async fn event_ingest_closes_session_only_for_inserted_session_end() {
     );
     let config = IngestionConfig::default();
     let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(inserted_session_end).await;
+    sender.enqueue(inserted_session_end);
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1321,25 +1292,28 @@ async fn event_ingest_closes_session_only_for_inserted_session_end() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn event_ingest_config_version_dual_writes_config_versions_once() {
+async fn event_ingest_configuration_change_replays_once_with_exact_metadata() {
     let shared = common::setup_pool().await;
     let pool = shared.get().clone();
-
     let user_id = format!("test-user-{}", Uuid::new_v4());
     let session_id = Uuid::new_v4().to_string();
-    let version_id = config_version_fixture_id();
     cleanup_session(&pool, &user_id, &session_id).await;
-    cleanup_config_version(&pool, &user_id, &version_id).await;
     insert_session_root(&pool, &user_id, &session_id).await;
-
-    let row = ConfigVersionPayload {
-        version_id: version_id.clone(),
-        user_id: user_id.clone(),
-        toml_body: format!("model = \"worker-config\"\n# {}\n", "x".repeat(70_000)),
-        first_seen_session: Some(session_id.clone()),
-    };
-    let event = IngestionEvent::for_config_version(&row).expect("config version event");
-
+    let version_id = config_version_fixture_id();
+    let journal = astra_services::session_journal::JournalEvent::config_version_change(
+        Some(&session_id),
+        1,
+        Some("cfg_previous"),
+        &version_id,
+        "settings_overlay",
+    );
+    let event =
+        IngestionEvent::from_journal_event(&journal, &user_id).expect("configuration change");
+    let retry =
+        IngestionEvent::from_journal_event(&journal, &user_id).expect("exact journal replay");
+    assert_eq!(event.event_id, retry.event_id);
+    assert_eq!(event.created_at, retry.created_at);
+    let event_id = event.event_id.clone();
     let config = IngestionConfig {
         batch_size: 20,
         flush_interval_secs: 300,
@@ -1347,59 +1321,33 @@ async fn event_ingest_config_version_dual_writes_config_versions_once() {
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(event.clone()).await;
-    let mut reconstructed_retry =
-        IngestionEvent::for_config_version(&row).expect("reconstruct retry");
-    reconstructed_retry.created_at = "2026-01-02T00:00:00Z".into();
-    sender.enqueue_async(reconstructed_retry).await;
+    sender.enqueue(event);
+    sender.enqueue(retry);
     shutdown.signal();
     sender.shutdown();
-    handle.await.expect("config version ingestion worker join");
-
-    {
-        let stats = stats.lock().expect("config version ingestion stats");
-        assert!(
-            stats.last_error.is_none(),
-            "config version ingestion must not record MatrixOne errors: {:?}",
-            stats.last_error
-        );
-    }
-
-    let config_toml: String = sqlx::query_scalar(CONFIG_VERSIONS_SELECT_TOML_SQL)
-        .bind(&user_id)
-        .bind(&version_id)
-        .fetch_one(&pool)
+    handle
         .await
-        .expect("load config version body");
-    assert_eq!(config_toml, row.toml_body);
-
-    let config_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM config_versions WHERE user_id = ? AND version_id = ?",
+        .expect("configuration change ingestion worker join");
+    let metadata: String = sqlx::query_scalar(
+        "SELECT CAST(metadata AS CHAR) FROM agent_events WHERE event_id = ? AND user_id = ?",
     )
+    .bind(&event_id)
     .bind(&user_id)
-    .bind(&version_id)
     .fetch_one(&pool)
     .await
-    .expect("count config version rows");
+    .expect("persisted config metadata");
     assert_eq!(
-        config_rows, 1,
-        "duplicate config events must be idempotent in config_versions"
+        serde_json::from_str::<serde_json::Value>(&metadata).unwrap(),
+        journal.metadata.unwrap()
     );
-
-    let event_rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE event_id = ? AND user_id = ?")
-            .bind(&version_id)
-            .bind(&user_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count agent event rows");
-    assert_eq!(
-        event_rows, 1,
-        "duplicate config events must be idempotent in agent_events"
-    );
+    assert_eq!(event_count(&pool, &user_id, &event_id).await, 1);
     assert_session_event_count(&pool, &user_id, &session_id, 1).await;
-
-    cleanup_config_version(&pool, &user_id, &version_id).await;
+    {
+        let stats = astra_core::sync_poison::recover_mutex_lock(&stats);
+        assert_eq!(stats.events_flushed, 2, "{stats:?}");
+        assert_eq!(stats.events_dropped_permanent, 0, "{stats:?}");
+        assert!(stats.last_error.is_none(), "{stats:?}");
+    }
     cleanup_session(&pool, &user_id, &session_id).await;
 }
 
@@ -1444,7 +1392,7 @@ async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy
         ..Default::default()
     };
     let (sender, shutdown, first_stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(duplicate_a.clone()).await;
+    sender.enqueue(duplicate_a.clone());
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1466,7 +1414,7 @@ async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy
         unique_b1.clone(),
         unique_b2.clone(),
     ] {
-        sender.enqueue_async(event).await;
+        sender.enqueue(event);
     }
     shutdown.signal();
     handle.await.unwrap();
@@ -1511,9 +1459,7 @@ async fn event_ingest_drops_late_events_for_deleted_session_without_recreating_r
 
     let (sender, shutdown, stats, handle) =
         EventIngestionWorker::spawn(pool.clone(), IngestionConfig::default());
-    sender
-        .enqueue_async(test_event(&event_id, &session_id, "late_after_delete"))
-        .await;
+    sender.enqueue(test_event(&event_id, &session_id, "late_after_delete"));
     shutdown.signal();
     handle.await.expect("join ingestion worker");
 
@@ -1541,7 +1487,7 @@ async fn event_ingest_drops_late_events_for_deleted_session_without_recreating_r
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn rejected_session_group_cannot_publish_config_side_effects_or_block_a_peer() {
+async fn rejected_session_configuration_change_cannot_block_a_peer() {
     let shared = common::setup_pool().await;
     let pool = shared.get().clone();
     let user_id = format!("rejected-config-user-{}", Uuid::new_v4().simple());
@@ -1551,7 +1497,6 @@ async fn rejected_session_group_cannot_publish_config_side_effects_or_block_a_pe
     let healthy_event = format!("healthy-event-{}", Uuid::new_v4().simple());
     cleanup_session(&pool, &user_id, &rejected_session).await;
     cleanup_session(&pool, &user_id, &healthy_session).await;
-    cleanup_config_version(&pool, &user_id, &version_id).await;
     sqlx::query(
         "INSERT INTO agent_session_lifecycle_fences
          (user_id, session_id, delete_requested_at, database_deleted_at)
@@ -1564,14 +1509,16 @@ async fn rejected_session_group_cannot_publish_config_side_effects_or_block_a_pe
     .expect("seed rejected session fence");
     insert_session_root(&pool, &user_id, &healthy_session).await;
 
-    let payload = ConfigVersionPayload {
-        version_id: version_id.clone(),
-        user_id: user_id.clone(),
-        toml_body: "model = \"must-not-persist\"\n".to_string(),
-        first_seen_session: Some(rejected_session.clone()),
-    };
-    let rejected_config =
-        IngestionEvent::for_config_version(&payload).expect("rejected config event");
+    let journal = astra_services::session_journal::JournalEvent::config_version_change(
+        Some(&rejected_session),
+        1,
+        None,
+        &version_id,
+        "startup",
+    );
+    let rejected_config = IngestionEvent::from_journal_event(&journal, &user_id)
+        .expect("rejected configuration change");
+    let rejected_event_id = rejected_config.event_id.clone();
     let healthy = test_event_for_user(&user_id, &healthy_event, &healthy_session, "healthy_peer");
     let config = IngestionConfig {
         batch_size: 1,
@@ -1580,23 +1527,14 @@ async fn rejected_session_group_cannot_publish_config_side_effects_or_block_a_pe
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(rejected_config).await;
-    sender.enqueue_async(healthy).await;
+    sender.enqueue(rejected_config);
+    sender.enqueue(healthy);
     shutdown.signal();
     sender.shutdown();
     handle.await.expect("join mixed rejected ingestion worker");
 
-    let config_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM config_versions WHERE user_id = ? AND version_id = ?",
-    )
-    .bind(&user_id)
-    .bind(&version_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count rejected config projection");
-    let rejected_event_rows: i64 = event_count(&pool, &user_id, &version_id).await;
+    let rejected_event_rows = event_count(&pool, &user_id, &rejected_event_id).await;
     let healthy_event_rows: i64 = event_count(&pool, &user_id, &healthy_event).await;
-    assert_eq!(config_rows, 0);
     assert_eq!(rejected_event_rows, 0);
     assert_eq!(healthy_event_rows, 1);
     assert_session_event_count(&pool, &user_id, &healthy_session, 1).await;
@@ -1606,7 +1544,6 @@ async fn rejected_session_group_cannot_publish_config_side_effects_or_block_a_pe
         assert_eq!(stats.events_dropped_permanent, 1, "{stats:?}");
     }
 
-    cleanup_config_version(&pool, &user_id, &version_id).await;
     cleanup_session(&pool, &user_id, &rejected_session).await;
     cleanup_session(&pool, &user_id, &healthy_session).await;
 }
@@ -1645,14 +1582,15 @@ async fn retryable_group_failure_retains_only_that_session_and_commits_its_peer_
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(failing).await;
-    sender.enqueue_async(healthy).await;
+    sender.enqueue(failing);
+    sender.enqueue(healthy);
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let healthy_rows: i64 = event_count(&pool, &user_id, &healthy_event_id).await;
             let snapshot = astra_core::sync_poison::recover_mutex_lock(&stats).clone();
-            if healthy_rows == 1 && snapshot.errors == 1 {
+            // DB visibility can precede the worker's commit acknowledgement.
+            if healthy_rows == 1 && snapshot.errors == 1 && snapshot.events_flushed > 0 {
                 assert_eq!(snapshot.events_flushed, 1, "{snapshot:?}");
                 assert_eq!(snapshot.flush_count, 1, "{snapshot:?}");
                 break;
@@ -1740,14 +1678,12 @@ async fn event_ingest_100_users_by_10_sessions_finishes_finite_burst() {
             let user_id = format!("{user_prefix}{user:03}");
             let session_id = format!("session-{user:03}-{session:02}-{run}");
             let event_id = format!("event-{user:03}-{session:02}-{run}");
-            sender
-                .enqueue_async(test_event_for_user(
-                    &user_id,
-                    &event_id,
-                    &session_id,
-                    &event_type,
-                ))
-                .await;
+            sender.enqueue(test_event_for_user(
+                &user_id,
+                &event_id,
+                &session_id,
+                &event_type,
+            ));
         }
     }
 
@@ -1864,8 +1800,8 @@ async fn event_ingest_isolates_same_session_id_across_owners_without_blocking_va
     );
     let config = IngestionConfig::default();
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(foreign_event).await;
-    sender.enqueue_async(valid_event).await;
+    sender.enqueue(foreign_event);
+    sender.enqueue(valid_event);
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1941,7 +1877,7 @@ async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
     let config = IngestionConfig::default();
     let (sender, shutdown, _initial_stats, handle) =
         EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(first.clone()).await;
+    sender.enqueue(first.clone());
     shutdown.signal();
     handle.await.unwrap();
 
@@ -1959,8 +1895,8 @@ async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
         ..Default::default()
     };
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
-    sender.enqueue_async(duplicate_with_parent).await;
-    sender.enqueue_async(unique_with_parent).await;
+    sender.enqueue(duplicate_with_parent);
+    sender.enqueue(unique_with_parent);
     shutdown.signal();
     handle.await.unwrap();
 

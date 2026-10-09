@@ -1,12 +1,11 @@
 //! Dynamic agent orchestration — runtime agent spawning and management.
 //!
 //! This module provides the ability for LLMs to dynamically spawn sub-agents
-//! at runtime without pre-defined team configurations.
+//! at runtime without pre-defined agent configurations.
 
 mod agent_result_status;
 pub mod agent_tool;
 pub mod agent_trace_status;
-mod fork_cache_probe;
 pub(crate) mod spawner;
 
 pub use agent_result_status::{
@@ -16,10 +15,9 @@ pub use agent_result_status::{
 };
 pub use agent_tool::{
     AgentToolContext, AgentTranscriptLocation, WorkspaceMutationAuthority,
-    handle_agent_fanout_tool, handle_agent_get_result_action,
+    handle_agent_fanout_tool, handle_agent_get_result_action, handle_agent_list_action,
     handle_agent_send_message_with_router, handle_agent_spawn_action, handle_agent_tool,
-    normalize_agent_spawn_args, recover_agent_fanout_tool_result,
-    render_agent_runtime_binding_error,
+    normalize_agent_spawn_args, render_agent_runtime_binding_error,
 };
 pub use agent_trace_status::{
     AGENT_TRACE_EVENT_CANCELLED, AGENT_TRACE_EVENT_COMPLETED, AGENT_TRACE_EVENT_FAILED,
@@ -30,20 +28,14 @@ pub use agent_trace_status::{
     agent_trace_requires_result_collection, agent_trace_status_from_event,
     agent_trace_terminal_event_type, is_agent_trace_settled_event,
 };
-pub use astra_turn_core::orchestration_context_cache::{
-    CacheStats, CachedFile, Knowledge, SharedContextCache, query_context_schema,
-    share_context_schema,
-};
 pub use astra_turn_core::orchestration_progress::{
     AgentProgressEmitter, AgentProgressEvent, ProgressBroadcaster, ProgressEventType,
 };
 pub use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
-pub use astra_turn_core::orchestration_team_config::{AgentRegistry, AgentTypeConfig};
 pub use astra_turn_core::orchestration_types::CancellationOrigin;
 pub mod permission_sync {
     pub use astra_turn_core::permission::sync::*;
 }
-pub use fork_cache_probe::{ForkCacheProbeState, maybe_emit_fork_cache_probe};
 pub use permission_sync::{
     ChildPermissionMode, InheritedPermissions, PermissionAction, PermissionCallback,
     PermissionDecision, PermissionMode, PermissionRequest, PermissionRequestHandler,
@@ -66,10 +58,12 @@ pub(crate) fn workspace_mutation_from_context(
 }
 pub use spawner::{
     AgentHistoryRecord, AgentStatus, CANCELLATION_ORIGIN_UNVERIFIED, CancellationTransferOutcome,
-    DescendantCancellationReason, DurableAgentReconciler, DynamicAgentSpawner,
-    FanoutGroupCancellation, InheritedChildPrefix, PermissionSummary, ROOT_RUN_ID,
-    SpawnAgentExecutor, SpawnContext, SpawnError, SpawnRunCancellationDurability, SpawnRunConfig,
-    SpawnRunResult, SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics,
-    SpawnedAgentState, WaitForAgentOutcome, project_subrun_status_to_spawn,
+    DelegationAuthority, DescendantCancellationReason, DurableAgentReconciler, DynamicAgentSpawner,
+    FANOUT_GROUP_CANCELLED_EVENT_TYPE, FanoutGroupCancellation, FanoutParentAdmission,
+    InheritedChildPrefix, PermissionSummary, PreparedSpawn, PreparedSpawnModelIdentity,
+    ROOT_RUN_ID, SpawnAgentExecutor, SpawnContext, SpawnError, SpawnExecution,
+    SpawnRunCancellationDurability, SpawnRunConfig, SpawnRunFrontier, SpawnRunResult,
+    SpawnStatusProjection, SpawnedAgentInfo, SpawnedAgentMetrics, SpawnedAgentState,
+    WaitForAgentOutcome, project_subrun_status_to_spawn, selector_for_admitted_spawn_input,
     spawn_completion_status_from_finish_reason,
 };

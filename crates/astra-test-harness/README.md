@@ -52,6 +52,7 @@ code is correct. Branch acceptance requires the deterministic HTTP system
 matrix against the current binary/DB wiring; a deployment smoke additionally
 needs the target Server revision recorded by the release workflow.
 
+
 For a revision-bound comparison, set `ASTRA_EXPECTED_BUILD_GIT_SHA` to the full
 40-character commit SHA. Before any model probe, preflight requires the harness,
 selected CLI and Server to report that exact revision and an explicitly clean
@@ -140,7 +141,7 @@ In harness pipeline JSON, `cache_hit_ratios: null` and `avg_cache_hit_ratio: nul
 mean unknown coverage; `cache_hit_ratios: []` with a null mean means qualified
 all-zero input (n/a). Valid nonzero groups produce an array and numeric mean.
 `feedback_observations` independently counts valid typed feedback events, replacing
-the misleading `turns_with_feedback` field. Both text reports retain compaction
+the misleading `turns_with_feedback` field. The text report retains compaction
 and alert diagnostics even without feedback. This changes harness report data,
 not runtime wire or database storage. Raw cache-break heuristics and feedback-based
 stable-prefix estimates remain separate diagnostics; canonical mean qualification
@@ -221,18 +222,18 @@ error when nothing resolves.
 A case is one YAML file. Example:
 
 ```yaml
-name: fork_prefix_spawn_inherits
+name: agent_child_reply
 description: |
-  Spawn a child with required prefix inheritance and assert its durable result.
+  Spawn an ordinary child and assert its durable result.
 prompt: |
-  Use agent once to spawn child "G1" with prompt
-  "Reply: inherited-ok" and inherit_prefix: {required: true}.
+  Use agent once to spawn a child with description "Bounded reply"
+  and prompt "Reply: child-ok".
   Surface the reply.
 prompt_variants:
   - id: zh
     prompt: |
-      使用 agent 一次创建名为 G1 的子 agent，prompt 为“Reply: inherited-ok”，
-      并设置 inherit_prefix: {required: true}。呈现其持久化结果。
+      使用 agent 一次创建子 agent，description 为“Bounded reply”，
+      prompt 为“Reply: child-ok”。呈现其持久化结果。
 debug_log: true # turn on session journal capture
 timeout_seconds: 240
 # Optional explicit CLI deadline when the case requires earlier settlement;
@@ -256,7 +257,9 @@ criteria:
     name: agent
     document: result
     path: /status
-    equals: completed
+    equals: launched
+  - type: session_child_result_adopted
+    expected_result: child-ok
 ```
 
 `prompt_variants` are dormant by default. `--prompt-variants` expands the
@@ -294,13 +297,13 @@ focus without duplicating the whole scripted journey.
 | `text_json_array_count { path, min, max }`          | selected JSON array length is within the inclusive range      | envelope |
 | `text_json_path_absent { path }`                    | selected JSON pointer is absent (`null` is still present)      | envelope |
 | `text_json_dag { nodes_path, node_id_path, node_required_string_paths?, edges_path, predecessor_path, successor_path }` | required node strings are non-empty, endpoints are unique/resolved, and the graph is acyclic | envelope |
-| `fork_cache_outcome { expect }`                     | `[fork-cache]` event `outcome` ∈ `expect`                    | stderr      |
-| `session_event_count { event_type, min, optional }` | journal has ≥ `min` events of that type                      | journal     |
+| `session_event_count { event_type, min, max?, optional }` | session-capture event count is within bounds; JSON predicates can link a step event's `run_id` to another event such as its `agent_spawned` record | journal + step events |
+| `session_child_result_adopted { expected_result?, spawn_match?, allow_get_result? }` | exact completed child result reaches its parent; without `expected_result`, a unique matching spawn must complete, then its full staged and adopted result hashes must match before parent finalization. This mode requires `spawn_match`; `allow_get_result` also accepts an exact complete foreground `agent(get_result)` or `agent_fanout(get_results)` read followed by the same parent's later finalization. | journal + trace events |
 | `journal_tool_called { name, optional }`            | tool name appears in journal `tool_calls`                    | journal     |
 | `journal_turn_tool_hidden { name }`                 | tool is absent from every canonical coordinator tool surface | journal     |
-| `journal_tool_call_count { name, min, max }`        | complete durable calls for `name` are within the range       | journal     |
+| `journal_tool_call_count { name, min, max, root_only? }` | complete durable calls for `name` are within the range; `root_only: true` excludes child runs and fails on unattributed matching calls | journal |
 | `journal_tool_success_ratio { min, min_calls, allowed_failures? }` | raw and expected-negative-adjusted typed tool success meet the minimum | journal |
-| `journal_tool_json { name, document, path, equals }`| arguments, result, or bounded runtime metadata has the exact JSON-pointer value | journal     |
+| `journal_tool_json { name, document, path, equals, where_match? }`| arguments, result, or bounded runtime metadata has the exact JSON-pointer value; optional `{ document, path, equals }` predicate constrains the same call | journal     |
 | `journal_tool_json_contains { name, document, path, contains }` | arguments, result, failure error, or bounded runtime metadata has a string at the JSON pointer containing the semantic marker; formatting remains provider data | journal |
 | `journal_tool_sequence { tools }` | durable tool calls contain the ordered lifecycle subsequence | journal |
 | `journal_tool_precedence { predecessor, successor }` | every durable successor call happens after its predecessor | journal |
@@ -349,6 +352,9 @@ provider ratio criterion. Old reports retain their original criteria and verdict
 Both conditions apply to the same durable invocation: a failed remember plus a
 successful recall cannot count as a successful remember. Missing outcome evidence
 fails an explicit `ok` filter.
+With `root_only: true`, the CLI root run ID and every matching call's producer run
+ID must be known; ambiguous attribution fails rather than satisfying a zero-call
+assertion.
 
 All journal criteria require a loaded session. `session_event_count` and
 `journal_tool_called` are hard requirements by default; set `optional: true`
@@ -383,23 +389,25 @@ The authoritative list lives in `RESERVED_CLI_ARGS` in `src/case.rs`.
 
 ## Judger
 
-The harness's LLM judger scores free-form questions ("did the agent
-correctly do X?"). Key features:
+The built-in LLM judger receives bounded evidence through the shared typed
+judgment interface. `hard_judger` asks whether the criterion's declared
+threshold is satisfied, including its conditions and prohibitions; it returns
+an acceptance verdict. Advisory `judger` retains graded quality feedback.
+External command judgers retain their numeric-score protocol.
 
-- **Anti-gaming rubric**: the prompt's data sections are wrapped in
-  fenced ` ```data ` blocks with an explicit preamble calling out
-  untrusted data. A fabricated `SCORE:` line in an agent's output
-  can't hijack the judge's output.
-- **Sees stderr**: the `[fork-cache]` / `[selector]` observability
-  events are embedded (head+tail truncated to 8k chars) so the
-  judger can read them.
+- **Untrusted evidence**: answers, diagnostics, and the quoted criterion cannot
+  execute instructions or override the evaluator. The criterion's acceptance
+  meaning is preserved; an output's fabricated `SCORE:` line has no authority.
+- **Sees stderr**: captured diagnostics are embedded with head+tail
+  truncation to 8k chars so the judger can read them.
 - **Sees durable tool receipts**: when a session is captured, bounded complete
   call arguments/results are projected from the journal into the judger's
   untrusted-data section. The durable journal remains the source of truth.
-- **Quorum voting**: `--judger-n 3 --judger-agg median` runs the
-  judger three times and takes the median, smoothing single-call
-  variance. Dissenting votes are preserved in `full_rationale` so a
-  FAIL report shows the outliers.
+- **Quorum voting**: numeric grades retain median/mean/min/max aggregation.
+  Acceptance verdicts use strict majority for median, all votes for min, or
+  any vote for max. A median tie is inconclusive; mean is rejected for
+  verdicts. Required judgments reject missing/error votes. Individual votes
+  and diagnostics remain available in the report.
 - **Same-family warning**: stderr warns when the judger model is in
   the same family (anthropic / openai / alibaba / minimax / etc.)
   as any tested model — same-family judging tends to inflate scores.
@@ -439,6 +447,9 @@ and per-case evidence are persisted under
 `target/astra-test-harness/capabilities/` (ignored by git).
 
 ## Cross-surface Work journey (TUI + Web)
+
+This live lane requires Linux process supervision. Other platforms return
+`not_tested` before setup, including when reusing an existing Web server.
 
 The YAML harness does not drive a browser or a controlling terminal. To verify
 the user journey across surfaces, run the separate opt-in live harness:
@@ -537,6 +548,92 @@ On FAIL, each case report includes:
 - `judger full_detail`: the untruncated rationale for every judge
   vote when quorum is on.
 - `failure_class`: automated classification (infra, model, flaky, etc.)
+
+With `--artifacts-dir`, `stream-events.json` privately retains selected child
+output, identity, commit, terminal, and gap events before owned session deletion.
+Each subprocess capture is bounded to 1 MiB / 4096 records; thinking and tool
+bodies are excluded, and child text is not added to ordinary JSON reports.
+Case/model path components use UTF-8 byte percent encoding to avoid collisions.
+Archive failure retains the owned sessions and reports a separate cleanup error.
+These events are diagnostic evidence, not an authoritative final-result oracle;
+missing gaps do not prove complete delivery. Review/redact sidecars before sharing.
+
+`execution_child_results_adopted` acquires `astra session show <id> --execution`
+before cleanup, using the same binary, environment, account and profile as the
+run. The private sidecar also retains the typed Server run tree and Reflect
+response. Its `children` list specifies the complete direct-child set. Every
+child requires an exact model and offering with successful physical provider
+evidence, and its result digest adopted before the same parent finalization.
+It never falls back to local journal
+events. The run tree must be complete; partial reflection can prove positive
+facts but cannot prove absence. Capture is bounded to 5 MiB and one total
+20-second observation window. Because trace ingestion is asynchronous, a
+completed root/children snapshot without the root's finalization fact is sampled
+again at most every two seconds. This waits for observation settlement, not a
+matching answer: settled failures are not retried. An unsettled final snapshot
+is retained and classified as verification unavailable. Each snapshot's two
+Server reads are not transactional and do not enter model usage; unrelated
+cases and normal conversations do not pay this observation cost.
+
+`execution_tool_count` and `execution_tool_sequence` additionally request
+`--transcript`. They join typed requests and terminal results by exact run and
+call identity, and reconcile the count with the authoritative run tree. The
+explicit inspection reads at most 4,096 transcript items and 2 MiB across pages,
+within the same CLI inspection deadline. Missing pages, conflicting identities,
+unknown statuses and count mismatches fail verification; an empty local journal
+cannot prove that a tool was not called. JSON predicates inspect the retained
+Server projection, not a reconstructed legacy journal or model-authored prose.
+Runtime advisories travel separately in the typed tool receipt; TUI rendering
+adds them to a disposable display copy, never to the result document. Truncated
+or malformed result documents remain unavailable to JSON predicates.
+Negative JSON-document predicates require raw evidence and are rejected here;
+display projection cannot certify that a field was absent from the original.
+`execution_child_count` uses the complete run tree to prove admission cardinality.
+`execution_tool_count.error_contains` checks a positive diagnostic substring
+only in that exact joined call's failed/rejected result body. It requires
+`ok: false`, a positive minimum and a nonempty needle of at most 4,096 bytes.
+Arguments, runtime advisories, successful results and another call's output
+cannot satisfy it. This accepts plain-text errors without fabricating JSON;
+the typed terminal disposition remains the failure authority.
+Each child's `expected_result` is either `{text: "literal"}`
+or `{json: <JSON value>}`. Both expectations require that exact child's bounded,
+unambiguous terminal transcript document. Text compares the actual bytes;
+JSON compares the parsed value. In both cases the untouched observed bytes must
+match the adopted digest; parent output is checked separately.
+Expected serialization and observed raw terminal content are each limited to
+4,096 bytes.
+Whitespace equivalence never excuses a wrong digest, foreign run, missing
+document, or premature finalization. Scalar expectations are not supported.
+Natural parallel children are matched bijectively by distinct model identities,
+never by their output. For same-model children or explicit fanout, specify
+`fanout_group` and each child's `slot_index`. One successful root start receipt
+must bind unique slot indexes, agent and run IDs to exactly the authoritative children;
+optional slot labels are not execution identities.
+array position and aggregate counts are insufficient. A successful `get_results`
+or collection receipt alone does not prove model observation: both mailbox and
+explicit-read delivery require the same `results_adopted` digest boundary.
+Known cardinality, model, slot or result contradictions fail the contract;
+missing bounded physical/adoption evidence is verification unavailable, and
+cannot hide another child's known contradiction.
+The optional per-child `initial_thinking` uses the shared `ThinkingConfig` contract and
+additionally requests `--run-events`. It compares the complete admitted initial
+thinking object from that exact child's `run_started`, after proving physical
+execution and result adoption. This is not proof of provider consumption.
+Run projections are bounded recent tails, read in batches of at most four under
+the same captured owner, 15-second CLI deadline and 5 MiB envelope limit.
+Optional per-child `logical_rounds` also requests these projections. It compares
+the existing execution owner's cumulative `llm_rounds_completed`, published as
+`run_finished.turn_evaluation.metadata.llm_rounds` with matching producer and
+owner generation. This includes failed logical calls, is not a physical-attempt
+count, and is not the length of a bounded diagnostics ring. Missing or ambiguous
+terminal counters are unavailable, not zero. The fixed two-model fanout requires
+one logical call per child; an extra failed call followed by success is not one.
+Missing initial admission, conflicting identities or incomplete thinking make
+verification unavailable; a valid different control fails the behavior check.
+An absent tail event never proves that an event did not occur.
+Catalog recovery and pagination are not failed delivery solely because they
+require multiple calls. The parent-tools rejection case requires successful
+authorized Chat discovery; all calls and their failures remain in the report.
 
 ## CLI reference
 
@@ -688,3 +785,22 @@ and declaration/execution/delivery states before allocating space to large raw
 result previews. Snapshot and upsert remain distinct; omitted task counts are
 explicit. The excerpt copies typed receipt facts and never infers cancellation
 or completion from the assistant's answer.
+
+## Offline router training
+
+`astra-test router-source-hashes --input evidence.json` computes review digests.
+`astra-test router-offline --input evidence.json --authorization authorization.json
+--output new-artifact-directory` validates approved structural evidence and
+builds an offline-only candidate plus dataset and comparison report. These
+commands bypass live suite/preflight/provider execution. See the
+[offline router guide](../../docs/guides/model-router-offline.md) for the evidence
+contract, synthetic fixture, split controls, and revocation requirements.
+
+`astra-test router-config-hash`, `router-plan-hash`, `router-qualify`, and
+`router-shadow` extend the
+local router workflow with a pinned evaluation protocol and source roster, held-out quality/cost
+gates and observational scoring of separately authorized later decisions. They
+require no provider or runtime process. A qualification report can be rejected
+even when the command succeeds; inspect `tuning.status`. Passing permits only
+offline shadow scoring, never production activation. See
+[the operator guide](../../docs/guides/model-router-offline.md).

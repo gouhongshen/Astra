@@ -5,6 +5,23 @@
 
 The capability system owns tools, skills, MCP, provider decisions, tool schema projection, admission, execution routing, fallback, and diagnostics.
 
+CLI-owned dynamic tools carry their full contracts plus an explicit
+`edge_profile.tool_native_ids` map on the authenticated CLI callback channel.
+The CLI adapter uses its dispatch name as the native identity and retains the
+MCP server/tool mapping locally. The Server accepts this map only for declared
+non-builtin contracts; missing, invalid, or conflicting identities remain
+unbound. Builtin identities remain registry-owned. One-shot CLI turns retain
+the same connected MCP manager as discovery instead of dropping it in the
+basic-turn adapter.
+CLI result advertisements use the actual per-tool executor binding: a tool
+owned by a connected MCP manager advertises that MCP provider, while shell
+tools retain the local CLI binding. The Server revalidates the result against
+this same executable surface; a disconnected MCP name cannot acquire an MCP
+advertisement from its prefix alone.
+The CLI invocation guard checks that same MCP manager as discovery and result
+advertisement. It must not fall back to the builtin catalog for a connected
+MCP name after successfully resolving its provider binding.
+
 This is the target contract for implementation. It is not a snapshot of the current tool code.
 
 The protocol-independent provider snapshot, internal tool identity, invocation,
@@ -18,6 +35,11 @@ visible(tool) and execute(tool_call) must come from the same provider decision.
 ```
 
 No host loop, schema builder, or executor should maintain a separate shadow allowlist.
+
+MCP registry registration retains owner-scoped metadata, encrypted credentials
+and discovered tool schemas. Server MCP connections and discovery are prepared
+from the authorized request or Agent Binding. The unused registry-to-runtime
+loader and its Rust source result type are retired; registration remains available.
 
 ## Concepts
 
@@ -114,8 +136,10 @@ projections expose only the ordinary call shape; advanced reflection fields
 remain available through explicit typed `tool_search`/`invoke_tool` selection.
 Fan-out, advanced memory operations, and graph-maintenance schemas remain
 discoverable through the deferred surface. The resident compact-JSON schema
-projection has an 8 KiB regression budget with a safety margin; explicit user-
-pinned tools may exceed it. Ordinary workspace navigation (`read_file`,
+projection has an 8 KiB regression budget for the actual serialized schema
+array, without reserving space for hypothetical future fields; explicit user-
+pinned tools may exceed it. This budget excludes the rest of the provider
+request. Ordinary workspace navigation (`read_file`,
 `list_dir`, and `grep`) stays resident, while the specialized `glob` query is
 deferred and remains fully reachable through explicit selection. Deferred
 entries carry only compact discovery metadata and are activated through the
@@ -196,3 +220,22 @@ Capability migration should proceed in stages:
 | Tool schema visible but execution route unavailable | Invalid state; projection/admission/execution decision must be fixed. |
 | Plan mode mutation | PolicyBlocked with explanation. |
 | Unknown tool name | Unknown/malformed, not missing runtime binding. |
+
+Approval fingerprint decisions and denial-loop limits remain active. The unused
+`DenialTracker` auto-rule extraction and denial-reason history APIs are retired;
+repeated denial does not synthesize a second permission rule store. Final-text
+response guards retain hard redaction and advisory evidence, while tool names
+and arguments are validated by tool binding and execution admission. The
+source-only tool-quality report fields and warning projection are retired.
+Request-failure dumps remain owner-scoped remote artifacts; the unused
+`LlmRequestDump::write_local` API is retired.
+
+Tool-health retry guidance is emitted by `TurnGuard` from current health
+evidence, with read-only tool exemptions and duplicate-warning suppression.
+The unused `ToolHealthTracker::health_avoidance_warning` text projection is
+retired; tracking, recovery evidence and cross-session persistence remain.
+
+SQL approval and snapshot policy retain their shared quote- and comment-aware
+scanner. The unused `strip_sql_comments` source API is retired. Sandbox retry
+continues through its validated path-expansion entrypoint; the unused
+`extract_first_absolute_path` API is retired without a compatibility wrapper.

@@ -441,23 +441,17 @@ fn evaluate_trace_completeness(
         }
     }
 
-    for (run_id, spawn_event) in &spawned_by_run {
+    for run_id in spawned_by_run.keys() {
         if !terminal_by_run.contains_key(run_id) && !liveness.active_run_ids.contains(*run_id) {
             missing.push(format!("agent_terminal:{run_id}"));
         }
 
-        if spawn_event
-            .metadata
-            .get("run_in_background")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            && terminal_by_run.get(run_id).is_some_and(|event| {
-                agent_trace_requires_result_collection(
-                    event.event_type.as_str(),
-                    event.metadata.get("status").and_then(Value::as_str),
-                )
-            })
-            && !collected_child_runs.contains(*run_id)
+        if terminal_by_run.get(run_id).is_some_and(|event| {
+            agent_trace_requires_result_collection(
+                event.event_type.as_str(),
+                event.metadata.get("status").and_then(Value::as_str),
+            )
+        }) && !collected_child_runs.contains(*run_id)
             && !turn_running
         {
             missing.push(format!("agent_result_collected:{run_id}"));
@@ -762,7 +756,6 @@ mod tests {
 
         let mut spawned = event("agent_spawned", "child-run");
         spawned.parent_run_id = Some("root-run".to_string());
-        spawned.metadata = serde_json::json!({"run_in_background": true});
         events.push(spawned);
 
         let mut completed = event("agent_completed", "child-run");
@@ -859,7 +852,6 @@ mod tests {
 
         let mut spawned = event("agent_spawned", "child-run");
         spawned.parent_run_id = Some("root-run".to_string());
-        spawned.metadata = serde_json::json!({"run_in_background": true});
         events.push(spawned);
 
         let mut waiting = event("agent_waiting", "child-run");

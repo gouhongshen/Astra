@@ -29,7 +29,7 @@ mod capability_handlers;
 mod capability_source;
 mod chat_handlers;
 mod cleanup_retry;
-pub mod conflict_resolver;
+pub(crate) mod context_history_artifact;
 pub mod delegation;
 pub(crate) mod deployment_tool_policy;
 pub mod device_lease_sweeper;
@@ -44,15 +44,17 @@ mod interaction_metrics;
 mod llm_trusted_domains_handlers;
 mod mcp_handlers;
 mod meta_handlers;
-mod model_execution_admission;
+pub(crate) mod model_execution_admission;
 mod platform_handlers;
 mod preferences_handlers;
-mod product_harness_handlers;
 mod provider_runtime_context;
+#[cfg(any(test, feature = "e2e-hooks"))]
+pub mod provider_test_support;
 mod reflect_handlers;
 mod request_trace;
 mod resource_handlers;
 mod router_builder;
+mod router_rollout_handlers;
 pub mod run;
 mod runtime_maintenance_sweeper;
 pub(crate) mod runtime_mcp;
@@ -64,10 +66,8 @@ pub mod server_loop_host;
 pub mod server_skill_subrun;
 pub(crate) mod session;
 pub(crate) mod session_turn;
-mod skillify_agent_executor;
 mod state_builder;
 pub mod sweeper_lease;
-pub mod team;
 pub(crate) mod tool_admission;
 pub(crate) mod tool_agent_info;
 pub(crate) mod tool_agent_runtime;
@@ -80,7 +80,6 @@ pub(crate) mod tool_edge_transport;
 pub(crate) mod tool_execution_binding;
 pub(crate) mod tool_execution_result;
 pub(crate) mod tool_execution_service;
-pub(crate) mod tool_external_transport;
 pub(crate) mod tool_file_runtime;
 pub(crate) mod tool_introspect;
 pub mod tool_invocation_compactor;
@@ -88,11 +87,13 @@ pub(crate) mod tool_invocation_decision;
 pub(crate) mod tool_invocation_runtime;
 pub(crate) mod tool_local_execution;
 pub(crate) mod tool_local_transport;
+pub(crate) mod tool_model_catalog;
 mod work_branch_deletion_runtime;
 mod work_handlers;
 mod work_patch_commit_runtime;
 mod work_patch_export_runtime;
 mod work_patch_materialization_runtime;
+mod work_patch_workspace;
 
 fn external_request_descriptor(
     method: &Method,
@@ -325,11 +326,13 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         bg_handles.push(
             work_patch_materialization_runtime::spawn_work_patch_materialization_recovery(
                 pool.clone(),
+                state.execution.run_lifecycle_service.clone(),
                 bg_cancel.clone(),
             ),
         );
         bg_handles.push(work_patch_commit_runtime::spawn_work_patch_commit_recovery(
             pool.clone(),
+            state.execution.run_lifecycle_service.clone(),
             bg_cancel.clone(),
         ));
         // Spawn background cleanup-debt retry task
@@ -813,7 +816,8 @@ mod tests {
             _run_id: String,
             _user_id: String,
             _last_index: u32,
-        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+        ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
+        {
             unreachable!("stream_run is not used in shutdown tests")
         }
 

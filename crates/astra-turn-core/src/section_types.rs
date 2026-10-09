@@ -5,13 +5,11 @@
 //! (prompt builders). Moving them here keeps the dependency DAG clean:
 //! `astra-turn-core` does NOT depend on `astra-runtime`.
 
-use std::borrow::Cow;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::context_assembly_trace::PromptTraceSignals;
-use crate::spill_backend::SpillRegistry;
 
 // ── Types moved from runtime::prompts::system ──────────────────────────────
 
@@ -182,12 +180,6 @@ pub enum SectionKind {
     /// These change every turn so they must live in `CacheScope::None`, AFTER
     /// the cache marker, otherwise they would invalidate the cached prefix.
     RuntimeVolatile,
-    /// Emergent — discovered skills from previous turn.
-    EmergentSkills,
-    /// Emergent — prefetched memory from previous turn.
-    EmergentMemory,
-    /// Emergent — tool use summary from previous turn.
-    EmergentSummary,
 }
 
 impl SectionKind {
@@ -214,16 +206,11 @@ impl SectionKind {
             Self::Skills,
             Self::RuntimeIdentity,
             Self::RuntimeVolatile,
-            Self::EmergentSkills,
-            Self::EmergentMemory,
-            Self::EmergentSummary,
         ]
     }
 
     /// Sections whose budget is pre-allocated by `ContextBudget::allocate`,
-    /// carried outside the planned-text stream (`History`), or emitted with a
-    /// fixed zero budget (`Emergent*`) and must NOT be included in the
-    /// remainder distribution.
+    /// or carried outside the planned-text stream (`History`).
     ///
     /// Centralising this predicate means adding a new "pre-allocated" variant
     /// only requires updating this match. The exhaustive match forces
@@ -233,11 +220,8 @@ impl SectionKind {
         match self {
             // Pre-allocated with explicit budget in `ContextBudget::allocate`.
             Self::Identity | Self::Constraints | Self::Memory => true,
-            // Carried as provider messages, not a planned text section, or
-            // emitted as opportunistic zero-budget context by the planner.
-            Self::History | Self::EmergentSkills | Self::EmergentMemory | Self::EmergentSummary => {
-                true
-            }
+            // Carried as provider messages, not a planned text section.
+            Self::History => true,
             // Remaining variants participate in the remainder distribution.
             Self::SelfModel
             | Self::ProjectContext
@@ -264,8 +248,8 @@ impl SectionKind {
             Self::AvailableSkills => 4,
             Self::Skills => 5,
             Self::RuntimeIdentity => 6, // session-stable; sits with Session blocks
-            Self::Memory | Self::EmergentMemory => 7,
-            Self::WorkingMemory | Self::EmergentSkills | Self::EmergentSummary => 8,
+            Self::Memory => 7,
+            Self::WorkingMemory => 8,
             Self::History => 9,
             Self::RuntimeVolatile => 10, // turn-volatile; latest in the prompt
         }
@@ -299,13 +283,7 @@ impl SectionKind {
             | Self::Skills
             | Self::RuntimeIdentity => false,
             // Mutate per-turn — must sit post-boundary.
-            Self::Memory
-            | Self::WorkingMemory
-            | Self::History
-            | Self::RuntimeVolatile
-            | Self::EmergentSkills
-            | Self::EmergentMemory
-            | Self::EmergentSummary => true,
+            Self::Memory | Self::WorkingMemory | Self::History | Self::RuntimeVolatile => true,
         }
     }
 }
@@ -337,8 +315,6 @@ pub enum SectionSource {
     Skill,
     /// Edge profile / runtime environment.
     Environment,
-    /// Emergent context from previous turn's execution.
-    Emergent,
 }
 
 /// A section as planned (before binding). Describes what to include and how.
@@ -362,7 +338,6 @@ pub enum SectionArtifact {
     RuntimeText(String),
     MemoryText(String),
     HistorySummary(String),
-    SpillReference { path: String, original_tokens: u32 },
     Empty,
 }
 
@@ -374,7 +349,7 @@ impl SectionArtifact {
         }
         match kind {
             SectionKind::Identity | SectionKind::Constraints => Self::SystemText(text),
-            SectionKind::Memory | SectionKind::EmergentMemory => Self::MemoryText(text),
+            SectionKind::Memory => Self::MemoryText(text),
             SectionKind::History => Self::HistorySummary(text),
             SectionKind::SelfModel
             | SectionKind::ProjectContext
@@ -383,14 +358,12 @@ impl SectionArtifact {
             | SectionKind::WorkingMemory
             | SectionKind::Skills
             | SectionKind::RuntimeIdentity
-            | SectionKind::RuntimeVolatile
-            | SectionKind::EmergentSkills
-            | SectionKind::EmergentSummary => Self::RuntimeText(text),
+            | SectionKind::RuntimeVolatile => Self::RuntimeText(text),
         }
     }
 
     /// Returns the text content of this artifact, or `None` for non-text
-    /// variants (`SpillReference`, `Empty`).
+    /// variants (`Empty`).
     #[must_use]
     pub fn text(&self) -> Option<&str> {
         match self {
@@ -398,22 +371,7 @@ impl SectionArtifact {
             | Self::RuntimeText(text)
             | Self::MemoryText(text)
             | Self::HistorySummary(text) => Some(text),
-            Self::SpillReference { .. } | Self::Empty => None,
-        }
-    }
-
-    /// Returns `(path, original_tokens)` for `SpillReference`, else `None`.
-    ///
-    /// Callers use this to decide whether a section needs rehydration
-    /// without pattern-matching the enum at every call site.
-    #[must_use]
-    pub fn spill_locator(&self) -> Option<(&str, u32)> {
-        match self {
-            Self::SpillReference {
-                path,
-                original_tokens,
-            } => Some((path.as_str(), *original_tokens)),
-            _ => None,
+            Self::Empty => None,
         }
     }
 
@@ -426,36 +384,7 @@ impl SectionArtifact {
             Self::Empty if !suffix.is_empty() => {
                 *self = Self::from_text(kind, suffix.to_string());
             }
-            Self::SpillReference { .. } | Self::Empty => {}
-        }
-    }
-
-    /// Resolve this artifact to concrete text.
-    ///
-    /// - Inline variants return a borrowed view (zero-copy).
-    /// - `SpillReference` resolves its locator through `registry`; on
-    ///   success the bytes are decoded as UTF-8. On failure (scheme
-    ///   unregistered, file missing, non-UTF-8) a human-readable
-    ///   placeholder is returned — fail-open keeps downstream
-    ///   serialization alive rather than poisoning the whole turn.
-    /// - `Empty` returns an empty string.
-    #[must_use]
-    pub fn rehydrate<'a>(&'a self, registry: &SpillRegistry) -> Cow<'a, str> {
-        match self {
-            Self::SystemText(t)
-            | Self::RuntimeText(t)
-            | Self::MemoryText(t)
-            | Self::HistorySummary(t) => Cow::Borrowed(t.as_str()),
-            Self::SpillReference { path, .. } => match registry.load(path) {
-                Ok(bytes) => match String::from_utf8(bytes) {
-                    Ok(s) => Cow::Owned(s),
-                    Err(_) => {
-                        Cow::Owned(format!("[spilled content unavailable: non-UTF8 at {path}]"))
-                    }
-                },
-                Err(_) => Cow::Owned(format!("[spilled content unavailable: {path}]")),
-            },
-            Self::Empty => Cow::Borrowed(""),
+            Self::Empty => {}
         }
     }
 }
@@ -661,80 +590,6 @@ mod tests {
             3,
             "ASCII keeps bytes/4 estimate while non-ASCII chars are not discounted"
         );
-    }
-
-    // ── rehydrate (Phase 12: on-demand spill resolution) ───────────────
-
-    use crate::spill_backend::{DEFAULT_SCHEME, FileSystemSpillBackend, SpillBackend};
-    use std::sync::Arc;
-    use tempfile::TempDir;
-
-    #[test]
-    fn rehydrate_inline_returns_borrowed() {
-        let art = SectionArtifact::RuntimeText("inline content".into());
-        let reg = SpillRegistry::new();
-        let got = art.rehydrate(&reg);
-        assert!(matches!(got, Cow::Borrowed(_)));
-        assert_eq!(got.as_ref(), "inline content");
-    }
-
-    #[test]
-    fn rehydrate_empty_returns_empty_borrowed() {
-        let art = SectionArtifact::Empty;
-        let reg = SpillRegistry::new();
-        assert_eq!(art.rehydrate(&reg).as_ref(), "");
-    }
-
-    #[test]
-    fn rehydrate_spill_reference_loads_from_backend() {
-        let dir = TempDir::new().unwrap();
-        let backend: Arc<dyn SpillBackend> = Arc::new(FileSystemSpillBackend::new(dir.path()));
-        let locator = backend.store("k", b"rehydrated text").unwrap();
-
-        let mut reg = SpillRegistry::new();
-        reg.register(DEFAULT_SCHEME, backend);
-
-        let art = SectionArtifact::SpillReference {
-            path: locator,
-            original_tokens: 10,
-        };
-        let got = art.rehydrate(&reg);
-        assert!(matches!(got, Cow::Owned(_)));
-        assert_eq!(got.as_ref(), "rehydrated text");
-    }
-
-    #[test]
-    fn rehydrate_missing_locator_degrades_gracefully() {
-        let reg = SpillRegistry::new(); // no backends registered
-        let art = SectionArtifact::SpillReference {
-            path: "file:///nonexistent".into(),
-            original_tokens: 5,
-        };
-        let got = art.rehydrate(&reg);
-        // Fail-open: placeholder, not panic, not empty string.
-        assert!(got.as_ref().contains("[spilled content unavailable"));
-        assert!(got.as_ref().contains("/nonexistent"));
-    }
-
-    #[test]
-    fn rehydrate_after_process_restart_with_new_backend_instance() {
-        // Phase 12 core promise: spill written in one "process" must be
-        // loadable through a fresh backend + registry instance.
-        let dir = TempDir::new().unwrap();
-        let locator = {
-            let first: Arc<dyn SpillBackend> = Arc::new(FileSystemSpillBackend::new(dir.path()));
-            first.store("k", b"survives restart").unwrap()
-        };
-
-        let reborn: Arc<dyn SpillBackend> = Arc::new(FileSystemSpillBackend::new(dir.path()));
-        let mut reg = SpillRegistry::new();
-        reg.register(DEFAULT_SCHEME, reborn);
-
-        let art = SectionArtifact::SpillReference {
-            path: locator,
-            original_tokens: 42,
-        };
-        assert_eq!(art.rehydrate(&reg).as_ref(), "survives restart");
     }
 
     /// Regression guard: `SectionKind::all_planned()` must enumerate every

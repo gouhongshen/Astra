@@ -21,7 +21,8 @@ use astra_services::{
 use astra_turn_types::{
     NativeToolId, ProviderBindingRef, ProviderClaim, ProviderClaimSource, ProviderClaimTrust,
     ProviderDiscoverySnapshot, ProviderIdentity, ProviderProtocolId, ProviderSemanticCacheContract,
-    PublicToolAlias, ResolvedProviderSnapshot, SemanticFreshnessFact, SemanticFreshnessScope,
+    PublicToolAlias, ResolvedProviderSnapshot, ResolvedToolEffect, SemanticFreshnessFact,
+    SemanticFreshnessScope,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -169,6 +170,7 @@ pub(crate) struct AgentBindingMcpRuntime {
     authorization: String,
     tool_names_by_public_name: Arc<HashMap<String, String>>,
     resolved_snapshot: Arc<ResolvedProviderSnapshot>,
+    workspace_effects_by_public_name: Arc<HashMap<String, ResolvedToolEffect>>,
     semantic_read_tools: Arc<HashSet<String>>,
     pub(crate) capability_source_config: Option<super::capability_source::CapabilitySourceConfig>,
 }
@@ -1380,6 +1382,32 @@ fn tool_names_by_public_name(
         .collect()
 }
 
+fn workspace_effects_by_public_name(
+    snapshot: &ResolvedProviderSnapshot,
+) -> Result<HashMap<String, ResolvedToolEffect>, String> {
+    let descriptors = snapshot
+        .descriptors
+        .iter()
+        .map(|descriptor| (descriptor.descriptor_ref(), descriptor))
+        .collect::<BTreeMap<_, _>>();
+    snapshot
+        .alias_index
+        .iter()
+        .map(|(public_alias, descriptor_ref)| {
+            let descriptor = descriptors.get(descriptor_ref).ok_or_else(|| {
+                format!(
+                    "Agent Binding alias '{}' references missing descriptor '{}@{}'",
+                    public_alias,
+                    descriptor_ref.identity.native_tool_id,
+                    descriptor_ref.descriptor_version,
+                )
+            })?;
+            let effect = descriptor.semantic_baseline.effect;
+            Ok((public_alias.as_str().to_string(), effect))
+        })
+        .collect()
+}
+
 fn agent_binding_tool_call_arguments(args: &Value) -> Value {
     match args {
         Value::Object(_) => args.clone(),
@@ -1482,10 +1510,15 @@ impl AgentBindingMcpRuntime {
         } else {
             AgentBindingMcpRpcRisk::SideEffectFree
         };
+        let secrets = json!({
+            "authorization": self.authorization,
+            "url": self.endpoint_url,
+            "credentials": params.pointer("/capability/reference"),
+        });
         post_agent_binding_mcp_rpc_with_risk(&self.endpoint_url, &self.authorization,
             json!({"jsonrpc": "2.0", "id": "astra-capability-source", "method": method, "params": params}),
             Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS), risk).await
-            .map_err(|error| error.redacted(&json!({"authorization": self.authorization, "url": self.endpoint_url})))
+            .map_err(|error| error.redacted(&secrets))
     }
 
     #[cfg(test)]
@@ -1520,6 +1553,12 @@ impl AgentBindingMcpRuntime {
             endpoint_url: endpoint_url.to_string(),
             authorization: "Bearer test".to_string(),
             tool_names_by_public_name: Arc::new(tool_names_by_public_name),
+            workspace_effects_by_public_name: Arc::new(
+                public_tool_names
+                    .iter()
+                    .map(|name| ((*name).to_string(), ResolvedToolEffect::Unknown))
+                    .collect(),
+            ),
             semantic_read_tools: Arc::new(HashSet::new()),
             resolved_snapshot: bundle.agent_binding_mcp.unwrap().resolved_snapshot.clone(),
             capability_source_config: None,
@@ -1528,6 +1567,23 @@ impl AgentBindingMcpRuntime {
 
     pub(crate) fn owns_public_tool_name(&self, public_name: &str) -> bool {
         self.tool_names_by_public_name.contains_key(public_name)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_workspace_effect(mut self, effect: ResolvedToolEffect) -> Self {
+        for value in Arc::make_mut(&mut self.workspace_effects_by_public_name).values_mut() {
+            *value = effect;
+        }
+        self
+    }
+
+    pub(crate) fn workspace_effect_for_public_name(
+        &self,
+        public_name: &str,
+    ) -> Option<ResolvedToolEffect> {
+        self.workspace_effects_by_public_name
+            .get(public_name)
+            .copied()
     }
 
     pub(crate) async fn call_tool_by_mcp_name(
@@ -1896,12 +1952,21 @@ fn build_agent_binding_mcp_bundle(
                 "agent_binding_provider_resolution_failed",
             )
         })?;
+    let workspace_effects_by_public_name = workspace_effects_by_public_name(&resolved_snapshot)
+        .map_err(|error| {
+            mcp_error(
+                StatusCode::BAD_GATEWAY,
+                error,
+                "agent_binding_provider_resolution_failed",
+            )
+        })?;
     let agent_binding_mcp = Arc::new(AgentBindingMcpRuntime {
         server_name: tool_namespace,
         endpoint_url: endpoint_url.to_string(),
         authorization: authorization.to_string(),
         tool_names_by_public_name: Arc::new(tool_names_by_public_name),
         resolved_snapshot: Arc::new(resolved_snapshot.clone()),
+        workspace_effects_by_public_name: Arc::new(workspace_effects_by_public_name),
         semantic_read_tools: Arc::new(semantic_read_tools),
         capability_source_config: None,
     });
@@ -1982,6 +2047,57 @@ mod tests {
 
         assert!(error.side_effects_maybe());
         assert!(error.is_timeout());
+    }
+
+    #[tokio::test]
+    async fn capability_source_rpc_redacts_private_references_before_error_consumers() {
+        use axum::response::IntoResponse;
+        let app = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(|axum::Json(request): axum::Json<Value>| async move {
+                let reference = request["params"]["capability"]["reference"]
+                    .as_str()
+                    .unwrap();
+                let message = format!("expired reference {reference}");
+                if request["params"]["raw_error"] == true {
+                    (StatusCode::BAD_GATEWAY, message).into_response()
+                } else {
+                    axum::Json(json!({"jsonrpc":"2.0", "id":request["id"],
+                        "error":{"code":-32602,"message":message}}))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let transport =
+            AgentBindingMcpRuntime::for_tests_at_endpoint("source", &["search"], &endpoint);
+        for (method, effectful) in [
+            ("astra/capabilities/describe", false),
+            ("astra/capabilities/read_skill", false),
+            ("astra/capabilities/invoke", true),
+        ] {
+            for reference in ["opaque-ref-private", "q"] {
+                for raw_error in [false, true] {
+                    let error = transport
+                        .capability_rpc(
+                            method,
+                            json!({"capability":{"reference":reference}, "raw_error":raw_error}),
+                            effectful,
+                        )
+                        .await
+                        .unwrap_err();
+                    assert!(!error.to_string().contains(reference));
+                    assert!(!error.to_string().contains(&endpoint));
+                    assert_eq!(error.side_effects_maybe(), effectful && raw_error);
+                    assert_eq!(error.provider_acknowledged, !raw_error);
+                }
+            }
+        }
+        server.abort();
     }
 
     #[test]

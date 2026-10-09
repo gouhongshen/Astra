@@ -230,33 +230,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(crate::server::delegation::handlers::resume_delegations_handler),
         )
         .route(
-            "/teams",
-            get(crate::server::team::handlers::list_teams_handler)
-                .post(crate::server::team::handlers::upsert_team_handler),
-        )
-        .route(
-            "/teams/{name}",
-            get(crate::server::team::handlers::get_team_handler)
-                .delete(crate::server::team::handlers::delete_team_handler),
-        )
-        .route(
-            "/teams/{name}/executions",
-            get(crate::server::team::handlers::list_executions_handler),
-        )
-        .route(
-            "/teams/{name}/execute",
-            post(crate::server::team::handlers::execute_team_handler),
-        )
-        .route(
-            "/teams/{name}/snapshots",
-            get(crate::server::team::handlers::list_snapshots_handler)
-                .post(crate::server::team::handlers::create_snapshot_handler),
-        )
-        .route(
-            "/teams/snapshots/{id}",
-            delete(crate::server::team::handlers::delete_snapshot_handler),
-        )
-        .route(
             "/chat/session/{session_id}/reflect",
             get(reflect_handlers::reflect_session_handler),
         )

@@ -8,9 +8,11 @@ mod common;
 
 use astra_services::tool_invocation_ledger::{
     DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission, ToolInvocationLedgerStoreError,
+    ToolInvocationPreparationProbe,
 };
 use astra_services::{
-    DatabaseSessionContextCoordinator, SessionExecutionBindingStateV1, SessionExecutionBindingV1,
+    BeginSessionExecutionSwitchV1, DatabaseSessionContextCoordinator,
+    SessionExecutionBindingStateV1, SessionExecutionBindingV1,
 };
 use astra_turn_types::{
     DispatchCertainty, DurableToolReference, SessionKeyV1, ToolInvocationCompletionSource,
@@ -579,6 +581,20 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
     assert_eq!(hot_rows, 2);
     for (identity, expected) in identities.iter().zip(&expected) {
         assert_eq!(ledger.get(identity).await.unwrap().as_ref(), Some(expected));
+        let ToolInvocationPreparationProbe::Missing(miss) = ledger
+            .probe_for_prepare(identity, &invocation_fingerprint)
+            .await
+            .unwrap()
+        else {
+            panic!("compacted invocation remained hot");
+        };
+        assert!(matches!(
+            ledger
+                .finish_prepare_after_miss(miss, &invocation_decision)
+                .await
+                .unwrap(),
+            ToolInvocationPrepareOutcome::Existing(record) if record == *expected
+        ));
         assert!(matches!(
             ledger
                 .prepare(identity, &invocation_fingerprint, &invocation_decision)
@@ -594,6 +610,22 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
                 &fingerprint("conflicting archived invocation"),
                 &invocation_decision,
             )
+            .await,
+        Err(ToolInvocationLedgerStoreError::IdentityConflict { .. })
+    ));
+    let ToolInvocationPreparationProbe::Missing(conflicting_miss) = ledger
+        .probe_for_prepare(
+            &identities[0],
+            &fingerprint("conflicting archived invocation"),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("compacted invocation remained hot");
+    };
+    assert!(matches!(
+        ledger
+            .finish_prepare_after_miss(conflicting_miss, &invocation_decision)
             .await,
         Err(ToolInvocationLedgerStoreError::IdentityConflict { .. })
     ));
@@ -641,8 +673,30 @@ async fn dispatch_fails_closed_when_the_work_provider_generation_is_stale() {
     let prefix = Uuid::new_v4().simple().to_string();
     let invocation = identity(&prefix, "stale-provider-generation");
     cleanup(&pool, &invocation).await;
-    let binding =
+    let mut binding =
         SessionExecutionBindingV1::server_work_default(format!("work:{prefix}:branch:main"));
+    binding.physical_workspace_id = Some(
+        SessionExecutionBindingV1::edge_materialization_physical_identity(
+            "source",
+            "/workspace/source",
+        ),
+    );
+    binding.workspace = astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+        display_name: None,
+        root: Some("/workspace/source".into()),
+        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+            path: "/workspace/source".into(),
+        }),
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    };
+    binding.executor = astra_services::runs::ExecutorBindingRequest {
+        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+        executor_id: Some("source-edge".into()),
+        display_name: None,
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger),
+        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+    };
     sqlx::query(
         "INSERT INTO session_execution_bindings \
          (isolation_domain, owner_user_id, session_id, branch_id, generation, binding_json) \
@@ -670,12 +724,46 @@ async fn dispatch_fails_closed_when_the_work_provider_generation_is_stale() {
         &invocation.session_id,
         "main",
     );
+    let actor = astra_turn_types::ActorContextV1::owner_user(
+        &invocation.user_id,
+        "dispatch-generation-db-it",
+        astra_turn_types::ActorKindV1::Server,
+        astra_turn_types::SessionSurfaceV1::Server,
+        None,
+        astra_turn_types::AuthorityEpochsV1::default(),
+    );
+    let attachment = common::controller_attachment(&shared, &key, actor).await;
     let mut switching = binding.clone();
     switching.generation = 2;
     switching.state = SessionExecutionBindingStateV1::Switching;
+    switching.executor.executor_id = Some("target-edge".into());
+    switching.physical_workspace_id = Some(
+        SessionExecutionBindingV1::edge_materialization_physical_identity(
+            "target",
+            "/workspace/target",
+        ),
+    );
+    switching.workspace.root = Some("/workspace/target".into());
+    switching.workspace.source = Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+        path: "/workspace/target".into(),
+    });
     assert!(matches!(
         coordinator
-            .compare_and_swap_execution_binding(&key, 1, &switching)
+            .begin_execution_switch(
+                &key,
+                &BeginSessionExecutionSwitchV1 {
+                    request_id: "blocked-provider-switch".into(),
+                    operation_id: "blocked-provider-operation".into(),
+                    controller_attachment_id: attachment.attachment_id,
+                    expected_generation: 1,
+                    target: switching,
+                    source_evidence: json!({
+                        "schema_version": 1, "root": "/workspace/source", "head": "head",
+                        "tree": "tree", "object_format": "sha1", "reference": "main",
+                        "repository": "repo", "clean": true,
+                    }),
+                }
+            )
             .await,
         Err(astra_services::SessionContextCoordinatorError::ExecutionBindingBusy)
     ));
@@ -698,6 +786,8 @@ async fn dispatch_fails_closed_when_the_work_provider_generation_is_stale() {
         .await
         .expect("the exact ready provider generation may dispatch");
     assert_eq!(dispatched.state, ToolInvocationState::Dispatched);
+    sqlx::query("DELETE FROM session_attachments WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'")
+        .bind(&invocation.user_id).bind(&invocation.session_id).execute(&pool).await.unwrap();
     cleanup(&pool, &invocation).await;
 }
 
@@ -956,6 +1046,135 @@ async fn dispatch_claim_atomically_orders_guidance_owner_and_invocation_state() 
         "only A's successful claim may leave an admission grant"
     );
 
+    cleanup(&pool, &first).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn split_prepare_reuses_one_initial_probe_and_keeps_transactional_winner() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let first = identity(&Uuid::new_v4().simple().to_string(), "split-call");
+    cleanup(&pool, &first).await;
+    insert_active_run(&pool, &first).await;
+    let ledger = DatabaseToolInvocationLedger::new(shared);
+    let original = fingerprint("inspect");
+    let original_decision = decision();
+    let competing_decision = named_decision("competing");
+
+    let ToolInvocationPreparationProbe::Missing(first_miss) =
+        ledger.probe_for_prepare(&first, &original).await.unwrap()
+    else {
+        panic!("fresh invocation already existed");
+    };
+    let ToolInvocationPreparationProbe::Missing(racing_miss) =
+        ledger.probe_for_prepare(&first, &original).await.unwrap()
+    else {
+        panic!("uncommitted invocation became visible");
+    };
+    assert!(matches!(
+        ledger
+            .finish_prepare_after_miss(first_miss, &original_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Prepared(_)
+    ));
+    assert!(matches!(
+        ledger
+            .finish_prepare_after_miss(racing_miss, &competing_decision)
+            .await
+            .unwrap(),
+        ToolInvocationPrepareOutcome::Existing(record)
+            if record.decision == original_decision
+    ));
+    assert!(matches!(
+        ledger.probe_for_prepare(&first, &original).await.unwrap(),
+        ToolInvocationPreparationProbe::Existing(record)
+            if record.decision == original_decision
+                && record.fingerprint.policy_decision_id == original_decision.decision_id
+    ));
+    assert!(matches!(
+        ledger
+            .probe_for_prepare(&first, &fingerprint("other"))
+            .await,
+        Err(ToolInvocationLedgerStoreError::IdentityConflict { .. })
+    ));
+
+    let parallel = identity(
+        first.user_id.strip_prefix("invocation-user-").unwrap(),
+        "parallel-call",
+    );
+    let ToolInvocationPreparationProbe::Missing(left) = ledger
+        .probe_for_prepare(&parallel, &original)
+        .await
+        .unwrap()
+    else {
+        panic!("parallel invocation already existed");
+    };
+    let ToolInvocationPreparationProbe::Missing(right) = ledger
+        .probe_for_prepare(&parallel, &original)
+        .await
+        .unwrap()
+    else {
+        panic!("parallel invocation already existed");
+    };
+    let (left_result, right_result) = tokio::join!(
+        ledger.finish_prepare_after_miss(left, &original_decision),
+        ledger.finish_prepare_after_miss(right, &competing_decision)
+    );
+    let results = [left_result.unwrap(), right_result.unwrap()];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|outcome| matches!(outcome, ToolInvocationPrepareOutcome::Prepared(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|outcome| matches!(outcome, ToolInvocationPrepareOutcome::Existing(_)))
+            .count(),
+        1
+    );
+    let authoritative = ledger.get(&parallel).await.unwrap().unwrap();
+    assert!(results.iter().all(|outcome| match outcome {
+        ToolInvocationPrepareOutcome::Prepared(record)
+        | ToolInvocationPrepareOutcome::Existing(record) => record == &authoritative,
+    }));
+
+    let closed = identity(
+        first.user_id.strip_prefix("invocation-user-").unwrap(),
+        "closed-after-probe",
+    );
+    let ToolInvocationPreparationProbe::Missing(closed_miss) =
+        ledger.probe_for_prepare(&closed, &original).await.unwrap()
+    else {
+        panic!("closing invocation already existed");
+    };
+    sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ? AND run_id = ?")
+        .bind(&first.user_id)
+        .bind(&first.run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        ledger
+            .finish_prepare_after_miss(closed_miss, &original_decision)
+            .await,
+        Err(ToolInvocationLedgerStoreError::RunNotExecutable { .. })
+    ));
+    let ToolInvocationPreparationProbe::Missing(closed_retry) =
+        ledger.probe_for_prepare(&closed, &original).await.unwrap()
+    else {
+        panic!("closed run unexpectedly acquired a hot invocation");
+    };
+    assert!(matches!(
+        ledger
+            .finish_prepare_after_miss(closed_retry, &original_decision)
+            .await,
+        Err(ToolInvocationLedgerStoreError::RunNotExecutable { .. })
+    ));
     cleanup(&pool, &first).await;
 }
 

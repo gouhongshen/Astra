@@ -4,9 +4,7 @@
 //!
 //! Key features:
 //! - User preferences (verbosity, language style, explicit tool blocks)
-//! - Scenario strategy selected by the LLM-produced [`TurnIntent`]
-//! - Config overrides per user
-//! - A/B experiment enrollment
+//! - Typed scenario state selected by the LLM-produced [`TurnIntent`]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,7 +15,6 @@ use astra_turn_types::{ObjectiveRelation, UserFeedback};
 use serde::{Deserialize, Serialize};
 
 use crate::lock_ext::RwLockExt;
-use crate::runtime_config::RuntimeConfig;
 
 // ─── User Profile ───────────────────────────────────────────────────────────
 
@@ -32,9 +29,6 @@ pub struct UserProfile {
 
     /// Scenario selected from the latest accepted typed turn intent.
     pub current_scenario: Option<Scenario>,
-
-    /// Active A/B experiments for this user.
-    pub active_experiments: Vec<String>,
 
     /// Profile creation time.
     pub created_at: SystemTime,
@@ -54,7 +48,6 @@ impl UserProfile {
             user_id: user_id.into(),
             preferences: UserPreferences::default(),
             current_scenario: None,
-            active_experiments: Vec::new(),
             created_at: now,
             updated_at: now,
             stats: UserStats::default(),
@@ -87,21 +80,6 @@ impl UserProfile {
             self.touch();
         }
     }
-
-    /// Enroll in an A/B experiment.
-    pub fn enroll_experiment(&mut self, experiment_id: impl Into<String>) {
-        let id = experiment_id.into();
-        if !self.active_experiments.contains(&id) {
-            self.active_experiments.push(id);
-            self.touch();
-        }
-    }
-
-    /// Leave an A/B experiment.
-    pub fn leave_experiment(&mut self, experiment_id: &str) {
-        self.active_experiments.retain(|id| id != experiment_id);
-        self.touch();
-    }
 }
 
 // ─── User Preferences ───────────────────────────────────────────────────────
@@ -121,10 +99,6 @@ pub struct UserPreferences {
     /// Response length preference.
     pub response_length: ResponseLength,
 
-    /// Runtime config overrides.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub config_overrides: HashMap<String, serde_json::Value>,
-
     /// Custom prompt additions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_prompt_suffix: Option<String>,
@@ -137,44 +111,17 @@ impl Default for UserPreferences {
             blocked_tools: Vec::new(),
             language_style: LanguageStyle::default(),
             response_length: ResponseLength::Medium,
-            config_overrides: HashMap::new(),
             custom_prompt_suffix: None,
         }
     }
 }
 
 impl UserPreferences {
-    /// Apply config overrides to a RuntimeConfig.
-    pub fn apply_to_config(&self, config: &mut RuntimeConfig) {
-        for (key, value) in &self.config_overrides {
-            apply_preference_override(config, key, value);
-        }
-    }
-
     /// Check if a tool is blocked.
     pub fn is_blocked_tool(&self, tool_name: &str) -> bool {
         self.blocked_tools
             .iter()
             .any(|t| t == tool_name || tool_name.starts_with(t))
-    }
-}
-
-/// Apply a single config override based on key path.
-fn apply_preference_override(config: &mut RuntimeConfig, key: &str, value: &serde_json::Value) {
-    match key {
-        "token_budget.max_prompt_tokens" => {
-            if let Some(v) = value.as_u64() {
-                config.token_budget.max_prompt_tokens = v as u32;
-            }
-        }
-        "token_budget.system_prompt_reserve" => {
-            if let Some(v) = value.as_u64() {
-                config.token_budget.system_prompt_reserve = v as u32;
-            }
-        }
-        _ => {
-            // Unknown key - log or ignore
-        }
     }
 }
 
@@ -562,6 +509,9 @@ pub struct TurnIntent {
     /// the canonical user message; this field supplies kind and target only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<UserFeedback>,
+    /// Optional observational signals for feedback analysis and future routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<astra_turn_types::TurnAssessment>,
     /// Whether the current turn requires, permits, or forbids workspace
     /// mutation. Defaults to `Unknown` so judge failures fail closed.
     #[serde(default)]
@@ -654,131 +604,6 @@ impl TurnIntent {
         self.workspace_mutation == WorkspaceMutationIntent::MustMutate
             && self.mutation_completion_scope.requires_workspace_receipt()
     }
-}
-
-impl Scenario {
-    /// Get suggested tool labels for this scenario.
-    pub fn suggested_tools(&self) -> Vec<&'static str> {
-        match self {
-            Scenario::CodeReview => vec!["read_file", "grep"],
-            Scenario::Debugging => vec!["bash", "read_file", "grep", "glob"],
-            Scenario::Exploration => vec!["glob", "grep", "read_file", "tool_search"],
-            Scenario::Planning => vec!["read_file", "write_file", "mo_query"],
-            Scenario::Implementation => vec!["str_replace", "write_file", "bash", "read_file"],
-            Scenario::Refactoring => vec!["str_replace", "read_file", "grep", "bash"],
-            Scenario::Testing => vec!["bash", "read_file", "str_replace", "write_file"],
-            Scenario::Documentation => vec!["read_file", "str_replace", "write_file"],
-            Scenario::DevOps => vec!["bash", "read_file", "str_replace", "write_file"],
-            Scenario::Learning => vec!["read_file", "grep", "web_search"],
-            Scenario::QuickAnswer => vec!["read_file", "grep"],
-            Scenario::BenchmarkComparison => Vec::new(),
-        }
-    }
-
-    /// Get strategy adjustments for this scenario.
-    pub fn strategy_hints(&self) -> ScenarioStrategy {
-        match self {
-            Scenario::CodeReview => ScenarioStrategy {
-                max_tools_per_turn: 80,
-                prefer_read_only: true,
-                detail_level: Verbosity::Verbose,
-                memory_top_k: Some(7),
-                verification_strictness: Some(0.7),
-            },
-            Scenario::Debugging => ScenarioStrategy {
-                max_tools_per_turn: 100,
-                prefer_read_only: false,
-                detail_level: Verbosity::Debug,
-                memory_top_k: Some(8),
-                verification_strictness: None,
-            },
-            Scenario::Exploration => ScenarioStrategy {
-                max_tools_per_turn: 100,
-                prefer_read_only: true,
-                detail_level: Verbosity::Normal,
-                memory_top_k: Some(10),
-                verification_strictness: None,
-            },
-            Scenario::Planning => ScenarioStrategy {
-                max_tools_per_turn: 60,
-                prefer_read_only: true,
-                detail_level: Verbosity::Verbose,
-                memory_top_k: None,
-                verification_strictness: None,
-            },
-            Scenario::Implementation => ScenarioStrategy {
-                max_tools_per_turn: 100,
-                prefer_read_only: false,
-                detail_level: Verbosity::Normal,
-                memory_top_k: None,
-                verification_strictness: Some(0.6),
-            },
-            Scenario::Refactoring => ScenarioStrategy {
-                max_tools_per_turn: 100,
-                prefer_read_only: false,
-                detail_level: Verbosity::Verbose,
-                memory_top_k: Some(7),
-                verification_strictness: Some(0.65),
-            },
-            Scenario::Testing => ScenarioStrategy {
-                max_tools_per_turn: 100,
-                prefer_read_only: false,
-                detail_level: Verbosity::Normal,
-                memory_top_k: None,
-                verification_strictness: Some(0.55),
-            },
-            Scenario::Documentation => ScenarioStrategy {
-                max_tools_per_turn: 60,
-                prefer_read_only: false,
-                detail_level: Verbosity::Verbose,
-                memory_top_k: None,
-                verification_strictness: None,
-            },
-            Scenario::DevOps => ScenarioStrategy {
-                max_tools_per_turn: 80,
-                prefer_read_only: false,
-                detail_level: Verbosity::Normal,
-                memory_top_k: None,
-                verification_strictness: Some(0.6),
-            },
-            Scenario::Learning => ScenarioStrategy {
-                max_tools_per_turn: 80,
-                prefer_read_only: true,
-                detail_level: Verbosity::Verbose,
-                memory_top_k: Some(10),
-                verification_strictness: None,
-            },
-            // QuickAnswer is intentionally the tightest profile in the set.
-            // The execution cap keeps short factual questions from drifting into
-            // long tool rounds without an explicit escalation.
-            Scenario::QuickAnswer => ScenarioStrategy {
-                max_tools_per_turn: 20,
-                prefer_read_only: true,
-                detail_level: Verbosity::Normal,
-                memory_top_k: Some(5),
-                verification_strictness: None,
-            },
-            Scenario::BenchmarkComparison => ScenarioStrategy {
-                max_tools_per_turn: 80,
-                prefer_read_only: true,
-                detail_level: Verbosity::Verbose,
-                memory_top_k: None,
-                verification_strictness: Some(0.6),
-            },
-        }
-    }
-}
-
-/// Strategy adjustments for a scenario.
-#[derive(Debug, Clone)]
-pub struct ScenarioStrategy {
-    pub max_tools_per_turn: usize,
-    pub prefer_read_only: bool,
-    pub detail_level: Verbosity,
-    /// Suggested memory retrieval top-k override (None = use default).
-    pub memory_top_k: Option<u32>,
-    /// Suggested verification strictness override (None = use default).
-    pub verification_strictness: Option<f64>,
 }
 
 // ─── User Stats ─────────────────────────────────────────────────────────────
@@ -989,21 +814,6 @@ mod tests {
         let profile = UserProfile::new("user123");
         assert_eq!(profile.user_id, "user123");
         assert!(profile.current_scenario.is_none());
-        assert!(profile.active_experiments.is_empty());
-    }
-
-    #[test]
-    fn test_experiment_enrollment() {
-        let mut profile = UserProfile::new("user123");
-        profile.enroll_experiment("exp-001");
-        profile.enroll_experiment("exp-002");
-        profile.enroll_experiment("exp-001"); // Duplicate
-
-        assert_eq!(profile.active_experiments.len(), 2);
-
-        profile.leave_experiment("exp-001");
-        assert_eq!(profile.active_experiments.len(), 1);
-        assert_eq!(profile.active_experiments[0], "exp-002");
     }
 
     #[test]
@@ -1127,16 +937,6 @@ mod tests {
     }
 
     #[test]
-    fn test_scenario_strategy() {
-        let strategy = Scenario::Debugging.strategy_hints();
-        assert_eq!(strategy.detail_level, Verbosity::Debug);
-        assert!(!strategy.prefer_read_only);
-
-        let strategy = Scenario::CodeReview.strategy_hints();
-        assert!(strategy.prefer_read_only);
-    }
-
-    #[test]
     fn test_user_stats() {
         let mut stats = UserStats::default();
         stats.record_tool_use("read_file");
@@ -1157,12 +957,12 @@ mod tests {
         let profile1 = store.get_or_create("user1");
         assert_eq!(profile1.user_id, "user1");
 
-        let mut modified = profile1.clone();
-        modified.enroll_experiment("exp1");
+        let mut modified = profile1;
+        modified.stats.record_tool_use("read_file");
         store.update(modified);
 
         let retrieved = store.get("user1").unwrap();
-        assert_eq!(retrieved.active_experiments.len(), 1);
+        assert_eq!(retrieved.stats.tool_usage.get("read_file"), Some(&1));
     }
 
     #[test]

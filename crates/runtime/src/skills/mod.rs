@@ -30,7 +30,7 @@
 // These are the standalone, service-independent types.
 pub use astra_skills::executor;
 pub use astra_skills::{
-    activation, arguments, composition, hooks, loader, manifest, pack, quality, traits, version,
+    activation, arguments, composition, hooks, loader, manifest, quality, traits, version,
 };
 
 // Re-export providers - note: BundledSkillProvider comes from both places,
@@ -54,12 +54,10 @@ pub use astra_skills::quality::{SkillOutcome, SkillQualityEntry, SkillQualityTra
 pub use astra_skills::traits::{SkillError, SkillExecutor, SkillProvider, SkillResolver};
 pub use astra_skills::version::{Dependency, Version, VersionConstraint};
 
-pub use astra_skills::improvement::{ImprovementProposal, ImprovementTracker, SkillImprovement};
 pub use astra_skills::providers::DatabaseSkillProvider;
-pub use astra_skills::verify::SkillVerifier;
 pub use registry::{
-    SharedSkillRegistry, SkillDiscoveryFailure, SkillDiscoveryReport, SkillHealthInputs,
-    UnifiedSkillRegistry, UnifiedSkillResolver,
+    SharedSkillRegistry, SkillDiscoveryFailure, SkillDiscoveryReport, UnifiedSkillRegistry,
+    UnifiedSkillResolver,
 };
 
 /// Returns a shared reference to a static empty `UnifiedSkillRegistry`.

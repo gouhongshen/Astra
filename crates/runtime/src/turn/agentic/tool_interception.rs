@@ -12,7 +12,7 @@ use astra_turn_core::tool::deferred_activation::{
 };
 
 use super::super::agentic_loop::host::{
-    AgenticLoopState, DELEGATE_TOOL_NAME, HostTurnResult, RejectedToolCall, ToolCallAdmission,
+    AgenticLoopState, HostTurnResult, RejectedToolCall, ToolCallAdmission,
 };
 
 pub(crate) const CONTROL_PLANE_TOOLS: &[&str] = &[
@@ -37,7 +37,6 @@ pub(crate) struct PreparedToolRound {
     pub(crate) runtime_control_calls_by_id: HashMap<String, RuntimeControlInvocationKind>,
     pub(crate) pre_resolved_results: Vec<HeadlessPreResolvedToolResult>,
     pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
-    pub(crate) communication_events: Vec<astra_messaging::AgentCommunicationEvent>,
 }
 
 /// Persist pre-execution admission rejections as exact terminal outcomes.
@@ -65,6 +64,12 @@ pub(crate) fn record_pre_execution_rejections(
             astra_turn_core::tool_result_semantics::ToolResultStatus::Failed,
         ));
         let structured_result = serde_json::from_str::<Value>(&rejected.result).ok();
+        let error_kind = structured_result
+            .as_ref()
+            .and_then(|value| value.get("error_kind"))
+            .and_then(Value::as_str)
+            .and_then(astra_core::ErrorKind::parse_tag)
+            .unwrap_or(astra_core::ErrorKind::ContractViolation);
         let rejection_detail = structured_result
             .as_ref()
             .and_then(|value| value.get("error"))
@@ -115,7 +120,7 @@ pub(crate) fn record_pre_execution_rejections(
             result_full: Some(rejected.result),
             round,
             start_offset_ms,
-            error_kind: Some(astra_core::ErrorKind::ContractViolation),
+            error_kind: Some(error_kind),
             disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
             ..Default::default()
         });
@@ -248,33 +253,74 @@ pub(crate) fn resolve_deferred_tool_admission<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    resolve_deferred_tool_admission_with_identity(
+    resolve_carrier_tool_admission_with_identity(
         admission,
         activations,
         current_schema_digest,
         |activation| activation.descriptor.is_some(),
+        |_, _| false,
     )
 }
 
-/// Resolve deferred carriers while requiring an additional host-owned
-/// descriptor identity proof. The ordinary resolver requires a bound
-/// descriptor; authenticated edge/server hosts use this variant to also
-/// compare that descriptor with the current offer so a same-name,
-/// same-schema tool cannot cross a sequential provider rebind.
-pub(crate) fn resolve_deferred_tool_admission_with_identity<F, G>(
+/// Resolve the one carrier protocol against either explicit deferred
+/// selection evidence or a currently visible resident tool. Resident targets
+/// are still re-admitted by the ordinary logical-tool path; this only avoids
+/// requiring a needless `tool_search` round for the ordinary resident shape.
+/// Advanced arguments still require current selection evidence.
+pub(crate) fn resolve_carrier_tool_admission_with_identity<F, G, H>(
     mut admission: ToolCallAdmission,
     activations: &[DeferredToolActivation],
     current_schema_digest: F,
     descriptor_is_current: G,
+    resident_tool_is_current: H,
 ) -> ToolCallAdmission
 where
     F: Fn(&str) -> Option<String>,
     G: Fn(&DeferredToolActivation) -> bool,
+    H: Fn(&str, &Value) -> bool,
 {
     let mut retained = Vec::with_capacity(admission.admitted.len());
     for invocation in admission.admitted.drain(..) {
         if invocation.runtime_control_kind().is_some() {
             retained.push(invocation);
+            continue;
+        }
+        let resident_target = if astra_turn_core::tool::args::shape::tool_call_name(
+            invocation.physical_provider_call(),
+        ) == Some(
+            astra_turn_core::tool::deferred_activation::DEFERRED_TOOL_INVOCATION_CARRIER,
+        ) {
+            astra_turn_core::tool::args::shape::parse_tool_call_arguments(
+                invocation.physical_provider_call(),
+            )
+            .ok()
+            .and_then(|args| {
+                astra_turn_core::tool::deferred_activation::parse_deferred_tool_invocation(&args)
+                    .ok()
+            })
+            .map(|target| (target.name, target.arguments))
+        } else {
+            None
+        };
+        if resident_target
+            .as_ref()
+            .is_some_and(|(name, arguments)| resident_tool_is_current(name, arguments))
+        {
+            match astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::resident_from_carrier(
+                invocation.physical_provider_call(),
+            ) {
+                Ok(resolved) => retained.push(resolved),
+                Err(error) => admission.rejected.push(RejectedToolCall {
+                    invocation,
+                    result: serde_json::json!({
+                        "status": "rejected",
+                        "error_kind": "deferred_tool_activation_invalid",
+                        "retryable": true,
+                        "error": error.as_str(),
+                    })
+                    .to_string(),
+                }),
+            }
             continue;
         }
         match astra_turn_core::tool::deferred_activation::canonicalize_deferred_tool_invocation(
@@ -558,21 +604,6 @@ pub(crate) fn effective_runtime_allowed_tools(state: &AgenticLoopState) -> Optio
 }
 
 pub(crate) fn runtime_allows_tool(state: &AgenticLoopState, tool_name: &str) -> bool {
-    if tool_name == "submit_task_resolution"
-        && !state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .is_some_and(|window| {
-                matches!(
-                    window.action,
-                    super::super::agentic_loop::host::CompletionAction::OutcomeReconciliation { .. }
-                )
-            })
-    {
-        return false;
-    }
     if !optional_tool_is_enabled(state, tool_name) {
         return false;
     }
@@ -697,11 +728,10 @@ fn intercept_disallowed_tool_calls(
 pub(crate) async fn try_prepare_intercepted_tool_round(
     state: &mut AgenticLoopState,
     turn_result: &HostTurnResult,
+    edge_tool_round: Vec<EdgeToolExecResult>,
     admitted_tool_calls: &[CanonicalToolInvocation],
     effective_tool_calls: &[Value],
     rejected_tool_calls: Vec<RejectedToolCall>,
-    delegation_intercepted: bool,
-    _valid_tool_names: &HashSet<String>,
 ) -> Result<PreparedToolRound, String> {
     let mut deferred_activations_by_call_id = admitted_tool_calls
         .iter()
@@ -761,38 +791,12 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
             logical_tool_calls.push(logical);
         }
     }
-    if !turn_result.accum.tool_calls.is_empty()
-        && (!physical_by_id.is_empty() || !logical_by_id.is_empty())
-    {
+    if !physical_by_id.is_empty() || !logical_by_id.is_empty() {
         return Err(format!(
             "intercepted tool round lost provider identities while restoring provider order: physical_leftovers={:?}, logical_leftovers={:?}",
             physical_by_id.keys().collect::<Vec<_>>(),
             logical_by_id.keys().collect::<Vec<_>>(),
         ));
-    }
-    // Unit-level callers without a provider transcript still exercise the
-    // interception layer. Production always has the provider order above;
-    // this fallback is deliberately confined to an absent transcript and
-    // preserves the caller's explicit disposition ordering.
-    if physical_tool_calls.is_empty() && !physical_by_id.is_empty() {
-        for call in admitted_tool_calls {
-            if let Some(id) = call.provider_call_id()
-                && let (Some(physical), Some(logical)) =
-                    (physical_by_id.remove(id), logical_by_id.remove(id))
-            {
-                physical_tool_calls.push(physical);
-                logical_tool_calls.push(logical);
-            }
-        }
-        for physical in &rejected_calls {
-            if let Some(id) = physical.get("id").and_then(Value::as_str)
-                && let (Some(physical), Some(logical)) =
-                    (physical_by_id.remove(id), logical_by_id.remove(id))
-            {
-                physical_tool_calls.push(physical);
-                logical_tool_calls.push(logical);
-            }
-        }
     }
     // Invalid provider identities cannot be matched to source order; their
     // canonical rejection still gets a terminal tool result, but never an
@@ -801,7 +805,6 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
     let (allowlist_blocked_tool_results, allowed_tool_calls) =
         intercept_disallowed_tool_calls(state, effective_tool_calls);
     let blocked_tool_results = allowlist_blocked_tool_results;
-    let communication_events = Vec::new();
     let SkillInterceptionResult {
         results: skill_results,
         surgically_removed_ids,
@@ -991,17 +994,6 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
     let mut runtime_control_calls_by_id = runtime_control_calls_by_id;
     runtime_control_calls_by_id.retain(|call_id, _| !surgically_removed_ids.contains(call_id));
 
-    let edge_tool_round = if delegation_intercepted {
-        turn_result
-            .edge_tool_round
-            .iter()
-            .filter(|r| r.tool != DELEGATE_TOOL_NAME)
-            .cloned()
-            .collect()
-    } else {
-        turn_result.edge_tool_round.clone()
-    };
-
     Ok(PreparedToolRound {
         physical_tool_calls,
         logical_tool_calls,
@@ -1009,7 +1001,6 @@ pub(crate) async fn try_prepare_intercepted_tool_round(
         runtime_control_calls_by_id,
         pre_resolved_results,
         edge_tool_round,
-        communication_events,
     })
 }
 
@@ -1020,17 +1011,14 @@ async fn prepare_intercepted_tool_round(
     admitted_tool_calls: &[CanonicalToolInvocation],
     effective_tool_calls: &[Value],
     rejected_tool_calls: Vec<RejectedToolCall>,
-    delegation_intercepted: bool,
-    valid_tool_names: &HashSet<String>,
 ) -> PreparedToolRound {
     try_prepare_intercepted_tool_round(
         state,
         turn_result,
+        Vec::new(),
         admitted_tool_calls,
         effective_tool_calls,
         rejected_tool_calls,
-        delegation_intercepted,
-        valid_tool_names,
     )
     .await
     .expect("test tool round has an exhaustive provider identity partition")
@@ -1363,6 +1351,11 @@ pub(crate) fn build_skill_context(
     });
 
     crate::turn::skill_tool::SkillContext {
+        read_only_execution: state.permission_context.as_ref().is_some_and(|context| {
+            context
+                .try_read()
+                .map_or(true, |guard| guard.inherited.read_only_execution)
+        }),
         session_id: state.current_session_id.clone(),
         session_dir,
         work_dir: state.hooks.workspace_root_hint.clone(),
@@ -1767,10 +1760,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_round_rejects_dispositions_missing_from_provider_batch() {
+        let calls = vec![json!({
+            "id": "call-unrequested",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{}"}
+        })];
+        let mut state = make_state();
+        let error = try_prepare_intercepted_tool_round(
+            &mut state,
+            &empty_host_turn_result(),
+            Vec::new(),
+            &ordinary_calls(&calls),
+            &calls,
+            Vec::new(),
+        )
+        .await
+        .err()
+        .expect("an admission disposition cannot create a provider request");
+        assert!(error.contains("call-unrequested"));
+        assert!(state.stall.tool_call_records.is_empty());
+    }
+
+    #[tokio::test]
     async fn malformed_arguments_are_returned_to_model_without_tool_execution() {
         let mut state = make_state();
         state.last_finish_reason = Some("length".to_string());
-        let turn_result = empty_host_turn_result();
         let calls = vec![json!({
             "id": "call-python",
             "type": "function",
@@ -1779,7 +1794,7 @@ mod tests {
                 "arguments": "{\"code\":\"from docx import Document"
             }
         })];
-        let valid_tool_names = HashSet::from(["python".to_string()]);
+        let turn_result = provider_host_turn_result(&calls);
         let admission = admit_tool_calls(&calls, state.last_finish_reason.as_deref());
 
         let prepared = prepare_intercepted_tool_round(
@@ -1788,8 +1803,6 @@ mod tests {
             &admission.admitted,
             &[],
             admission.rejected,
-            false,
-            &valid_tool_names,
         )
         .await;
 
@@ -1847,8 +1860,6 @@ mod tests {
             &[invocation],
             std::slice::from_ref(&call),
             Vec::new(),
-            false,
-            &HashSet::new(),
         )
         .await;
 
@@ -1907,8 +1918,6 @@ mod tests {
             &[deferred, direct],
             &logical,
             Vec::new(),
-            false,
-            &HashSet::from(["web_fetch".to_string(), "read_file".to_string()]),
         )
         .await;
 
@@ -1934,7 +1943,6 @@ mod tests {
     async fn policy_rejection_preserves_canonical_cause_and_arguments() {
         let mut state = make_state();
         state.step_recorder.begin_turn(1);
-        let turn_result = empty_host_turn_result();
         let rejected = RejectedToolCall::ordinary(
             json!({
                 "id": "call-web",
@@ -1953,16 +1961,12 @@ mod tests {
             .to_string(),
         );
 
-        let prepared = prepare_intercepted_tool_round(
-            &mut state,
-            &turn_result,
-            &[],
-            &[],
-            vec![rejected],
-            false,
-            &HashSet::new(),
-        )
-        .await;
+        let turn_result = provider_host_turn_result(std::slice::from_ref(
+            rejected.invocation.physical_provider_call(),
+        ));
+        let prepared =
+            prepare_intercepted_tool_round(&mut state, &turn_result, &[], &[], vec![rejected])
+                .await;
 
         assert_eq!(prepared.pre_resolved_results.len(), 1);
         let result: Value = serde_json::from_str(&prepared.pre_resolved_results[0].content)
@@ -2034,12 +2038,12 @@ mod tests {
 
         prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(std::slice::from_ref(
+                rejected.invocation.physical_provider_call(),
+            )),
             &[],
             &[],
             vec![rejected],
-            false,
-            &HashSet::new(),
         )
         .await;
 
@@ -2049,11 +2053,18 @@ mod tests {
         assert!(args_full.contains("[REDACTED:TOKEN_ARGUMENT]"));
     }
 
+    fn provider_host_turn_result(tool_calls: &[Value]) -> HostTurnResult {
+        let mut result = empty_host_turn_result();
+        result.accum.tool_calls = tool_calls.to_vec();
+        result.accum.has_tool_calls = !tool_calls.is_empty();
+        result
+    }
+
     fn empty_host_turn_result() -> HostTurnResult {
         HostTurnResult {
             accum: ChatTurnSseAccum::default(),
             ttft_ms: None,
-            edge_tool_round: Vec::new(),
+
             error_kind: None,
         }
     }
@@ -2099,6 +2110,16 @@ mod tests {
             !ctx.extra.contains_key("turns_remaining"),
             "skill prompts must not gain completion authority from runtime budget telemetry"
         );
+    }
+
+    #[test]
+    fn skill_context_inherits_read_only_child_ceiling() {
+        let mut state = make_state();
+        let mut permissions = astra_turn_core::permission::types::InheritedPermissions::default();
+        permissions.read_only_execution = true;
+        state.permission_context =
+            Some(astra_turn_core::permission::types::PermissionSyncContext::shared(permissions));
+        assert!(build_skill_context(&state).read_only_execution);
     }
 
     #[test]
@@ -2250,12 +2271,10 @@ mod tests {
         ];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["bash".to_string(), "str_replace".to_string()]),
         )
         .await;
 
@@ -2309,17 +2328,10 @@ mod tests {
         ];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from([
-                "session".to_string(),
-                "notify".to_string(),
-                "ask_user".to_string(),
-                "str_replace".to_string(),
-            ]),
         )
         .await;
 
@@ -2353,12 +2365,10 @@ mod tests {
         })];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["session".to_string(), "bash".to_string()]),
         )
         .await;
 
@@ -2396,12 +2406,10 @@ mod tests {
         })];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["bash".to_string()]),
         )
         .await;
 
@@ -2433,12 +2441,10 @@ mod tests {
         ];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["bash".to_string(), "read_file".to_string()]),
         )
         .await;
 
@@ -2474,12 +2480,10 @@ mod tests {
 
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["bash".to_string(), "read_file".to_string()]),
         )
         .await;
 
@@ -2518,12 +2522,10 @@ mod tests {
         })];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["bash".to_string()]),
         )
         .await;
 
@@ -2553,12 +2555,10 @@ mod tests {
         })];
         let prepared = prepare_intercepted_tool_round(
             &mut state,
-            &empty_host_turn_result(),
+            &provider_host_turn_result(&tool_calls),
             &ordinary_calls(&tool_calls),
             &tool_calls,
             Vec::new(),
-            false,
-            &HashSet::from(["bash".to_string()]),
         )
         .await;
 
@@ -2818,6 +2818,52 @@ mod tests {
             Some("web_fetch")
         );
 
+        let resident = super::resolve_carrier_tool_admission_with_identity(
+            super::admit_tool_calls(
+                &[json!({
+                    "id": "resident-carrier",
+                    "type": "function",
+                    "function": {
+                        "name": "invoke_tool",
+                        "arguments": r#"{"name":"agent","arguments":{"action":"wait"}}"#
+                    }
+                })],
+                Some("tool_calls"),
+            ),
+            &[],
+            |_| None,
+            |_| true,
+            |name, arguments| name == "agent" && arguments == &json!({"action":"wait"}),
+        );
+        assert!(resident.rejected.is_empty());
+        assert_eq!(resident.admitted.len(), 1);
+        assert_eq!(
+            astra_turn_core::tool::args::shape::tool_call_name(
+                resident.admitted[0].logical_target_call()
+            ),
+            Some("agent")
+        );
+
+        let unbound_resident = super::resolve_carrier_tool_admission_with_identity(
+            super::admit_tool_calls(
+                &[json!({
+                    "id": "unbound-resident-carrier",
+                    "type": "function",
+                    "function": {
+                        "name": "invoke_tool",
+                        "arguments": r#"{"name":"agent","arguments":{"action":"wait"}}"#
+                    }
+                })],
+                Some("tool_calls"),
+            ),
+            &[],
+            |_| None,
+            |_| true,
+            |_, _| false,
+        );
+        assert!(unbound_resident.admitted.is_empty());
+        assert_eq!(unbound_resident.rejected.len(), 1);
+
         // A matching compact digest is not an execution identity.  The
         // provider-owned descriptor must be present even when the schema has
         // not changed; otherwise a resumed/name-only projection could cross
@@ -2853,14 +2899,20 @@ mod tests {
 
         let stale = super::resolve_deferred_tool_admission(
             super::admit_tool_calls(
-                &[json!({
-                    "id": "carrier-2",
-                    "type": "function",
-                    "function": {
-                        "name": "invoke_tool",
-                        "arguments": r#"{"name":"web_fetch","arguments":{}}"#
-                    }
-                })],
+                &[
+                    json!({
+                        "id": "direct-2", "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"}
+                    }),
+                    json!({
+                        "id": "carrier-2",
+                        "type": "function",
+                        "function": {
+                            "name": "invoke_tool",
+                            "arguments": r#"{"name":"web_fetch","arguments":{}}"#
+                        }
+                    }),
+                ],
                 Some("tool_calls"),
             ),
             &[DeferredToolActivation {
@@ -2870,7 +2922,13 @@ mod tests {
             }],
             |_| Some("sha256:changed".to_string()),
         );
-        assert!(stale.admitted.is_empty());
+        assert_eq!(stale.admitted.len(), 1);
+        assert_eq!(stale.admitted[0].provider_call_id(), Some("direct-2"));
+        assert_eq!(
+            stale.admitted[0].physical_provider_call(),
+            stale.admitted[0].logical_target_call(),
+            "rejecting a stale carrier must preserve independent direct calls"
+        );
         assert_eq!(stale.rejected.len(), 1);
         assert_eq!(stale.rejected[0].provider_call_id(), "carrier-2");
         assert_eq!(

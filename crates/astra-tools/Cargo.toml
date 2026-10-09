@@ -7,6 +7,7 @@ publish = false
 description = "Tool execution library shared by the Astra CLI and server"
 
 [dependencies]
+astra-text-utils.workspace = true
 astra-core.workspace = true
 astra-memoria.workspace = true
 astra-prompts.workspace = true
@@ -19,6 +20,7 @@ regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+similar.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
 base64.workspace = true
@@ -57,6 +59,7 @@ which = "7"
 [dev-dependencies]
 serde_json.workspace = true
 serial_test = "3"
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
 wiremock = "0.6"
 

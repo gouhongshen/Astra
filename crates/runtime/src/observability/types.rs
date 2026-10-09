@@ -13,7 +13,6 @@ use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
 use astra_core::feedback::FeedbackSignal;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
-use astra_turn_core::decision_explainer::DecisionExplanation;
 
 pub struct ObservabilitySession {
     /// User ID for this session.
@@ -33,9 +32,6 @@ pub struct ObservabilitySession {
 
     /// Context assembly traces for this session.
     pub context_traces: Vec<ContextAssemblyTrace>,
-
-    /// Decision explanations for this session.
-    pub decision_explanations: Vec<DecisionExplanation>,
 
     /// Drift detector state.
 
@@ -63,30 +59,6 @@ pub struct ObservabilitySession {
     /// Fuzzy str_replace matching telemetry for this session.
     pub fuzzy_match_events: Vec<FuzzyMatchEvent>,
 
-    // ── Anti-flap dampening state ──
-    /// The turn at which the last scenario change occurred.
-    pub last_scenario_change_turn: Option<u32>,
-
-    /// Previous direction of per-turn token budget adjustments (+1 = increase, -1 = decrease).
-    /// Used to prevent oscillation.
-    pub last_token_budget_direction: i8,
-
-    /// Turn at which the last per-turn token budget change occurred.
-    pub last_token_budget_change_turn: Option<u32>,
-
-    /// Most recent [`StrategyApplication`] summary, if any, published into
-    /// observability for self-model rendering so the agent passively "knows"
-    /// what tool-surface surfaces were adjusted (blocked/boosted/widened).
-    ///
-    /// Reset lazily — it lingers until the next published strategy update.
-    pub last_strategy_application:
-        Option<crate::turn::agentic::strategy_application::StrategyApplication>,
-
-    /// Most recent [`GuardrailView`] snapshot published by the auto-reflection
-    /// path after adjusting the reflection threshold. Surfaced into the SelfModel
-    /// so the agent passively "knows" how sensitive it currently is.
-    pub last_guardrail_view: Option<crate::self_model::GuardrailView>,
-
     /// Cumulative permission-denial pressure published by the CLI-side
     /// `PermissionManager`. `None` when the CLI has not published yet (e.g.
     /// headless runtime). Surfaced into the SelfModel so the agent perceives
@@ -107,12 +79,6 @@ pub struct ObservabilitySession {
     /// Gap 5: short excerpts of user utterances that were detected as
     /// corrections. Newest at the back. Capped by the publisher.
     pub recent_correction_excerpts: Vec<String>,
-
-    /// Cumulative session-wide stall event count. Incremented once per
-    /// pipeline-detected stall via [`Self::record_stall_event`]. Used by
-    /// the session-end lesson extractor to emit `PromptShape` lessons
-    /// when the agent loops too often.
-    pub stall_event_count: u32,
 
     /// Gap 6: per-tool outcome bias currently applied as advisory health signal
     /// (`ToolHealthTracker::outcome_bias_by_tool`). Sorted by tool name.

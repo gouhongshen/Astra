@@ -44,11 +44,23 @@ const STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES: usize = 64_000;
 const RELIABLE_STREAM_EVENT_RESERVE: usize = 2;
 
 fn approval_unavailable_tool_output(reason: &str) -> String {
-    let (redacted, _) = astra_tools::credential_redaction::redact_credentials_for_display(reason);
+    let (redacted, _) =
+        astra_text_utils::credential_redaction::redact_credentials_for_display(reason);
     let reason = astra_text_utils::str_preview::truncate_line(&redacted, 240);
     format!(
         "Operation not executed: {reason}. Approval is unavailable in this execution context. Use an operation within the permitted scope, or report this blocker to the parent/user."
     )
+}
+
+fn rejected_tool_result_fields() -> Map<String, Value> {
+    Map::from_iter([
+        ("execution_started".to_string(), Value::Bool(false)),
+        (
+            "disposition".to_string(),
+            serde_json::to_value(ToolCallDisposition::Rejected)
+                .expect("tool disposition must serialize"),
+        ),
+    ])
 }
 
 pub(crate) fn agent_control_action(args: &Value) -> Option<&str> {
@@ -103,11 +115,10 @@ pub(crate) fn agent_id_from_output(output: &str) -> Option<String> {
         })
 }
 
-/// Execution may create a fanout group and still lose its launch response.
-/// Such a local result or server projection is transport evidence, not a
-/// semantic terminal: the owning host reconciles the same call from the group
-/// registry and emits the single authoritative completion. Ordinary tools and
-/// usable typed fanout receipts remain immediate.
+/// A fanout completion requires a typed control receipt. Transport delivery
+/// alone is not terminal evidence; Server owns execution settlement and emits
+/// the authoritative result. Ordinary tools and usable fanout receipts remain
+/// immediate display evidence.
 fn tool_completion_is_authoritative(tool: &str, output: &str) -> bool {
     tool != "agent_fanout"
         || astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_result_is_usable(
@@ -323,16 +334,45 @@ pub(crate) fn tool_output_event_text(_tool: &str, output: &str) -> String {
             "target_count",
             "transcript_location",
             "parent_run_id",
-            "agents",
             "fanout",
         ] {
             if let Some(value) = parsed.get(key) {
                 compact.insert(key.to_string(), value.clone());
             }
         }
+        for key in ["agents", "results"] {
+            if let Some(slots) = parsed.get(key).and_then(Value::as_array) {
+                let identities = slots
+                    .iter()
+                    .map(|slot| {
+                        let mut identity = Map::new();
+                        for field in [
+                            "id",
+                            "slot_index",
+                            "agent_id",
+                            "run_id",
+                            "status",
+                            "transcript_location",
+                        ] {
+                            if let Some(value) = slot.get(field) {
+                                identity.insert(field.to_string(), value.clone());
+                            }
+                        }
+                        if !identity.contains_key("status") {
+                            if let Some(status) = slot.pointer("/result/status") {
+                                identity.insert("status".to_string(), status.clone());
+                            }
+                        }
+                        Value::Object(identity)
+                    })
+                    .collect();
+                compact.insert(key.to_string(), Value::Array(identities));
+            }
+        }
         let mut rendered = Value::Object(compact.clone()).to_string();
         if rendered.len() > STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES {
             compact.remove("agents");
+            compact.remove("results");
             compact.remove("fanout");
             compact.insert(
                 "control_membership_omitted".to_string(),
@@ -604,7 +644,6 @@ fn normalized_fanout_start_status(event: &Value, output: &str) -> String {
         output,
     ) {
         Some(AgentFanoutControlReceiptKind::Group) => "completed".to_string(),
-        Some(AgentFanoutControlReceiptKind::SkippedBeforeAcceptance) => "skipped".to_string(),
         Some(
             AgentFanoutControlReceiptKind::RejectedBeforeAcceptance
             | AgentFanoutControlReceiptKind::ExecutionUnknown,
@@ -1187,18 +1226,10 @@ pub(crate) struct EdgeSseContext<'a> {
     pub ask_user_request_tx: Option<chat_stream::AskUserRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls in the SSE stream.
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
-    /// When true, this is a continuation turn after a skill has already produced output.
-    /// Text is buffered (not streamed) and thinking previews are suppressed to avoid
-    /// intermediate noise between skill iterations.
-    pub skill_continuation: bool,
     /// When true, the whole turn becomes a deterministic rollback-on-failure boundary.
     pub turn_rollback_on_failure: bool,
     /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
     pub tool_cache: &'a mut EdgeToolCache,
-    /// Optional ObservabilityHub for recording streaming-speculation metrics.
-    /// `None` for tests and non-observable contexts; production supplies it
-    /// from `CliAgenticLoopHost`.
-    pub observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Incremental turn snapshot mirrored during SSE consumption so forced
     /// cancellation can recover partial text, ids, usage, and tool audit data.
     pub incremental_state:
@@ -1236,9 +1267,6 @@ struct CliSseStreamHost<'a> {
     render_policy: RenderPolicy,
     perm_manager: Option<&'a mut crate::cli::permission_manager::PermissionManager>,
     render: StreamRenderState,
-    /// Once this turn has emitted or requested tool work, hide any further prose
-    /// so we don't flash an intermediate draft that will be invalidated.
-    tool_work_detected: bool,
     /// Ordered tool executions from this SSE stream.
     pub edge_tool_round: Vec<EdgeToolExecResult>,
     /// Server-owned tool calls are already executed remotely.  Keep only the
@@ -1262,11 +1290,6 @@ struct CliSseStreamHost<'a> {
         std::collections::HashMap<String, ServerToolTerminalFingerprint>,
     server_tool_protocol_error: Option<String>,
     server_tool_sequence: u64,
-    // ── XML tag suppression ────────────────────────────────────────────
-    /// Text accumulated while inside an open `<think>`/`<reflect>` tag.
-    /// Flushed (after stripping the tags) once the closing tag arrives.
-    /// Empty when not inside a tag — text goes directly to the renderer.
-    xml_tag_buffer: String,
     /// Optional cancellation token to abort SSE stream on auth failure.
     cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
     /// Optional channel for forwarding fine-grained stream events.
@@ -1308,7 +1331,7 @@ struct CliSseStreamHost<'a> {
     /// answer suffix in order. It is sent immediately before
     /// `AssistantOutputSettled`, allowing the TUI to reconcile a complete
     /// answer without duplicating the prefix that was already delivered.
-    deferred_token_projection: Option<String>,
+    deferred_token_projection: Option<std::collections::VecDeque<chat_stream::StreamEvent>>,
     /// Optional channel for async tool approval requests during plan execution.
     approval_request_tx: Option<chat_stream::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
@@ -1341,18 +1364,6 @@ struct CliSseStreamHost<'a> {
     turn_rollback_fired: Option<TurnRollbackFired>,
     /// Cross-turn tool output cache (shared with `CliAgenticLoopHost`).
     tool_cache: &'a mut EdgeToolCache,
-    /// Speculative streaming tool executor (D-9).
-    ///
-    /// When `ASTRA_STREAMING_TOOL_EXEC=1` is set, read-only tool_use blocks
-    /// that complete mid-stream are dispatched here via `on_tool_block` so
-    /// their I/O overlaps with the remaining LLM stream. After the stream
-    /// ends, results are harvested and merged so normal permission checks
-    /// and journal/observability events still fire exactly once in the
-    /// batch phase.
-    streaming_tool_exec:
-        Option<std::sync::Arc<astra_turn_core::streaming_tool_exec::StreamingToolExecutor>>,
-    /// Optional ObservabilityHub for streaming-speculation metric reporting.
-    observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Set when posting edge-side tool or approval results receives 401.
     auth_failure: bool,
     /// Terminal failure to acknowledge an edge control-plane callback after
@@ -1735,8 +1746,7 @@ impl<'a> CliSseStreamHost<'a> {
         render_md: bool,
         auth_profile: Option<&'a str>,
     ) -> Self {
-        let suppress_reasoning =
-            ctx.render_policy == RenderPolicy::Silent || ctx.skill_continuation;
+        let suppress_reasoning = ctx.render_policy == RenderPolicy::Silent;
         let active_turn_rollback = ctx.turn_rollback_on_failure.then(|| ActiveTurnRollback {
             turn_index: ctx
                 .executor
@@ -1748,21 +1758,6 @@ impl<'a> CliSseStreamHost<'a> {
             worktree_checkpoint: ctx.executor.git_worktree_journal_checkpoint(),
             session_state_checkpoint: ctx.executor.session_state_journal_checkpoint(),
         });
-        // Always buffer text from the start.  Text is accumulated in
-        // `xml_tag_buffer` and only rendered one-shot at finalization when
-        // it turns out to be the final answer (no tool calls).  This avoids
-        // two classes of leakage that ANSI-based `discard_and_reset()` cannot
-        // reliably fix:
-        //   1. Non-TTY (piped/redirected) — cursor movement has no effect.
-        //   2. TTY with interleaved stderr — tool status lines push the
-        //      cursor further than TerminalRegion tracks, so MoveUp(rows)
-        //      falls short and the first few text lines persist in
-        //      scrollback even after the "clear".
-        // Trade-off: streaming text display is deferred to finalization.
-        // The thinking spinner and tool status lines still stream normally,
-        // so the terminal is never blank during generation.
-        let buffer_from_start = true;
-        let streaming_tool_exec = build_streaming_tool_exec(std::sync::Arc::clone(&ctx.executor));
         Self {
             last_permission_selection: None,
             api: ctx.api,
@@ -1774,7 +1769,6 @@ impl<'a> CliSseStreamHost<'a> {
             render_policy: ctx.render_policy,
             perm_manager: ctx.perm_manager,
             render: StreamRenderState::with_term_width(term_width, render_md, suppress_reasoning),
-            tool_work_detected: buffer_from_start,
             edge_tool_round: Vec::new(),
             server_tool_calls: std::collections::HashMap::new(),
             server_tool_completed_ids: std::collections::HashSet::new(),
@@ -1783,7 +1777,6 @@ impl<'a> CliSseStreamHost<'a> {
             server_tool_completed_terminals: std::collections::HashMap::new(),
             server_tool_protocol_error: None,
             server_tool_sequence: 0,
-            xml_tag_buffer: String::new(),
             cancel_token: ctx.cancel_token,
             stream_event_tx: ctx.stream_event_tx,
             explain_analyze_enabled: false,
@@ -1809,8 +1802,6 @@ impl<'a> CliSseStreamHost<'a> {
             turn_rollback_boundary_emitted: false,
             turn_rollback_fired: None,
             tool_cache: ctx.tool_cache,
-            streaming_tool_exec,
-            observability_hub: ctx.observability_hub,
             auth_failure: false,
             callback_failure: None,
             callback_failure_run_id: None,
@@ -1818,23 +1809,6 @@ impl<'a> CliSseStreamHost<'a> {
             hard_failure_before_output: false,
             incremental_state: ctx.incremental_state,
             request_session_execution_lease: ctx.request_session_execution_lease,
-        }
-    }
-
-    /// Push text to the active renderer (markdown or raw stdout).
-    fn render_text(&mut self, s: &str) {
-        // Track output bytes for live token estimation
-        self.render.output_bytes = self.render.output_bytes.saturating_add(s.len());
-        if let Some(pane) = self.render.thinking_pane.take() {
-            let summary = pane.summary_line();
-            self.render.clear_thinking_with_summary(pane, &summary);
-        }
-        if let Some(md) = &mut self.render.md {
-            md.push(s);
-        } else {
-            stdout_print!("{s}");
-            let _ = crate::cli::stream::output_sink::flush_stdout();
-            self.render.track_output(s);
         }
     }
 
@@ -2059,61 +2033,13 @@ impl<'a> CliSseStreamHost<'a> {
         }
     }
 
-    /// Accept a text delta, suppressing content inside XML thinking tags.
-    /// Text outside tags is rendered immediately (preserving streaming UX).
-    /// Handles tags split across SSE chunks by holding back partial `<…` tails.
-    fn push_text(&mut self, s: &str) {
-        self.xml_tag_buffer.push_str(s);
-
-        // Fast path: no tag markers at all.
-        if !self.xml_tag_buffer.contains('<') {
-            let buf = std::mem::take(&mut self.xml_tag_buffer);
-            self.render_text(&buf);
-            return;
-        }
-
-        // Check if there's an open thinking tag.
-        if streaming_md::has_open_xml_tag(&self.xml_tag_buffer) {
-            // Still inside a tag — keep buffering, don't render.
-            return;
-        }
-
-        // Check for a potential incomplete thinking tag at the end of the buffer.
-        // Only hold back if the tail could plausibly become one of our known tags.
-        if let Some(last_lt) = self.xml_tag_buffer.rfind('<') {
-            let tail = &self.xml_tag_buffer[last_lt..];
-            if !tail.contains('>') && streaming_md::could_become_suppressed_tag(tail) {
-                // Potential partial tag — split: flush before, hold tail.
-                let before = self.xml_tag_buffer[..last_lt].to_string();
-                let held = self.xml_tag_buffer[last_lt..].to_string();
-                self.xml_tag_buffer = held;
-                if !before.is_empty() {
-                    let mut buf = before;
-                    streaming_md::strip_xml_tags_inplace(&mut buf);
-                    if !buf.is_empty() {
-                        self.render_text(&buf);
-                    }
-                }
-                return;
-            }
-        }
-
-        // Tag is closed (or there was never one).  Strip and flush.
-        let mut buf = std::mem::take(&mut self.xml_tag_buffer);
-        streaming_md::strip_xml_tags_inplace(&mut buf);
-        if !buf.is_empty() {
-            self.render_text(&buf);
-        }
-    }
-
-    fn cli_runtime_environment_advertisement(&self) -> Value {
+    fn cli_runtime_environment_advertisement(&self, tool: &str) -> Value {
         static REGISTRY: std::sync::OnceLock<astra_runtime_env::ToolRegistry> =
             std::sync::OnceLock::new();
         let registry = REGISTRY.get_or_init(astra_runtime_env::ToolRegistry::builtins);
-        let binding = astra_runtime_env::RunBinding::local_developer(
-            self.executor.project_root.to_string_lossy().to_string(),
-            registry,
-        );
+        let binding = self
+            .executor
+            .runtime_environment_binding_for_tool(tool, registry);
         serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
             binding,
         ))
@@ -2122,17 +2048,32 @@ impl<'a> CliSseStreamHost<'a> {
 
     fn tool_result_fields_with_cli_runtime(
         &self,
+        tool: &str,
         fields: Option<Map<String, Value>>,
     ) -> Map<String, Value> {
         let mut fields = fields.unwrap_or_default();
+        // MCP dispatch supplies the binding that admitted this invocation. A
+        // failed reconnect may have removed that route from the live manager.
         fields
             .entry("runtime_environment_advertisement".to_string())
-            .or_insert_with(|| self.cli_runtime_environment_advertisement());
+            .or_insert_with(|| self.cli_runtime_environment_advertisement(tool));
         fields
     }
 
     fn tool_result_identity(&self, request_id: &str) -> Option<ToolResultIdentity> {
         self.tool_result_identities.get(request_id).cloned()
+    }
+
+    fn callback_tool_belongs_to_foreground(&self, request_id: &str) -> bool {
+        self.last_bound_run_id
+            .as_deref()
+            .is_some_and(|root_run_id| {
+                self.tool_result_identities
+                    .get(request_id)
+                    .is_some_and(|identity| {
+                        !root_run_id.is_empty() && identity.run_id == root_run_id
+                    })
+            })
     }
 
     fn tool_result_request(
@@ -2186,9 +2127,11 @@ impl<'a> CliSseStreamHost<'a> {
         duration_ms: u64,
     ) -> EdgeToolExecResult {
         let (output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
         let typed_fields = tool_result_fields.as_ref();
-        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+        if self.callback_tool_belongs_to_foreground(request_id)
+            && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
+        {
             let output_summary = self
                 .render
                 .format_output_summary(tool, &output, &status)
@@ -2229,7 +2172,7 @@ impl<'a> CliSseStreamHost<'a> {
             }
         }
 
-        let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
+        let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool, tool_result_fields);
         let result = EdgeToolExecResult {
             execution_completion: None,
             request_id: request_id.to_string(),
@@ -2585,7 +2528,6 @@ impl<'a> CliSseStreamHost<'a> {
                     | "str_replace"
                     | "multi_edit"
                     | "rename_symbol"
-                    | "notebook_edit"
                     | "mo_query"
             )
     }
@@ -2961,13 +2903,16 @@ impl<'a> CliSseStreamHost<'a> {
         // output and extensible fields once before any side channel sees
         // them.
         let (output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&output);
-        let mut tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
+        let mut tool_result_fields =
+            self.tool_result_fields_with_cli_runtime(&req.tool, tool_result_fields);
         for value in tool_result_fields.values_mut() {
-            astra_tools::credential_redaction::redact_credentials_in_json(value);
+            astra_text_utils::credential_redaction::redact_credentials_in_json(value);
         }
 
-        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+        if self.callback_tool_belongs_to_foreground(&req.request_id)
+            && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
+        {
             let output_summary = self
                 .render
                 .format_output_summary(&req.tool, &output, status)
@@ -3336,30 +3281,6 @@ impl<'a> CliSseStreamHost<'a> {
     }
 }
 
-// `extract_first_absolute_path` moved to `crate::sandbox_retry`.
-
-/// D-9 correctness guard: decide whether a speculative result may be
-/// reused as-is in place of a real tool execution.
-///
-/// A speculative tool invocation returns `(output, success)`. A `success=false`
-/// outcome means the speculation **errored** (permission-denied mid-stream,
-/// tool panic surfaced as error string, bash non-zero exit, grep pattern not
-/// found reported as error, etc.). Silently substituting an errored output as
-/// if it were a successful tool_result causes the LLM to reason on an
-/// error-as-success and cascades into hallucinated next steps.
-///
-/// When `success=false`, callers must fall through to the normal execution
-/// path so the tool re-runs and the real outcome (success or genuine error)
-/// surfaces through the standard journal/observability pipeline.
-///
-/// Returns `Some(output)` only when the speculation was a genuine success.
-pub(crate) fn reusable_speculative_output(r: Option<(String, bool)>) -> Option<String> {
-    match r {
-        Some((output, true)) => Some(output),
-        _ => None,
-    }
-}
-
 impl CliSseStreamHost<'_> {
     fn effective_tool_cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
         self.active_execution_cancel
@@ -3369,7 +3290,18 @@ impl CliSseStreamHost<'_> {
 
     async fn emit_stream_event(&self, event: chat_stream::StreamEvent) {
         if let Some(tx) = &self.stream_event_tx {
-            if tx.send(event.clone()).await.is_err() {
+            let cancelled = async {
+                match self.cancel_token {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let sent = tokio::select! {
+                biased;
+                result = tx.send(event.clone()) => Some(result),
+                _ = cancelled => None,
+            };
+            if matches!(sent, Some(Err(_))) {
                 tracing::debug!("stream event receiver closed");
             }
         }
@@ -3464,11 +3396,21 @@ impl CliSseStreamHost<'_> {
     }
 
     fn try_emit_stream_observation(&mut self, event: chat_stream::StreamEvent) {
-        if let chat_stream::StreamEvent::Token(text) = event.clone() {
+        if let chat_stream::StreamEvent::Token {
+            model_item_id,
+            text,
+        } = &event
+        {
             if let Some(pending) = self.deferred_token_projection.as_mut() {
-                pending.push_str(&text);
+                match pending.back_mut() {
+                    Some(chat_stream::StreamEvent::Token {
+                        model_item_id: pending_id,
+                        text: pending_text,
+                    }) if pending_id == model_item_id => pending_text.push_str(text),
+                    _ => pending.push_back(event.clone()),
+                }
                 if let Some(sink) = &self.stream_event_sink {
-                    sink.send(chat_stream::StreamEvent::Token(text));
+                    sink.send(event);
                 }
                 return;
             }
@@ -3479,21 +3421,23 @@ impl CliSseStreamHost<'_> {
                 return;
             };
             if tx.capacity() <= RELIABLE_STREAM_EVENT_RESERVE {
-                self.deferred_token_projection = Some(text.clone());
+                self.deferred_token_projection =
+                    Some(std::collections::VecDeque::from([event.clone()]));
                 if let Some(sink) = &self.stream_event_sink {
-                    sink.send(chat_stream::StreamEvent::Token(text.clone()));
+                    sink.send(event);
                 }
                 return;
             }
-            match tx.try_send(chat_stream::StreamEvent::Token(text.clone())) {
+            match tx.try_send(event.clone()) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    self.deferred_token_projection = Some(text.clone());
+                    self.deferred_token_projection =
+                        Some(std::collections::VecDeque::from([event.clone()]));
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
             }
             if let Some(sink) = &self.stream_event_sink {
-                sink.send(chat_stream::StreamEvent::Token(text));
+                sink.send(event);
             }
             return;
         }
@@ -3917,72 +3861,6 @@ impl CliSseStreamHost<'_> {
         .await;
     }
 
-    /// D-9: Harvest speculative results for the upcoming concurrent batch.
-    ///
-    /// `wait_all()` is used so in-flight speculations finish before the
-    /// merge; the overall latency is still bounded by the stream itself
-    /// (the stream has already finished by the time this runs). Results
-    /// keyed by request_id are returned so the join_all closure can
-    /// short-circuit matching requests without re-executing.
-    async fn harvest_speculation_for_batch(
-        &self,
-        conc_reqs: &[(usize, &ToolBatchRequest)],
-    ) -> std::collections::HashMap<String, (String, bool)> {
-        let Some(exec) = self.streaming_tool_exec.as_ref() else {
-            return std::collections::HashMap::new();
-        };
-        // Use `merge_speculative` (not raw `wait_all`) so per-call-id hit
-        // counters and saved-ms metrics are updated for observability.
-        let ids: Vec<String> = conc_reqs
-            .iter()
-            .map(|(_, r)| r.request_id.clone())
-            .collect();
-        let (done, _needed) = exec.merge_speculative(&ids).await;
-        let mut out = std::collections::HashMap::new();
-        let mut reusable = 0usize;
-        let mut rejected_failure = 0usize;
-        for r in done {
-            if r.success {
-                reusable += 1;
-            } else {
-                // Speculation completed but failed — the reconciler will fall
-                // back to real execution (see `reusable_speculative_output`).
-                // Track this separately from `snapshot().wasted` so operators
-                // can distinguish "speculation errored" from "speculation
-                // never started" when diagnosing hit-rate drops.
-                rejected_failure += 1;
-            }
-            out.insert(r.call_id.clone(), (r.content.clone(), r.success));
-        }
-        // Per-batch reconciliation breakdown: complements the cumulative
-        // `astra::streaming_speculation::metrics` with this-batch counts so
-        // operators can correlate a specific turn's LLM-emitted batch against
-        // what actually came back from speculation. Target:
-        // `astra::streaming_speculation::batch`.
-        tracing::info!(
-            target: "astra::streaming_speculation::batch",
-            batch_size = conc_reqs.len(),
-            reusable = reusable,
-            rejected_failure = rejected_failure,
-            not_speculated = conc_reqs.len().saturating_sub(reusable + rejected_failure),
-            session_id = self.executor.active_session_id().as_deref().unwrap_or(""),
-            "speculation reconciliation for batch"
-        );
-        // Emit a structured metrics event once per batch merge so log
-        // aggregators / ObservabilityHub can track speculation effectiveness
-        // over time. Target: `astra::streaming_speculation::metrics`.
-        exec.emit_metrics_log(self.executor.active_session_id().as_deref())
-            .await;
-        if let Some(hub) = self.observability_hub.as_ref() {
-            let snap = exec.snapshot().await;
-            hub.record_streaming_speculation_metrics(&snap);
-            // Reset so each batch report is a delta; ObservabilityHub sums
-            // incoming reports additively.
-            exec.reset_metrics().await;
-        }
-        out
-    }
-
     fn pending_permission_selection(&self) -> bool {
         self.perm_manager.as_ref().is_some_and(|manager| {
             manager
@@ -4350,40 +4228,9 @@ fn sync_incremental_tool_result_state(
     incremental_state: &astra_turn_core::turn_event_sink::IncrementalTurnState,
     result: &EdgeToolExecResult,
 ) {
-    let is_failure = tool_result_status_is_failure(&result.status);
-    let error = is_failure.then(|| result.output.clone());
-    let fields = result.tool_result_fields.as_ref();
-    let error_kind = fields
-        .and_then(|fields| fields.get("error_kind"))
-        .and_then(Value::as_str)
-        .and_then(astra_core::ErrorKind::parse_tag);
-    let disposition = fields
-        .and_then(|fields| fields.get("disposition"))
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or(astra_services::session_journal::ToolCallDisposition::Executed);
-    let exit_semantics = fields
-        .and_then(|fields| fields.get("exit_semantics"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    let result_class = fields
-        .and_then(|fields| fields.get("result_class"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string);
-    incremental_state.push_tool_record(astra_services::session_journal::ToolCallRecord {
-        tool_call_id: Some(result.request_id.clone()),
-        name: result.tool.clone(),
-        ok: !is_failure,
-        ms: result.duration_ms,
-        error,
-        output_bytes: Some(result.output.len().min(u32::MAX as usize) as u32),
-        result_preview: Some(tool_output_event_text(&result.tool, &result.output)),
-        error_kind,
-        disposition: Some(disposition),
-        exit_semantics,
-        result_class,
-        ..Default::default()
-    });
+    incremental_state.push_tool_record(
+        astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(result),
+    );
     incremental_state.add_tool_used(&result.tool);
 }
 
@@ -4421,7 +4268,9 @@ async fn execute_server_budgeted(
         .unwrap_or_default();
     host.active_execution_cancel = Some(cancellation.clone());
     let result = {
-        let execution = host.execute_tool(&request.request_id, &request.tool, args);
+        let mut invocation_request = request.clone();
+        invocation_request.args = args.clone();
+        let execution = host.execute_tool(&invocation_request);
         tokio::pin!(execution);
         tokio::select! {
             result = &mut execution => result,
@@ -4442,7 +4291,8 @@ async fn settle_unexecuted_server_tool_result(
     host: &mut CliSseStreamHost<'_>,
     result: &mut EdgeToolExecResult,
 ) {
-    let fields = host.tool_result_fields_with_cli_runtime(result.tool_result_fields.take());
+    let fields =
+        host.tool_result_fields_with_cli_runtime(&result.tool, result.tool_result_fields.take());
     result.tool_result_fields = Some(fields.clone());
     host.edge_tool_round.push(result.clone());
     if let Some(body) = host.tool_result_request(
@@ -4478,6 +4328,23 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
+        if event.get("type").and_then(Value::as_str) == Some("tool_request") {
+            let read_only_execution = match event.get("read_only_execution") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => {
+                    return Err("tool_request read_only_execution must be a boolean".to_string());
+                }
+            };
+            if read_only_execution
+                && event
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+            {
+                return Err("read-only tool_request omitted request_id".to_string());
+            }
+        }
         if event.get("type").and_then(Value::as_str) == Some("permission_mode_applied") {
             let data = event.get("data").unwrap_or(event);
             let session_id = data.get("session_id").and_then(Value::as_str);
@@ -4759,8 +4626,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let changed = self.executor.active_session_id().as_deref() != Some(session_id);
         if changed {
             self.executor.set_active_session_id(session_id.to_string());
-            self.try_emit_stream_event(chat_stream::StreamEvent::SessionBound(session_id.into()));
         }
+        // The shared SSE consumer de-duplicates this stream's identity. A
+        // resumed executor already having the id does not bind a new observer.
+        self.try_emit_stream_event(chat_stream::StreamEvent::SessionBound(session_id.into()));
         if let Some(pm) = self.perm_manager.as_mut() {
             pm.set_active_session_id(session_id);
         }
@@ -4837,16 +4706,33 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         self.try_emit_stream_event(chat_stream::StreamEvent::AgentCommunication(event));
     }
 
-    fn on_agent_live_event(&mut self, event: astra_turn_core::agent_live_event::AgentLiveEvent) {
-        self.try_emit_stream_event(chat_stream::StreamEvent::AgentLive(event));
+    async fn on_agent_live_event(
+        &mut self,
+        event: astra_turn_core::agent_live_event::AgentLiveEvent,
+    ) {
+        if !event.requires_ordered_delivery() {
+            self.try_emit_stream_event(chat_stream::StreamEvent::AgentLive(event));
+        } else {
+            self.emit_stream_event(chat_stream::StreamEvent::AgentLive(event))
+                .await;
+        }
     }
 
-    fn on_agent_live_gap(&mut self, gap: astra_turn_core::agent_live_event::AgentLiveGap) {
-        self.try_emit_stream_event(chat_stream::StreamEvent::AgentLiveGap(gap));
+    async fn on_agent_live_gap(&mut self, gap: astra_turn_core::agent_live_event::AgentLiveGap) {
+        self.emit_stream_event(chat_stream::StreamEvent::AgentLiveGap(gap))
+            .await;
     }
 
-    fn on_server_tool_surface_admission(&mut self, tool: &str) -> Result<(), String> {
-        self.executor.accept_server_tool_surface_admission(tool)
+    fn on_server_tool_surface_admission(
+        &mut self,
+        request: &ToolBatchRequest,
+    ) -> Result<(), String> {
+        self.tool_result_identities.insert(
+            request.request_id.clone(),
+            ToolResultIdentity::from_batch_request(request),
+        );
+        self.executor
+            .accept_server_tool_surface_admission(&request.tool)
     }
 
     async fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
@@ -4855,14 +4741,22 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             use crate::cli::chat_stream::StreamEvent;
             for effect in &effects {
                 let ev = match effect {
-                    SseRenderEffect::StreamText(s) if !s.is_empty() => {
-                        Some(StreamEvent::Token(s.clone()))
-                    }
+                    SseRenderEffect::StreamText {
+                        model_item_id,
+                        text: s,
+                    } if !s.is_empty() => Some(StreamEvent::Token {
+                        model_item_id: model_item_id.clone(),
+                        text: s.clone(),
+                    }),
                     SseRenderEffect::StartThinkingSpinner => Some(StreamEvent::Thinking(true)),
                     SseRenderEffect::StopThinkingSpinner => Some(StreamEvent::Thinking(false)),
-                    SseRenderEffect::ThinkingPreviewChunk(s) if !s.is_empty() => {
-                        Some(StreamEvent::ThinkingChunk(s.clone()))
-                    }
+                    SseRenderEffect::ThinkingPreviewChunk {
+                        model_item_id,
+                        text: s,
+                    } if !s.is_empty() => Some(StreamEvent::ThinkingChunk {
+                        model_item_id: model_item_id.clone(),
+                        text: s.clone(),
+                    }),
                     _ => None,
                 };
                 if let Some(ev) = ev {
@@ -4881,10 +4775,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     match effect {
                         SseRenderEffect::StartThinkingSpinner => self.render.start_thinking(),
                         SseRenderEffect::StopThinkingSpinner => self.render.stop_thinking(),
-                        SseRenderEffect::ThinkingPreviewChunk(s) => {
+                        SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => {
                             self.render.push_thinking_preview_chunk(s);
                         }
-                        SseRenderEffect::StreamText(_) => {} // suppressed
+                        SseRenderEffect::StreamText { .. } => {} // suppressed
                     }
                 }
                 return;
@@ -4901,13 +4795,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     // the pane on every token.
                     let skip = policy == RenderPolicy::PlanDecompose
                         && i + 1 < effects.len()
-                        && matches!(&effects[i + 1], SseRenderEffect::StreamText(_));
+                        && matches!(&effects[i + 1], SseRenderEffect::StreamText { .. });
                     if !skip {
                         self.render.stop_thinking();
                     }
                     i += 1;
                 }
-                SseRenderEffect::StreamText(s) => {
+                SseRenderEffect::StreamText { .. } => {
                     if policy == RenderPolicy::PlanDecompose {
                         // Plan decompose mode: don't show the raw JSON body in
                         // the thinking preview.  Only genuine <thinking> content
@@ -4915,21 +4809,18 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         i += 1;
                         continue;
                     }
-                    // When tool_work_detected, buffer text instead of discarding.
-                    // It will be rendered at stream completion if it's the final answer.
-                    if self.tool_work_detected {
-                        self.xml_tag_buffer.push_str(s);
-                        i += 1;
-                        continue;
-                    }
-                    self.push_text(s);
+                    // The accumulator is the authoritative final-text carrier.
+                    // StreamText is deliberately not rendered here: tool turns
+                    // may replace the draft and final answer publication is
+                    // owned by the outer turn loop.
                     i += 1;
+                    continue;
                 }
                 SseRenderEffect::StartThinkingSpinner => {
                     self.render.start_thinking();
                     i += 1;
                 }
-                SseRenderEffect::ThinkingPreviewChunk(s) => {
+                SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => {
                     self.render.push_thinking_preview_chunk(s);
                     i += 1;
                 }
@@ -4947,20 +4838,26 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn on_tool_result(&mut self, result: &EdgeToolExecResult) {
-        self.sync_incremental_tool_result(result);
+        // The foreground snapshot belongs to one run, not every callback
+        // transported through its stream. Child results retain their own
+        // durable journal and AgentLive publication.
+        if self.callback_tool_belongs_to_foreground(&result.request_id) {
+            self.sync_incremental_tool_result(result);
+        }
     }
 
-    async fn execute_tool(
-        &mut self,
-        request_id: &str,
-        tool: &str,
-        args: &serde_json::Value,
-    ) -> EdgeToolExecResult {
+    async fn execute_tool(&mut self, request: &ToolBatchRequest) -> EdgeToolExecResult {
+        let request_id = request.request_id.as_str();
+        let tool = request.tool.as_str();
+        let args = &request.args;
         self.sync_permission_manager_session_id();
 
-        // Forward tool-started event to observer channel
+        // Child tool detail already arrives through the canonical AgentLive
+        // lane. Only an exact root callback can also be foreground UI.
         let tool_description = self.render.format_tool_description(tool, args);
-        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+        if self.callback_tool_belongs_to_foreground(request_id)
+            && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
+        {
             if tool == "agent"
                 && let Some(action) = agent_control_action(args)
             {
@@ -4989,33 +4886,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // tools are atomic and never emit progress. Cleanup (abort
         // ticker, clear sink) happens unconditionally at the bottom
         // of `execute_tool` via `_progress_guard`.
-        let _progress_guard = (tool == "bash").then(|| {
-            BashProgressGuard::install(&self.executor, tool, self.stream_event_tx.as_ref())
-        });
+        let _progress_guard = (tool == "bash"
+            && self.callback_tool_belongs_to_foreground(request_id))
+        .then(|| BashProgressGuard::install(&self.executor, tool, self.stream_event_tx.as_ref()));
 
-        // Clear text that was rendered or buffered BEFORE the first tool call
-        // (intermediate draft). After first tool, keep buffering new text.
-        if !self.tool_work_detected {
-            self.tool_work_detected = true;
-            // Discard any XML-tag-buffered text that was never rendered.
-            self.xml_tag_buffer.clear();
-
-            // Clear text that WAS already rendered (intermediate draft).
-            if let Some(md) = &mut self.render.md {
-                md.discard_and_reset();
-            } else if self.render.lines_written > 0 && io::stdout().is_terminal() {
-                let _ = crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
-                    execute!(
-                        stdout,
-                        cursor::MoveUp(self.render.lines_written as u16),
-                        cursor::MoveToColumn(0),
-                        terminal::Clear(terminal::ClearType::FromCursorDown)
-                    )
-                });
-                self.render.lines_written = 0;
-                self.render.col = 0;
-            }
-        }
         // `tool_request` does not emit StopThinking; clear the thinking stderr line so it does
         // not fight the running-tool spinner (`\r` on the same fd).
         self.render.stop_thinking();
@@ -5114,9 +4988,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // the cloud approval gate (approval_required → user approved → tool_request).
         // This eliminates the double-prompt issue where the same operation requires
         // both cloud approval and local approval.
+        let read_only_execution = request.read_only_execution;
         let cloud_approved = self.cloud_pre_approved.remove(request_id);
 
-        let decision = if cloud_approved {
+        let decision = if read_only_execution {
+            match self.perm_manager.as_mut() {
+                Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_read_only_request(
+                    Some(&mut **pm),
+                    tool,
+                    args,
+                ),
+                None => crate::tool_safety_guard::ToolSafetyGuard::check_read_only_request(
+                    None, tool, args,
+                ),
+            }
+        } else if cloud_approved {
             crate::cli::permission_manager::GateOutcome::Allow
         } else {
             match self.perm_manager.as_mut() {
@@ -5461,14 +5347,23 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         dedup_key,
                     )
                 } else if let Some(resolver) = &self.skill_resolver {
-                    // D-9 dedup: discard any speculative execution tied to this call_id.
-                    if let Some(exec) = self.streaming_tool_exec.clone() {
-                        exec.discard(request_id).await;
-                    }
+                    let skill_context = self
+                        .perm_manager
+                        .as_ref()
+                        .map(|manager| {
+                            let inherited = manager.runtime_permission_context().inherited;
+                            astra_runtime::turn::skill_tool::SkillContext {
+                                read_only_execution: inherited.read_only_execution
+                                    || read_only_execution,
+                                ..Default::default()
+                            }
+                        })
+                        .unwrap_or_default();
                     let executed = astra_runtime::turn::skill_tool::execute_skill_inline(
                         resolver.as_ref(),
                         tool,
                         args,
+                        &skill_context,
                     )
                     .await;
                     let (skill_output, execution_topology, loaded) =
@@ -5502,17 +5397,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 } else {
                     "Error: skill resolver not available".to_string()
                 }
-            } else if tool == astra_runtime::turn::agentic_loop::host::DELEGATE_TOOL_NAME {
-                // Delegate calls must be intercepted by the agentic runtime.
-                // If a standalone delegate reaches edge execution, fail closed
-                // instead of manufacturing a success result.
-                if let Some(exec) = self.streaming_tool_exec.clone() {
-                    exec.discard(request_id).await;
-                }
-                "Error: delegate must be handled by the delegation runtime before \
-                 local tool execution. Use agent(action='spawn', description='...', \
-                 prompt='...', run_in_background=true) for direct agent spawning."
-                    .to_string()
             } else if tool == astra_turn_core::interaction_types::ASK_USER_TOOL_NAME {
                 self.ask_user_via_tui(args).await
             } else {
@@ -5527,6 +5411,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         .as_ref()
                         .map(|identity| identity.turn_chain_id.as_str()),
                     tool_call_id: Some(request_id),
+                    command_timeout_cap_ms: request.command_timeout_cap_ms,
                     ..Default::default()
                 };
                 let mut outcome = execute_with_invocation_metadata_responsive(
@@ -5541,6 +5426,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // authorization. On approval, temporarily expand the sandbox
                 // boundary and retry the tool.
                 if let Some(sandbox_msg) = normalize_sandbox_denied_outcome(&mut outcome) {
+                    tool_result_fields = outcome.tool_result_fields.clone();
                     if let Some(expand_dir) = self.sandbox_expansion_scope(args, &sandbox_msg) {
                         let execution_cancel = self.effective_tool_cancel_token();
                         if let Some(pm) = &mut self.perm_manager {
@@ -5751,11 +5637,16 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         } else {
             denied_output.unwrap_or_else(|| "Permission denied".to_string())
         };
+        if !allowed {
+            tool_result_fields
+                .get_or_insert_with(Map::new)
+                .extend(rejected_tool_result_fields());
+        }
         // The stream renderer emits ToolCompleted, tool_call_end, and the
         // callback request before the runtime's durable record pass.  Keep
         // those earlier lanes on the same executor-owned redacted value.
         let (sanitized_output, _) =
-            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+            astra_text_utils::credential_redaction::redact_credentials_for_display(&output);
         output = sanitized_output;
         let status = if !allowed || tool_execution_marked_error {
             "failed"
@@ -5825,7 +5716,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
 
         // Forward tool-completed event to observer channel
-        if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+        if self.callback_tool_belongs_to_foreground(request_id)
+            && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
+        {
             let output_summary = self
                 .render
                 .format_output_summary(tool, &output, &status)
@@ -5875,7 +5768,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.render
                 .tool_done(idx, tool, args, &status, duration_ms, &output);
         }
-        let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
+        let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool, tool_result_fields);
         self.edge_tool_round.push(EdgeToolExecResult {
             execution_completion: None,
             request_id: request_id.to_string(),
@@ -5942,12 +5835,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 reason: Some("approval requires run_id".to_string()),
             };
         };
-        // `resolve_cloud_approval` writes to stderr only. Never bump `lines_written` here:
-        // that counter drives stdout `MoveUp` when clearing streamed text before the first
-        // tool line; mixing in stderr line counts caused a large blank gap after prompts.
-        //
-        // Stop spinner/animation before prompting so inquire::Select renders
-        // cleanly and doesn't fight the running-tool spinner on stderr.
+        // Approval uses the TUI bottom pane, outside the streamed stdout text.
+        // Stop animations before handing off without changing `lines_written`,
+        // which only counts stdout rows for clearing streamed text.
         self.render.stop_tool_stderr_running();
         self.render.stop_tool_stdout_anim();
         self.render.stop_thinking();
@@ -6231,15 +6121,28 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Read-only tools hit the fast-path in check_nonblocking (SideEffect::Read → Allow).
         let mut all_allowed = true;
         for (_, req) in &conc_reqs {
-            let decision = match self.perm_manager.as_mut() {
-                Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_request(
-                    Some(&mut **pm),
-                    &req.tool,
-                    &req.args,
-                ),
-                None => crate::tool_safety_guard::ToolSafetyGuard::check_request(
-                    None, &req.tool, &req.args,
-                ),
+            let decision = if req.read_only_execution {
+                match self.perm_manager.as_mut() {
+                    Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_read_only_request(
+                        Some(&mut **pm),
+                        &req.tool,
+                        &req.args,
+                    ),
+                    None => crate::tool_safety_guard::ToolSafetyGuard::check_read_only_request(
+                        None, &req.tool, &req.args,
+                    ),
+                }
+            } else {
+                match self.perm_manager.as_mut() {
+                    Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                        Some(&mut **pm),
+                        &req.tool,
+                        &req.args,
+                    ),
+                    None => crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                        None, &req.tool, &req.args,
+                    ),
+                }
             };
             let ok = matches!(decision, crate::cli::permission_manager::GateOutcome::Allow);
             if !ok {
@@ -6272,7 +6175,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         for (i, (_, req)) in conc_reqs.iter().enumerate() {
             // Forward tool-started event.
             let desc = self.render.format_tool_description(&req.tool, &req.args);
-            if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+            if self.callback_tool_belongs_to_foreground(&req.request_id)
+                && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
+            {
                 if req.tool == "agent"
                     && let Some(action) = agent_control_action(&req.args)
                 {
@@ -6293,25 +6198,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     parent_tool_use_id: None,
                 })
                 .await;
-            }
-            // First-tool clearing (once per turn).
-            if !self.tool_work_detected {
-                self.tool_work_detected = true;
-                self.xml_tag_buffer.clear();
-                if let Some(md) = &mut self.render.md {
-                    md.discard_and_reset();
-                } else if self.render.lines_written > 0 && io::stdout().is_terminal() {
-                    let _ = crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
-                        execute!(
-                            stdout,
-                            cursor::MoveUp(self.render.lines_written as u16),
-                            cursor::MoveToColumn(0),
-                            terminal::Clear(terminal::ClearType::FromCursorDown)
-                        )
-                    });
-                    self.render.lines_written = 0;
-                    self.render.col = 0;
-                }
             }
             self.render.stop_thinking();
 
@@ -6349,15 +6235,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // process — previously each batch constructed its own `Semaphore::new(10)`,
         // which allowed 10·N concurrent tools when N batches overlapped.
         let sem = astra_turn_core::parallel_tool_exec::shared_tool_semaphore();
-        // D-9: harvest speculative results from mid-stream execution.
-        // Matching request_ids skip the normal dispatch and reuse the
-        // speculative output. Journal/observability still fire exactly
-        // once from the post-execution pass below.
-        // A server-owned `tool_request` is the authority that binds an
-        // immutable deadline. Speculation begins before that authority exists,
-        // so it must not execute this batch.
-        let speculative_by_id: std::collections::HashMap<String, (String, bool)> =
-            std::collections::HashMap::new();
         // Explicit-path sandbox expansion may require an interactive approval.
         // It therefore runs only through the per-invocation retry path below,
         // after that invocation's immutable deadline has been armed.
@@ -6367,6 +6244,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 .map(|(_, req)| {
                     let tool = req.tool.clone();
                     let args = req.args.clone();
+                    let command_timeout_cap_ms = req.command_timeout_cap_ms;
                     let request_id = req.request_id.clone();
                     let run_id = req.run_id.clone();
                     let turn_chain_id = req.turn_chain_id.clone();
@@ -6396,7 +6274,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             deadline_cancellation.cancel();
                         });
                     }
-                    let speculative = speculative_by_id.get(&req.request_id).cloned();
                     async move {
                         if expired_before_start {
                             return (
@@ -6414,50 +6291,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 ),
                                 0u64,
                             );
-                        }
-                        if let Some(output) = reusable_speculative_output(speculative) {
-                            return (
-                                crate::edge_tools::ToolExecutionOutcome {
-                                    output,
-                                    tool_result_fields: None,
-                                    is_error: false,
-                                },
-                                0u64,
-                            );
-                        }
-                        // ── Pre-tool hooks (global registry, no-op when empty) ──
-                        // Rewrites to inputs from pre-hooks are honored; a Block
-                        // decision short-circuits execution with a synthesized
-                        // error output so the model sees the reason.
-                        let mut effective_args = args.clone();
-                        if astra_turn_core::tool_hooks::global_has_hooks().await {
-                            let pre_ctx = astra_turn_core::tool_hooks::ToolHookContext::pre(
-                                &tool,
-                                args.clone(),
-                            )
-                            .with_call_id(&request_id);
-                            match astra_turn_core::tool_hooks::global_run_pre(&pre_ctx).await {
-                                astra_turn_core::tool_hooks::PreHookOutcome::Proceed {
-                                    final_input,
-                                } => {
-                                    effective_args = final_input;
-                                }
-                                astra_turn_core::tool_hooks::PreHookOutcome::Blocked {
-                                    hook_id,
-                                    reason,
-                                } => {
-                                    return (
-                                        crate::edge_tools::ToolExecutionOutcome {
-                                            output: format!(
-                                                "Tool blocked by hook '{hook_id}': {reason}"
-                                            ),
-                                            tool_result_fields: None,
-                                            is_error: true,
-                                        },
-                                        0u64,
-                                    );
-                                }
-                            }
                         }
                         // Capacity is process-wide, so another session may own every
                         // permit for an arbitrarily long tool.  Durable cancellation
@@ -6478,13 +6311,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             run_id: Some(&run_id),
                             turn_chain_id: Some(&turn_chain_id),
                             tool_call_id: Some(&request_id),
+                            command_timeout_cap_ms,
                             ..Default::default()
                         };
                         let exec = catch_tool_execution_panic(
                             execute_with_invocation_metadata_responsive(
                                 std::sync::Arc::clone(&executor),
                                 tool.clone(),
-                                effective_args.clone(),
+                                args,
                                 invocation,
                                 Some(cancel_token_for_tool.clone()),
                             ),
@@ -6497,29 +6331,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         // that delta incorrectly.  Bash receives the same
                         // token internally and must settle its child/post
                         // window before this batch future is dropped.
-                        let (outcome, dur) = exec.await;
-                        // ── Post-tool hooks (rewrite output if any hook requests it) ──
-                        if astra_turn_core::tool_hooks::global_has_hooks().await {
-                            let post_ctx = astra_turn_core::tool_hooks::ToolHookContext::post(
-                                &tool,
-                                effective_args.clone(),
-                                outcome.output.clone(),
-                            )
-                            .with_call_id(&request_id);
-                            let post =
-                                astra_turn_core::tool_hooks::global_run_post(&post_ctx).await;
-                            if post.final_output != outcome.output {
-                                return (
-                                    crate::edge_tools::ToolExecutionOutcome {
-                                        output: post.final_output,
-                                        tool_result_fields: outcome.tool_result_fields,
-                                        is_error: outcome.is_error,
-                                    },
-                                    dur,
-                                );
-                            }
-                        }
-                        (outcome, dur)
+                        exec.await
                     }
                 })
                 .collect::<Vec<_>>(),
@@ -6575,10 +6387,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 .saturating_sub(now_unix_ms)
                 .min(req.execution_timeout_ms);
             if remaining_execution_ms == 0 {
-                outputs[pos].0 = crate::edge_tools::ToolExecutionOutcome::error(
+                outputs[pos].0.output =
                     "Server-issued tool execution deadline expired before sandbox retry"
-                        .to_string(),
-                );
+                        .to_string();
+                outputs[pos].0.is_error = true;
                 outputs[pos].1 = 0;
                 continue;
             }
@@ -6595,9 +6407,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let args = req.args.clone();
             let sandbox_tool_key = format!("sandbox_expand:{tool}");
             let Some(expand_dir) = self.sandbox_expansion_scope(&args, &sandbox_msg) else {
-                outputs[pos].0 = crate::edge_tools::ToolExecutionOutcome::error(
-                    crate::sandbox_retry::sandbox_retry_no_expand_dir_output(&tool, &sandbox_msg),
-                );
+                outputs[pos].0.output =
+                    crate::sandbox_retry::sandbox_retry_no_expand_dir_output(&tool, &sandbox_msg);
+                outputs[pos].0.is_error = true;
                 continue;
             };
             let guard_args = serde_json::json!({
@@ -6699,10 +6511,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 continue;
             }
             if retry_cancel.is_cancelled() {
-                outputs[pos].0 = crate::edge_tools::ToolExecutionOutcome::error(
+                outputs[pos].0.output =
                     "Server-issued tool execution deadline expired before sandbox retry"
-                        .to_string(),
-                );
+                        .to_string();
+                outputs[pos].0.is_error = true;
                 outputs[pos].1 = 0;
                 continue;
             }
@@ -6722,6 +6534,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         run_id: Some(&req.run_id),
                         turn_chain_id: Some(&req.turn_chain_id),
                         tool_call_id: Some(&req.request_id),
+                        command_timeout_cap_ms: req.command_timeout_cap_ms,
                         ..Default::default()
                     },
                     Some(retry_cancel.clone()),
@@ -6739,7 +6552,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let output = outcome.output;
 
             // Forward tool-completed event.
-            if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
+            if self.callback_tool_belongs_to_foreground(&req.request_id)
+                && (self.stream_event_tx.is_some() || self.stream_event_sink.is_some())
+            {
                 let output_summary = self
                     .render
                     .format_output_summary(&req.tool, &output, status)
@@ -6803,7 +6618,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
 
             let tool_result_fields =
-                self.tool_result_fields_with_cli_runtime(outcome.tool_result_fields);
+                self.tool_result_fields_with_cli_runtime(&req.tool, outcome.tool_result_fields);
             let result = EdgeToolExecResult {
                 execution_completion: None,
                 request_id: req.request_id.clone(),
@@ -6852,134 +6667,6 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             .map(|r| r.expect("all tool result slots filled"))
             .collect()
     }
-
-    /// D-9: Harvest speculative results for the upcoming concurrent batch.
-    ///
-    /// `wait_all()` is used so in-flight speculations finish before the
-    /// merge; the overall latency is still bounded by the stream itself
-    /// (the stream has already finished by the time this runs). Results
-    /// keyed by request_id are returned so the join_all closure can
-    /// short-circuit matching requests without re-executing.
-    async fn on_tool_call_complete(&mut self, index: usize, tool_call: &Value) {
-        // D-9 speculative streaming hook.
-        //
-        // When `ASTRA_STREAMING_TOOL_EXEC=1` is set, a read-only tool_use
-        // block that completes mid-stream is dispatched to the shared
-        // `StreamingToolExecutor` so its I/O overlaps with the remaining
-        // SSE stream. Results are later harvested in `execute_tools_batch`
-        // and replace the normal dispatch for matching request_ids;
-        // permission / journal / observability events still fire exactly
-        // once from the batch phase.
-        let Some(exec) = self.streaming_tool_exec.clone() else {
-            return;
-        };
-        let Some(tool_name) = tool_call
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(|n| n.as_str())
-            .and_then(astra_core::canonical_names::normalize_name)
-        else {
-            return;
-        };
-        let tool_name = tool_name.to_string();
-        // Shell execution owns a workspace lease and a post-execution
-        // fingerprint.  Streaming speculation may be discarded by the
-        // renderer, which would otherwise abort the async wrapper while its
-        // blocking child keeps running.  Keep shell calls on the normal
-        // lifecycle-owned path; pure typed/read tools may still speculate.
-        if matches!(tool_name.as_str(), "bash" | "powershell") {
-            return;
-        }
-        let call_id = tool_call
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if call_id.is_empty() {
-            return;
-        }
-        let args = astra_turn_core::parallel_tool_exec::parse_tool_args(tool_call);
-        if !astra_turn_core::streaming_tool_exec::should_speculate(&tool_name, args.as_ref(), None)
-        {
-            return;
-        }
-        tracing::debug!(
-            target = "astra_cli::streaming_tool_exec",
-            tool = %tool_name,
-            call_id = %call_id,
-            "dispatching speculative execution"
-        );
-        let _ = exec
-            .on_tool_block(call_id, tool_name, tool_call.clone(), index)
-            .await;
-    }
-}
-
-/// Build the speculative streaming tool executor when enabled via env.
-///
-/// The returned executor is a background dispatcher that drives the
-/// shared `Arc<ToolExecutor>` off-thread. Each speculative task invokes
-/// `execute_with_metadata(tool_name, args)` and returns the output +
-/// error flag, matching the `ToolExecutorFn` signature used in
-/// `parallel_tool_exec`.
-fn build_streaming_tool_exec(
-    executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
-) -> Option<std::sync::Arc<astra_turn_core::streaming_tool_exec::StreamingToolExecutor>> {
-    // `tool_call` arrives before the server's durable `tool_request` lease.
-    // Executing it here would let an optional local latency optimization bypass
-    // deadline, approval, and callback authority.  Re-enable only when the
-    // speculative protocol carries the same immutable server lease.
-    if !astra_turn_core::streaming_tool_exec::streaming_tool_exec_enabled()
-        || !server_leased_speculation_supported()
-    {
-        return None;
-    }
-    let fn_exec: astra_turn_core::parallel_tool_exec::ToolExecutorFn =
-        std::sync::Arc::new(move |tc: Value| {
-            let executor = std::sync::Arc::clone(&executor);
-            Box::pin(async move {
-                let call_id = tc
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let tool_name = tc
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let args: Value = tc
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .map(|a| match a {
-                        Value::String(s) => {
-                            serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({}))
-                        }
-                        other => other.clone(),
-                    })
-                    .unwrap_or_else(|| serde_json::json!({}));
-                let outcome = execute_with_invocation_metadata_responsive(
-                    executor,
-                    tool_name.clone(),
-                    args,
-                    astra_tools::tool_engine::ToolInvocationMetadata {
-                        tool_call_id: Some(&call_id),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await;
-                (call_id, tool_name, outcome.output, true)
-            })
-        });
-    Some(std::sync::Arc::new(
-        astra_turn_core::streaming_tool_exec::StreamingToolExecutor::new(fn_exec),
-    ))
-}
-
-fn server_leased_speculation_supported() -> bool {
-    false
 }
 
 // ─── Turn result from one /chat/stream SSE stream ───────────────────────────────
@@ -7013,7 +6700,8 @@ pub(crate) struct TurnResult {
     pub(crate) pending_explain_analyze_snapshot: Option<chat_stream::StreamEvent>,
     /// Answer suffix held after token observation backpressure. It is emitted
     /// before `AssistantOutputSettled` by the Server-admission host.
-    pub(crate) deferred_token_projection: Option<String>,
+    pub(crate) deferred_token_projection:
+        Option<std::collections::VecDeque<chat_stream::StreamEvent>>,
 }
 
 impl Deref for TurnResult {
@@ -7152,7 +6840,7 @@ fn str_starts_with_any_prefix(text: &str, prefixes: &[&str]) -> bool {
 #[inline]
 fn tool_slow_warning_threshold_ms(tool: &str) -> u64 {
     match tool {
-        "bash" | "shell" | "shell_exec" | "run_build_test" => 60_000,
+        "bash" | "shell" | "shell_exec" => 60_000,
         _ => 30_000,
     }
 }
@@ -7684,7 +7372,7 @@ impl StreamRenderState {
         match tool {
             "mo_query" => summarize_mo_query_output(output).map(structural),
             "web_fetch" => summarize_web_fetch_output(output).map(structural),
-            "bash" | "shell" | "shell_exec" | "run_build_test" => {
+            "bash" | "shell" | "shell_exec" => {
                 if output.trim().is_empty() {
                     return None;
                 }
@@ -8182,7 +7870,7 @@ pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
                 return s;
             }
         }
-        "bash" | "shell" | "shell_exec" | "run_build_test" => {
+        "bash" | "shell" | "shell_exec" => {
             if let Some(rest) = description.strip_prefix("$ ") {
                 return magenta_bold_tool_prefix("$ ", rest);
             }
@@ -8257,18 +7945,8 @@ pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
                 return s;
             }
         }
-        "notebook_edit" => {
-            if let Some(s) = style_first_matching_prefix(description, &["Notebook edit: "]) {
-                return s;
-            }
-        }
         "reflect" => {
             if let Some(s) = style_first_matching_prefix(description, &["Reflecting: "]) {
-                return s;
-            }
-        }
-        "context_analysis" => {
-            if let Some(s) = style_first_matching_prefix(description, &["Context analysis: "]) {
                 return s;
             }
         }
@@ -8441,22 +8119,6 @@ async fn acquire_tool_permit_or_cancel(
     }
 }
 
-pub(crate) async fn execute_with_metadata_responsive(
-    executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
-    tool_name: String,
-    args: Value,
-    cancel_token: Option<tokio_util::sync::CancellationToken>,
-) -> crate::edge_tools::ToolExecutionOutcome {
-    execute_with_invocation_metadata_responsive(
-        executor,
-        tool_name,
-        args,
-        astra_tools::tool_engine::ToolInvocationMetadata::default(),
-        cancel_token,
-    )
-    .await
-}
-
 pub(crate) async fn execute_with_invocation_metadata_responsive(
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
     tool_name: String,
@@ -8475,9 +8137,7 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
     // The async Bash path owns the workspace pre/post observer and its
     // per-root lease. Keep it on this path even when the caller is the
     // responsive stream renderer; the shell itself is moved to a blocking
-    // worker by `bash_outcome_with_cancel_async`. The legacy synchronous
-    // helper cannot safely await that shared lease and would re-open the
-    // cross-session attribution race.
+    // worker by `bash_outcome_with_cancel_async`.
     if tool_name == "bash" {
         return executor
             .execute_with_invocation_metadata_cancelable(
@@ -8500,11 +8160,8 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
             .await;
     }
 
-    // The cancelable bash/powershell paths are sync work wrapped in an
-    // `async fn`, so we can call the sync core directly inside
-    // `spawn_blocking`. This avoids re-entering the runtime via
-    // `Handle::block_on` from a blocking-pool thread, which is fragile on
-    // `current_thread` runtimes and a well-known anti-pattern.
+    // Windows PowerShell uses a synchronous process core. Offload it without
+    // re-entering the async runtime from the blocking worker.
     let executor_for_blocking = std::sync::Arc::clone(&executor);
     let tool_for_blocking = tool_name.clone();
     let args_for_blocking = args.clone();
@@ -8520,12 +8177,14 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
     let admission_source_for_blocking = invocation.admission_source;
     let blocking_outcome = tokio::task::spawn_blocking(move || {
         let invocation_for_blocking = astra_tools::tool_engine::ToolInvocationMetadata {
-            task_resolution_authority: None,
+            admission_deadline: invocation.admission_deadline,
             run_id: run_id_for_blocking.as_deref(),
             turn_chain_id: turn_chain_id_for_blocking.as_deref(),
             tool_call_id: tool_call_id_for_blocking.as_deref(),
             admission_source: admission_source_for_blocking,
             expected_control_epoch: None,
+            command_timeout_cap_ms: invocation.command_timeout_cap_ms,
+            delegation_model_admission: None,
         };
         executor_for_blocking.execute_blocking_shell_tool(
             &tool_for_blocking,
@@ -8573,7 +8232,7 @@ fn is_agent_control_preview(preview: &str) -> bool {
 pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<&str>) -> String {
     let preview = args_preview.unwrap_or("");
     match name {
-        "bash" | "shell_exec" | "run_build_test" => format!("$ {preview}"),
+        "bash" | "shell_exec" => format!("$ {preview}"),
         "powershell" => format!("PS> {preview}"),
         "read_file" => format!("Reading: {preview}"),
         "write_file" => format!("Writing: {preview}"),
@@ -8608,18 +8267,11 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "introspect" => "Introspecting…".to_string(),
         "get_agent_info" => format!("Getting agent info: {preview}"),
         "reflect" => format!("Reflecting: \"{preview}\""),
-        "context_analysis" => format!("Context analysis: {preview}"),
         "run_chain" => format!("Running chain: {preview}"),
         "rollback_file_edits" => format!("Revert file edits: {preview}"),
         "rollback_database_snapshots" => format!("Revert DB snapshots: {preview}"),
         "send_message" => format!("Send message: {preview}"),
-        "diagnose" => format!("Diagnose: {preview}"),
         "env" => format!("Env: {preview}"),
-        "notebook_edit" => format!("Notebook edit: {preview}"),
-        "config" => format!("Config: {preview}"),
-        "brief" => format!("Brief: {preview}"),
-        "share_context" => format!("Share context: {preview}"),
-        "query_context" => format!("Query context: {preview}"),
         "adjust_config" => format!("Adjust config: {preview}"),
         "compress_context" => format!("Compress context: {preview}"),
         "rollback_session_state" => format!("Rollback session state: {preview}"),
@@ -8670,7 +8322,7 @@ fn apply_sse_render_effects(
     }
     for effect in effects {
         match effect {
-            SseRenderEffect::StreamText(s) => {
+            SseRenderEffect::StreamText { text: s, .. } => {
                 if let Some(md) = &mut render.md {
                     md.push(&s);
                 } else {
@@ -8681,7 +8333,9 @@ fn apply_sse_render_effects(
             }
             SseRenderEffect::StopThinkingSpinner => render.stop_thinking(),
             SseRenderEffect::StartThinkingSpinner => render.start_thinking(),
-            SseRenderEffect::ThinkingPreviewChunk(s) => render.push_thinking_preview_chunk(&s),
+            SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => {
+                render.push_thinking_preview_chunk(&s)
+            }
         }
     }
 }
@@ -8728,7 +8382,6 @@ pub(crate) async fn consume_turn_sse(
         host_edge_tool_round,
         mut md_renderer,
         lines_written,
-        _pending_xml_buffer,
         auth_failure,
         callback_failure,
         callback_failure_run_id,
@@ -8783,7 +8436,6 @@ pub(crate) async fn consume_turn_sse(
         }
         let lw = host.render.lines_written;
         let md = host.render.md.take();
-        let pending = std::mem::take(&mut host.xml_tag_buffer);
         let auth_failure = host.auth_failure;
         let callback_failure = host.callback_failure.clone();
         let callback_failure_run_id = host.callback_failure_run_id.clone();
@@ -8805,7 +8457,6 @@ pub(crate) async fn consume_turn_sse(
             host.edge_tool_round,
             md,
             lw,
-            pending,
             auth_failure,
             callback_failure,
             callback_failure_run_id,
@@ -8840,7 +8491,6 @@ pub(crate) async fn consume_turn_sse(
             Vec::new(),
             md,
             lw,
-            String::new(),
             false,
             None,
             None,
@@ -8889,10 +8539,7 @@ pub(crate) async fn consume_turn_sse(
     }
 
     // ─── Finalize incremental markdown ───────────────────────────────────
-    // With buffer_from_start=true, ALL text went to `xml_tag_buffer` during
-    // SSE consumption. No incremental text was rendered to stdout.
-    //
-    // Text rendering is now DEFERRED to the agentic loop via
+    // Text rendering is deferred to the agentic loop via
     // `host.render_final_text()`. This prevents text leakage when stop-hooks
     // or factual retries cause the loop to continue after a text-only turn.
     //
@@ -9052,6 +8699,10 @@ fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "mcp_result_tests.rs"]
+mod mcp_result_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         ApprovalMemoryAction, ChatTurnEdgePending, ChatTurnSseAccum, CliSseStreamHost,
@@ -9067,15 +8718,14 @@ mod tests {
         approval_unavailable_tool_output, catch_tool_execution_panic, dispatch_turn_event_block,
         durable_allow_was_acknowledged, edge_callback_detach_message, edge_callback_error_kind,
         edge_tool_is_cacheable_read, edge_tool_outcome_status,
-        execute_with_invocation_metadata_responsive, execute_with_metadata_responsive,
-        extract_cli_diff_block, file_content_sha256, finalize_cli_skill_execution,
-        format_terminal_tool_summary, format_tool_display_from_preview, is_edge_auth_failure,
-        merge_edge_tool_rounds, normalize_sandbox_denied_outcome, path_mtime_ms,
-        recorded_approval_decision, request_token_usage_from_accum, reusable_speculative_output,
-        sanitize_final_stream_text, server_context_window_policy_from_accum,
-        server_tool_completion_id, server_tool_completion_is_authoritative,
-        server_tool_completion_output, server_tool_completion_status,
-        server_tool_event_is_client_owned, server_tool_event_owner,
+        execute_with_invocation_metadata_responsive, extract_cli_diff_block, file_content_sha256,
+        finalize_cli_skill_execution, format_terminal_tool_summary,
+        format_tool_display_from_preview, is_edge_auth_failure, merge_edge_tool_rounds,
+        normalize_sandbox_denied_outcome, path_mtime_ms, recorded_approval_decision,
+        request_token_usage_from_accum, sanitize_final_stream_text,
+        server_context_window_policy_from_accum, server_tool_completion_id,
+        server_tool_completion_is_authoritative, server_tool_completion_output,
+        server_tool_completion_status, server_tool_event_is_client_owned, server_tool_event_owner,
         server_tool_event_requires_provenance, server_tool_start_fields, style_tool_description,
         sync_incremental_accum_state, sync_incremental_tool_result_state,
         terminal_output_failure_for_event, theme, tool_completion_icon,
@@ -9086,6 +8736,7 @@ mod tests {
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::cli::stream::streaming_md;
+    use astra_services::session_journal::ToolCallDisposition;
     use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
     use astra_turn_core::sse_stream_host::SseStreamHost;
     use astra_turn_core::turn_event_sink::IncrementalTurnState;
@@ -9104,6 +8755,85 @@ mod tests {
         assert!(output.contains("Git command crosses the allowed boundary"));
         assert!(output.contains("Approval is unavailable"));
         assert!(!output.contains("ghp_123456789012345678901234567890123456"));
+    }
+
+    #[tokio::test]
+    async fn server_read_only_tool_request_binds_an_immutable_local_ceiling() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut cache = EdgeToolCache::new(2);
+        let mut permissions = crate::cli::permission_manager::PermissionManager::new(true);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: Some(&mut permissions),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut cache,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+
+        // Both requests and DONE share a network chunk. The second exchange
+        // proves ordinary permission still works, rather than all writes being
+        // denied by a broken fixture or a leaked host-wide ceiling.
+        for read_only in [true, false] {
+            let marker = temp.path().join(format!("marker-{read_only}"));
+            let event = serde_json::json!({
+                "type": "tool_request", "session_id": "readonly-session",
+                "run_id": "readonly-run", "turn_chain_id": "readonly-chain",
+                "request_id": format!("readonly-write-{read_only}"),
+                "schema_admitted_by_server": true, "read_only_execution": read_only,
+                "execution_timeout_ms": 300000, "command_timeout_cap_ms": 30_000, "execution_deadline_unix_ms": 4102444800000u64,
+                "tool": "write_file", "args": {"path": marker, "content": "published"}
+            });
+            let wire = format!(
+                "data: {{\"type\":\"session_info\",\"session_id\":\"readonly-session\",\"run_id\":\"readonly-run\"}}\n\ndata: {event}\n\ndata: [DONE]\n\n"
+            );
+            let mut chunks = futures_util::stream::iter(vec![Ok::<_, String>(wire.into_bytes())]);
+            let (result, abort) = super::consume_sse_stream_cancellable(
+                &mut chunks,
+                &mut host,
+                std::time::Duration::from_secs(1),
+                None,
+                None,
+            )
+            .await;
+            assert!(abort.is_none(), "unexpected abort: {abort:?}");
+            assert_eq!(result.tool_results.len(), 1);
+            assert_eq!(marker.exists(), !read_only);
+            assert_eq!(
+                result.tool_results[0].status,
+                if read_only { "failed" } else { "completed" }
+            );
+        }
+
+        let malformed = serde_json::json!({
+            "type": "tool_request",
+            "request_id": "bad-authority",
+            "read_only_execution": "true"
+        });
+        assert!(host.on_accepted_sse_event(&malformed).await.is_err());
     }
 
     #[tokio::test]
@@ -9141,17 +8871,31 @@ mod tests {
                     approval_request_tx: None,
                     ask_user_request_tx: None,
                     skill_resolver: None,
-                    skill_continuation: false,
                     turn_rollback_on_failure: false,
                     tool_cache: &mut tool_cache,
-                    observability_hub: None,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
                 80,
                 false,
             );
-            let result = host.execute_tool("denied-git", "bash", &args).await;
+            host.tool_result_identities.insert(
+                "denied-git".to_string(),
+                ToolResultIdentity {
+                    session_id: "test-session".to_string(),
+                    run_id: "test-run".to_string(),
+                    turn_chain_id: "test-chain".to_string(),
+                    request_id: "denied-git".to_string(),
+                },
+            );
+            let result = host
+                .execute_tool(&parallel_batch_request(
+                    "direct",
+                    "denied-git",
+                    "bash",
+                    (args).clone(),
+                ))
+                .await;
             assert_eq!(result.status, "failed", "{}", result.output);
             assert!(
                 result.output.contains("Approval is unavailable"),
@@ -9163,6 +8907,33 @@ mod tests {
                 "{}",
                 result.output
             );
+            assert_eq!(
+                result
+                    .tool_result_fields
+                    .as_ref()
+                    .and_then(|fields| fields.get("execution_started")),
+                Some(&Value::Bool(false))
+            );
+            assert_eq!(
+                result
+                    .tool_result_fields
+                    .as_ref()
+                    .and_then(|fields| fields.get("disposition")),
+                Some(&Value::String("rejected".to_string()))
+            );
+            let fields = result.tool_result_fields.as_ref().unwrap();
+            assert_eq!(
+                ToolCallDisposition::from_execution_metadata(
+                    fields.get("disposition"),
+                    fields.get("execution_started").and_then(Value::as_bool),
+                    ToolCallDisposition::Executed,
+                ),
+                ToolCallDisposition::Rejected
+            );
+            let requests = server.received_requests().await.expect("requests");
+            let callback: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert_eq!(callback["tool_result_fields"]["execution_started"], false);
+            assert_eq!(callback["tool_result_fields"]["disposition"], "rejected");
         }
     }
 
@@ -9326,10 +9097,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -9422,10 +9191,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -9651,10 +9418,8 @@ mod tests {
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
-            observability_hub: None,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -10319,6 +10084,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_explain_analyze_fact_reaches_the_typed_stream_channel() {
+        let cancel = tokio_util::sync::CancellationToken::new();
         let server = MockServer::start().await;
         let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
         let workspace = tempdir().expect("workspace");
@@ -10333,16 +10099,14 @@ mod tests {
             executor,
             render_policy: RenderPolicy::Silent,
             perm_manager: None,
-            cancel_token: None,
+            cancel_token: Some(&cancel),
             stream_event_tx: Some(tx),
             stream_event_sink: None,
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
-            observability_hub: None,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -10397,7 +10161,10 @@ mod tests {
         // make the next short user turn appear to hang.
         for _ in 0..8 {
             fill_tx
-                .try_send(chat_stream::StreamEvent::Token("queued".into()))
+                .try_send(chat_stream::StreamEvent::Token {
+                    model_item_id: None,
+                    text: "queued".into(),
+                })
                 .expect("test queue accepts the saturation fixture");
         }
         let mut congested = event.clone();
@@ -10413,17 +10180,44 @@ mod tests {
             host.explain_analyze_observer_gap,
             "a dropped typed fact must retain an integrity marker outside the lossy queue"
         );
-        for _ in 0..8 {
-            assert!(matches!(
-                rx.recv().await,
-                Some(chat_stream::StreamEvent::Token(text)) if text == "queued"
-            ));
-        }
+        // Lifecycle facts must survive the same congestion that may sample
+        // Explain observations. Drain only after polling the terminal send.
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveTermination,
+        };
+        let terminal = AgentLiveEvent {
+            run_id: "child-run".into(),
+            agent_id: "child".into(),
+            kind: AgentLiveEventKind::AgentTerminated {
+                termination: AgentLiveTermination::Completed,
+                duration_ms: 10,
+                reason: None,
+            },
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(host.on_agent_live_event(terminal), async {
+                for _ in 0..8 {
+                    assert!(matches!(
+                        rx.recv().await,
+                        Some(chat_stream::StreamEvent::Token { text, .. }) if text == "queued"
+                    ));
+                }
+                assert!(
+                    matches!(rx.recv().await, Some(chat_stream::StreamEvent::AgentLive(event))
+                    if matches!(event.kind, AgentLiveEventKind::AgentTerminated { .. }))
+                );
+            });
+        })
+        .await
+        .expect("child terminal survives the full renderer channel");
 
         host.last_bound_run_id = Some("run-1".into());
         for _ in 0..8 {
             fill_tx
-                .try_send(chat_stream::StreamEvent::Token("queued".into()))
+                .try_send(chat_stream::StreamEvent::Token {
+                    model_item_id: None,
+                    text: "queued".into(),
+                })
                 .expect("test queue accepts the publication fixture");
         }
         let publication = astra_turn_types::ArtifactPublicationV1 {
@@ -10448,7 +10242,7 @@ mod tests {
         for _ in 0..8 {
             assert!(matches!(
                 rx.recv().await,
-                Some(chat_stream::StreamEvent::Token(text)) if text == "queued"
+                Some(chat_stream::StreamEvent::Token { text, .. }) if text == "queued"
             ));
         }
         host.on_sse_done(&ChatTurnSseAccum::default())
@@ -10480,7 +10274,10 @@ mod tests {
             .expect("the fixture is a canonical Explain Analyze fact");
         for _ in 0..8 {
             fill_tx
-                .try_send(chat_stream::StreamEvent::Token("queued".into()))
+                .try_send(chat_stream::StreamEvent::Token {
+                    model_item_id: None,
+                    text: "queued".into(),
+                })
                 .expect("test queue accepts the snapshot saturation fixture");
         }
         let canonical_accum = ChatTurnSseAccum {
@@ -10505,7 +10302,7 @@ mod tests {
         for _ in 0..8 {
             assert!(matches!(
                 rx.recv().await,
-                Some(chat_stream::StreamEvent::Token(text)) if text == "queued"
+                Some(chat_stream::StreamEvent::Token { text, .. }) if text == "queued"
             ));
         }
         host.on_sse_done(&canonical_accum)
@@ -10525,7 +10322,10 @@ mod tests {
         // `send().await` forever.
         for _ in 0..8 {
             fill_tx
-                .try_send(chat_stream::StreamEvent::Token("queued".into()))
+                .try_send(chat_stream::StreamEvent::Token {
+                    model_item_id: None,
+                    text: "queued".into(),
+                })
                 .expect("test queue accepts the final text fixture");
         }
         host.on_accepted_sse_event(&publication.to_wire())
@@ -10560,7 +10360,7 @@ mod tests {
         for _ in 0..8 {
             assert!(matches!(
                 rx.recv().await,
-                Some(chat_stream::StreamEvent::Token(text)) if text == "queued"
+                Some(chat_stream::StreamEvent::Token { text, .. }) if text == "queued"
             ));
         }
         host.on_sse_done(&ChatTurnSseAccum {
@@ -10576,16 +10376,40 @@ mod tests {
         ));
 
         for _ in 0..8 {
-            host.try_emit_stream_event(chat_stream::StreamEvent::Token("queued".into()));
+            host.try_emit_stream_event(chat_stream::StreamEvent::Token {
+                model_item_id: None,
+                text: "queued".into(),
+            });
         }
         host.render_policy = RenderPolicy::Stream;
         tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            host.on_render_effects(vec![SseRenderEffect::StreamText("answer".into())]),
+            host.on_render_effects(vec![SseRenderEffect::StreamText {
+                model_item_id: None,
+                text: "answer".into(),
+            }]),
         )
         .await
         .expect("full TUI queue must not block final text capture");
-        assert_eq!(host.xml_tag_buffer, "answer");
+        while fill_tx
+            .try_send(chat_stream::StreamEvent::StatusLine("queued".into()))
+            .is_ok()
+        {}
+        let delivery = host.on_agent_live_gap(astra_turn_core::agent_live_event::AgentLiveGap {
+            run_id: "child-run".into(),
+            agent_id: "child".into(),
+            dropped_event_count: 1,
+        });
+        tokio::pin!(delivery);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut delivery)
+                .await
+                .is_err()
+        );
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), delivery)
+            .await
+            .expect("cancellation releases reliable delivery to an unread UI");
     }
 
     #[test]
@@ -10608,7 +10432,10 @@ mod tests {
             "group_id": "review-group",
             "title": "Review",
             "target_count": 2,
-            "results": [{"result": "x".repeat(70_000)}],
+            "results": [{
+                "slot_index": 0, "agent_id": "a", "run_id": "run-a",
+                "result": {"status": "completed", "result": "x".repeat(70_000)}
+            }],
             "fanout": {
                 "group_id": "review-group",
                 "target_count": 2,
@@ -10634,7 +10461,10 @@ mod tests {
         assert_eq!(parsed["group_id"], "review-group");
         assert_eq!(parsed["target_count"], 2);
         assert_eq!(parsed["fanout"]["slots"].as_array().map(Vec::len), Some(2));
-        assert!(parsed.get("results").is_none());
+        assert_eq!(parsed["results"][0]["agent_id"], "a");
+        assert_eq!(parsed["results"][0]["run_id"], "run-a");
+        assert_eq!(parsed["results"][0]["status"], "completed");
+        assert!(parsed["results"][0].get("result").is_none());
         assert!(event.len() < 4_000, "compact envelope was too large");
     }
 
@@ -10940,13 +10770,14 @@ mod tests {
     async fn blocking_bash_execution_yields_to_runtime_ticks() {
         let dir = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(dir.path()));
-        let execution = execute_with_metadata_responsive(
+        let execution = execute_with_invocation_metadata_responsive(
             executor,
             "bash".to_string(),
             serde_json::json!({
                 "command": "sleep 0.2 && echo responsive",
                 "timeout": 2.0,
             }),
+            astra_tools::tool_engine::ToolInvocationMetadata::default(),
             None,
         );
         tokio::pin!(execution);
@@ -10974,7 +10805,7 @@ mod tests {
             crate::edge_tools::ToolExecutor::new(dir.path()).with_bash_detach_slot(slot),
         );
 
-        let execution = tokio::spawn(execute_with_metadata_responsive(
+        let execution = tokio::spawn(execute_with_invocation_metadata_responsive(
             executor,
             "bash".to_string(),
             serde_json::json!({
@@ -10984,6 +10815,7 @@ mod tests {
                 "command": "sleep 5",
                 "timeout": 30.0,
             }),
+            astra_tools::tool_engine::ToolInvocationMetadata::default(),
             None,
         ));
 
@@ -11073,14 +10905,6 @@ mod tests {
             astra_core::work_unit::WorkUnitObservationMode::Transition
         );
     }
-
-    // ── D-9 regression: speculative success flag must gate reuse ──
-    //
-    // Guards against the cascade bug where a speculative tool execution that
-    // failed (semaphore saturated, permission denied mid-stream, tool errored
-    // with non-empty error message) was silently reused as a successful
-    // tool_result because the consumer discarded `success` with `_ok`.
-    // See `reusable_speculative_output` for the fix rationale.
 
     #[test]
     fn edge_post_auth_failure() {
@@ -11231,10 +11055,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -11661,10 +11483,8 @@ mod tests {
                         approval_request_tx: Some(approval_tx),
                         ask_user_request_tx: None,
                         skill_resolver: None,
-                        skill_continuation: false,
                         turn_rollback_on_failure: false,
                         tool_cache: &mut tool_cache,
-                        observability_hub: None,
                         incremental_state: None,
                         request_session_execution_lease: None,
                     },
@@ -11736,10 +11556,8 @@ mod tests {
                 approval_request_tx: Some(approval_tx),
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -11829,10 +11647,8 @@ mod tests {
                 approval_request_tx: Some(approval_tx),
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -11904,10 +11720,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -11976,10 +11790,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -12043,10 +11855,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -12077,6 +11887,497 @@ mod tests {
         );
     }
 
+    // Hold real async memory calls at the existing cloud-proxy boundary. These
+    // gates observe executor dispatch, not a replacement batch executor.
+    struct ParallelBatchFixture {
+        callbacks: MockServer,
+        api: astra_thin_client::ThinClient,
+        memory_base: String,
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl ParallelBatchFixture {
+        async fn new() -> (
+            Self,
+            tokio::sync::mpsc::UnboundedReceiver<(String, tokio::sync::oneshot::Sender<()>)>,
+        ) {
+            let callbacks = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/tools/result"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})),
+                )
+                .mount(&callbacks)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&callbacks.uri(), None).unwrap();
+            let (tx, arrivals) = tokio::sync::mpsc::unbounded_channel();
+            let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed_peak = peak.clone();
+            let router = axum::Router::new().route(
+                "/memory/retrieve",
+                axum::routing::post(
+                    move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                        let tx = tx.clone();
+                        let active = active.clone();
+                        let peak = observed_peak.clone();
+                        async move {
+                            use std::sync::atomic::Ordering::SeqCst;
+                            assert_eq!(headers["authorization"], "Bearer tok");
+                            let query = body["query"].as_str().expect("recall query").to_owned();
+                            let current = active.fetch_add(1, SeqCst) + 1;
+                            peak.fetch_max(current, SeqCst);
+                            let (release, held) = tokio::sync::oneshot::channel();
+                            tx.send((query.clone(), release)).expect("arrival observer");
+                            let _ = held.await;
+                            active.fetch_sub(1, SeqCst);
+                            axum::Json(serde_json::json!({"memories": [{"content": query}]}))
+                        }
+                    },
+                ),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let memory_base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            (
+                Self {
+                    callbacks,
+                    api,
+                    memory_base,
+                    peak,
+                    server,
+                },
+                arrivals,
+            )
+        }
+
+        fn host<'a>(
+            &'a self,
+            workspace: &std::path::Path,
+            cache: &'a mut EdgeToolCache,
+            cancel: Option<&'a tokio_util::sync::CancellationToken>,
+        ) -> CliSseStreamHost<'a> {
+            let host = CliSseStreamHost::from_edge_ctx(
+                EdgeSseContext {
+                    api: &self.api,
+                    token: "tok",
+                    executor_id: "edge-test",
+                    executor: std::sync::Arc::new(
+                        crate::edge_tools::ToolExecutor::new(workspace)
+                            .with_cloud(&self.memory_base, "tok"),
+                    ),
+                    render_policy: RenderPolicy::Silent,
+                    perm_manager: None,
+                    cancel_token: cancel,
+                    stream_event_tx: None,
+                    stream_event_sink: None,
+                    approval_request_tx: None,
+                    ask_user_request_tx: None,
+                    skill_resolver: None,
+                    turn_rollback_on_failure: false,
+                    tool_cache: cache,
+                    incremental_state: None,
+                    request_session_execution_lease: None,
+                },
+                80,
+                false,
+            );
+            host.executor
+                .accept_server_tool_surface_admission("memory")
+                .expect("existing cloud memory binding accepts server admission");
+            host
+        }
+
+        async fn assert_settlements(
+            &self,
+            requests: &[ToolBatchRequest],
+            results: &[EdgeToolExecResult],
+        ) {
+            let received = self.callbacks.received_requests().await.unwrap();
+            let callbacks: Vec<astra_thin_client::ToolResultRequest> = received
+                .iter()
+                .map(|request| serde_json::from_slice(&request.body).unwrap())
+                .collect();
+            assert_eq!(results.len(), requests.len());
+            assert_eq!(
+                callbacks.len(),
+                requests.len(),
+                "every request settles once"
+            );
+            for (req, result) in requests.iter().zip(results) {
+                assert_eq!(
+                    result.request_id, req.request_id,
+                    "input order survives completion order"
+                );
+                assert_eq!(result.tool, req.tool);
+                assert_eq!(result.args, req.args);
+                if req.tool == "memory" && result.status == "completed" {
+                    let payload: Value = serde_json::from_str(&result.output)
+                        .expect("successful fixture recall returns JSON");
+                    assert_eq!(
+                        payload["memories"][0]["content"], req.args["query"],
+                        "recall payload belongs to its originating request"
+                    );
+                }
+                let matching: Vec<_> = callbacks
+                    .iter()
+                    .filter(|body| body.request_id == req.request_id)
+                    .collect();
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "exactly one callback for {}",
+                    req.request_id
+                );
+                let body = matching[0];
+                assert_eq!(body.session_id, req.session_id);
+                assert_eq!(body.run_id, req.run_id);
+                assert_eq!(body.turn_chain_id, req.turn_chain_id);
+                assert_eq!(body.edge_agent_id, "edge-test");
+                assert_eq!(body.status, result.status);
+                assert_eq!(body.output, result.output);
+                assert_eq!(body.tool_result_fields, result.tool_result_fields);
+            }
+        }
+    }
+
+    impl Drop for ParallelBatchFixture {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    fn parallel_batch_request(owner: &str, id: &str, tool: &str, args: Value) -> ToolBatchRequest {
+        ToolBatchRequest {
+            session_id: format!("batch-session-{owner}"),
+            run_id: format!("batch-run-{id}"),
+            turn_chain_id: format!("batch-chain-{id}"),
+            request_id: id.to_owned(),
+            read_only_execution: false,
+            execution_timeout_ms: 30_000,
+            command_timeout_cap_ms: (tool == "bash").then_some(30_000),
+            execution_deadline_unix_ms: u64::MAX,
+            tool: tool.to_owned(),
+            args,
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn server_bash_budget_does_not_change_invocation_arguments() {
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let workspace = tempdir().unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut requests = Vec::new();
+        let mut settled = Vec::new();
+        for (id, args) in [
+            ("default", serde_json::json!({"command": "sleep 10"})),
+            (
+                "explicit",
+                serde_json::json!({"command": "sleep 10", "timeout": 90}),
+            ),
+        ] {
+            let mut request = parallel_batch_request("budget", id, "bash", args.clone());
+            request.command_timeout_cap_ms = Some(200);
+            host.on_server_tool_surface_admission(&request).unwrap();
+            let results = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                host.execute_tools_batch(vec![request.clone()]),
+            )
+            .await
+            .expect("command cap ends execution before delivery deadline");
+            assert_eq!(results.len(), 1);
+            let result = &results[0];
+            assert!(result.output.contains("timed out"), "{}", result.output);
+            assert_eq!(result.args, args);
+            assert_eq!(request.args, args);
+            requests.push(request);
+            settled.extend(results);
+        }
+        fixture.assert_settlements(&requests, &settled).await;
+    }
+
+    fn parallel_recall(owner: &str, id: &str) -> ToolBatchRequest {
+        parallel_batch_request(
+            owner,
+            id,
+            "memory",
+            serde_json::json!({
+                "action": "recall", "query": id, "scope": "all", "top_k": 1
+            }),
+        )
+    }
+
+    async fn reserve_shared_tool_capacity() -> (
+        std::sync::Arc<tokio::sync::Semaphore>,
+        tokio::sync::OwnedSemaphorePermit,
+        usize,
+    ) {
+        let sem = astra_turn_core::parallel_tool_exec::shared_tool_semaphore();
+        let capacity = astra_turn_core::parallel_tool_exec::max_concurrent_tool_executions();
+        assert!(capacity > 0, "tool execution requires configured capacity");
+        let held = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sem.clone()
+                .acquire_many_owned(u32::try_from(capacity).unwrap()),
+        )
+        .await
+        .expect("other tool executions must settle")
+        .expect("open shared semaphore");
+        assert_eq!(sem.available_permits(), 0);
+        (sem, held, capacity)
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn parallel_batches_share_capacity_and_preserve_order_and_owners() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
+        let workspace = tempdir().unwrap();
+        let (sem, mut held, capacity) = reserve_shared_tool_capacity().await;
+        let slots = capacity.min(2);
+        drop(held.split(slots).unwrap());
+        let mut cache_a = EdgeToolCache::new(8);
+        let mut cache_b = EdgeToolCache::new(8);
+        let mut host_a = fixture.host(workspace.path(), &mut cache_a, None);
+        let mut host_b = fixture.host(workspace.path(), &mut cache_b, None);
+        let requests_a = vec![
+            parallel_recall("a", "capacity-a-first"),
+            parallel_batch_request(
+                "a",
+                "capacity-a-write",
+                "write_file",
+                serde_json::json!({"path": "marker.txt", "content": "mutation first\n"}),
+            ),
+            parallel_recall("a", "capacity-a-last"),
+        ];
+        let requests_b = vec![
+            parallel_recall("b", "capacity-b-first"),
+            parallel_recall("b", "capacity-b-last"),
+        ];
+        let mut batch_a = Box::pin(host_a.execute_tools_batch(requests_a.clone()));
+        let mut admitted = Vec::new();
+        for _ in 0..slots {
+            let arrival = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = &mut batch_a => panic!("batch cannot finish while recall responses are held"),
+                    arrival = arrivals.recv() => arrival.unwrap(),
+                }
+            }).await.expect("real recall must enter the proxy");
+            admitted.push(arrival);
+        }
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("marker.txt")).unwrap(),
+            "mutation first\n"
+        );
+        assert_eq!(sem.available_permits(), 0);
+        let mut batch_b = Box::pin(host_b.execute_tools_batch(requests_b.clone()));
+        assert!(futures_util::poll!(batch_b.as_mut()).is_pending());
+        assert!(
+            arrivals.try_recv().is_err(),
+            "second batch cannot acquire occupied shared capacity"
+        );
+        // With two slots, finish A's last input first; with a configured single
+        // slot, the same test proves serial admission rather than assuming ten.
+        admitted.sort_by(|a, b| a.0.cmp(&b.0));
+        let (first_finished, release) = admitted.pop().unwrap();
+        if slots == 2 {
+            assert_eq!(first_finished, "capacity-a-last");
+        }
+        release.send(()).unwrap();
+        let mut batches = Box::pin(async { tokio::join!(batch_a, batch_b) });
+        for _ in slots..4 {
+            let arrival = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = &mut batches => panic!("all recalls must reach the real executor"),
+                    arrival = arrivals.recv() => arrival.unwrap(),
+                }
+            })
+            .await
+            .expect("released capacity must admit a queued request");
+            if slots == 2 && admitted.len() == 1 {
+                assert!(
+                    arrival.0.starts_with("capacity-b-"),
+                    "B overlaps A's still-held first call"
+                );
+            }
+            // Keep one response held so each new admission tests cross-batch
+            // capacity while another real tool remains in flight.
+            arrival.1.send(()).unwrap();
+        }
+        for (_, release) in admitted {
+            release.send(()).unwrap();
+        }
+        let (results_a, results_b) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), batches)
+                .await
+                .expect("both batches settle");
+        assert_eq!(
+            fixture.peak.load(SeqCst),
+            slots,
+            "real dispatch overlaps only within the shared budget"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            slots,
+            "all execution permits return"
+        );
+        drop(held);
+        assert_eq!(sem.available_permits(), capacity);
+        let requests: Vec<_> = requests_a.into_iter().chain(requests_b).collect();
+        let results: Vec<_> = results_a.into_iter().chain(results_b).collect();
+        assert!(results.iter().all(|result| result.status == "completed"));
+        fixture.assert_settlements(&requests, &results).await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn parallel_capacity_wait_settles_on_cancel_or_server_deadline_without_dispatch() {
+        let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
+        let workspace = tempdir().unwrap();
+        let (sem, held, capacity) = reserve_shared_tool_capacity().await;
+        let mut all_requests = Vec::new();
+        let mut all_results = Vec::new();
+        for deadline in [false, true] {
+            let owner = if deadline { "deadline" } else { "cancel" };
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut cache = EdgeToolCache::new(8);
+            let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+            let mut requests = vec![
+                parallel_recall(owner, &format!("{owner}-root")),
+                parallel_recall(owner, &format!("{owner}-child")),
+            ];
+            if deadline {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                for req in &mut requests {
+                    req.execution_timeout_ms = 300_000;
+                    req.execution_deadline_unix_ms = now + 30_000;
+                }
+            }
+            if deadline {
+                tokio::time::pause();
+            }
+            let mut batch = Box::pin(host.execute_tools_batch(requests.clone()));
+            assert!(
+                futures_util::poll!(batch.as_mut()).is_pending(),
+                "parallel batch must really wait on held capacity"
+            );
+            assert_eq!(sem.available_permits(), 0);
+            assert!(arrivals.try_recv().is_err());
+            if deadline {
+                // Arm the production child-token timers before moving the clock.
+                tokio::task::yield_now().await;
+                tokio::time::advance(std::time::Duration::from_secs(30)).await;
+                tokio::time::resume();
+            } else {
+                cancel.cancel();
+            }
+            let results = tokio::time::timeout(std::time::Duration::from_secs(5), batch)
+                .await
+                .expect("settlement must not wait for another session's capacity");
+            assert_eq!(
+                cancel.is_cancelled(),
+                !deadline,
+                "server deadline cancels child invocations, not the parent"
+            );
+            assert!(
+                results
+                    .iter()
+                    .all(|result| result.status == "failed" && result.duration_ms == 0)
+            );
+            assert!(host.callback_failure.is_none());
+            assert_eq!(
+                sem.available_permits(),
+                0,
+                "the other owner's permits remain held"
+            );
+            all_requests.extend(requests);
+            all_results.extend(results);
+        }
+        assert!(
+            arrivals.try_recv().is_err(),
+            "neither cancelled batch dispatched a tool"
+        );
+        assert_eq!(fixture.peak.load(std::sync::atomic::Ordering::SeqCst), 0);
+        fixture
+            .assert_settlements(&all_requests, &all_results)
+            .await;
+        drop(held);
+        assert_eq!(
+            sem.available_permits(),
+            capacity,
+            "cancelled waiters leak no capacity"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn parallel_typed_failure_settles_successful_siblings_without_aborting_batch() {
+        let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
+        let workspace = tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("message.txt"),
+            "Error: literal file content\n",
+        )
+        .unwrap();
+        let (sem, held, capacity) = reserve_shared_tool_capacity().await;
+        drop(held);
+        let mut cache = EdgeToolCache::new(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let requests = vec![
+            parallel_recall("failure", "failure-held-sibling"),
+            parallel_batch_request(
+                "failure",
+                "failure-missing-file",
+                "read_file",
+                serde_json::json!({"path": "missing.txt"}),
+            ),
+            parallel_batch_request(
+                "failure",
+                "failure-successful-read",
+                "read_file",
+                serde_json::json!({"path": "message.txt"}),
+            ),
+        ];
+        let mut batch = Box::pin(host.execute_tools_batch(requests.clone()));
+        let (_, release) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                _ = &mut batch => panic!("the async sibling must actually execute"),
+                arrival = arrivals.recv() => arrival.unwrap(),
+            }
+        })
+        .await
+        .expect("real async sibling enters the proxy");
+        release.send(()).unwrap();
+        let results = tokio::time::timeout(std::time::Duration::from_secs(5), batch)
+            .await
+            .expect("failure and siblings all settle");
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.status.as_str())
+                .collect::<Vec<_>>(),
+            ["completed", "failed", "completed"]
+        );
+        assert!(
+            results[2].output.contains("Error: literal file content"),
+            "source success wins over rendered error prose"
+        );
+        assert!(
+            !cancel.is_cancelled(),
+            "one tool failure is not a batch cancellation"
+        );
+        assert!(host.callback_failure.is_none());
+        assert_eq!(sem.available_permits(), capacity);
+        fixture.assert_settlements(&requests, &results).await;
+    }
+
     #[serial_test::serial]
     #[tokio::test]
     async fn parallel_batch_preflights_external_paths_in_auto_mode() {
@@ -12098,6 +12399,9 @@ mod tests {
         std::fs::write(&second, "two\n").expect("second");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project));
 
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let incremental =
+            std::sync::Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
         let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
@@ -12111,22 +12415,25 @@ mod tests {
                 render_policy: RenderPolicy::Silent,
                 perm_manager: Some(&mut pm),
                 cancel_token: None,
-                stream_event_tx: None,
+                stream_event_tx: Some(tx),
                 stream_event_sink: None,
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
-                incremental_state: None,
+                incremental_state: Some(incremental.clone()),
                 request_session_execution_lease: None,
             },
             80,
             false,
         );
 
+        host.on_accum_update(&ChatTurnSseAccum {
+            run_id: Some("test-run".into()),
+            ..Default::default()
+        });
+        while rx.try_recv().is_ok() {}
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
@@ -12134,17 +12441,21 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "pf-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({"path": first.to_string_lossy()}),
                 },
                 ToolBatchRequest {
                     session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
+                    run_id: "child-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "pf-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({"path": second.to_string_lossy()}),
@@ -12153,6 +12464,16 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 2);
+        for result in &results {
+            host.on_tool_result(result);
+        }
+        assert_eq!(incremental.snapshot().tool_call_records.len(), 1);
+        assert_eq!(
+            incremental.snapshot().tool_call_records[0]
+                .tool_call_id
+                .as_deref(),
+            Some("pf-1")
+        );
         assert!(results.iter().all(|result| result.status == "completed"));
         assert!(results[0].output.contains("one"), "{}", results[0].output);
         assert!(results[1].output.contains("two"), "{}", results[1].output);
@@ -12161,6 +12482,115 @@ mod tests {
                 .output
                 .contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX)
         }));
+        let mut foreground = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                chat_stream::StreamEvent::ToolStarted { tool_use_id, .. }
+                | chat_stream::StreamEvent::ToolCompleted { tool_use_id, .. } => {
+                    foreground.push(tool_use_id)
+                }
+                other => panic!("unexpected callback presentation: {other:?}"),
+            }
+        }
+        assert_eq!(
+            foreground,
+            ["pf-1", "pf-1"],
+            "parallel child callback must not be foreground"
+        );
+        for (request_id, run_id, expected_ui) in [
+            ("serial-root", "test-run", 2),
+            ("serial-child", "child-run", 0),
+        ] {
+            let results = host
+                .execute_tools_batch(vec![ToolBatchRequest {
+                    session_id: "test-session".into(),
+                    run_id: run_id.into(),
+                    turn_chain_id: "test-chain".into(),
+                    request_id: request_id.into(),
+                    read_only_execution: false,
+                    execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
+                    tool: "list_dir".into(),
+                    args: serde_json::json!({"path": project}),
+                }])
+                .await;
+            assert_eq!(results[0].status, "completed");
+            host.on_tool_result(&results[0]);
+            if request_id == "serial-child" {
+                let fields = results[0]
+                    .tool_result_fields
+                    .as_ref()
+                    .expect("cache evidence");
+                assert_eq!(fields.get("executed"), Some(&Value::Bool(false)));
+                assert_eq!(
+                    fields.get("disposition"),
+                    Some(&Value::String("reused".into()))
+                );
+            }
+            let mut count = 0;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    chat_stream::StreamEvent::ToolStarted { tool_use_id, .. }
+                    | chat_stream::StreamEvent::ToolCompleted { tool_use_id, .. } => {
+                        assert_eq!(tool_use_id, request_id);
+                        count += 1;
+                    }
+                    other => panic!("unexpected callback presentation: {other:?}"),
+                }
+            }
+            assert_eq!(
+                count, expected_ui,
+                "serial presentation follows exact accepted owner"
+            );
+        }
+        let rejected = host
+            .execute_tools_batch(vec![ToolBatchRequest {
+                session_id: "test-session".into(),
+                run_id: "child-run".into(),
+                turn_chain_id: "test-chain".into(),
+                request_id: "child-synthetic".into(),
+                read_only_execution: false,
+                execution_timeout_ms: 300_000,
+                command_timeout_cap_ms: None,
+                execution_deadline_unix_ms: 4_102_444_800_000,
+                tool: "read_file".into(),
+                args: serde_json::json!({"path": first, "transaction_id": 1}),
+            }])
+            .await;
+        assert_eq!(rejected[0].status, "failed");
+        host.on_tool_result(&rejected[0]);
+        assert_eq!(incremental.snapshot().tool_call_records.len(), 2);
+        assert!(
+            rx.try_recv().is_err(),
+            "child synthetic rejection stays out of root UI"
+        );
+        assert!(!host.callback_tool_belongs_to_foreground("unknown-request"));
+        let mut callbacks: Vec<(String, String)> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap();
+                (
+                    body["request_id"].as_str().unwrap().to_owned(),
+                    body["run_id"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        callbacks.sort();
+        assert_eq!(
+            callbacks,
+            vec![
+                ("child-synthetic".into(), "child-run".into()),
+                ("pf-1".into(), "test-run".into()),
+                ("pf-2".into(), "child-run".into()),
+                ("serial-child".into(), "child-run".into()),
+                ("serial-root".into(), "test-run".into()),
+            ],
+            "UI filtering must not lose or reattribute callback settlement"
+        );
     }
 
     #[serial_test::serial]
@@ -12191,10 +12621,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -12217,7 +12645,9 @@ mod tests {
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
                 request_id: "expired-1".to_string(),
+                read_only_execution: false,
                 execution_timeout_ms: 300_000,
+                command_timeout_cap_ms: None,
                 execution_deadline_unix_ms: 1,
                 tool: "read_file".to_string(),
                 args: serde_json::json!({"path": target}),
@@ -12273,10 +12703,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -12291,7 +12719,9 @@ mod tests {
                     run_id: "test-run".into(),
                     turn_chain_id: "test-chain".into(),
                     request_id: "callback-1".into(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".into(),
                     args: serde_json::json!({"path": "one.txt"}),
@@ -12301,7 +12731,9 @@ mod tests {
                     run_id: "test-run".into(),
                     turn_chain_id: "test-chain".into(),
                     request_id: "callback-2".into(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".into(),
                     args: serde_json::json!({"path": "two.txt"}),
@@ -12351,10 +12783,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: Some(request_lease.clone()),
             },
@@ -12371,7 +12801,7 @@ mod tests {
                 "data: {{\"type\":\"tool_request\",\"session_id\":{first:?},",
                 "\"run_id\":\"run-late-bind\",\"turn_chain_id\":\"chain-late-bind\",",
                 "\"request_id\":\"tool-must-not-run\",",
-                "\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"write_file\",",
+                "\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"write_file\",",
                 "\"args\":{{\"path\":{output:?},\"content\":\"forbidden\"}}}}\n\n",
                 "data: [DONE]\n\n"
             ),
@@ -12434,10 +12864,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -12486,10 +12914,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: Some(incremental_state.clone()),
                 request_session_execution_lease: None,
             },
@@ -12514,6 +12940,28 @@ mod tests {
             }),
             ..Default::default()
         });
+        // A rejected server request still has an exact owner before any
+        // execution starts; unknown callbacks must not enter this snapshot.
+        for (id, run) in [("child-rejected", "child-live"), ("tool-1", "run-live")] {
+            let mut request =
+                parallel_batch_request(run, id, "unavailable_tool", serde_json::json!({}));
+            request.run_id = run.into();
+            request.session_id = "sess-live".into();
+            assert!(host.on_server_tool_surface_admission(&request).is_err());
+            host.on_tool_result(&EdgeToolExecResult {
+                execution_completion: None,
+                request_id: id.into(),
+                tool: request.tool,
+                args: request.args,
+                output: "surface rejected".into(),
+                tool_result_fields: None,
+                status: "failed".into(),
+                duration_ms: 0,
+            });
+        }
+        assert_eq!(incremental_state.snapshot().tool_call_records.len(), 1);
+        incremental_state.replace_tool_records(Vec::new());
+        incremental_state.replace_tools_used(Vec::new());
         host.on_tool_result(&EdgeToolExecResult {
             execution_completion: None,
             request_id: "tool-1".to_string(),
@@ -12547,77 +12995,153 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn cloud_approval_always_persists_benign_project_scope() {
-        let server = MockServer::start().await;
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        let mut pm =
-            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
-        let (approval_tx, mut approval_rx) =
-            tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(
-                chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
-            );
-
-        let decision = {
-            let mut host = CliSseStreamHost::from_edge_ctx(
-                EdgeSseContext {
-                    api: &api,
-                    token: "tok",
-                    executor_id: "edge-test",
-                    executor,
-                    render_policy: RenderPolicy::Stream,
-                    perm_manager: Some(&mut pm),
-                    cancel_token: None,
-                    stream_event_tx: None,
-                    stream_event_sink: None,
-                    approval_request_tx: Some(approval_tx),
-                    ask_user_request_tx: None,
-                    skill_resolver: None,
-                    skill_continuation: false,
-                    turn_rollback_on_failure: false,
-                    tool_cache: &mut tool_cache,
-                    observability_hub: None,
-                    incremental_state: None,
-                    request_session_execution_lease: None,
-                },
-                80,
-                false,
-            );
-            let decision_fut = host.resolve_cloud_approval_via_tui(
+        for (tool, detail, kind) in [
+            (
                 "write_file",
-                Some("src/main.rs"),
-                None,
+                "src/main.rs",
                 astra_thin_client::ApprovalKind::Standard,
-            );
-            let responder = async {
-                let request = approval_rx.recv().await.expect("approval request");
-                assert_eq!(
-                    request.args["path"].as_str(),
-                    Some("src/main.rs"),
-                    "cloud approval card should carry command args for re-evaluation"
+            ),
+            (
+                "bash",
+                "cargo test --lib",
+                astra_thin_client::ApprovalKind::Explicit,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+            let temp = tempdir().expect("tempdir");
+            let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+            let mut tool_cache = EdgeToolCache::new(8);
+            let mut pm =
+                crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
+            let (approval_tx, mut approval_rx) =
+                tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(
+                    chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
                 );
-                request
-                    .response_tx
-                    .send(chat_stream::ApprovalResponse::AlwaysAllow)
-                    .expect("send response");
+
+            let later_detail = if tool == "bash" {
+                format!(
+                    "cd {} && cargo test -p astra-cli --lib",
+                    temp.path().display()
+                )
+            } else {
+                "tests/another.rs".to_string()
             };
-            let (decision, ()) = tokio::join!(decision_fut, responder);
-            decision
-        };
+            let args = if tool == "bash" {
+                serde_json::json!({"command": later_detail})
+            } else {
+                serde_json::json!({"path": later_detail})
+            };
+            let decision = {
+                let mut host = CliSseStreamHost::from_edge_ctx(
+                    EdgeSseContext {
+                        api: &api,
+                        token: "tok",
+                        executor_id: "edge-test",
+                        executor,
+                        render_policy: RenderPolicy::Stream,
+                        perm_manager: Some(&mut pm),
+                        cancel_token: None,
+                        stream_event_tx: None,
+                        stream_event_sink: None,
+                        approval_request_tx: Some(approval_tx),
+                        ask_user_request_tx: None,
+                        skill_resolver: None,
+                        turn_rollback_on_failure: false,
+                        tool_cache: &mut tool_cache,
+                        incremental_state: None,
+                        request_session_execution_lease: None,
+                    },
+                    80,
+                    false,
+                );
+                let decision_fut =
+                    host.resolve_cloud_approval_via_tui(tool, Some(detail), None, kind);
+                let responder = async {
+                    let request = approval_rx.recv().await.expect("approval request");
+                    assert_eq!(
+                        request.args[if tool == "bash" { "command" } else { "path" }].as_str(),
+                        Some(detail),
+                        "cloud approval card should carry command args for re-evaluation"
+                    );
+                    request
+                        .response_tx
+                        .send(chat_stream::ApprovalResponse::AlwaysAllow)
+                        .expect("send response");
+                };
+                let (decision, ()) = tokio::join!(decision_fut, responder);
+                let second = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    host.resolve_cloud_approval_via_tui(tool, Some(&later_detail), None, kind),
+                )
+                .await
+                .expect("the matching family must not prompt again");
+                assert_eq!(second, Ok(astra_thin_client::ApprovalDecision::Allow));
+                assert!(matches!(
+                    approval_rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+                decision
+            };
 
-        assert_eq!(
-            decision,
-            Ok(astra_thin_client::ApprovalDecision::AllowSession)
-        );
+            assert_eq!(
+                decision,
+                Ok(astra_thin_client::ApprovalDecision::AllowSession)
+            );
 
-        let args = serde_json::json!({"path": "src/main.rs"});
-        let mut reloaded =
-            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
-        assert!(matches!(
-            reloaded.check_nonblocking("write_file", &args),
-            crate::cli::permission_manager::GateOutcome::Allow
-        ));
+            let saved: crate::cli::permission_manager::PermissionSettings = serde_json::from_slice(
+                &std::fs::read(temp.path().join(".astra/permissions.json"))
+                    .expect("persisted project permission JSON"),
+            )
+            .expect("valid permission JSON");
+            assert!(
+                !saved.allow.is_empty(),
+                "the real TUI response must persist a project rule"
+            );
+            if tool == "bash" {
+                assert!(
+                    saved
+                        .allow
+                        .iter()
+                        .any(|rule| rule == r#"Bash(argv_prefix="cargo test", op="execute")"#),
+                    "{saved:?}"
+                );
+                assert_eq!(
+                    pm.preflight_cloud_approval_decision("bash", Some("cargo build"), kind, false),
+                    None,
+                    "a different command family must not inherit the grant"
+                );
+            }
+            for quiet in [false, true] {
+                assert_eq!(
+                    pm.preflight_cloud_approval_decision(tool, Some(&later_detail), kind, quiet),
+                    Some(astra_thin_client::ApprovalDecision::Allow)
+                );
+            }
+            assert!(matches!(
+                pm.check_nonblocking(tool, &args),
+                crate::cli::permission_manager::GateOutcome::Allow
+            ));
+            let mut reloaded =
+                crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
+            if tool == "bash" {
+                assert_eq!(
+                    reloaded.preflight_cloud_approval_decision(
+                        tool,
+                        Some(&later_detail),
+                        kind,
+                        false
+                    ),
+                    None,
+                    "a persistent rule cannot skip the explicit approval boundary after the session grant ends"
+                );
+            } else {
+                assert!(matches!(
+                    reloaded.check_nonblocking(tool, &args),
+                    crate::cli::permission_manager::GateOutcome::Allow
+                ));
+            }
+        }
     }
 
     #[serial_test::serial]
@@ -12650,10 +13174,8 @@ mod tests {
                     approval_request_tx: Some(approval_tx),
                     ask_user_request_tx: None,
                     skill_resolver: None,
-                    skill_continuation: false,
                     turn_rollback_on_failure: false,
                     tool_cache: &mut tool_cache,
-                    observability_hub: None,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -12699,6 +13221,12 @@ mod tests {
             pm.check_nonblocking("write_file", &args),
             crate::cli::permission_manager::GateOutcome::Allow
         ));
+        let saved = crate::cli::permission_manager::PermissionSettings::try_load(temp.path());
+        assert!(saved.error.is_none(), "{saved:?}");
+        assert!(
+            saved.settings.allow.is_empty(),
+            "session-only approval must not persist any project grant"
+        );
         let mut reloaded =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         assert!(matches!(
@@ -12738,10 +13266,8 @@ mod tests {
                     approval_request_tx: Some(approval_tx),
                     ask_user_request_tx: None,
                     skill_resolver: None,
-                    skill_continuation: false,
                     turn_rollback_on_failure: false,
                     tool_cache: &mut tool_cache,
-                    observability_hub: None,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -12792,6 +13318,12 @@ mod tests {
             "same-session explicit git Always should avoid re-prompting"
         );
 
+        let saved = crate::cli::permission_manager::PermissionSettings::try_load(temp.path());
+        assert!(saved.error.is_none(), "{saved:?}");
+        assert!(
+            saved.settings.allow.is_empty(),
+            "session-only approval must not persist any project grant"
+        );
         let mut reloaded =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         assert_eq!(
@@ -12890,10 +13422,8 @@ mod tests {
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
-            observability_hub: None,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -12923,6 +13453,11 @@ mod tests {
     #[tokio::test]
     async fn edge_tool_result_refresh_failure_returns_terminal_auth_error() {
         let _creds_guard = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "test",
+            Some("user-id-1"),
+        )
+        .unwrap();
 
         let mut creds = CredentialsFile {
             current_profile: Some("test".to_string()),
@@ -12931,6 +13466,7 @@ mod tests {
         creds.profiles.insert(
             "test".to_string(),
             Profile {
+                account_id: Some("user-id-1".to_string()),
                 access_token: Some("expired-token".to_string()),
                 refresh_token: Some("refresh-token".to_string()),
                 ..Default::default()
@@ -12973,10 +13509,8 @@ mod tests {
             approval_request_tx: None,
             ask_user_request_tx: None,
             skill_resolver: None,
-            skill_continuation: false,
             turn_rollback_on_failure: false,
             tool_cache: &mut tool_cache,
-            observability_hub: None,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -13003,29 +13537,6 @@ mod tests {
         assert_eq!(err, PostToolResultError::AuthRefreshFailed);
         assert!(err.is_terminal_auth());
         assert!(host.auth_failure);
-    }
-
-    #[test]
-    fn test_reusable_speculative_output() {
-        // accepts successful result
-        let out = reusable_speculative_output(Some(("real grep hit: line 42".to_string(), true)));
-        assert_eq!(out, Some("real grep hit: line 42".to_string()));
-
-        // rejects failed result even with content
-        let out2 = reusable_speculative_output(Some((
-            "Error: permission denied on /etc/shadow".to_string(),
-            false,
-        )));
-        assert_eq!(out2, None);
-
-        // rejects None
-        assert_eq!(reusable_speculative_output(None), None);
-
-        // rejects failed empty content (semaphore saturation)
-        assert_eq!(
-            reusable_speculative_output(Some((String::new(), false))),
-            None
-        );
     }
 
     fn boundary_events(session_id: &str) -> Vec<JournalEvent> {
@@ -13139,7 +13650,7 @@ mod tests {
         let mut r = TurnResult::new();
         let mut s = StreamRenderState::new();
         let mut pending = Vec::new();
-        let block = "data: {\"type\":\"tool_request\",\"session_id\":\"test-session\",\"run_id\":\"test-run\",\"turn_chain_id\":\"test-chain\",\"request_id\":\"tr-1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"bash\",\"args\":{\"command\":\"echo x\"}}\n\n";
+        let block = "data: {\"type\":\"tool_request\",\"session_id\":\"test-session\",\"run_id\":\"test-run\",\"turn_chain_id\":\"test-chain\",\"request_id\":\"tr-1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"bash\",\"args\":{\"command\":\"echo x\"}}\n\n";
         dispatch_turn_event_block(block, &mut r, &mut s, RenderPolicy::Silent, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
@@ -13365,10 +13876,6 @@ mod tests {
         assert_eq!(got2.as_ref(), embedded.trim());
     }
 
-    // extract_first_absolute_path moved to crate::sandbox_retry — its
-    // tests live there now as part of the TDD coverage for the shared
-    // SANDBOX_DENIED retry path.
-
     // ── style_tool_description tests ──
 
     #[test]
@@ -13460,14 +13967,6 @@ mod tests {
             format_tool_display_from_preview("env", Some("get PATH")),
             "Env: get PATH"
         );
-        assert_eq!(
-            format_tool_display_from_preview("notebook_edit", Some("replace analysis.ipynb")),
-            "Notebook edit: replace analysis.ipynb"
-        );
-        assert_eq!(
-            format_tool_display_from_preview("query_context", Some("auth/")),
-            "Query context: auth/"
-        );
         // memory
         assert_eq!(
             format_tool_display_from_preview("memory", Some("action=purge topic=...")),
@@ -13495,10 +13994,6 @@ mod tests {
         assert_eq!(
             format_tool_display_from_preview("reflect", Some("why did the tool fail?")),
             "Reflecting: \"why did the tool fail?\""
-        );
-        assert_eq!(
-            format_tool_display_from_preview("context_analysis", Some("compare 3 vs 7")),
-            "Context analysis: compare 3 vs 7"
         );
         assert_eq!(
             format_tool_display_from_preview("run_chain", Some("search-and-read")),
@@ -13687,7 +14182,7 @@ mod tests {
         };
 
         let rendered = format_terminal_tool_summary("str_replace", &summary, false);
-        let plain = crate::cli::theme::strip_ansi(&rendered);
+        let plain = crate::cli::terminal_region::strip_ansi_codes(&rendered);
         let rows = plain.lines().collect::<Vec<_>>();
 
         assert_eq!(rows[1].trim(), "1 - old");
@@ -13857,60 +14352,6 @@ mod tests {
             .expect("summary");
         assert_eq!(s.kind, ToolOutputSummaryKind::Structural);
         assert_eq!(s.text, "Query OK, 1 row affected (0.02 sec)");
-    }
-
-    // ── Text buffering contract ─────────────────────────────────────────
-    //
-    // These tests verify that text is ALWAYS buffered from the start
-    // (buffer_from_start=true), preventing the two classes of leakage:
-    //   1. Non-TTY: ANSI cursor movement has no effect on pipes.
-    //   2. TTY with stderr interleave: MoveUp(rows) falls short because
-    //      TerminalRegion doesn't track stderr rows from tool spinners.
-    //
-    // The invariant: buffer_from_start=true → tool_work_detected=true
-    // from the start → StreamText goes to xml_tag_buffer, never to the
-    // renderer during streaming.  At finalization, tool turns discard
-    // the buffer; non-tool turns render it one-shot.
-
-    #[test]
-    fn buffer_and_text_rendering_contract() {
-        // buffer_from_start must always be true to prevent text leakage
-        let buffer_from_start = true; // mirrors stream_render.rs:176
-        assert!(
-            buffer_from_start,
-            "buffer_from_start must be true to prevent TTY/scrollback text leakage"
-        );
-
-        // tool turn: buffer is discarded (not rendered)
-        let pending_xml_buffer = "╔══════ draft review text ══════╗".to_string();
-        let has_any_tool_work = true;
-        if has_any_tool_work {
-            drop(pending_xml_buffer);
-        } else {
-            panic!("Tool turn should discard text");
-        }
-
-        // final answer: buffer is rendered (no tools)
-        let pending_xml_buffer = "Here is my final answer".to_string();
-        let has_any_tool_work = false;
-        let rendered = if has_any_tool_work {
-            panic!("Non-tool turn should render text");
-        } else {
-            let mut buf = pending_xml_buffer;
-            streaming_md::strip_xml_tags_inplace(&mut buf);
-            streaming_md::strip_leading_narration(&mut buf);
-            buf
-        };
-        assert_eq!(rendered, "Here is my final answer");
-
-        // tool_turn_discards_text_buffer: when tools present, text discarded
-        let mut result = TurnResult::new();
-        result.core.full_text = "Let me use a tool...".to_string();
-        result.core.has_tool_calls = true;
-        assert!(
-            result.core.has_tool_calls || !result.edge_tool_round.is_empty(),
-            "tool turn should flag tool work"
-        );
     }
 
     #[test]
@@ -14256,10 +14697,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -14338,10 +14777,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -14374,9 +14811,30 @@ mod tests {
         );
 
         let args = serde_json::json!({"path": "output.txt", "content": "same bytes\n"});
-        let first = host.execute_tool("write-1", "write_file", &args).await;
-        let second = host.execute_tool("write-2", "write_file", &args).await;
-        let third = host.execute_tool("write-3", "write_file", &args).await;
+        let first = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-1",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
+        let second = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-2",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
+        let third = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-3",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
         assert_eq!(first.status, "completed", "{}", first.output);
         assert_eq!(second.status, "completed", "{}", second.output);
         assert_eq!(third.status, "failed");
@@ -14403,7 +14861,14 @@ mod tests {
                 .output_cache
                 .contains_key("read_file:cached")
         );
-        let next = host.execute_tool("write-4", "write_file", &args).await;
+        let next = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-4",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
         assert_eq!(
             next.status, "completed",
             "new provider round must reopen the call"
@@ -14411,25 +14876,53 @@ mod tests {
         host.on_accepted_sse_event(&round_two)
             .await
             .expect("same feedback replay");
-        let same_round_second = host.execute_tool("write-5", "write_file", &args).await;
+        let same_round_second = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-5",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
         assert_eq!(same_round_second.status, "completed");
         host.on_accepted_sse_event(&round_one)
             .await
             .expect("stale feedback replay");
-        let same_round_third = host.execute_tool("write-6", "write_file", &args).await;
+        let same_round_third = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-6",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
         assert_eq!(same_round_third.status, "failed");
 
         let missing_request = provider_round_feedback_event("session-1", "run-1", 3, None);
         host.on_accepted_sse_event(&missing_request)
             .await
             .expect("request-less feedback remains presentation evidence only");
-        let after_missing = host.execute_tool("write-7", "write_file", &args).await;
+        let after_missing = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-7",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
         assert_eq!(after_missing.status, "failed");
 
         let mismatched =
             provider_round_feedback_event("other-session", "run-1", 3, Some("request-3"));
         assert!(host.on_accepted_sse_event(&mismatched).await.is_err());
-        let after_mismatch = host.execute_tool("write-8", "write_file", &args).await;
+        let after_mismatch = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "write-8",
+                "write_file",
+                (args).clone(),
+            ))
+            .await;
         assert_eq!(after_mismatch.status, "failed");
     }
 
@@ -14513,10 +15006,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -14531,7 +15022,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -14546,7 +15039,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -14620,10 +15115,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -14638,7 +15131,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -14653,7 +15148,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -14677,118 +15174,6 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&victim).expect("restored file"),
             "hello\n"
-        );
-        assert_eq!(
-            rollback_fields["transaction_rollback"]["files"]["reverted"]
-                .as_array()
-                .map(|entries| entries.len()),
-            Some(1)
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn transactional_batch_restores_notebook_edit_on_failure() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let temp = tempdir().expect("tempdir");
-        let notebook = temp.path().join("analysis.ipynb");
-        std::fs::write(
-            &notebook,
-            r#"{"cells":[{"cell_type":"code","id":"cell-1","source":"x=1","metadata":{},"outputs":[],"execution_count":null}],"metadata":{"language_info":{"name":"python"}},"nbformat":4,"nbformat_minor":5}"#,
-        )
-        .expect("seed notebook");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
-        executor
-            .journal_turn_index
-            .store(6, std::sync::atomic::Ordering::Relaxed);
-        let _ = executor.read_file(&serde_json::json!({"path": "analysis.ipynb"}));
-
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor: std::sync::Arc::clone(&executor),
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                skill_continuation: false,
-                turn_rollback_on_failure: false,
-                tool_cache: &mut tool_cache,
-                observability_hub: None,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-
-        let results = host
-            .execute_tools_batch(vec![
-                ToolBatchRequest {
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tr-1".to_string(),
-                    execution_timeout_ms: 300_000,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "notebook_edit".to_string(),
-                    args: serde_json::json!({
-                        "notebook_path": "analysis.ipynb",
-                        "edit_mode": "replace",
-                        "cell_id": "cell-1",
-                        "new_source": "x=2",
-                        "transaction_id": "tx-nb",
-                        "rollback_on_failure": true,
-                    }),
-                },
-                ToolBatchRequest {
-                    session_id: "test-session".to_string(),
-                    run_id: "test-run".to_string(),
-                    turn_chain_id: "test-chain".to_string(),
-                    request_id: "tr-2".to_string(),
-                    execution_timeout_ms: 300_000,
-                    execution_deadline_unix_ms: 4_102_444_800_000,
-                    tool: "read_file".to_string(),
-                    args: serde_json::json!({
-                        "path": "missing.txt",
-                        "transaction_id": "tx-nb",
-                        "rollback_on_failure": true,
-                    }),
-                },
-            ])
-            .await;
-
-        assert_eq!(results.len(), 2);
-        let rollback_fields = results[1]
-            .tool_result_fields
-            .as_ref()
-            .expect("rollback fields");
-        assert_eq!(
-            rollback_fields["transaction_state"].as_str(),
-            Some("rolled_back")
-        );
-        let restored = std::fs::read_to_string(&notebook).expect("restored notebook");
-        assert!(
-            restored.contains("\"x=1\""),
-            "restored notebook: {restored}"
-        );
-        assert!(
-            !restored.contains("\"x=2\""),
-            "restored notebook: {restored}"
         );
         assert_eq!(
             rollback_fields["transaction_rollback"]["files"]["reverted"]
@@ -14831,10 +15216,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -14849,7 +15232,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -14864,7 +15249,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -14878,7 +15265,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-3".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -14944,10 +15333,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -14961,7 +15348,9 @@ mod tests {
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
                 request_id: "tx-boundary-1".to_string(),
+                read_only_execution: false,
                 execution_timeout_ms: 300_000,
+                command_timeout_cap_ms: None,
                 execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "write_file".to_string(),
                 args: serde_json::json!({
@@ -15032,10 +15421,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15050,7 +15437,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-boundary-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -15065,7 +15454,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-boundary-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -15145,10 +15536,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15163,7 +15552,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -15176,7 +15567,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: Some(300_000),
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -15278,10 +15671,8 @@ mod tests {
                 ask_user_request_tx: None,
                 approval_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15293,7 +15684,9 @@ mod tests {
             run_id: "test-run".to_string(),
             turn_chain_id: "test-chain".to_string(),
             request_id: request_id.to_string(),
+            read_only_execution: false,
             execution_timeout_ms: 300_000,
+            command_timeout_cap_ms: Some(300_000),
             execution_deadline_unix_ms: 4_102_444_800_000,
             tool: tool.to_string(),
             args,
@@ -15622,10 +16015,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15642,7 +16033,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -15655,7 +16048,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: Some(300_000),
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -15667,7 +16062,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-3".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -15738,10 +16135,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15750,11 +16145,12 @@ mod tests {
         );
 
         let first = host
-            .execute_tool(
+            .execute_tool(&parallel_batch_request(
+                "direct",
                 "cache-read-1",
                 "read_file",
-                &serde_json::json!({"path": "cached.txt"}),
-            )
+                (serde_json::json!({"path": "cached.txt"})).clone(),
+            ))
             .await;
         assert!(first.output.contains("v1"), "{}", first.output);
 
@@ -15787,11 +16183,12 @@ mod tests {
         );
 
         let second = host
-            .execute_tool(
+            .execute_tool(&parallel_batch_request(
+                "direct",
                 "cache-read-2",
                 "read_file",
-                &serde_json::json!({"path": "cached.txt"}),
-            )
+                (serde_json::json!({"path": "cached.txt"})).clone(),
+            ))
             .await;
         assert!(second.output.contains("v2"), "{}", second.output);
         assert!(
@@ -15847,10 +16244,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15858,9 +16253,26 @@ mod tests {
             false,
         );
 
+        host.on_accum_update(&ChatTurnSseAccum {
+            run_id: Some("cache-root".into()),
+            ..Default::default()
+        });
+        while event_rx.try_recv().is_ok() {}
         let result = host
-            .execute_tool("cache-read-hit", "read_file", &read_args)
-            .await;
+            .execute_tools_batch(vec![ToolBatchRequest {
+                session_id: "cache-session".into(),
+                run_id: "cache-root".into(),
+                turn_chain_id: "cache-chain".into(),
+                request_id: "cache-read-hit".into(),
+                read_only_execution: false,
+                execution_timeout_ms: 300_000,
+                command_timeout_cap_ms: None,
+                execution_deadline_unix_ms: 4_102_444_800_000,
+                tool: "read_file".into(),
+                args: read_args,
+            }])
+            .await
+            .remove(0);
         assert_eq!(result.status, "completed");
         assert_eq!(result.output, "v1\n");
 
@@ -15927,10 +16339,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15940,7 +16350,12 @@ mod tests {
 
         let read_args = serde_json::json!({"path": "cached.txt"});
         let initial = host
-            .execute_tool("cache-read-1", "read_file", &read_args)
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "cache-read-1",
+                "read_file",
+                (read_args).clone(),
+            ))
             .await;
         assert!(initial.output.contains("v1"), "{}", initial.output);
         let read_sig = tool_dedup_signature("read_file", &read_args);
@@ -15964,11 +16379,12 @@ mod tests {
         host.tool_cache.call_counts.insert(read_sig.clone(), 2);
 
         let write = host
-            .execute_tool(
+            .execute_tool(&parallel_batch_request(
+                "direct",
                 "cache-write-1",
                 "write_file",
-                &serde_json::json!({"path": "cached.txt", "content": "v2\n"}),
-            )
+                (serde_json::json!({"path": "cached.txt", "content": "v2\n"})).clone(),
+            ))
             .await;
         assert_eq!(write.status, "completed", "{}", write.output);
         assert!(
@@ -15986,7 +16402,12 @@ mod tests {
         );
 
         let reread = host
-            .execute_tool("cache-read-2", "read_file", &read_args)
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "cache-read-2",
+                "read_file",
+                (read_args).clone(),
+            ))
             .await;
         assert!(reread.output.contains("v2"), "{}", reread.output);
         assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
@@ -16023,10 +16444,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16036,7 +16455,12 @@ mod tests {
 
         let read_args = serde_json::json!({"path": "cached.txt"});
         let initial = host
-            .execute_tool("cache-read-alpha", "read_file", &read_args)
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "cache-read-alpha",
+                "read_file",
+                (read_args).clone(),
+            ))
             .await;
         assert!(initial.output.contains("alpha"), "{}", initial.output);
         let read_sig = tool_dedup_signature("read_file", &read_args);
@@ -16064,15 +16488,17 @@ mod tests {
         host.tool_cache.call_counts.insert(read_sig.clone(), 2);
 
         let replace = host
-            .execute_tool(
+            .execute_tool(&parallel_batch_request(
+                "direct",
                 "cache-replace-1",
                 "str_replace",
-                &serde_json::json!({
+                (serde_json::json!({
                     "path": "cached.txt",
                     "old_str": "alpha",
                     "new_str": "omega"
-                }),
-            )
+                }))
+                .clone(),
+            ))
             .await;
         assert_eq!(replace.status, "completed", "{}", replace.output);
         assert!(
@@ -16090,7 +16516,12 @@ mod tests {
         );
 
         let reread = host
-            .execute_tool("cache-read-3", "read_file", &read_args)
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "cache-read-3",
+                "read_file",
+                (read_args).clone(),
+            ))
             .await;
         assert!(reread.output.contains("omega"), "{}", reread.output);
         assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
@@ -16128,10 +16559,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16150,7 +16579,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-bash-0".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -16163,7 +16594,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-bash-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: Some(300_000),
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -16175,7 +16608,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-bash-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: Some(300_000),
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -16218,7 +16653,32 @@ mod tests {
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut manager = crate::mcp_client::McpClientManager::new();
+        manager
+            .connect(crate::mcp_client::McpServerConfig {
+                name: "mock".to_string(),
+                transport: crate::mcp_client::Transport::Stdio {
+                    command: vec![
+                        crate::mcp_client::ensure_mock_mcp_server_binary()
+                            .to_string_lossy()
+                            .to_string(),
+                    ],
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                },
+                description: String::new(),
+                enabled: true,
+                retry: crate::mcp_client::RetryConfig::default(),
+            })
+            .await
+            .expect("connect mock MCP");
+        let schemas = manager.all_tool_schemas();
+        executor.install_mcp_bundle(
+            std::sync::Arc::new(tokio::sync::RwLock::new(manager)),
+            schemas,
+        );
+        let executor = std::sync::Arc::new(executor);
         let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
@@ -16238,10 +16698,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16249,12 +16707,40 @@ mod tests {
             false,
         );
 
+        for (name, allowed) in [("mcp__mock__echo", true), ("mcp__missing__echo", false)] {
+            let fields = host.tool_result_fields_with_cli_runtime(name, None);
+            let advertisement: astra_runtime_env::RuntimeEnvironmentAdvertisement =
+                serde_json::from_value(fields["runtime_environment_advertisement"].clone())
+                    .unwrap();
+            let admission = astra_runtime_env::CapabilityResolver.check_tool_call_for_surface(
+                &astra_runtime_env::ToolRegistry::builtins(),
+                name,
+                &serde_json::json!({"message": "hello"}),
+                &advertisement.binding.capabilities,
+                &advertisement.binding.tool_surface,
+            );
+            assert_eq!(admission.is_ok(), allowed, "{name}: {admission:?}");
+        }
+        executor
+            .accept_server_tool_surface_admission("mcp__mock__echo")
+            .unwrap();
+        let echo = executor
+            .execute(
+                "mcp__mock__echo",
+                &serde_json::json!({"message": "connected MCP response"}),
+            )
+            .await;
+        assert!(
+            echo.contains("connected MCP response"),
+            "MCP must execute after discovery: {echo}"
+        );
         let result = host
-            .execute_tool(
+            .execute_tool(&parallel_batch_request(
+                "direct",
                 "turn-bash-ro",
                 "bash",
-                &serde_json::json!({"command": "pwd"}),
-            )
+                (serde_json::json!({"command": "pwd"})).clone(),
+            ))
             .await;
 
         assert_ne!(result.status, "failed");
@@ -16325,10 +16811,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16337,11 +16821,12 @@ mod tests {
         );
 
         let result = host
-            .execute_tool(
+            .execute_tool(&parallel_batch_request(
+                "direct",
                 "bash-pkill-blocked",
                 "bash",
-                &serde_json::json!({"command": "pkill -f http.server"}),
-            )
+                (serde_json::json!({"command": "pkill -f http.server"})).clone(),
+            ))
             .await;
 
         assert_eq!(result.status, "failed");
@@ -16425,10 +16910,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16446,7 +16929,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "ro-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -16459,7 +16944,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "ro-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -16471,7 +16958,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "ro-3".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
@@ -16540,10 +17029,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16557,7 +17044,9 @@ mod tests {
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
                 request_id: "turn-boundary-1".to_string(),
+                read_only_execution: false,
                 execution_timeout_ms: 300_000,
+                command_timeout_cap_ms: None,
                 execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "read_file".to_string(),
                 args: serde_json::json!({
@@ -16625,10 +17114,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: true,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16643,7 +17130,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-boundary-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -16656,7 +17145,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-boundary-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: Some(300_000),
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -16733,10 +17224,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16751,7 +17240,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-bash-1".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: None,
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
@@ -16766,7 +17257,9 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-bash-2".to_string(),
+                    read_only_execution: false,
                     execution_timeout_ms: 300_000,
+                    command_timeout_cap_ms: Some(300_000),
                     execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
@@ -16835,10 +17328,8 @@ mod tests {
                 approval_request_tx: None,
                 ask_user_request_tx: None,
                 skill_resolver: None,
-                skill_continuation: false,
                 turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
-                observability_hub: None,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16852,7 +17343,9 @@ mod tests {
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
                 request_id: "tx-bash-ro".to_string(),
+                read_only_execution: false,
                 execution_timeout_ms: 300_000,
+                command_timeout_cap_ms: Some(300_000),
                 execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "bash".to_string(),
                 args: serde_json::json!({
@@ -17051,35 +17544,57 @@ mod tests {
 
     #[test]
     fn sync_incremental_tool_result() {
-        // pushes record and adds tool_used
-        let state = IncrementalTurnState::default();
-        sync_incremental_tool_result_state(
-            &state,
-            &EdgeToolExecResult {
+        for (tool, output, canonical) in [
+            ("read_file", "pub fn main() {}", "pub fn main() {}"),
+            ("bash", "first\r\nsecond\r\n", "first\r\nsecond\r\n"),
+            (
+                "write_file",
+                r#"{"status":"written","_cli_unified_diff":"UI diff"}"#,
+                r#"{"status":"written"}"#,
+            ),
+            (
+                "str_replace",
+                "Updated\n<<<ASTRA_UNIFIED_DIFF>>>\nUI diff\n<<<END_ASTRA_UNIFIED_DIFF>>>\n",
+                "Updated",
+            ),
+            (
+                "multi_edit",
+                "Updated\n<<<ASTRA_UNIFIED_DIFF>>>\nUI diff\n<<<END_ASTRA_UNIFIED_DIFF>>>\n",
+                "Updated",
+            ),
+        ] {
+            let state = IncrementalTurnState::default();
+            let result = EdgeToolExecResult {
                 execution_completion: None,
                 request_id: "req-1".into(),
-                tool: "read_file".into(),
+                tool: tool.into(),
                 args: serde_json::json!({"path": "lib.rs"}),
-                output: "pub fn main() {}".into(),
+                output: output.into(),
                 tool_result_fields: None,
                 status: "completed".into(),
                 duration_ms: 42,
-            },
-        );
-        let snap = state.snapshot();
-        assert_eq!(snap.tool_call_records.len(), 1);
-        assert_eq!(
-            snap.tool_call_records[0].tool_call_id.as_deref(),
-            Some("req-1")
-        );
-        assert_eq!(snap.tool_call_records[0].name, "read_file");
-        assert!(snap.tool_call_records[0].ok);
-        assert_eq!(snap.tool_call_records[0].ms, 42);
-        assert_eq!(
-            snap.tool_call_records[0].effective_disposition(),
-            astra_services::session_journal::ToolCallDisposition::Executed
-        );
-        assert_eq!(snap.tools_used, vec!["read_file"]);
+            };
+            sync_incremental_tool_result_state(&state, &result);
+            let snap = state.snapshot();
+            assert_eq!(snap.tool_call_records.len(), 1);
+            let record = &snap.tool_call_records[0];
+            assert_eq!(record.tool_call_id.as_deref(), Some("req-1"));
+            assert_eq!(record.name, tool);
+            assert!(record.ok);
+            assert_eq!(record.ms, 42);
+            assert_eq!(
+                record.effective_disposition(),
+                astra_services::session_journal::ToolCallDisposition::Executed
+            );
+            assert_eq!(record.result_full.as_deref(), Some(canonical));
+            assert_eq!(record.result_preview.as_deref(), Some(canonical));
+            assert_eq!(record.output_bytes, Some(canonical.len() as u32));
+            assert_eq!(snap.tools_used, vec![tool]);
+            assert_eq!(
+                result.output, output,
+                "UI/callback output remains unchanged"
+            );
+        }
 
         // error status records error
         let state = IncrementalTurnState::default();
@@ -17101,7 +17616,14 @@ mod tests {
         assert!(!snap.tool_call_records[0].ok);
         assert_eq!(
             snap.tool_call_records[0].error.as_deref(),
-            Some("Permission denied")
+            Some("status=permission_denied\nPermission denied")
+        );
+        let record = &snap.tool_call_records[0];
+        assert_eq!(record.result_full.as_deref(), record.error.as_deref());
+        assert_eq!(record.result_preview.as_deref(), record.error.as_deref());
+        assert_eq!(
+            record.output_bytes,
+            Some("status=permission_denied\nPermission denied".len() as u32)
         );
         assert_eq!(snap.tools_used, vec!["bash"]);
 

@@ -199,13 +199,6 @@ async fn build_test_router_keeps_representative_domain_routes_registered() {
     let app = build_test_router(build_guardrail_state());
     let auth_headers = &[("authorization", "Bearer test-token")];
 
-    let teams = request_status(
-        app.clone(),
-        request("GET", "/teams", auth_headers, Body::empty()),
-    )
-    .await;
-    assert_ne!(teams, StatusCode::NOT_FOUND);
-
     let admin_init = request_status(
         app.clone(),
         request("POST", "/admin/init", auth_headers, Body::empty()),
@@ -225,7 +218,7 @@ async fn build_test_router_keeps_representative_domain_routes_registered() {
         request("GET", "/evaluation/drift", auth_headers, Body::empty()),
     )
     .await;
-    assert_ne!(evaluation, StatusCode::NOT_FOUND);
+    assert_eq!(evaluation, StatusCode::NOT_FOUND);
 
     let introspection = request_status(
         app.clone(),
@@ -246,12 +239,34 @@ async fn build_test_router_keeps_representative_domain_routes_registered() {
     .await;
     assert_ne!(marketplace, StatusCode::NOT_FOUND);
 
-    let preferences = request_status(
-        app,
-        request("GET", "/preferences", auth_headers, Body::empty()),
-    )
-    .await;
-    assert_ne!(preferences, StatusCode::NOT_FOUND);
+    for (method, path, body) in [
+        ("GET", "/preferences", ""),
+        ("PUT", "/preferences/explain_mode", r#"{"value":"true"}"#),
+    ] {
+        for (headers, expected) in [
+            (
+                vec![("content-type", "application/json")],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                vec![
+                    ("content-type", "application/json"),
+                    ("authorization", "Bearer test-token"),
+                ],
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            assert_eq!(
+                request_status(
+                    app.clone(),
+                    request(method, path, &headers, Body::from(body))
+                )
+                .await,
+                expected,
+                "preference storage requires authentication and a configured pool"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -262,9 +277,11 @@ async fn legacy_task_plan_and_todo_surfaces_are_not_routable() {
         ("GET", "/tasks"),
         ("POST", "/tasks"),
         ("POST", "/tasks:rpc"),
+        ("GET", "/tasks/task-1/lease"),
         ("POST", "/tasks/task-1/lease/claim"),
-        // The thin client still carries these legacy paths for compatibility
-        // with older servers; they are not capabilities of this runtime.
+        ("POST", "/tasks/task-1/lease/release"),
+        ("POST", "/tasks/task-1/lease/renew"),
+        // Retired lifecycle paths must not become runtime capabilities.
         ("GET", "/agent-jobs"),
         ("POST", "/agent-jobs/task-1/lease/claim"),
         ("GET", "/plans"),

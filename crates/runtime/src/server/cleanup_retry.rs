@@ -207,6 +207,7 @@ mod tests {
             authority: WorkspaceAuthority::ReadWrite,
             root_or_volume_ref: "/test/path".to_string(),
             source: WorkspaceSource::ServerSandbox {
+                executor_id: "test-executor".into(),
                 session_id: "test-session".to_string(),
             },
             persistence: WorkspacePersistence::Session,

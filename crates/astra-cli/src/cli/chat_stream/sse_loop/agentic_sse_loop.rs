@@ -1,9 +1,9 @@
-//! Post-loop finalization: CLI sidecars (explain and verdict reports)
-//! and [`StreamResult`] assembly from [`AgenticLoopState`].
+//! CLI sidecar presentation and [`StreamResult`] assembly from the accepted
+//! Server stream and its local callback records.
 
 use astra_core::canonical_names::normalize_name_list;
-use astra_pipeline::{step_protocol::StepCheckpoint, step_recorder::StepRecorder};
-use astra_runtime::turn::turn_guard::TurnGuard;
+use astra_pipeline::step_protocol::StepCheckpoint;
+use astra_runtime::turn::tool_health::ToolHealthTracker;
 use astra_services::session_journal::ToolCallRecord;
 use astra_turn_core::{
     tool_health_persistence::ToolHealthEntry, tool_registry_report::ToolSelectionReport,
@@ -82,6 +82,7 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
 }
 
 pub(crate) struct StreamResultBuild<'a> {
+    pub(crate) turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
     pub(crate) qualified_usage: Option<astra_turn_types::CanonicalTokenUsage>,
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
     pub(crate) session_id: Option<String>,
@@ -102,8 +103,7 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) budget_pressure: f64,
     pub(crate) stall_events: Vec<(String, u32)>,
     pub(crate) verdict_events: Vec<VerdictEvent>,
-    pub(crate) step_recorder: &'a StepRecorder,
-    pub(crate) turn_guard: &'a TurnGuard,
+    pub(crate) tool_health: &'a ToolHealthTracker,
     pub(crate) last_heavy_checkpoint: Option<StepCheckpoint>,
     pub(crate) ttft_ms: Option<u64>,
     pub(crate) context_ms: Option<u64>,
@@ -125,17 +125,6 @@ pub(crate) struct StreamResultBuild<'a> {
 }
 
 pub(crate) fn resolved_tool_metrics<I>(
-    fallback_count: u32,
-    fallback_tools: I,
-    tool_call_records: &[ToolCallRecord],
-) -> (u32, Vec<String>)
-where
-    I: IntoIterator<Item = String>,
-{
-    resolved_tool_metrics_with_authority(fallback_count, fallback_tools, tool_call_records, false)
-}
-
-fn resolved_tool_metrics_with_authority<I>(
     fallback_count: u32,
     fallback_tools: I,
     tool_call_records: &[ToolCallRecord],
@@ -219,15 +208,12 @@ pub(crate) fn partial_interruption_notice(result: &StreamResult) -> Option<Strin
     if assistant_text.is_empty() || assistant_text == notice.trim() {
         return None;
     }
-    if result.interruption_kind.as_deref() == Some("execution_incomplete") {
-        Some(format!("Partial answer shown. {notice}"))
-    } else {
-        Some(notice)
-    }
+    Some(notice)
 }
 
 pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
     let StreamResultBuild {
+        turn_evaluation,
         qualified_usage,
         tool_health_entries,
         session_id,
@@ -247,8 +233,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         budget_pressure,
         stall_events,
         verdict_events,
-        step_recorder,
-        turn_guard,
+        tool_health,
         last_heavy_checkpoint,
         ttft_ms,
         context_ms,
@@ -268,11 +253,11 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         run_transcript_messages,
         applied_user_intents,
     } = ctx;
-    let (_, tools_used) = resolved_tool_metrics_with_authority(
+    let (_, tools_used) = resolved_tool_metrics(
         tool_calls_count,
         tools_used,
         &tool_call_records,
-        tool_record_coverage_partial,
+        server_terminal_authoritative || tool_record_coverage_partial,
     );
     let mut interruption = interruption;
     let mut server_terminal_unverified = server_terminal_unverified;
@@ -341,6 +326,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
     };
 
     StreamResult {
+        turn_evaluation,
         qualified_usage,
         session_id,
         run_id,
@@ -361,8 +347,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         budget_pressure,
         stall_events: deduped_stall_events,
         verdict_events: deduped_verdict_events,
-        step_recorder_summary: Some(step_recorder.summary()),
-        tool_health_export: turn_guard.health.export_merged(tool_health_entries),
+        tool_health_export: tool_health.export_merged(tool_health_entries),
         last_heavy_checkpoint,
         ttft_ms,
         context_ms,
@@ -383,7 +368,6 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         deferred_tool_activations,
         run_transcript_messages,
         applied_user_intents,
-        background_agent_results: Vec::new(),
     }
 }
 #[cfg(test)]
@@ -392,19 +376,14 @@ mod tests {
         StreamResultBuild, build_stream_result, partial_interruption_notice, resolved_tool_metrics,
     };
     use crate::cli::stream::streaming_types::UsageAttribution;
-    use astra_pipeline::step_recorder::StepRecorder;
-    use astra_runtime::turn::turn_guard::TurnGuard;
+    use astra_runtime::turn::tool_health::ToolHealthTracker;
     use astra_services::session_journal::ToolCallRecord;
     use std::collections::HashSet;
 
     use crate::VerdictEvent;
 
-    fn make_step_recorder() -> StepRecorder {
-        StepRecorder::with_persistence_for_run("test-user", "test-session", "test-task", "test-run")
-    }
-
-    fn make_turn_guard() -> TurnGuard {
-        TurnGuard::new()
+    fn make_tool_health() -> ToolHealthTracker {
+        ToolHealthTracker::new()
     }
 
     fn succeeded_aggregate(
@@ -422,11 +401,9 @@ mod tests {
         }
     }
 
-    fn make_build_ctx<'a>(
-        step_recorder: &'a StepRecorder,
-        turn_guard: &'a TurnGuard,
-    ) -> StreamResultBuild<'a> {
+    fn make_build_ctx<'a>(tool_health: &'a ToolHealthTracker) -> StreamResultBuild<'a> {
         StreamResultBuild {
+            turn_evaluation: None,
             qualified_usage: None,
             tool_health_entries: &[],
             session_id: Some("sess-1".into()),
@@ -446,8 +423,7 @@ mod tests {
             budget_pressure: 0.5,
             stall_events: vec![],
             verdict_events: vec![],
-            step_recorder,
-            turn_guard,
+            tool_health,
             last_heavy_checkpoint: None,
             ttft_ms: Some(42),
             context_ms: Some(100),
@@ -475,9 +451,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_passes_cache_tokens_through() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let ctx = make_build_ctx(&tg);
         let result = build_stream_result(ctx);
         assert_eq!(result.cache_read_tokens, 800);
         assert_eq!(result.cache_creation_tokens, 100);
@@ -487,9 +462,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_passes_basic_fields() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let ctx = make_build_ctx(&tg);
         let result = build_stream_result(ctx);
         assert_eq!(result.session_id.as_deref(), Some("sess-1"));
         assert_eq!(result.run_id.as_deref(), Some("run-1"));
@@ -504,9 +478,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_interrupts_when_canonical_classes_do_not_close() {
-        let recorder = make_step_recorder();
-        let guard = make_turn_guard();
-        let mut ctx = make_build_ctx(&recorder, &guard);
+        let guard = make_tool_health();
+        let mut ctx = make_build_ctx(&guard);
         ctx.tool_ledger_aggregate.result_classes.succeeded = 2;
 
         let result = build_stream_result(ctx);
@@ -521,9 +494,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_marks_interrupted_state() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let mut ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let mut ctx = make_build_ctx(&tg);
         ctx.interruption = Some(serde_json::json!({"kind": "budget_exhausted"}));
 
         let result = build_stream_result(ctx);
@@ -537,9 +509,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_surfaces_empty_text_interruption() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let mut ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let mut ctx = make_build_ctx(&tg);
         ctx.full_text.clear();
         ctx.interruption = Some(serde_json::json!({
             "kind": "budget_exhausted",
@@ -562,9 +533,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_keeps_partial_answer_and_interruption_notice_separate() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let mut ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let mut ctx = make_build_ctx(&tg);
         ctx.full_text = "The requested file was updated successfully.".into();
         ctx.interruption = Some(serde_json::json!({
             "kind": "execution_incomplete",
@@ -582,7 +552,7 @@ mod tests {
         assert_eq!(
             partial_interruption_notice(&result).as_deref(),
             Some(
-                "Partial answer shown. Execution did not reach a verified terminal state. Progress is saved. Review the saved progress, then continue to reconcile the unfinished work."
+                "Execution did not reach a verified terminal state. Progress is saved. Review the saved progress, then continue to reconcile the unfinished work."
             )
         );
         assert!(!result.full_text.contains("persistent unresolved"));
@@ -590,9 +560,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_falls_back_when_interruption_lacks_user_message() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let mut ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let mut ctx = make_build_ctx(&tg);
         ctx.full_text = "  ".into();
         ctx.interruption = Some(serde_json::json!({
             "kind": "harness_blocked",
@@ -613,9 +582,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_marks_malformed_interruption_as_interrupted() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let mut ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let mut ctx = make_build_ctx(&tg);
         ctx.full_text.clear();
         ctx.interruption = Some(serde_json::json!({
             "resumable": true,
@@ -666,6 +634,7 @@ mod tests {
                 String::new(),
             ],
             &[],
+            false,
         );
 
         assert_eq!(count, 4);
@@ -681,7 +650,7 @@ mod tests {
             tool_record(" read_file", true, Some("contents")),
         ];
 
-        let (count, tools) = resolved_tool_metrics(0, std::iter::empty(), &records);
+        let (count, tools) = resolved_tool_metrics(0, std::iter::empty(), &records, false);
 
         assert_eq!(count, 3);
         assert_eq!(tools, vec!["bash".to_string(), "read_file".to_string()]);
@@ -689,14 +658,15 @@ mod tests {
 
     #[test]
     fn build_stream_result_keeps_server_aggregate_over_partial_records() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let mut ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let mut ctx = make_build_ctx(&tg);
         ctx.tool_calls_count = 34;
         ctx.tool_ledger_aggregate = succeeded_aggregate(34);
         ctx.tools_used = HashSet::from(["bash".to_string(), "write_file".to_string()]);
         ctx.server_terminal_authoritative = true;
-        ctx.tool_record_coverage_partial = true;
+        // A complete Server ledger still does not make the edge-only local
+        // records a complete projection of all executed tools.
+        ctx.tool_record_coverage_partial = false;
         ctx.tool_call_records = vec![tool_record("bash", false, Some("first run failed"))];
 
         let result = build_stream_result(ctx);
@@ -710,9 +680,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_keeps_remote_aggregate_after_edge_terminal() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let mut ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let mut ctx = make_build_ctx(&tg);
         ctx.tool_calls_count = 34;
         ctx.tool_ledger_aggregate = succeeded_aggregate(34);
         ctx.tools_used = HashSet::from(["bash".to_string(), "write_file".to_string()]);
@@ -728,9 +697,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_excludes_blocked_tools_from_metrics() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let mut ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let mut ctx = make_build_ctx(&tg);
         ctx.tool_calls_count = 2;
         ctx.tool_ledger_aggregate =
             astra_turn_core::tool_ledger_receipt::ToolLedgerCanonicalAggregate {
@@ -769,9 +737,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_ignores_synthetic_tool_metrics() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let mut ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let mut ctx = make_build_ctx(&tg);
         ctx.tool_calls_count = 1;
         ctx.tool_ledger_aggregate = succeeded_aggregate(1);
         ctx.tools_used = HashSet::from([
@@ -802,9 +769,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_deduplicates_stall_events() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let mut ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let mut ctx = make_build_ctx(&tg);
         ctx.stall_events = vec![
             ("slow_tool".into(), 1),
             ("slow_tool".into(), 2),
@@ -818,9 +784,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_deduplicates_verdict_events() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let mut ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let mut ctx = make_build_ctx(&tg);
         ctx.verdict_events = vec![
             VerdictEvent {
                 severity: "warn".into(),
@@ -887,9 +852,8 @@ mod tests {
 
     #[test]
     fn build_stream_result_zero_cache_tokens() {
-        let sr = make_step_recorder();
-        let tg = make_turn_guard();
-        let mut ctx = make_build_ctx(&sr, &tg);
+        let tg = make_tool_health();
+        let mut ctx = make_build_ctx(&tg);
         ctx.cache_read_tokens = 0;
         ctx.cache_creation_tokens = 0;
         let result = build_stream_result(ctx);

@@ -1,13 +1,200 @@
 use crate::cli::theme;
 use astra_services::session_journal;
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-    style::Stylize,
-    terminal,
-};
-use std::io::{self, Write};
+use crossterm::{style::Stylize, terminal};
+use std::io;
 use std::path::PathBuf;
 use std::sync::{LazyLock, RwLock};
+
+type TokenPair = (Option<String>, Option<String>);
+type BindingKey = (PathBuf, String);
+
+/// One login's confirmed rotations, shared by all owner snapshots and refresh
+/// callers. Unknown disk replacement is a new generation, never a rotation.
+pub(crate) struct LegacyAuthBinding {
+    key: BindingKey,
+    pub(crate) pair: std::sync::Arc<tokio::sync::Mutex<TokenPair>>,
+    revoked: std::sync::atomic::AtomicBool,
+}
+
+struct LegacyBindingEntry {
+    binding: std::sync::Weak<LegacyAuthBinding>,
+    fingerprint: [u8; 32],
+}
+
+static LEGACY_AUTH_BINDINGS: LazyLock<
+    std::sync::Mutex<std::collections::HashMap<BindingKey, LegacyBindingEntry>>,
+> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn credential_fingerprint(account: Option<&str>, pair: &TokenPair) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(serde_json::to_vec(&(account, pair)).expect("credential identity serializes"))
+        .into()
+}
+
+pub(crate) fn legacy_auth_binding(
+    profile_name: &str,
+    account: Option<&str>,
+) -> Option<std::sync::Arc<LegacyAuthBinding>> {
+    capture_legacy_auth_binding(profile_name, account, None)
+}
+
+pub(crate) fn legacy_refresh_binding(
+    profile_name: &str,
+    expected: &Profile,
+) -> Option<std::sync::Arc<LegacyAuthBinding>> {
+    capture_legacy_auth_binding(profile_name, expected.account_id.as_deref(), Some(expected))
+}
+
+fn capture_legacy_auth_binding(
+    profile_name: &str,
+    account: Option<&str>,
+    expected: Option<&Profile>,
+) -> Option<std::sync::Arc<LegacyAuthBinding>> {
+    let account = account.filter(|account| !account.trim().is_empty())?;
+    let store = credential_store();
+    let mut bindings = astra_core::sync_poison::recover_mutex_lock(&LEGACY_AUTH_BINDINGS);
+    bindings.retain(|_, entry| entry.binding.strong_count() > 0);
+    let credentials = store.load().ok()?;
+    let key = (store.path().clone(), profile_name.to_owned());
+    let profile = credentials.profiles.get(profile_name);
+    let disk_fingerprint = profile.map(|profile| {
+        credential_fingerprint(
+            profile.account_id.as_deref(),
+            &(profile.access_token.clone(), profile.refresh_token.clone()),
+        )
+    });
+    if bindings
+        .get(&key)
+        .is_some_and(|entry| Some(entry.fingerprint) != disk_fingerprint)
+        && let Some(binding) = bindings
+            .remove(&key)
+            .and_then(|entry| entry.binding.upgrade())
+    {
+        binding
+            .revoked
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    if profile.is_none_or(|profile| profile.account_id.as_deref() != Some(account)) {
+        return None;
+    }
+    let profile = profile?;
+    if expected.is_some_and(|expected| {
+        profile.account_id != expected.account_id
+            || profile.access_token != expected.access_token
+            || profile.refresh_token != expected.refresh_token
+    }) {
+        return None;
+    }
+    let pair = (profile.access_token.clone(), profile.refresh_token.clone());
+    let fingerprint = credential_fingerprint(Some(account), &pair);
+    if let Some(entry) = bindings.get(&key)
+        && let Some(binding) = entry.binding.upgrade()
+    {
+        if entry.fingerprint == fingerprint && binding.is_active() {
+            return Some(binding);
+        }
+        binding
+            .revoked
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    let binding = std::sync::Arc::new(LegacyAuthBinding {
+        key: key.clone(),
+        pair: std::sync::Arc::new(tokio::sync::Mutex::new(pair)),
+        revoked: std::sync::atomic::AtomicBool::new(false),
+    });
+    bindings.insert(
+        key,
+        LegacyBindingEntry {
+            binding: std::sync::Arc::downgrade(&binding),
+            fingerprint,
+        },
+    );
+    Some(binding)
+}
+
+impl LegacyAuthBinding {
+    fn validated_token(&self, pair: &TokenPair) -> Option<String> {
+        let mut bindings = astra_core::sync_poison::recover_mutex_lock(&LEGACY_AUTH_BINDINGS);
+        let entry = bindings.get_mut(&self.key)?;
+        if !self.is_active()
+            || entry.binding.as_ptr() != std::ptr::from_ref(self)
+            || self.key.0 != credential_store().path().clone()
+        {
+            return None;
+        }
+        // A read failure denies this read; only confirmed replacement retires the owner.
+        let credentials = credential_store().load().ok()?;
+        let matches = credentials
+            .profiles
+            .get(&self.key.1)
+            .is_some_and(|profile| {
+                entry.fingerprint
+                    == credential_fingerprint(
+                        profile.account_id.as_deref(),
+                        &(profile.access_token.clone(), profile.refresh_token.clone()),
+                    )
+                    && profile.access_token == pair.0
+                    && profile.refresh_token == pair.1
+            });
+        if !matches {
+            self.revoked
+                .store(true, std::sync::atomic::Ordering::Release);
+            return None;
+        }
+        pair.0.clone()
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        !self.revoked.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn matches_profile(&self, profile: &str) -> bool {
+        self.is_active() && self.key == (credential_store().path().clone(), profile.to_owned())
+    }
+
+    pub(crate) fn commit_rotation(
+        &self,
+        expected: &Profile,
+        pair: &mut TokenPair,
+        replacement: TokenPair,
+        write: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut bindings = astra_core::sync_poison::recover_mutex_lock(&LEGACY_AUTH_BINDINGS);
+        let entry = bindings
+            .get_mut(&self.key)
+            .filter(|entry| {
+                self.is_active()
+                    && self.key.0 == credential_store().path().clone()
+                    && entry.binding.as_ptr() == std::ptr::from_ref(self)
+                    && entry.fingerprint
+                        == credential_fingerprint(expected.account_id.as_deref(), pair)
+                    && pair.0 == expected.access_token
+                    && pair.1 == expected.refresh_token
+            })
+            .ok_or_else(|| "refresh login binding was replaced".to_string())?;
+        write()?;
+        *pair = replacement;
+        entry.fingerprint = credential_fingerprint(expected.account_id.as_deref(), pair);
+        Ok(())
+    }
+}
+
+/// Disk mutation and generation retirement share a short publication boundary.
+/// Never hold this lock across HTTP or while waiting for a refresh gate.
+pub(crate) fn replace_profile_auth(
+    write: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    let mut bindings = astra_core::sync_poison::recover_mutex_lock(&LEGACY_AUTH_BINDINGS);
+    let name = write()?;
+    if let Some(entry) = bindings.remove(&(credential_store().path().clone(), name.clone()))
+        && let Some(binding) = entry.binding.upgrade()
+    {
+        binding
+            .revoked
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    Ok(name)
+}
 
 pub(crate) use astra_credentials::{
     CredentialStore, CredentialsFile, Profile, local_profile_owner_id,
@@ -99,11 +286,42 @@ pub(crate) struct CliProfileIdentity {
     local_owner_id: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct CliOwnerAuthSnapshot {
     pub(crate) owner_scope: astra_services::OwnerScope,
-    pub(crate) access_token: Option<String>,
+    pub(crate) profile_name: Option<String>,
+    pub(crate) server_account_id: Option<String>,
+    pub(crate) legacy_binding: Option<std::sync::Arc<LegacyAuthBinding>>,
     pub(crate) native_binding: Option<std::sync::Arc<crate::cli::native_auth::Binding>>,
+}
+
+impl CliOwnerAuthSnapshot {
+    pub(crate) fn is_current(&self) -> bool {
+        self.owner_scope == astra_services::local_owner_scope()
+            && match (&self.native_binding, crate::cli::native_auth::active()) {
+                (Some(bound), Some(active)) => std::sync::Arc::ptr_eq(bound, &active),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    pub(crate) async fn access_token(&self) -> Option<String> {
+        let binding = self.legacy_binding.as_ref()?;
+        let pair = binding.pair.lock().await;
+        binding.validated_token(&pair)
+    }
+}
+
+impl std::fmt::Debug for CliOwnerAuthSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CliOwnerAuthSnapshot")
+            .field("owner_scope", &self.owner_scope)
+            .field("profile_name", &self.profile_name)
+            .field("server_account_id", &self.server_account_id)
+            .field("legacy_binding", &"[redacted]")
+            .field("native_binding", &self.native_binding)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +373,13 @@ fn current_cli_profile_identity() -> Option<CliProfileIdentity> {
     }
 }
 
+/// Atomic presentation provenance; never opens credential storage or builds auth bindings.
+pub(crate) fn installed_cli_owner_metadata() -> (Option<String>, Option<String>) {
+    current_cli_profile_identity()
+        .map(|identity| (Some(identity.profile_name), identity.account_id))
+        .unwrap_or((None, None))
+}
+
 /// Atomically describe which owner a background cloud operation belongs to.
 ///
 /// The credential file is checked against the captured account id before its
@@ -165,7 +390,9 @@ pub(crate) fn cli_owner_auth_snapshot() -> CliOwnerAuthSnapshot {
     let Some(identity) = current_cli_profile_identity() else {
         return CliOwnerAuthSnapshot {
             owner_scope: astra_services::local_owner_scope(),
-            access_token: None,
+            profile_name: None,
+            server_account_id: None,
+            legacy_binding: None,
             native_binding: None,
         };
     };
@@ -175,23 +402,23 @@ pub(crate) fn cli_owner_auth_snapshot() -> CliOwnerAuthSnapshot {
     if let Some(binding) = &native_binding {
         let matches_owner = binding.profile_name() == identity.profile_name
             && binding
-                .snapshot()
-                .is_ok_and(|session| Some(session.astra_user_id) == identity.account_id);
+                .account_id()
+                .is_ok_and(|account_id| Some(account_id) == identity.account_id);
         return CliOwnerAuthSnapshot {
             owner_scope,
-            access_token: None,
+            profile_name: Some(identity.profile_name),
+            server_account_id: identity.account_id.filter(|_| matches_owner),
+            legacy_binding: None,
             native_binding: matches_owner.then(|| binding.clone()),
         };
     }
-    let access_token = load_credentials()
-        .profiles
-        .get(&identity.profile_name)
-        .filter(|profile| profile.account_id == identity.account_id)
-        .and_then(bound_profile_access_token)
-        .map(ToString::to_string);
+    let legacy_binding =
+        legacy_auth_binding(&identity.profile_name, identity.account_id.as_deref());
     CliOwnerAuthSnapshot {
         owner_scope,
-        access_token,
+        profile_name: Some(identity.profile_name),
+        server_account_id: identity.account_id,
+        legacy_binding,
         native_binding: None,
     }
 }
@@ -235,8 +462,7 @@ pub(crate) fn configure_cli_profile_identity(
     admission: CliProfileIdentityAdmission,
 ) -> Result<(), String> {
     if let Some(binding) = crate::cli::native_auth::active() {
-        let session = binding.snapshot()?;
-        return install_cli_profile_identity(binding.profile_name(), Some(session.astra_user_id));
+        return install_cli_profile_identity(binding.profile_name(), Some(binding.account_id()?));
     }
     let creds = credential_store()
         .load()
@@ -268,10 +494,56 @@ pub(crate) fn bound_profile_access_token(profile: &Profile) -> Option<&str> {
         .filter(|token| !token.trim().is_empty())
 }
 
+/// Account bound to the CLI identity installed at admission.
+/// Ingestion metadata and the local journal owner are not account identities.
+pub(crate) fn cli_account_id() -> Option<String> {
+    current_cli_profile_identity().and_then(|identity| identity.account_id)
+}
+
 pub(crate) fn cli_user_id() -> String {
-    current_cli_profile_identity()
-        .and_then(|identity| identity.account_id)
-        .unwrap_or_else(astra_services::local_owner_user_id)
+    cli_account_id().unwrap_or_else(astra_services::local_owner_user_id)
+}
+
+/// The two local journal owners attached to the current CLI identity. The
+/// profile owner isolates local state; the authenticated account owns Server
+/// execution facts. A journal cursor is never authority to read another owner.
+pub(crate) fn attached_journal_owners() -> Result<
+    (
+        astra_services::OwnerScope,
+        Option<astra_services::OwnerScope>,
+    ),
+    String,
+> {
+    attached_journal_owners_for_profile(None)
+}
+
+pub(crate) fn attached_journal_owners_for_profile(
+    profile: Option<&str>,
+) -> Result<
+    (
+        astra_services::OwnerScope,
+        Option<astra_services::OwnerScope>,
+    ),
+    String,
+> {
+    let local = astra_services::local_owner_scope();
+    let Some(identity) = current_cli_profile_identity() else {
+        return Ok((local, None));
+    };
+    if profile.is_some_and(|requested| requested != identity.profile_name.as_str()) {
+        return Err("requested CLI profile is not the attached journal identity".into());
+    }
+    if identity.local_owner_id != local.id() {
+        return Err("CLI profile identity changed while selecting journal sources".into());
+    }
+    let account = identity
+        .account_id
+        .as_deref()
+        .map(astra_services::OwnerScope::user)
+        .transpose()
+        .map_err(|error| error.to_string())?
+        .filter(|owner| owner != &local);
+    Ok((local, account))
 }
 
 pub(crate) fn get_profile_and_token(
@@ -533,9 +805,10 @@ pub(crate) async fn preflight_remote_resume_session(
     cli_profile: Option<&str>,
     session_id: &str,
 ) -> SessionResumePreflight {
-    let Some(token) = crate::cli::session::session_runtime::current_access_token(cli_profile)
-    else {
-        return SessionResumePreflight::NoAuth;
+    let token = match crate::cli::session::session_runtime::current_access_token(cli_profile) {
+        Some(token) => token,
+        None if crate::cli::native_auth::active().is_some() => String::new(),
+        None => return SessionResumePreflight::NoAuth,
     };
 
     match api.get_session(Some(&token), session_id).await {
@@ -556,9 +829,6 @@ pub(crate) async fn validated_resumable_last_session_id(
         SessionResumePreflight::Valid | SessionResumePreflight::Unknown => Some(session_id),
         SessionResumePreflight::NoAuth => {
             local_resumable_last_session_id(cli_profile).filter(|local| local == &session_id)
-        }
-        SessionResumePreflight::Missing if local_session_is_resumable(&session_id) => {
-            Some(session_id)
         }
         SessionResumePreflight::Missing => {
             clear_profile_last_session_if_matches_or_warn(
@@ -693,6 +963,7 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
             format!("SSE parse error: {error}")
         }
         error @ (astra_thin_client::ThinClientError::IncompatibleRuntime { .. }
+        | astra_thin_client::ThinClientError::ResponseTooLarge { .. }
         | astra_thin_client::ThinClientError::SessionCancellationPending { .. }
         | astra_thin_client::ThinClientError::InvalidSessionCancellationResponse(_)) => {
             error.to_string()
@@ -737,34 +1008,6 @@ pub(crate) fn eprint_api_error(status: u16, context: &str) {
     eprintln!("  {} {} ({})", theme::icon_err(), context, status);
     if let Some(hint) = status_hint(status) {
         eprintln!("      {}", hint.dim());
-    }
-}
-
-/// Print a transport/request error with helpful hints.
-pub(crate) fn eprint_request_error<E: std::fmt::Display>(error: &E) {
-    use crossterm::style::Stylize;
-    let err_str = error.to_string().to_lowercase();
-
-    eprintln!("  {} Request failed: {}", theme::icon_err(), error);
-
-    // Provide hints based on common error patterns
-    let hint = if err_str.contains("connection refused") || err_str.contains("connrefused") {
-        Some("Server may be down — check if the service is running")
-    } else if err_str.contains("timeout") || err_str.contains("timed out") {
-        Some("Request timed out — check network or try again")
-    } else if err_str.contains("dns") || err_str.contains("resolve") {
-        Some("DNS lookup failed — check your network connection")
-    } else if err_str.contains("ssl") || err_str.contains("tls") || err_str.contains("certificate")
-    {
-        Some("TLS/SSL error — check certificates or system time")
-    } else if err_str.contains("reset") || err_str.contains("closed") {
-        Some("Connection was reset — server may have restarted")
-    } else {
-        None
-    };
-
-    if let Some(h) = hint {
-        eprintln!("      {}", h.dim());
     }
 }
 
@@ -831,195 +1074,6 @@ fn flush_prompt_stdout() -> Result<(), String> {
     }
 }
 
-/// Interactive list picker — renders below the prompt line, supports ↑/↓ navigation
-/// and type-to-filter. Returns the selected item's label, or None on Esc/Ctrl-C.
-///
-/// Each item is `(label, description)`. The `current` marks the initially highlighted item.
-pub(crate) fn interactive_select(
-    title: &str,
-    items: &[(String, String)],
-    current: Option<&str>,
-) -> Option<String> {
-    if items.is_empty() {
-        eprintln!("{}", "  No items available.".yellow());
-        return None;
-    }
-
-    let mut selected: usize = current
-        .and_then(|c| items.iter().position(|i| i.0 == c))
-        .unwrap_or(0);
-    let mut filter = String::new();
-    let mut prev_rendered_lines = 0usize;
-
-    // Enter raw mode for key capture
-    if terminal::enable_raw_mode().is_err() {
-        return None;
-    }
-
-    let result = (|| -> Option<String> {
-        loop {
-            // Filter items
-            let filtered: Vec<(usize, &(String, String))> = items
-                .iter()
-                .enumerate()
-                .filter(|(_, (label, desc))| {
-                    if filter.is_empty() {
-                        true
-                    } else {
-                        let q = filter.to_lowercase();
-                        label.to_lowercase().contains(&q) || desc.to_lowercase().contains(&q)
-                    }
-                })
-                .collect();
-
-            // Clamp selected
-            if !filtered.is_empty() && selected >= filtered.len() {
-                selected = filtered.len() - 1;
-            }
-
-            // Calculate max label width for alignment
-            let max_label = filtered
-                .iter()
-                .map(|(_, (l, _))| l.len())
-                .max()
-                .unwrap_or(10);
-
-            // Clear previous render
-            for _ in 0..prev_rendered_lines {
-                eprint!("{}", theme::CURSOR_UP_CLEAR);
-            }
-            let _ = io::stderr().flush();
-
-            // Render: title + items
-            let mut lines_rendered = 0usize;
-
-            // Title line
-            eprint!("\r  {}", title.bold());
-            if !filter.is_empty() {
-                eprint!(" {}", format!("(filter: {filter})").dim());
-            }
-            eprint!("\r\n");
-            lines_rendered += 1;
-
-            // Items
-            for (idx, (_, (label, desc))) in filtered.iter().enumerate() {
-                let is_current = current == Some(label.as_str());
-                let marker = if idx == selected {
-                    "❯"
-                } else if is_current {
-                    "*"
-                } else {
-                    " "
-                };
-
-                if idx == selected {
-                    eprint!(
-                        "  {} {:<width$}  {}\r\n",
-                        marker.cyan().bold(),
-                        label.as_str().cyan().bold(),
-                        desc.as_str().dim(),
-                        width = max_label,
-                    );
-                } else if is_current {
-                    eprint!(
-                        "  {} {:<width$}  {}\r\n",
-                        marker.cyan(),
-                        label.as_str().cyan(),
-                        desc.as_str().dim(),
-                        width = max_label,
-                    );
-                } else {
-                    eprint!(
-                        "  {} {:<width$}  {}\r\n",
-                        marker,
-                        label,
-                        desc.as_str().dim(),
-                        width = max_label,
-                    );
-                }
-                lines_rendered += 1;
-            }
-
-            if filtered.is_empty() {
-                eprint!("  {}\r\n", "No matches".dim());
-                lines_rendered += 1;
-            }
-
-            let _ = io::stderr().flush();
-            prev_rendered_lines = lines_rendered;
-
-            // Read key
-            let key = match event::read() {
-                Ok(Event::Key(k)) => k,
-                _ => continue,
-            };
-
-            match key {
-                KeyEvent {
-                    code: KeyCode::Up, ..
-                }
-                | KeyEvent {
-                    code: KeyCode::BackTab,
-                    ..
-                } if !filtered.is_empty() && selected > 0 => {
-                    selected -= 1;
-                }
-                KeyEvent {
-                    code: KeyCode::Down,
-                    ..
-                }
-                | KeyEvent {
-                    code: KeyCode::Tab, ..
-                } if !filtered.is_empty() && selected + 1 < filtered.len() => {
-                    selected += 1;
-                }
-                KeyEvent {
-                    code: KeyCode::Enter,
-                    ..
-                } => {
-                    if let Some((_, (label, _))) = filtered.get(selected) {
-                        return Some(label.clone());
-                    }
-                    return None;
-                }
-                KeyEvent {
-                    code: KeyCode::Esc, ..
-                }
-                | KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                } => {
-                    return None;
-                }
-                KeyEvent {
-                    code: KeyCode::Backspace,
-                    ..
-                } => {
-                    filter.pop();
-                    selected = 0;
-                }
-                KeyEvent {
-                    code: KeyCode::Char(c),
-                    modifiers,
-                    ..
-                } if !modifiers.contains(KeyModifiers::CONTROL) => {
-                    filter.push(c);
-                    selected = 0;
-                }
-                _ => {}
-            }
-        }
-    })();
-
-    // Clean up: clear the picker display and restore terminal
-    for _ in 0..prev_rendered_lines {
-        eprint!("{}", theme::CURSOR_UP_CLEAR);
-    }
-    let _ = io::stderr().flush();
-    terminal::disable_raw_mode().ok();
-    result
-}
 /// Best-effort terminal width for wrapping (matches SSE `term_width` default on error).
 pub(crate) fn terminal_width_usize() -> usize {
     terminal::size()
@@ -1034,55 +1088,18 @@ pub(crate) fn urlencoding(s: &str) -> String {
     astra_text_utils::url_component::encode_url_component(s)
 }
 
-/// Read current git HEAD (short SHA) and branch name for journal git snapshots.
-///
-/// `cwd` should be the session's `git_root` so the snapshot reflects the
-/// correct repo even if the process cwd differs. Falls back to process cwd
-/// when `None`.
-///
-/// Returns `(git_head, git_branch)` — either or both may be `None` if not in a
-/// git repo or in detached HEAD state (branch will be None).
-pub(crate) fn git_snapshot(cwd: Option<&str>) -> (Option<String>, Option<String>) {
-    let mut head_cmd = std::process::Command::new("git");
-    head_cmd.args(["rev-parse", "--short", "HEAD"]);
-    if let Some(dir) = cwd {
-        head_cmd.current_dir(dir);
-    }
-    let head = head_cmd
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    let mut branch_cmd = std::process::Command::new("git");
-    branch_cmd.args(["symbolic-ref", "--short", "HEAD"]);
-    if let Some(dir) = cwd {
-        branch_cmd.current_dir(dir);
-    }
-    let branch = branch_cmd
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty());
-
-    (head, branch)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         CliProfileIdentityAdmission, CredentialsFile, Profile,
         clear_profile_last_session_if_matches, cli_owner_auth_snapshot, cli_user_id,
         compact_or_raw, configure_cli_profile_identity, credentials_path,
-        format_error_with_context, get_profile_and_token, git_snapshot,
-        install_cli_profile_identity_for_test, is_astra_session_auth_error, load_credentials,
-        local_profile_owner_id, local_resumable_last_session_id, local_session_is_resumable,
-        mutate_credentials, normalize_model_override, persist_profile_last_session,
-        persist_profile_memoria_api_key, profile_name, read_api_error, save_credentials,
-        session_is_resumable, status_hint, status_hint_for, urlencoding,
-        validated_resumable_last_session_id,
+        format_error_with_context, get_profile_and_token, install_cli_profile_identity_for_test,
+        is_astra_session_auth_error, load_credentials, local_profile_owner_id,
+        local_resumable_last_session_id, local_session_is_resumable, mutate_credentials,
+        normalize_model_override, persist_profile_last_session, persist_profile_memoria_api_key,
+        profile_name, read_api_error, save_credentials, session_is_resumable, status_hint,
+        status_hint_for, urlencoding, validated_resumable_last_session_id,
     };
     use astra_services::{SessionArtifactStore as _, session_journal};
     use std::sync::{Mutex, OnceLock};
@@ -1214,13 +1231,44 @@ mod tests {
             Profile {
                 account_id: Some("account-a".to_string()),
                 access_token: Some("token-a".to_string()),
+                refresh_token: Some("refresh-a".to_string()),
                 ..Default::default()
             },
         );
         save_credentials(&credentials).unwrap();
 
         let before = cli_owner_auth_snapshot();
-        assert_eq!(before.access_token.as_deref(), Some("token-a"));
+        assert_eq!(
+            before
+                .legacy_binding
+                .as_ref()
+                .unwrap()
+                .pair
+                .try_lock()
+                .unwrap()
+                .0
+                .as_deref(),
+            Some("token-a")
+        );
+        assert_eq!(
+            before
+                .legacy_binding
+                .as_ref()
+                .unwrap()
+                .pair
+                .try_lock()
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("refresh-a")
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            before.legacy_binding.as_ref().unwrap(),
+            before.clone().legacy_binding.as_ref().unwrap()
+        ));
+        let debug = format!("{before:?}");
+        assert!(!debug.contains("token-a"));
+        assert!(!debug.contains("refresh-a"));
 
         credentials.profiles.insert(
             "profile-a".to_string(),
@@ -1234,8 +1282,8 @@ mod tests {
 
         let transition_window = cli_owner_auth_snapshot();
         assert_eq!(transition_window.owner_scope, before.owner_scope);
-        assert_eq!(
-            transition_window.access_token, None,
+        assert!(
+            transition_window.legacy_binding.is_none(),
             "an account mismatch must pause delivery instead of borrowing the replacement token"
         );
 
@@ -1243,7 +1291,18 @@ mod tests {
             install_cli_profile_identity_for_test("profile-a", Some("account-b")).unwrap();
         let after = cli_owner_auth_snapshot();
         assert_ne!(after.owner_scope, before.owner_scope);
-        assert_eq!(after.access_token.as_deref(), Some("token-b"));
+        assert_eq!(
+            after
+                .legacy_binding
+                .as_ref()
+                .unwrap()
+                .pair
+                .try_lock()
+                .unwrap()
+                .0
+                .as_deref(),
+            Some("token-b")
+        );
     }
 
     #[serial_test::serial]
@@ -1273,9 +1332,8 @@ mod tests {
 
         configure_cli_profile_identity(None, CliProfileIdentityAdmission::AuthenticationBootstrap)
             .expect("login/register must reach the server to obtain account_id");
-        assert_eq!(
-            cli_owner_auth_snapshot().access_token,
-            None,
+        assert!(
+            cli_owner_auth_snapshot().legacy_binding.is_none(),
             "anonymous bootstrap state must never inherit an unbound credential"
         );
         let token_error = get_profile_and_token(None)
@@ -1284,21 +1342,6 @@ mod tests {
             token_error.contains("server-issued account_id"),
             "{token_error}"
         );
-    }
-
-    struct CliOverlayGuard;
-
-    impl CliOverlayGuard {
-        fn install(overlay: astra_config::runtime_config::RuntimeConfig) -> Self {
-            astra_config::runtime_config::set_cli_overlay(Some(overlay));
-            Self
-        }
-    }
-
-    impl Drop for CliOverlayGuard {
-        fn drop(&mut self) {
-            astra_config::runtime_config::set_cli_overlay(None);
-        }
     }
 
     fn write_resumable_session(session_id: &str) {
@@ -1965,7 +2008,8 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn validated_resumable_last_session_id_keeps_local_state_when_remote_404s() {
+    async fn validated_resumable_last_session_id_clears_remote_404_pointer_without_deleting_local_copy()
+     {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("stale-session-{}", uuid::Uuid::new_v4());
@@ -1984,13 +2028,14 @@ mod tests {
 
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let resolved = validated_resumable_last_session_id(&api, None).await;
-        assert_eq!(resolved.as_deref(), Some(session_id.as_str()));
+        assert_eq!(resolved, None);
+        assert!(local_session_is_resumable(&session_id));
         assert_eq!(
             load_credentials()
                 .profiles
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),
-            Some(session_id.as_str())
+            None
         );
     }
 
@@ -2162,53 +2207,5 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "credentials.json must be 0600, got {mode:o}");
         }
-    }
-
-    #[test]
-    fn git_snapshot_returns_head_and_branch_in_git_repo() {
-        // This test runs inside the astra git repo, so both should be Some.
-        let (head, _branch) = git_snapshot(None);
-        assert!(
-            head.is_some(),
-            "git_snapshot must return Some(head) inside a git repo"
-        );
-        let h = head.unwrap();
-        assert!(
-            h.len() >= 7 && h.len() <= 40,
-            "git HEAD should be 7-40 chars, got {}: '{h}'",
-            h.len()
-        );
-        // branch may be None in CI detached HEAD, so we only check head is valid hex
-        assert!(
-            h.chars().all(|c| c.is_ascii_hexdigit()),
-            "git HEAD must be hex, got '{h}'"
-        );
-    }
-
-    #[test]
-    fn git_snapshot_with_explicit_cwd_matches_none() {
-        // Passing the current dir explicitly should give the same result as None.
-        let cwd = std::env::current_dir().unwrap();
-        let (head_none, branch_none) = git_snapshot(None);
-        let (head_cwd, branch_cwd) = git_snapshot(Some(cwd.to_str().unwrap()));
-        assert_eq!(head_none, head_cwd, "explicit cwd must match implicit cwd");
-        assert_eq!(
-            branch_none, branch_cwd,
-            "explicit cwd must match implicit cwd"
-        );
-    }
-
-    #[test]
-    fn git_snapshot_with_non_git_dir_returns_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (head, branch) = git_snapshot(Some(tmp.path().to_str().unwrap()));
-        assert!(
-            head.is_none(),
-            "non-git dir must return None for head, got {head:?}"
-        );
-        assert!(
-            branch.is_none(),
-            "non-git dir must return None for branch, got {branch:?}"
-        );
     }
 }

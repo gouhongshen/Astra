@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
@@ -10,6 +11,24 @@ use tracing;
 
 use crate::ToolResult;
 use crate::schemas::schema_exists_for_tool;
+
+/// Apply the canonical tool panic classification without discarding private
+/// execution facts from a successful handler return.
+pub async fn execute_tool_with_panic_boundary<R>(
+    name: &str,
+    execution: impl Future<Output = R>,
+) -> R
+where
+    R: From<ToolResult>,
+{
+    AssertUnwindSafe(execution)
+        .catch_unwind()
+        .await
+        .unwrap_or_else(|_| {
+            tracing::error!(tool_name = %name, "tool handler panicked; returning error to caller");
+            ToolResult::error(format!("Internal error: tool '{name}' panicked")).into()
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ToolEngineRegistrationError {
@@ -40,8 +59,9 @@ pub enum ToolInvocationAdmissionSource {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ToolInvocationMetadata<'a> {
-    pub task_resolution_authority:
-        Option<&'a astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
+    /// Caller-selected admission cutoff, retained only for this invocation.
+    /// Leaf handlers check it after waits; they do not choose budget phases.
+    pub admission_deadline: Option<std::time::Instant>,
     pub run_id: Option<&'a str>,
     pub turn_chain_id: Option<&'a str>,
     pub tool_call_id: Option<&'a str>,
@@ -49,6 +69,10 @@ pub struct ToolInvocationMetadata<'a> {
     /// Durable user-intent epoch used by the invocation's atomic action
     /// admission. Provider arguments cannot populate this field.
     pub expected_control_epoch: Option<i64>,
+    /// Server-issued command ceiling, distinct from the delivery deadline
+    /// that also reserves time to publish the settled result.
+    pub command_timeout_cap_ms: Option<u64>,
+    pub delegation_model_admission: Option<&'a astra_turn_types::DelegationModelAdmission>,
 }
 
 #[async_trait]
@@ -255,21 +279,11 @@ impl<C: Sync> ToolEngine<C> {
     ) -> Option<ToolResult> {
         if let Some(handler) = self.handlers.get(name) {
             return Some(
-                AssertUnwindSafe(handler.execute_invocation(
-                    context,
-                    args,
-                    invocation,
-                    cancel_token,
-                ))
-                .catch_unwind()
-                .await
-                .unwrap_or_else(|_| {
-                    tracing::error!(
-                        tool_name = %name,
-                        "tool handler panicked; returning error to caller"
-                    );
-                    ToolResult::error(format!("Internal error: tool '{name}' panicked"))
-                }),
+                execute_tool_with_panic_boundary(
+                    name,
+                    handler.execute_invocation(context, args, invocation, cancel_token),
+                )
+                .await,
             );
         }
         let handler = self
@@ -277,22 +291,13 @@ impl<C: Sync> ToolEngine<C> {
             .iter()
             .find(|entry| entry.matches(name))?;
         Some(
-            AssertUnwindSafe(handler.handler.execute_invocation(
+            execute_tool_with_panic_boundary(
                 name,
-                context,
-                args,
-                invocation,
-                cancel_token,
-            ))
-            .catch_unwind()
-            .await
-            .unwrap_or_else(|_| {
-                tracing::error!(
-                    tool_name = %name,
-                    "prefix handler panicked; returning error to caller"
-                );
-                ToolResult::error(format!("Internal error: tool '{name}' panicked"))
-            }),
+                handler
+                    .handler
+                    .execute_invocation(name, context, args, invocation, cancel_token),
+            )
+            .await,
         )
     }
 }
@@ -437,12 +442,14 @@ mod tests {
                 &TestContext { prefix: "ctx" },
                 &args,
                 ToolInvocationMetadata {
-                    task_resolution_authority: None,
+                    admission_deadline: None,
                     run_id: Some("run-1"),
                     turn_chain_id: Some("turn-1"),
                     tool_call_id: Some("call-1"),
                     admission_source: Some(ToolInvocationAdmissionSource::Policy),
                     expected_control_epoch: None,
+                    command_timeout_cap_ms: None,
+                    delegation_model_admission: None,
                 },
                 None,
             )

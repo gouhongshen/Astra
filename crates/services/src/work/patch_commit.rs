@@ -6,7 +6,6 @@ use super::{
 use astra_core::SharedPool;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, query};
 use thiserror::Error;
@@ -138,6 +137,7 @@ impl WorkPatchCommitPhase {
 pub enum WorkPatchCommitFailureCode {
     AuthorizationDenied,
     WorkspaceUnavailable,
+    InvalidWorkspace,
     ProviderUnavailable,
     InvalidMetadata,
     BaseChanged,
@@ -152,6 +152,7 @@ impl WorkPatchCommitFailureCode {
         match self {
             Self::AuthorizationDenied => "authorization_denied",
             Self::WorkspaceUnavailable => "workspace_unavailable",
+            Self::InvalidWorkspace => "invalid_workspace",
             Self::ProviderUnavailable => "provider_unavailable",
             Self::InvalidMetadata => "invalid_metadata",
             Self::BaseChanged => "base_changed",
@@ -166,6 +167,7 @@ impl WorkPatchCommitFailureCode {
         match value {
             "authorization_denied" => Some(Self::AuthorizationDenied),
             "workspace_unavailable" => Some(Self::WorkspaceUnavailable),
+            "invalid_workspace" => Some(Self::InvalidWorkspace),
             "provider_unavailable" => Some(Self::ProviderUnavailable),
             "invalid_metadata" => Some(Self::InvalidMetadata),
             "base_changed" => Some(Self::BaseChanged),
@@ -717,46 +719,8 @@ impl DatabaseWorkPatchCommitService {
         .fetch_optional(self.pool.get())
         .await?
         .ok_or(WorkPatchCommitError::NotFound)?;
-        if row.try_get::<String, _>("artifact_kind")? != "patch"
-            || row.try_get::<String, _>("artifact_status")? != "active"
-        {
-            return Err(repair("patch payload artifact is not active".into()));
-        }
-        let content: Value = serde_json::from_str(&row.try_get::<String, _>("content_json")?)
-            .map_err(|error| repair(error.to_string()))?;
-        let text = |field: &'static str| {
-            content
-                .get(field)
-                .and_then(Value::as_str)
-                .ok_or_else(|| repair(format!("patch payload is missing {field}")))
-        };
-        if text("kind")? != "patch"
-            || text("content_type")? != "text/x-diff"
-            || text("encoding")? != "utf-8"
-        {
-            return Err(repair("patch payload contract is unsupported".into()));
-        }
-        let data = text("data")?.as_bytes();
-        let declared_bytes = content
-            .get("byte_size")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| repair("patch payload is missing byte_size".into()))?;
-        let persisted_bytes = u64::try_from(row.try_get::<i64, _>("payload_bytes")?)
-            .map_err(|_| repair("patch payload byte count is negative".into()))?;
-        if declared_bytes != data.len() as u64
-            || persisted_bytes != declared_bytes
-            || declared_bytes > super::WORK_PATCH_ARTIFACT_MAX_BYTES
-        {
-            return Err(repair("patch payload byte count is incoherent".into()));
-        }
-        let digest = format!("sha256:{:x}", Sha256::digest(data));
-        if text("sha256")? != &digest[7..]
-            || row.try_get::<String, _>("payload_hash")? != digest
-            || row.try_get::<String, _>("operation_payload_hash")? != digest
-        {
-            return Err(repair("patch payload digest is incoherent".into()));
-        }
-        Ok(data.to_vec())
+        super::patch_artifact_repository::validated_operation_payload(&row)
+            .map_err(|error| repair(error.to_string()))
     }
 
     pub async fn claim_committing(

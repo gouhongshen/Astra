@@ -34,6 +34,7 @@ fn required_decision(
     mutations: Vec<WorkAdmissionGraphMutation>,
 ) -> WorkAdmissionDecision {
     WorkAdmissionDecision::Required {
+        assessment: None,
         domain: None,
         workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
         mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -56,12 +57,14 @@ fn start_args(goal: &str, tasks: &[WorkAdmissionTask]) -> Value {
 
 fn invocation<'a>(run_id: &'a str, call_id: &'a str) -> ToolInvocationMetadata<'a> {
     ToolInvocationMetadata {
+        admission_deadline: None,
         run_id: Some(run_id),
         turn_chain_id: Some("precedence-regression-replay"),
         tool_call_id: Some(call_id),
         admission_source: Some(ToolInvocationAdmissionSource::Policy),
         expected_control_epoch: None,
-        task_resolution_authority: None,
+        command_timeout_cap_ms: None,
+        delegation_model_admission: None,
     }
 }
 
@@ -1110,12 +1113,14 @@ async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
                 &repair,
                 &json!({}),
                 ToolInvocationMetadata {
+                    admission_deadline: None,
                     run_id: Some(&run_id),
                     turn_chain_id: Some("terminal-cut-repair-turn"),
                     tool_call_id: Some("terminal-cut-repair-call"),
                     admission_source: Some(ToolInvocationAdmissionSource::Policy),
                     expected_control_epoch: Some(-1),
-                    task_resolution_authority: None,
+                    command_timeout_cap_ms: None,
+                    delegation_model_admission: None,
                 },
             )
             .await;
@@ -1183,12 +1188,14 @@ async fn delayed_cancel_terminal_cut_recovers_across_both_commit_windows() {
                 &executor,
                 &serde_json::to_value(&settlement).expect("settlement arguments"),
                 ToolInvocationMetadata {
+                    admission_deadline: None,
                     run_id: Some(&run_id),
                     turn_chain_id: Some("settlement-replay-turn"),
                     tool_call_id: Some("settlement-replay-call"),
                     admission_source: Some(ToolInvocationAdmissionSource::Policy),
                     expected_control_epoch: Some(7),
-                    task_resolution_authority: None,
+                    command_timeout_cap_ms: None,
+                    delegation_model_admission: None,
                 },
             )
             .await;

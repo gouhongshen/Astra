@@ -51,33 +51,29 @@ mod validation;
 mod verified;
 
 pub use admin::{
-    DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminFeedbackStatsReader,
-    DatabaseAdminInitializer, DatabaseAdminTokenReader, DatabaseAdminTokenWriter,
-    DatabaseAdminUserRoleManager,
+    DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminInitializer,
+    DatabaseAdminTokenReader, DatabaseAdminTokenWriter, DatabaseAdminUserRoleManager,
 };
 pub use admin::{
-    UnconfiguredAdminAuditReader, UnconfiguredAdminAuthorizer,
-    UnconfiguredAdminFeedbackStatsReader, UnconfiguredAdminInitializer,
+    UnconfiguredAdminAuditReader, UnconfiguredAdminAuthorizer, UnconfiguredAdminInitializer,
     UnconfiguredAdminTokenReader, UnconfiguredAdminTokenWriter, UnconfiguredAdminUserRoleManager,
 };
 pub use encryption::FernetTokenEncryptor;
 use encryption::sha256_hex;
+use external::validate_provider_runtime_context;
 pub use external::{
     ExternalAuthProviderConfig, ExternalAuthorizeRequestData, ExternalAuthorizedRequest,
-    ExternalCatalogResponse, ExternalLoginRequestData, ExternalProviderClient,
-    ExternalProviderPublicRecord, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
-    ExternalRuntimeContextResponse, ExternalSessionRecord, HttpExternalProviderClient,
-};
-use external::{
-    encrypt_provider_session_handle, resolve_selected_scope, validate_provider_runtime_context,
+    ExternalCatalogResponse, ExternalProviderClient, ExternalRequestDescriptor,
+    ExternalRuntimeContextRequestData, ExternalRuntimeContextResponse, HttpExternalProviderClient,
 };
 use jwt::{JwtTokenClaims, create_jwt_token, decode_jwt_claims, decode_jwt_claims_with_detail};
 pub use provider_request::{ProviderAuthorizedRequest, ProviderRequestDescriptor};
 pub use session::UnconfiguredSessionService;
 pub use session::{
-    DatabaseSessionService, ProviderSessionCreationIdentity, SessionActivityCursor,
-    SessionActivityRecord, SessionCreateRequestData, SessionCreationResult, SessionListCursor,
-    SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
+    DatabaseSessionService, ExecutionContinuationGrant, ProviderSessionCreationIdentity,
+    SessionActivityCursor, SessionActivityRecord, SessionCreateRequestData, SessionCreationResult,
+    SessionListCursor, SessionListFilter, SessionListRecord, SessionRecord, SessionService,
+    SessionUpdateRequestData,
 };
 use validation::validate_register_request;
 
@@ -355,6 +351,43 @@ fn provider_request_auth_error(message: impl Into<String>) -> AuthHttpError {
     )
 }
 
+fn execution_continuation_denied() -> AuthHttpError {
+    error_response_coded(
+        StatusCode::FORBIDDEN,
+        "Execution continuation is not authorized",
+        "execution_continuation_denied",
+    )
+}
+
+fn execution_continuation_unavailable() -> AuthHttpError {
+    error_response_coded(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Execution continuation authorization is temporarily unavailable",
+        "execution_continuation_unavailable",
+    )
+}
+
+fn execution_continuation_db_error(_error: sqlx::Error, operation: &'static str) -> AuthHttpError {
+    warn!(
+        target: "astra_services::auth",
+        operation,
+        "execution continuation authorization database check unavailable"
+    );
+    execution_continuation_unavailable()
+}
+
+fn execution_continuation_provider_error(error: AuthHttpError) -> AuthHttpError {
+    match error.0 {
+        StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND => {
+            execution_continuation_denied()
+        }
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::INTERNAL_SERVER_ERROR => {
+            execution_continuation_unavailable()
+        }
+        _ => execution_continuation_unavailable(),
+    }
+}
+
 #[cfg(test)]
 fn provider_request_signature(key: &[u8], encoded_claims: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts keys of any length");
@@ -502,6 +535,15 @@ pub trait AuthService: Send + Sync {
         self.current_principal(headers).await
     }
 
+    /// Reauthorize only an atomically adopted handoff. A serialized run id,
+    /// user id, or provider scope is not sufficient to reconstruct a principal.
+    async fn reauthorize_execution_handoff(
+        &self,
+        _handoff: &crate::session_context_coordinator::ResumedExecutionTurn,
+    ) -> Result<AuthPrincipal, AuthHttpError> {
+        Err(execution_continuation_unavailable())
+    }
+
     /// Resolve the edge binding for the presented credential.
     ///
     /// Returns [`EdgeTokenBinding::Bound`] for an edge-registration token bound
@@ -518,46 +560,6 @@ pub trait AuthService: Send + Sync {
         _token: &str,
     ) -> Result<EdgeTokenBinding, (StatusCode, Json<ErrorResponse>)> {
         Ok(EdgeTokenBinding::NotEdgeToken)
-    }
-
-    async fn external_providers(
-        &self,
-    ) -> Result<Vec<ExternalProviderPublicRecord>, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "External auth providers are not configured",
-        ))
-    }
-
-    async fn external_login(
-        &self,
-        _request: ExternalLoginRequestData,
-    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "External auth providers are not configured",
-        ))
-    }
-
-    async fn external_catalog(
-        &self,
-        _principal: &AuthPrincipal,
-    ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "External runtime catalog is not configured",
-        ))
-    }
-
-    async fn external_runtime_context(
-        &self,
-        _principal: &AuthPrincipal,
-        _request: ExternalRuntimeContextRequestData,
-    ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "External runtime context is not configured",
-        ))
     }
 
     /// List catalog for an authorized-request principal (edge-JWT) using scope and subject
@@ -649,16 +651,76 @@ pub struct AuthUserRecord {
 pub struct AuthPrincipal {
     pub user: AuthUserRecord,
     pub session_id: Option<String>,
+    pub execution_continuation: Option<ExecutionContinuationGrant>,
     pub origin: AuthPrincipalOrigin,
 }
 
-impl AuthPrincipal {
-    pub fn internal(user: AuthUserRecord) -> Self {
-        Self {
-            user,
-            session_id: None,
-            origin: AuthPrincipalOrigin::Internal,
+/// Original authenticated identity references, never retained credentials or
+/// permission to resume execution. Only AuthService may reauthorize an adopted
+/// run; a fresh login by the same user is not the original session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutionAuthenticationProvenance {
+    LocalSession {
+        user_id: String,
+        session_id: String,
+        execution_continuation: Option<ExecutionContinuationGrant>,
+    },
+    VerifiedProviderSession {
+        user_id: String,
+        session_id: String,
+        provider_id: String,
+        external_subject: String,
+        execution_continuation: Option<ExecutionContinuationGrant>,
+    },
+    ProviderRequest {
+        user_id: String,
+        provider_id: String,
+        external_subject: String,
+        provider_scope_id: String,
+        request_authorization_id: String,
+    },
+}
+
+impl ExecutionAuthenticationProvenance {
+    pub fn user_id(&self) -> &str {
+        match self {
+            Self::LocalSession { user_id, .. }
+            | Self::VerifiedProviderSession { user_id, .. }
+            | Self::ProviderRequest { user_id, .. } => user_id,
         }
+    }
+}
+
+impl AuthPrincipal {
+    pub fn execution_authentication_provenance(&self) -> Option<ExecutionAuthenticationProvenance> {
+        let user_id = self.user.user_id.clone();
+        Some(match &self.origin {
+            AuthPrincipalOrigin::Internal => ExecutionAuthenticationProvenance::LocalSession {
+                user_id,
+                session_id: self.session_id.clone()?,
+                execution_continuation: self.execution_continuation.clone(),
+            },
+            AuthPrincipalOrigin::VerifiedProvider {
+                provider_id,
+                external_subject,
+            } => ExecutionAuthenticationProvenance::VerifiedProviderSession {
+                user_id,
+                session_id: self.session_id.clone()?,
+                provider_id: provider_id.clone(),
+                external_subject: external_subject.clone(),
+                execution_continuation: self.execution_continuation.clone(),
+            },
+            AuthPrincipalOrigin::ProviderAuthorizedRequest(context) => {
+                ExecutionAuthenticationProvenance::ProviderRequest {
+                    user_id,
+                    provider_id: context.provider_id.clone(),
+                    external_subject: context.external_subject.clone(),
+                    provider_scope_id: context.provider_scope_id.clone(),
+                    request_authorization_id: context.request_authorization_id.clone(),
+                }
+            }
+        })
     }
 
     pub fn is_provider_authorized_request(&self) -> bool {
@@ -1002,16 +1064,6 @@ impl DatabaseAuthService {
         self
     }
 
-    #[allow(dead_code)]
-    fn encryptor(&self) -> Result<&FernetTokenEncryptor, (StatusCode, Json<ErrorResponse>)> {
-        self.encryptor.as_ref().ok_or_else(|| {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "External auth session encryption is not configured",
-            )
-        })
-    }
-
     fn external_provider_config(
         &self,
         provider_id: &str,
@@ -1265,16 +1317,17 @@ impl DatabaseAuthService {
         pool: &sqlx::Pool<MySql>,
         user_id: &str,
         session_id: &str,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<Option<i64>, sqlx::Error> {
         let row = query(
-            "SELECT COUNT(*) AS count FROM auth_refresh_tokens \
+            "SELECT CAST(UNIX_TIMESTAMP(MAX(expires_at)) AS SIGNED) AS max_expires_at_unix \
+             FROM auth_refresh_tokens \
              WHERE user_id = ? AND session_id = ? AND is_revoked = 0 AND expires_at > NOW()",
         )
         .bind(user_id)
         .bind(session_id)
         .fetch_one(pool)
         .await?;
-        Ok(row.try_get::<i64, _>("count").unwrap_or(0) > 0)
+        row.try_get::<Option<i64>, _>("max_expires_at_unix")
     }
 
     fn parse_token_session(
@@ -1297,121 +1350,6 @@ impl DatabaseAuthService {
                 "Invalid token origin",
             )),
         }
-    }
-
-    #[allow(dead_code)]
-    fn parse_provider_expires_at(
-        &self,
-        raw: &str,
-    ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-        chrono::DateTime::parse_from_rfc3339(raw)
-            .map(|dt| {
-                dt.with_timezone(&Utc)
-                    .format("%Y-%m-%d %H:%M:%S")
-                    .to_string()
-            })
-            .map_err(|error| {
-                error_response_coded(
-                    StatusCode::BAD_GATEWAY,
-                    format!("external provider session expiry is invalid: {error}"),
-                    "external_provider_response_invalid",
-                )
-            })
-    }
-
-    #[allow(dead_code)]
-    async fn complete_external_auth(
-        &self,
-        provider: &ExternalAuthProviderConfig,
-        requested_scope_id: Option<&str>,
-        response: external::ExternalProviderAuthResponse,
-    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
-        let selected_scope = resolve_selected_scope(requested_scope_id, &response)?;
-        let encrypted_handle =
-            encrypt_provider_session_handle(self.encryptor()?, &response.provider_session_handle)?;
-        let external_subject = response.external_subject.id.clone();
-        let external_username = response.display_info.username.clone();
-        let external_email = response.display_info.email.clone();
-        let external_display_name = response.display_info.nickname.clone();
-        let pool = self
-            .get_pool()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
-        let now = Utc::now();
-        let external_expires_at = self.parse_provider_expires_at(&response.expires_at)?;
-        let astra_session_id = Uuid::new_v4().to_string();
-
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.begin_tx", Some(&pool)))?;
-        let user = self
-            .resolve_verified_provider_identity(&mut tx, &provider.id, &external_subject)
-            .await?;
-        let astra_user_id = user.user_id;
-        query("UPDATE auth_external_identities SET username = ?, email = ?, display_name = ?, updated_at = NOW() WHERE provider_id = ? AND external_subject = ?")
-            .bind(&external_username).bind(&external_email).bind(&external_display_name)
-            .bind(&provider.id).bind(&external_subject).execute(&mut *tx).await
-            .map_err(|e| map_auth_sqlx(e, "external.update_identity", Some(&pool)))?;
-
-        query(
-            "INSERT INTO auth_external_sessions \
-             (external_session_id, provider_id, astra_user_id, external_subject, \
-              provider_scope_id, provider_scope_display_name, encrypted_provider_session_handle, \
-              status, expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)",
-        )
-        .bind(&astra_session_id)
-        .bind(&provider.id)
-        .bind(&astra_user_id)
-        .bind(&external_subject)
-        .bind(&selected_scope.id)
-        .bind(&selected_scope.name)
-        .bind(&encrypted_handle)
-        .bind(&external_expires_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "external.insert_session", Some(&pool)))?;
-
-        let access_token = self
-            .create_access_token(
-                &astra_user_id,
-                &external_username,
-                &astra_session_id,
-                "external",
-            )
-            .map_err(internal_error)?;
-        let refresh_token = self
-            .create_refresh_token(&astra_user_id, &astra_session_id, "external")
-            .map_err(internal_error)?;
-        let refresh_token_hash = sha256_hex(&refresh_token);
-        let refresh_expires_at = self.refresh_token_expires_at_string(now);
-
-        query(
-            "INSERT INTO auth_refresh_tokens \
-             (token_id, user_id, session_id, token_hash, expires_at, is_revoked) \
-             VALUES (?, ?, ?, ?, ?, 0)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&astra_user_id)
-        .bind(&astra_session_id)
-        .bind(&refresh_token_hash)
-        .bind(refresh_expires_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| map_auth_sqlx(e, "external.insert_refresh_token", Some(&pool)))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| map_auth_sqlx(e, "external.commit_tx", Some(&pool)))?;
-
-        Ok(AuthTokenRecord {
-            user_id: astra_user_id,
-            access_token,
-            refresh_token,
-            token_type: "bearer".to_string(),
-            expires_in: self.access_token_expires_in_seconds(),
-        })
     }
 
     /// Resolve an [`AuthPrincipal`] from a moi-issued edge-registration token
@@ -1463,44 +1401,22 @@ impl DatabaseAuthService {
             format!("{MOI_USER_TOKEN_PREFIX}:jti:{}", claims.jti)
         };
         let user_id = format!("external_authorized:moi:{}", claims.sub);
-        Ok(AuthPrincipal {
-            user: AuthUserRecord {
+        Ok(AuthPrincipal::from_provider_request(
+            AuthUserRecord {
                 user_id,
                 username: claims.sub.clone(),
                 email: String::new(),
                 display_name: None,
             },
-            session_id: None,
-            origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
-                AuthProviderAuthorizedRequestContext {
-                    provider_id: "moi".to_string(),
-                    external_subject: claims.sub,
-                    provider_scope_id: claims.workspace_id,
-                    request_authorization_id,
-                    edge_agent_id: is_edge_registration.then(|| claims.edge_agent_id.clone()),
-                },
-            ),
-        })
+            AuthProviderAuthorizedRequestContext {
+                provider_id: "moi".to_string(),
+                external_subject: claims.sub,
+                provider_scope_id: claims.workspace_id,
+                request_authorization_id,
+                edge_agent_id: is_edge_registration.then(|| claims.edge_agent_id.clone()),
+            },
+        ))
     }
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-struct ExternalSessionDbRecord {
-    session: ExternalSessionRecord,
-    provider_expires_at: String,
-    encrypted_provider_session_handle: String,
-    external_username: String,
-    external_email: Option<String>,
-    external_display_name: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-struct ExternalSessionRefreshUpdate {
-    encrypted_provider_session_handle: String,
-    provider_scope_id: String,
-    expires_at: String,
 }
 
 fn header_exact(
@@ -2103,6 +2019,135 @@ impl AuthService for DatabaseAuthService {
         Ok(())
     }
 
+    async fn reauthorize_execution_handoff(
+        &self,
+        handoff: &crate::session_context_coordinator::ResumedExecutionTurn,
+    ) -> Result<AuthPrincipal, AuthHttpError> {
+        let run = handoff.run();
+        let receipt = handoff.receipt();
+        if receipt.run_id != run.run_id
+            || receipt.run_generation != run.run_generation
+            || receipt.source.key.owner_user_id != run.user_id
+            || receipt.source.key.session_id != run.session_id
+        {
+            return Err(execution_continuation_denied());
+        }
+
+        let provenance = run
+            .execution_authentication()
+            .map_err(|_| execution_continuation_denied())?
+            .ok_or_else(execution_continuation_denied)?;
+        let (user_id, session_id, execution_continuation, provider) = match provenance {
+            ExecutionAuthenticationProvenance::LocalSession {
+                user_id,
+                session_id,
+                execution_continuation: Some(grant),
+            } => (user_id, session_id, grant, None),
+            ExecutionAuthenticationProvenance::VerifiedProviderSession {
+                user_id,
+                session_id,
+                provider_id,
+                external_subject,
+                execution_continuation: Some(grant),
+            } => (
+                user_id,
+                session_id,
+                grant,
+                Some((provider_id, external_subject)),
+            ),
+            // UC, provider-request, edge, and historical records without the
+            // explicit local grant have no continuation authority.
+            _ => return Err(execution_continuation_denied()),
+        };
+        // The authentication session is not the agent conversation session.
+        if run.user_id != user_id || !execution_continuation.belongs_to(&user_id, &session_id) {
+            return Err(execution_continuation_denied());
+        }
+        let now = Utc::now().timestamp();
+        if execution_continuation.expires_at_unix <= now {
+            return Err(execution_continuation_denied());
+        }
+
+        let pool = self
+            .get_pool()
+            .await
+            .map_err(|error| execution_continuation_db_error(error, "reauthorize.get_pool"))?;
+        let current_session_expiry = self
+            .refresh_session_is_active(&pool, &user_id, &session_id)
+            .await
+            .map_err(|error| {
+                execution_continuation_db_error(error, "reauthorize.refresh_session")
+            })?;
+        // Refresh may extend this session's current lifetime, but must never
+        // extend the original run's frozen continuation ceiling.
+        if !current_session_expiry.is_some_and(|expiry| expiry > now) {
+            return Err(execution_continuation_denied());
+        }
+
+        let database_user = self
+            .fetch_user_by_id_or_username(&pool, &user_id, None)
+            .await
+            .map_err(|error| execution_continuation_db_error(error, "reauthorize.fetch_user"))?
+            .ok_or_else(execution_continuation_denied)?;
+        if !database_user.is_active {
+            return Err(execution_continuation_denied());
+        }
+        let user = AuthUserRecord {
+            user_id: database_user.user_id,
+            username: database_user.username,
+            email: database_user.email,
+            display_name: database_user.display_name,
+        };
+
+        let current_owner = self
+            .memoria_owner(&pool, &user_id)
+            .await
+            .map_err(execution_continuation_provider_error)?;
+
+        let Some((provider_id, external_subject)) = provider else {
+            if current_owner.is_some()
+                || execution_continuation.expires_at_unix <= Utc::now().timestamp()
+                || !current_session_expiry.is_some_and(|expiry| expiry > Utc::now().timestamp())
+            {
+                return Err(execution_continuation_denied());
+            }
+            return Ok(AuthPrincipal::from_local_jwt(
+                user,
+                session_id,
+                execution_continuation,
+            ));
+        };
+
+        let Some(memoria_provider) = self.memoria_provider.as_ref() else {
+            return Err(execution_continuation_unavailable());
+        };
+        if memoria_provider.provider_id != provider_id {
+            return Err(execution_continuation_denied());
+        }
+        let current_owner = current_owner.ok_or_else(execution_continuation_denied)?;
+        if current_owner != external_subject {
+            return Err(execution_continuation_denied());
+        }
+        self.revalidate_memoria_connection(&pool, &user_id, &current_owner)
+            .await
+            .map_err(execution_continuation_provider_error)?;
+
+        let now = Utc::now().timestamp();
+        if execution_continuation.expires_at_unix <= now
+            || !current_session_expiry.is_some_and(|expiry| expiry > now)
+        {
+            return Err(execution_continuation_denied());
+        }
+
+        Ok(AuthPrincipal::from_verified_provider_session(
+            user,
+            session_id,
+            provider_id,
+            external_subject,
+            Some(execution_continuation),
+        ))
+    }
+
     async fn current_user(
         &self,
         headers: &HeaderMap,
@@ -2159,16 +2204,14 @@ impl AuthService for DatabaseAuthService {
             .get_pool()
             .await
             .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
-        if !self
+        let session_expires_at_unix = self
             .refresh_session_is_active(&pool, &user_id, &session_id)
             .await
             .map_err(|e| map_auth_sqlx(e, "current_principal.refresh_session", Some(&pool)))?
-        {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                "Session expired or revoked",
-            ));
-        }
+            .filter(|expires_at| *expires_at > Utc::now().timestamp())
+            .ok_or_else(|| {
+                error_response(StatusCode::UNAUTHORIZED, "Session expired or revoked")
+            })?;
 
         // Bound legacy Memoria tokens too: earlier builds issued them with
         // `internal` origin and the self-hosted deployment's longer TTL.
@@ -2202,37 +2245,49 @@ impl AuthService for DatabaseAuthService {
             return Err(error_response(StatusCode::UNAUTHORIZED, "User is inactive"));
         }
 
-        Ok(AuthPrincipal {
-            user: AuthUserRecord {
-                user_id: user.user_id,
-                username: user.username,
-                email: user.email,
-                display_name: user.display_name,
-            },
-            session_id: Some(session_id),
-            origin: if let Some(subject) = memoria_owner {
-                let resolver = self
-                    .credential_resolver()
-                    .ok_or_else(|| internal_error("Memoria provider unavailable"))?;
-                if resolver
-                    .resolve(&user_id)
-                    .await
-                    .map_err(internal_error)?
-                    .is_none()
-                {
-                    return Err(error_response(
-                        StatusCode::UNAUTHORIZED,
-                        "Memoria connection disconnected",
-                    ));
-                }
-                AuthPrincipalOrigin::VerifiedProvider {
-                    provider_id: resolver.provider.provider_id,
-                    external_subject: subject,
-                }
-            } else {
-                AuthPrincipalOrigin::Internal
-            },
-        })
+        let user = AuthUserRecord {
+            user_id: user.user_id,
+            username: user.username,
+            email: user.email,
+            display_name: user.display_name,
+        };
+        if let Some(subject) = memoria_owner {
+            let resolver = self
+                .credential_resolver()
+                .ok_or_else(|| internal_error("Memoria provider unavailable"))?;
+            if resolver
+                .resolve(&user_id)
+                .await
+                .map_err(internal_error)?
+                .is_none()
+            {
+                return Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "Memoria connection disconnected",
+                ));
+            }
+            return Ok(AuthPrincipal::from_verified_provider_session(
+                user,
+                session_id.clone(),
+                resolver.provider.provider_id.clone(),
+                subject,
+                Some(ExecutionContinuationGrant::from_active_session(
+                    user_id.clone(),
+                    session_id.clone(),
+                    session_expires_at_unix,
+                )),
+            ));
+        }
+        let execution_continuation = ExecutionContinuationGrant::from_active_session(
+            user.user_id.clone(),
+            session_id.clone(),
+            session_expires_at_unix,
+        );
+        Ok(AuthPrincipal::from_local_jwt(
+            user,
+            session_id,
+            execution_continuation,
+        ))
     }
 
     async fn current_principal_for_request(
@@ -2278,25 +2333,22 @@ impl AuthService for DatabaseAuthService {
                 "Provider-authorized user principal exceeds the Astra user_id limit",
             ));
         }
-        Ok(AuthPrincipal {
-            user: AuthUserRecord {
+        Ok(AuthPrincipal::from_provider_request(
+            AuthUserRecord {
                 user_id,
                 username: authorized.external_subject.clone(),
                 email: String::new(),
                 display_name: None,
             },
-            session_id: None,
-            origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
-                AuthProviderAuthorizedRequestContext {
-                    provider_id: authorized.provider_id,
-                    external_subject: authorized.external_subject,
-                    provider_scope_id: authorized.provider_scope_id,
-                    request_authorization_id: authorized.request_authorization_id,
-                    // Provider-request (HMAC server-to-server) calls carry no edge binding.
-                    edge_agent_id: None,
-                },
-            ),
-        })
+            AuthProviderAuthorizedRequestContext {
+                provider_id: authorized.provider_id,
+                external_subject: authorized.external_subject,
+                provider_scope_id: authorized.provider_scope_id,
+                request_authorization_id: authorized.request_authorization_id,
+                // Provider-request (HMAC server-to-server) calls carry no edge binding.
+                edge_agent_id: None,
+            },
+        ))
     }
 
     async fn edge_registration_binding(
@@ -2365,16 +2417,6 @@ impl AuthService for DatabaseAuthService {
             edge_agent_id: claims.edge_agent_id,
             workspace_id: claims.workspace_id,
         })
-    }
-
-    async fn external_providers(
-        &self,
-    ) -> Result<Vec<ExternalProviderPublicRecord>, (StatusCode, Json<ErrorResponse>)> {
-        Ok(self
-            .ext_providers
-            .iter()
-            .map(ExternalProviderPublicRecord::from)
-            .collect())
     }
 
     async fn external_catalog_by_scope(

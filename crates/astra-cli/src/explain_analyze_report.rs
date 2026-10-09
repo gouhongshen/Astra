@@ -5,7 +5,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use crate::explain_analyze_format::{alpha_label, diagnostic_label, format_ms, format_tokens};
+use crate::explain_analyze_format::{
+    alpha_label, decision_detail_line, diagnostic_label, format_ms, format_tokens,
+};
 use astra_turn_types::{
     ExplainAnalyzeEventV1, ExplainAnalyzeGraphV1, ExplainAnalyzeNodeKindV1,
     ExplainAnalyzeOutcomeV1, ExplainAnalyzeUsageBasisV1,
@@ -175,6 +177,7 @@ fn append_tree(
                 .unwrap_or_default();
             let attempt = node
                 .attempt_index
+                .filter(|_| node.kind != ExplainAnalyzeNodeKindV1::Admission)
                 .filter(|attempt| verbose || *attempt > 0)
                 .map(|attempt| format!(" · attempt {}", u64::from(attempt).saturating_add(1)))
                 .unwrap_or_default();
@@ -182,6 +185,13 @@ fn append_tree(
                 "{tree}{} · {duration} · {state}{round}{attempt} · {offset}",
                 safe_label(&node.label),
             ));
+            if let Some(detail) = &node.decision_detail {
+                lines.push(format!(
+                    "{}{}",
+                    detail_prefix(&ancestor_has_sibling, last),
+                    decision_detail_line(detail)
+                ));
+            }
 
             if let Some(usage) = &node.usage {
                 lines.push(format!(
@@ -434,9 +444,6 @@ fn source_label(kind: astra_turn_types::ExplainAnalyzeContextSourceKindV1) -> &'
         Skills => "Skills",
         RuntimeIdentity => "Runtime identity",
         RuntimeVolatile => "Runtime state",
-        EmergentSkills => "Emergent skills",
-        EmergentMemory => "Emergent memory",
-        EmergentSummary => "Emergent summary",
     }
 }
 
@@ -493,6 +500,7 @@ mod tests {
             start_elapsed_ms: (transition == ExplainAnalyzeTransitionV1::Finished).then_some(start),
             duration_ms: duration,
             outcome,
+            decision_detail: None,
             usage: None,
             context: None,
             coverage_gaps: Vec::new(),
@@ -507,6 +515,56 @@ mod tests {
         start.duration_ms = Some(duration);
         start.outcome = Some(ExplainAnalyzeOutcomeV1::Succeeded);
         start
+    }
+
+    #[test]
+    fn admission_purpose_slot_is_not_displayed_as_a_provider_retry() {
+        let turn = fact(
+            "turn-start",
+            "turn",
+            None,
+            ExplainAnalyzeNodeKindV1::Turn,
+            ExplainAnalyzeTransitionV1::Started,
+            0,
+            None,
+            None,
+        );
+        let mut observer = fact(
+            "observe-start",
+            "observe",
+            Some("turn"),
+            ExplainAnalyzeNodeKindV1::Admission,
+            ExplainAnalyzeTransitionV1::Started,
+            1,
+            None,
+            None,
+        );
+        observer.attempt_index = Some(1);
+        let mut retry = fact(
+            "retry-start",
+            "retry",
+            Some("turn"),
+            ExplainAnalyzeNodeKindV1::ProviderAttempt,
+            ExplainAnalyzeTransitionV1::Started,
+            3,
+            None,
+            None,
+        );
+        retry.attempt_index = Some(1);
+        let events = vec![
+            turn.clone(),
+            observer.clone(),
+            finished(observer, 2),
+            retry.clone(),
+            finished(retry, 3),
+            finished(turn, 8),
+        ];
+        let report = render(&events, true, false);
+        assert_eq!(
+            report.matches("attempt 2").count(),
+            1,
+            "only the physical provider retry has an attempt label"
+        );
     }
 
     #[test]

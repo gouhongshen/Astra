@@ -1,6 +1,80 @@
 //! Native authority selection and legacy compatibility at the binary boundary.
 use std::process::Command;
 
+#[tokio::test]
+#[cfg(unix)]
+async fn status_distinguishes_pending_owner_without_refresh_or_credential_disclosure() {
+    use astra_credentials::native::{Environment, NativeSession, NativeStore};
+    use fs2::FileExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let store = NativeStore::with_directory(root.path().join(".moi"));
+    let issuer = "https://uc.example.test/realms/moi";
+    let (session, _) = store
+        .publish(NativeSession {
+            environment: Environment {
+                issuer: issuer.into(),
+                astra_url: "https://astra.example.test".into(),
+                moi_url: "https://moi.example.test".into(),
+                authorization_endpoint: format!("{issuer}/protocol/openid-connect/auth"),
+                token_endpoint: format!("{issuer}/protocol/openid-connect/token"),
+                revocation_endpoint: format!("{issuer}/protocol/openid-connect/revoke"),
+                jwks_uri: format!("{issuer}/protocol/openid-connect/certs"),
+            },
+            generation: String::new(),
+            subject: "user".into(),
+            session_id: "session".into(),
+            astra_user_id: "astra-user".into(),
+            moi_principal_id: "moi-user".into(),
+            catalog_user_id: "catalog-user".into(),
+            access_token: "private-access".into(),
+            refresh_token: "private-refresh".into(),
+            expires_at: 0,
+            workspace_id: None,
+            role_id: None,
+            refresh_pending: false,
+        })
+        .unwrap();
+    let path = root.path().join(".moi/auth.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    state["sessions"][session.environment.key()]["refresh_pending"] = true.into();
+    let original = serde_json::to_vec(&state).unwrap();
+    std::fs::write(&path, &original).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(
+            root.path()
+                .join(format!(".moi/refresh-{}.lock", session.environment.key())),
+        )
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    for expected in ["refresh_in_progress", "reauthentication_required"] {
+        if expected == "reauthentication_required" {
+            FileExt::unlock(&lock).unwrap();
+        }
+        let output =
+            client_output(isolated_client(root.path()).args(["auth", "status", "--json"])).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(status["state"], expected);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let public = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!public.contains("private-access") && !public.contains("private-refresh"));
+    }
+}
+
 #[cfg(unix)]
 fn isolated_client(root: &std::path::Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_astra"));

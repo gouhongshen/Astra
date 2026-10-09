@@ -51,7 +51,7 @@ pub(crate) async fn delegate_run_handler(
     let forward_headers = collect_forward_headers(&headers);
     request
         .context
-        .remove(crate::turn::agentic::delegate_interception::FORWARD_HEADERS_CONTEXT_KEY);
+        .remove(crate::server::delegation::FORWARD_HEADERS_CONTEXT_KEY);
 
     let engine = state.delegation_engine.as_ref().ok_or_else(|| {
         error_response(
@@ -76,6 +76,10 @@ pub(crate) async fn delegate_run_handler(
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, e))?;
 
     // Execute the delegation.
+    let engine = engine
+        .for_session(&request.user_id, &request.session_id)
+        .await
+        .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))?;
     let result = engine
         .execute_with_forward_headers(request, &source_agent_id, None, forward_headers, None)
         .await
@@ -381,7 +385,8 @@ mod tests {
             _run_id: String,
             _user_id: String,
             _last_index: u32,
-        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+        ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
+        {
             unreachable!("stream_run is not used in delegation handler tests")
         }
 

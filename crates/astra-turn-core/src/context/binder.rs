@@ -81,9 +81,6 @@ fn bind_section(planned: &PlannedSection, sources: &ContextSources<'_>) -> Bound
         SectionKind::History => String::new(),
         SectionKind::RuntimeIdentity => bind_runtime_identity(sources),
         SectionKind::RuntimeVolatile => bind_runtime_volatile(sources),
-        SectionKind::EmergentSkills => bind_emergent_skills(sources),
-        SectionKind::EmergentMemory => bind_emergent_memory(sources),
-        SectionKind::EmergentSummary => bind_emergent_summary(sources),
     };
     let actual_tokens = estimate_tokens(&content);
     let latency = start.elapsed();
@@ -269,7 +266,7 @@ fn bind_working_memory(sources: &ContextSources<'_>) -> String {
 /// Includes typed CWD/Branch header plus fragments that only
 /// change at session boundaries: `system_override` and opt-in
 /// `extra_stable_sections` (environment_static from the bridge / adapter
-/// edge_profile, output style, etc.). Runtime facts whose placement depends on
+/// edge_profile). Runtime facts whose placement depends on
 /// provider cache semantics, including model identity, are injected by the
 /// runtime entrypoint before binding. Turn-volatile content —
 /// self-awareness, tool-dependent guidance, memoria insights — routes
@@ -384,38 +381,6 @@ fn bind_runtime_volatile(sources: &ContextSources<'_>) -> String {
     parts.join("\n")
 }
 
-/// Bind emergent skills from previous turn.
-fn bind_emergent_skills(sources: &ContextSources<'_>) -> String {
-    let skills = &sources.emergent.discovered_skills;
-    if skills.is_empty() {
-        return String::new();
-    }
-    let names: Vec<_> = skills.iter().map(|s| s.value.skill_name.as_str()).collect();
-    format!("Discovered skills: {}", names.join(", "))
-}
-
-/// Bind emergent memory from previous turn.
-fn bind_emergent_memory(sources: &ContextSources<'_>) -> String {
-    let mems = &sources.emergent.prefetched_memory;
-    if mems.is_empty() {
-        return String::new();
-    }
-    mems.iter()
-        .map(|m| m.value.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Bind emergent tool use summary from previous turn.
-fn bind_emergent_summary(sources: &ContextSources<'_>) -> String {
-    sources
-        .emergent
-        .tool_summaries
-        .first()
-        .map(|s| s.value.summary.clone())
-        .unwrap_or_default()
-}
-
 /// Rough token estimate: ~4 bytes per token.
 fn estimate_tokens(s: &str) -> u32 {
     estimate_text_tokens(s)
@@ -426,7 +391,6 @@ mod tests {
     use super::*;
     use crate::context_planner::plan_turn;
     use crate::context_sources::*;
-    use crate::emergent_context::*;
     use crate::microcompact::ProviderCacheStrategy;
     use crate::pipeline_config::ProviderCachePolicy;
     use crate::pipeline_stats::PipelineStats;
@@ -443,7 +407,6 @@ mod tests {
         session: SessionContext,
         turn: TurnState,
         external: ExternalSources,
-        emergent: EmergentContext,
         working_memory: WorkingMemoryState,
         stats: PipelineStats,
     }
@@ -457,7 +420,6 @@ mod tests {
                 session: &self.session,
                 turn: &self.turn,
                 external: &self.external,
-                emergent: &self.emergent,
                 working_memory: Some(&self.working_memory),
                 stats: &self.stats,
             }
@@ -501,10 +463,8 @@ mod tests {
             },
             external: ExternalSources {
                 memory_entries: vec![MemoryEntry::new("Remember: prefer pipeline-first design.")],
-                spill_dir: None,
                 ..Default::default()
             },
-            emergent: EmergentContext::default(),
             working_memory: WorkingMemoryState::default(),
             stats: PipelineStats::default(),
         }
@@ -1017,30 +977,6 @@ mod tests {
         let sources = fixture.context();
         let content = bind_skills(&sources);
         assert!(content.contains("code_review"));
-    }
-
-    #[test]
-    fn bind_emergent_skills_empty_when_no_discoveries() {
-        let fixture = test_sources();
-        let sources = fixture.context();
-        let content = bind_emergent_skills(&sources);
-        assert!(content.is_empty());
-    }
-
-    #[test]
-    fn bind_emergent_skills_lists_discovered() {
-        let mut fixture = test_sources();
-        fixture.emergent.push_skill(EmergentItem {
-            value: DiscoveredSkill {
-                skill_name: "review".into(),
-                trigger: "file write".into(),
-            },
-            created_at_turn: 1,
-            content_hash: 42,
-        });
-        let sources = fixture.context();
-        let content = bind_emergent_skills(&sources);
-        assert!(content.contains("review"));
     }
 
     #[test]

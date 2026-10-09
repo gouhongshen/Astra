@@ -14,16 +14,15 @@ use super::tool_execution_binding::{
     ToolExecutionRequest, ToolTransportKind, WorkspaceAuthority, WorkspaceBinding,
     WorkspaceBindingKind,
 };
-use super::tool_external_transport::{
-    ExternalTransport, execute_gateway_relay, execute_sandbox_resident_agent,
+use super::tool_local_transport::{
+    ServerLocalToolTransport, ToolTransportResult, execute_local_transport,
 };
-use super::tool_local_transport::{ServerLocalToolTransport, execute_local_transport};
 use super::tool_route_boundary::{ToolRouteBoundary, route_binding_event_fields};
 use super::tool_route_selection::ToolExecutionRouteKind;
 use super::tool_route_selection::routing_decision_for_binding;
 use super::tool_transport_errors::{
     capability_denied_result, selected_offer_route_mismatch_result,
-    unsupported_workspace_executor_result,
+    transport_adapter_unavailable_result, unsupported_workspace_executor_result,
 };
 use super::tool_transport_metadata::{
     cancelled_runtime_tool_result, cancelled_runtime_tool_result_for_binding,
@@ -67,8 +66,6 @@ pub struct ToolExecutionServiceBuilder {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
-    gateway_relay_transport: Option<Arc<dyn ExternalTransport>>,
-    sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
     provider_capabilities: Arc<HashMap<String, HashSet<String>>>,
     disabled_tool_offers: Arc<RwLock<HashSet<String>>>,
@@ -81,8 +78,6 @@ impl Default for ToolExecutionServiceBuilder {
             edge_connection_pool: None,
             edge_dispatch_service: None,
             edge_registry_service: None,
-            gateway_relay_transport: None,
-            sandbox_resident_agent_transport: None,
             tool_registry: astra_runtime_env::ToolRegistry::builtins(),
             provider_capabilities: Arc::new(HashMap::new()),
             disabled_tool_offers: Arc::new(RwLock::new(HashSet::new())),
@@ -125,19 +120,6 @@ impl ToolExecutionServiceBuilder {
         self
     }
 
-    pub fn gateway_relay_transport(mut self, transport: Arc<dyn ExternalTransport>) -> Self {
-        self.gateway_relay_transport = Some(transport);
-        self
-    }
-
-    pub fn sandbox_resident_agent_transport(
-        mut self,
-        transport: Arc<dyn ExternalTransport>,
-    ) -> Self {
-        self.sandbox_resident_agent_transport = Some(transport);
-        self
-    }
-
     pub fn initial_disabled_tool_offers(mut self, tools: &[String]) -> Self {
         let mut set = HashSet::new();
         for t in tools {
@@ -175,8 +157,6 @@ impl ToolExecutionServiceBuilder {
             edge_connection_pool: self.edge_connection_pool,
             edge_dispatch_service: self.edge_dispatch_service,
             edge_registry_service: self.edge_registry_service,
-            gateway_relay_transport: self.gateway_relay_transport,
-            sandbox_resident_agent_transport: self.sandbox_resident_agent_transport,
             tool_registry: self.tool_registry,
             provider_capabilities: self.provider_capabilities,
             disabled_tool_offers: self.disabled_tool_offers,
@@ -190,8 +170,6 @@ pub struct ToolExecutionService {
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
-    gateway_relay_transport: Option<Arc<dyn ExternalTransport>>,
-    sandbox_resident_agent_transport: Option<Arc<dyn ExternalTransport>>,
     tool_registry: astra_runtime_env::ToolRegistry,
     /// Deployment-declared provider capacity. This is distinct from the user
     /// selecting an optional tool and from administrator offer policy.
@@ -204,39 +182,11 @@ pub struct ToolExecutionService {
 }
 
 impl ToolExecutionService {
-    /// Read existing durable Edge authority; this never creates or completes a
-    /// second invocation. Callers must check authenticated ownership first.
-    pub(crate) async fn edge_completion_result(
-        &self,
-        reference: &astra_turn_types::task_resolution::EdgeDispatchCompletionRef,
-    ) -> Result<astra_thin_client::ToolResultRequest, String> {
-        let service = self
-            .edge_dispatch_service
-            .as_ref()
-            .ok_or("edge evidence authority unavailable")?;
-        let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
-            &reference.identity.user_id,
-            &reference.identity.session_id,
-            &reference.identity.run_id,
-            &reference.identity.turn_chain_id,
-            &reference.identity.invocation_id,
-        );
-        let json = service
-            .wait_result(&identity, std::time::Duration::ZERO)
-            .await?
-            .ok_or("durable edge evidence missing")?;
-        let result = canonical_edge_completion(&identity, &reference.edge_agent_id, &json)?;
-        if result.result_hash != reference.result_hash {
-            return Err("edge evidence does not match retained completion hash".into());
-        }
-        Ok(result)
-    }
-
     pub fn builder() -> ToolExecutionServiceBuilder {
         ToolExecutionServiceBuilder::default()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn new_for_test() -> Self {
         Self::builder().build()
     }
@@ -408,7 +358,7 @@ impl ToolExecutionService {
     }
 
     /// Check whether a tool is currently disabled.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn is_tool_offer_disabled(&self, name: &str) -> bool {
         self.disabled_tool_offers.read().await.contains(name)
     }
@@ -658,14 +608,15 @@ impl ToolExecutionService {
             .await
     }
 
-    pub(crate) async fn execute_boundary_with_cancel<L>(
+    pub(crate) async fn execute_boundary_with_cancel<L, R>(
         &self,
         boundary: &ToolRouteBoundary,
         local_transport: &L,
         cancel_token: Option<Arc<CancellationToken>>,
-    ) -> astra_tools::ToolResult
+    ) -> R
     where
-        L: ServerLocalToolTransport + ?Sized,
+        L: ServerLocalToolTransport<R> + ?Sized,
+        R: ToolTransportResult,
     {
         self.execute_with_route_and_cancel(
             boundary.request().clone(),
@@ -676,15 +627,16 @@ impl ToolExecutionService {
         .await
     }
 
-    async fn execute_with_route_and_cancel<L>(
+    async fn execute_with_route_and_cancel<L, R>(
         &self,
         request: ToolExecutionRequest,
         route: ToolExecutionRouteKind,
         local_transport: &L,
         cancel_token: Option<Arc<CancellationToken>>,
-    ) -> astra_tools::ToolResult
+    ) -> R
     where
-        L: ServerLocalToolTransport + ?Sized,
+        L: ServerLocalToolTransport<R> + ?Sized,
+        R: ToolTransportResult,
     {
         let transport_request = request.with_transport_arguments();
         if transport_request.runtime_process_authorization_required
@@ -702,7 +654,8 @@ impl ToolExecutionService {
                 &binding,
                 "process-authorization",
                 reason,
-            );
+            )
+            .into();
         }
         if transport_request.runtime_edge_dispatch_authorization_required
             && (!matches!(route, ToolExecutionRouteKind::EdgeBound)
@@ -724,7 +677,8 @@ impl ToolExecutionService {
                 &binding,
                 "edge-authorization",
                 reason,
-            );
+            )
+            .into();
         }
         if matches!(route, ToolExecutionRouteKind::Unsupported)
             && !matches!(
@@ -733,16 +687,17 @@ impl ToolExecutionService {
             )
         {
             let binding = transport_request.runtime_environment_binding(&self.tool_registry);
-            return unsupported_workspace_executor_result(&transport_request, &binding);
+            return unsupported_workspace_executor_result(&transport_request, &binding).into();
         }
         let binding = match self.authorize_tool_request(&transport_request) {
             Ok(binding) => binding,
             Err(ref err) => {
-                return capability_denied_result(&transport_request, &err.0, err.1.clone());
+                return capability_denied_result(&transport_request, &err.0, err.1.clone()).into();
             }
         };
         if selected_offer_route_mismatch(&transport_request, route) {
-            return selected_offer_route_mismatch_result(&transport_request, &binding, route);
+            return selected_offer_route_mismatch_result(&transport_request, &binding, route)
+                .into();
         }
         if matches!(route, ToolExecutionRouteKind::RequestScopedMcp)
             && transport_request.selected_offer.is_none()
@@ -753,7 +708,8 @@ impl ToolExecutionService {
                 astra_runtime_env::ToolUnavailableReason::PolicyDenied(
                     "selected tool offer is required for request-scoped MCP execution".to_string(),
                 ),
-            );
+            )
+            .into();
         }
 
         // ── Runtime offer policy check (admin API / config) ──
@@ -834,7 +790,8 @@ impl ToolExecutionService {
                 metadata: Some(meta),
                 is_error: true,
                 exit_semantics: None,
-            };
+            }
+            .into();
         }
         if let Some((offer_id, provider_id)) =
             disallowed_offer_id_for_request(&transport_request, &admission, &provider_allowed_tools)
@@ -882,7 +839,8 @@ impl ToolExecutionService {
                 metadata: Some(meta),
                 is_error: true,
                 exit_semantics: None,
-            };
+            }
+            .into();
         }
         // A selected offer is the authoritative, precomputed provider binding
         // from prompt-surface assembly. Dynamic providers such as
@@ -893,7 +851,11 @@ impl ToolExecutionService {
         if transport_request.selected_offer.is_none()
             && let Some(reason) = admission_denied_unavailable_reason(&admission)
         {
-            return capability_denied_result(&transport_request, &binding, reason);
+            return capability_denied_result(&transport_request, &binding, reason).into();
+        }
+
+        if let Some(result) = transport_request.policy.dispatch_deadline_rejection() {
+            return result.into();
         }
 
         match route {
@@ -908,7 +870,7 @@ impl ToolExecutionService {
                 .await
             }
             ToolExecutionRouteKind::ServerRuntime | ToolExecutionRouteKind::RequestScopedMcp => {
-                let mut result = execute_local_route(
+                let mut result: R = execute_local_route(
                     &transport_request,
                     &binding,
                     route,
@@ -916,41 +878,47 @@ impl ToolExecutionService {
                     cancel_token.map(|t| (*t).clone()),
                 )
                 .await;
-                append_route_binding_metadata(&mut result, route, &transport_request);
+                append_route_binding_metadata(result.result_mut(), route, &transport_request);
                 result
             }
-            ToolExecutionRouteKind::EdgeBound => {
-                execute_edge_bound(
-                    transport_request,
-                    &binding,
-                    self.edge_connection_pool.clone(),
-                    self.edge_dispatch_service.clone(),
-                    self.edge_registry_service.clone(),
-                    &self.tool_registry,
-                    cancel_token,
-                )
-                .await
-            }
-            ToolExecutionRouteKind::GatewayRelay => {
-                execute_gateway_relay(
-                    transport_request,
-                    &binding,
-                    self.gateway_relay_transport.clone(),
-                    cancel_token,
-                )
-                .await
-            }
-            ToolExecutionRouteKind::SandboxResidentAgent => {
-                execute_sandbox_resident_agent(
-                    transport_request,
-                    &binding,
-                    self.sandbox_resident_agent_transport.clone(),
-                    cancel_token,
-                )
-                .await
+            ToolExecutionRouteKind::EdgeBound => execute_edge_bound(
+                transport_request,
+                &binding,
+                self.edge_connection_pool.clone(),
+                self.edge_dispatch_service.clone(),
+                self.edge_registry_service.clone(),
+                &self.tool_registry,
+                cancel_token,
+            )
+            .await
+            .into(),
+            ToolExecutionRouteKind::GatewayRelay | ToolExecutionRouteKind::SandboxResidentAgent => {
+                let (transport, adapter) = if route == ToolExecutionRouteKind::GatewayRelay {
+                    (ToolTransportKind::GatewayRelay, "gateway relay")
+                } else {
+                    (
+                        ToolTransportKind::SandboxResidentAgent,
+                        "sandbox resident agent",
+                    )
+                };
+                if cancel_token
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
+                {
+                    cancelled_runtime_tool_result(&transport_request, &binding, transport, false)
+                        .into()
+                } else {
+                    transport_adapter_unavailable_result(
+                        &transport_request,
+                        &binding,
+                        adapter,
+                        &format!("{adapter} transport is not configured"),
+                    )
+                    .into()
+                }
             }
             ToolExecutionRouteKind::Unsupported => {
-                unsupported_workspace_executor_result(&transport_request, &binding)
+                unsupported_workspace_executor_result(&transport_request, &binding).into()
             }
         }
     }
@@ -1048,15 +1016,16 @@ fn local_result_binding(
 }
 
 /// Execute a tool via the local transport, resolving binding metadata first.
-async fn execute_local_route<L>(
+async fn execute_local_route<L, R>(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
     route: ToolExecutionRouteKind,
     local_transport: &L,
     cancel_token: Option<CancellationToken>,
-) -> astra_tools::ToolResult
+) -> R
 where
-    L: ServerLocalToolTransport + ?Sized,
+    L: ServerLocalToolTransport<R> + ?Sized,
+    R: ToolTransportResult,
 {
     let (result_workspace, result_executor, result_transport) =
         local_result_binding(route, request);

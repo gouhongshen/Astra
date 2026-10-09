@@ -78,6 +78,54 @@ pub struct ContextCompactionObservation {
 }
 
 impl ContextCompactionObservation {
+    /// Project validated Server compaction facts into shared audit and display.
+    /// This records observations; it never chooses or executes compression.
+    pub fn record_projection(
+        &self,
+        input_budget_tokens: u64,
+        recorder: &mut astra_pipeline::step_recorder::StepRecorder,
+        pipeline: Option<&mut crate::pipeline_session::PipelineSession>,
+    ) -> Option<crate::compaction_types::CompactionEvent> {
+        if !self.is_consistent() {
+            tracing::warn!(observation_id = %self.id, "ignoring inconsistent context compaction observation");
+            return None;
+        }
+        let compacted_messages = self
+            .messages_before
+            .saturating_sub(self.messages_after)
+            .min(u64::from(u32::MAX)) as u32;
+        let pressure = if input_budget_tokens > 0 {
+            (self.tokens_before as f64 / input_budget_tokens as f64).min(1.0)
+        } else {
+            0.0
+        };
+        recorder.record_compaction_with_kind(
+            &self.kind.to_string(),
+            compacted_messages,
+            self.tokens_saved,
+            pressure,
+        );
+        if let Some(pipeline) = pipeline {
+            pipeline.record_compaction_audit(
+                &self.kind.to_string(),
+                compacted_messages,
+                self.tokens_saved.min(u64::from(u32::MAX)) as u32,
+            );
+            pipeline.stats.record_compaction(self.tokens_saved);
+        }
+        Some(crate::compaction_types::CompactionEvent::new(
+            self.kind,
+            pressure,
+            self.tokens_saved,
+            self.tokens_before,
+            input_budget_tokens,
+            compacted_messages as usize,
+            self.messages_after
+                .min(u64::try_from(usize::MAX).unwrap_or(u64::MAX)) as usize,
+            Vec::new(),
+        ))
+    }
+
     /// Whether all redundant counters agree with one another.
     ///
     /// This validates only typed structural facts; it never interprets
@@ -187,6 +235,8 @@ impl StreamRootIdentity {
 /// State collected from one `/chat/turn` SSE stream (excluding edge executor bookkeeping).
 #[derive(Debug, Clone, Default)]
 pub struct ChatTurnSseAccum {
+    /// Origin of the current output, independent of the physical receipt/event id.
+    pub model_item_id: Option<String>,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
     /// Durable guidance that the exact physical root incorporated while the
@@ -194,6 +244,9 @@ pub struct ChatTurnSseAccum {
     /// local turn commit; otherwise restart silently reconstructs a different
     /// conversation from the server's canonical transcript.
     pub applied_user_intents: Vec<StreamAppliedUserIntent>,
+    /// Exact-root coordination observations for transcript persistence only.
+    /// These are not provider messages or execution authority.
+    pub transcript_evidence: Vec<astra_turn_types::AgentTranscriptEvidence>,
     #[doc(hidden)]
     pub root_identity: StreamRootIdentity,
     /// Terminal lifecycle fact for the durable run that owns this physical
@@ -202,6 +255,7 @@ pub struct ChatTurnSseAccum {
     /// and clients must not turn it into an ordinary tool failure followed by
     /// another model round.
     pub run_terminal: Option<DurableRunTerminal>,
+    pub turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
     pub full_text: String,
     /// Thinking / reasoning chunks (for models that stream reasoning separately).
     pub reasoning_content: String,
@@ -309,6 +363,41 @@ pub struct StreamAppliedUserIntent {
 }
 
 impl ChatTurnSseAccum {
+    /// Enforce terminal evidence for a Server-owned admission without losing
+    /// observed execution facts or replacing an existing failure.
+    pub fn require_server_terminal_evidence(&mut self) {
+        if let Some(error) = self.remote_admission_error(None) {
+            self.error_kind = Some(error.kind);
+            self.error_message = Some(error.message);
+        }
+    }
+
+    pub(crate) fn remote_admission_error(
+        &self,
+        error_kind: Option<astra_core::ErrorKind>,
+    ) -> Option<astra_core::ClassifiedError> {
+        if self.error_message.is_some() {
+            return None;
+        }
+        if let Some(kind) = error_kind.or(self.error_kind) {
+            return Some(astra_core::ClassifiedError::new(
+                kind,
+                "Server admission stream reported an error without an error message",
+            ));
+        }
+        let message = if !self.server_loop_terminal {
+            "Server admission stream ended without terminal execution evidence"
+        } else if self.has_tool_calls || !self.tool_calls.is_empty() {
+            "remote Server returned pending client continuation work"
+        } else {
+            return None;
+        };
+        Some(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            message,
+        ))
+    }
+
     /// Context occupancy is independent of complete billing evidence.
     pub fn measured_request_input_tokens(&self) -> Option<u64> {
         let partition = (|| {
@@ -455,6 +544,26 @@ pub struct ServerLoopExecutionSummary {
 }
 
 impl ServerLoopExecutionSummary {
+    /// Select Server-produced feedback for the accepted terminal boundary.
+    /// Clients consume this fact without reconstructing execution state.
+    pub fn runtime_feedback_for(
+        &self,
+        session_id: Option<&str>,
+        run_id: Option<&str>,
+        model_id: Option<&str>,
+        session_turn: u32,
+    ) -> Option<&RuntimeFeedbackFrame> {
+        self.runtime_feedback.as_ref().filter(|frame| {
+            session_id == Some(frame.identity.session_id.as_str())
+                && run_id == Some(frame.identity.run_id.as_str())
+                && model_id == Some(frame.identity.model_id.as_str())
+                && frame.progress.session_turn == session_turn
+                // An interrupted summary may include a failed provider
+                // attempt after its last successfully ingested feedback.
+                && frame.progress.llm_rounds_completed <= self.llm_rounds
+        })
+    }
+
     /// Whether the terminal receipt closes every tool attempt reported by the
     /// same immutable server aggregate. A receipt may be internally complete
     /// for a strict prefix while still lacking authority for the whole run.
@@ -521,10 +630,16 @@ pub enum ChatTurnEdgePending {
         turn_chain_id: String,
         request_id: String,
         schema_admitted_by_server: bool,
+        /// Server-issued read-only execution ceiling carried with this exact
+        /// request through batching. It must not live in host-wide state,
+        /// because a later exchange can otherwise clear or replace it before
+        /// this request executes.
+        read_only_execution: bool,
         /// Absolute UTC deadline issued by the server.  This remains stable
         /// across batching, local queueing, and SSE replay.
         execution_deadline_unix_ms: u64,
         execution_timeout_ms: u64,
+        command_timeout_cap_ms: Option<u64>,
         tool: String,
         args: Value,
     },
@@ -550,8 +665,14 @@ pub enum SseRenderEffect {
     StopThinkingSpinner,
     StartThinkingSpinner,
     /// Incremental reasoning chunk for a compact terminal preview (CLI).
-    ThinkingPreviewChunk(String),
-    StreamText(String),
+    ThinkingPreviewChunk {
+        model_item_id: Option<String>,
+        text: String,
+    },
+    StreamText {
+        model_item_id: Option<String>,
+        text: String,
+    },
 }
 
 fn normalize_tool_call_for_accum(event: &Value) -> Result<Value, &'static str> {
@@ -785,16 +906,36 @@ fn apply_one_event(
     }
     match etype {
         "text_delta" => {
+            if let Some(id) = event.get("model_item_id").and_then(Value::as_str) {
+                if accum
+                    .model_item_id
+                    .as_deref()
+                    .is_some_and(|previous| previous != id)
+                {
+                    accum.full_text.clear();
+                }
+                accum.model_item_id = Some(id.to_string());
+            }
             if accum.thinking_active {
                 accum.thinking_active = false;
                 effects.push(SseRenderEffect::StopThinkingSpinner);
             }
             if let Some(content) = event.get("content").and_then(|v| v.as_str()) {
                 accum.full_text.push_str(content);
-                effects.push(SseRenderEffect::StreamText(content.to_string()));
+                effects.push(SseRenderEffect::StreamText {
+                    model_item_id: event
+                        .get("model_item_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    text: content.to_string(),
+                });
             }
         }
         "text_done" => {
+            accum.model_item_id = event
+                .get("model_item_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             if let Some(ft) = event.get("full_text").and_then(|v| v.as_str()) {
                 let was_empty = accum.full_text.is_empty();
                 // Durable/replayed server streams may contain only the
@@ -811,7 +952,13 @@ fn apply_one_event(
                         accum.thinking_active = false;
                         effects.push(SseRenderEffect::StopThinkingSpinner);
                     }
-                    effects.push(SseRenderEffect::StreamText(ft.to_string()));
+                    effects.push(SseRenderEffect::StreamText {
+                        model_item_id: event
+                            .get("model_item_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        text: ft.to_string(),
+                    });
                 }
             }
         }
@@ -823,7 +970,13 @@ fn apply_one_event(
             if let Some(chunk) = event.get("content").and_then(|v| v.as_str()) {
                 accum.reasoning_content.push_str(chunk);
                 if !chunk.is_empty() {
-                    effects.push(SseRenderEffect::ThinkingPreviewChunk(chunk.to_string()));
+                    effects.push(SseRenderEffect::ThinkingPreviewChunk {
+                        model_item_id: event
+                            .get("model_item_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        text: chunk.to_string(),
+                    });
                 }
             }
         }
@@ -842,6 +995,29 @@ fn apply_one_event(
             if accum.thinking_active {
                 accum.thinking_active = false;
                 effects.push(SseRenderEffect::StopThinkingSpinner);
+            }
+        }
+        "agent_communication" => {
+            let Ok(event) =
+                serde_json::from_value::<astra_turn_types::AgentCommunicationEvent>(event.clone())
+            else {
+                return;
+            };
+            if Some(event.observed_by.run_id.as_str()) != accum.root_identity.run_id()
+                || event.message_id.trim().is_empty()
+                || event.direction != astra_turn_types::AgentCommunicationDirection::Received
+                || !event.payload_kind.is_durable()
+            {
+                return;
+            }
+            let evidence = astra_turn_types::AgentTranscriptEvidence::AgentCommunication { event };
+            let key = evidence.stable_key();
+            if !accum
+                .transcript_evidence
+                .iter()
+                .any(|item| item.stable_key() == key)
+            {
+                accum.transcript_evidence.push(evidence);
             }
         }
         "user_intent_applied" => {
@@ -1000,6 +1176,19 @@ fn apply_one_event(
                         Some("Server tool_request omitted absolute execution deadline".to_string());
                     return;
                 };
+                let command_timeout_cap_ms = event
+                    .get("command_timeout_cap_ms")
+                    .and_then(Value::as_u64)
+                    .filter(|cap| *cap > 0 && *cap <= execution_timeout_ms);
+                if (tool == "bash" || event.get("command_timeout_cap_ms").is_some())
+                    && command_timeout_cap_ms.is_none()
+                {
+                    accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                    accum.error_message = Some(
+                        "Server tool_request omitted valid command timeout authority".to_string(),
+                    );
+                    return;
+                }
                 edge_pending.push(ChatTurnEdgePending::ToolRequest {
                     session_id: event
                         .get("session_id")
@@ -1018,8 +1207,13 @@ fn apply_one_event(
                         .to_string(),
                     request_id,
                     schema_admitted_by_server,
+                    read_only_execution: event
+                        .get("read_only_execution")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     execution_deadline_unix_ms,
                     execution_timeout_ms,
+                    command_timeout_cap_ms,
                     tool,
                     args,
                 });
@@ -1534,6 +1728,47 @@ fn apply_one_event(
                 }
                 match durable_run_terminal_from_event(event) {
                     Ok(Some(terminal)) => {
+                        let evaluation = event
+                            .get("turn_evaluation")
+                            .filter(|value| !value.is_null())
+                            .map(|value| {
+                                crate::evaluation::turn_evaluation_from_terminal(
+                                    value,
+                                    accum.session_id.as_deref(),
+                                    &terminal.run_id,
+                                    terminal.owner_generation,
+                                    event
+                                        .get("status")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default(),
+                                )
+                            })
+                            .transpose();
+                        let evaluation = match evaluation {
+                            Ok(evaluation) => evaluation,
+                            Err(error) => {
+                                accum.turn_evaluation = None;
+                                accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                                accum.error_message =
+                                    Some(format!("Invalid terminal evaluation: {error}"));
+                                return;
+                            }
+                        };
+                        if accum
+                            .run_terminal
+                            .as_ref()
+                            .is_some_and(|previous| previous != &terminal)
+                            || (accum.run_terminal.is_some()
+                                && serde_json::to_value(&accum.turn_evaluation).ok()
+                                    != serde_json::to_value(&evaluation).ok())
+                        {
+                            accum.turn_evaluation = None;
+                            accum.error_kind = Some(astra_core::ErrorKind::ContractViolation);
+                            accum.error_message =
+                                Some("Conflicting root terminal evaluation".into());
+                            return;
+                        }
+                        accum.turn_evaluation = evaluation;
                         accum.attempt_error_supersession_eligible = accum.pending_attempt_error
                             && accum.error_kind != Some(astra_core::ErrorKind::ContractViolation)
                             && matches!(
@@ -1750,6 +1985,9 @@ pub fn dispatch_chat_turn_sse_event_block(
             continue;
         };
         apply_one_event(&event, accum, edge_pending, &mut effects);
+        if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
+            accum.turn_evaluation = None;
+        }
     }
     effects
 }
@@ -1870,6 +2108,350 @@ pub fn parse_chat_turn_sse_utf8_body(body: &str) -> ParsedChatTurnSseBody {
 mod tests {
     use super::*;
 
+    fn server_feedback_frame() -> crate::context_feedback::RuntimeFeedbackFrame {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": crate::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
+            "identity": {
+                "session_id": "session-1",
+                "run_id": "run-1",
+                "agent_id": "agent-1",
+                "model_id": "deepseek-v4-flash",
+                "topology": "server_only"
+            },
+            "progress": {
+                "session_turn": 4,
+                "agentic_round_index": 2,
+                "llm_rounds_completed": 3,
+                "slice_round_limit": 60,
+                "slice_rounds_remaining": 57
+            },
+            "context": {
+                "model_context_window_tokens": 1000000,
+                "effective_input_limit_tokens": 800000,
+                "estimated_input_tokens": 840000,
+                "token_pressure": 1.05,
+                "compaction_tier": "compact_history"
+            },
+            "request_usage": {
+                "prompt": 100,
+                "cache_read": 200,
+                "cache_creation": 0,
+                "completion": 20
+            },
+            "run_usage": {
+                "prompt": 300,
+                "cache_read": 600,
+                "cache_creation": 0,
+                "completion": 60
+            },
+            "was_truncated": false,
+            "policy_feedback": {
+                "state": "evaluated",
+                "schema_version": crate::context_feedback::RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            "recovery": null,
+                "revision": 2,
+                "evaluated_at_round": 2,
+                "subject": {
+                    "kind": "work_item",
+                    "attempt_id": "attempt-1",
+                    "item_id": "item-1",
+                    "item_revision": 1,
+                    "objective": "Inspect one bounded target",
+                    "expected_result": "One verified result"
+                },
+                "entries": [{
+                    "signal": "read_coverage_overlap",
+                    "stage": "observe",
+                    "observed_at_round": 2,
+                    "evidence_count": 3,
+                    "recommendation": "review_read_coverage"
+                }]
+            }
+        }))
+        .expect("valid server feedback frame")
+    }
+
+    fn server_summary_tool_receipt(
+        attempted: u32,
+    ) -> crate::tool_ledger_receipt::ToolLedgerReceipt {
+        crate::tool_ledger_receipt::ToolLedgerReceipt::new(
+            "run-1",
+            1,
+            attempted,
+            attempted,
+            0,
+            crate::tool_ledger_receipt::ToolLedgerResultClassCounts {
+                succeeded: attempted,
+                ..Default::default()
+            },
+            u64::from(attempted),
+            crate::tool_ledger_receipt::EMPTY_TOOL_LEDGER_ROOT,
+            true,
+        )
+    }
+
+    #[test]
+    fn remote_server_feedback_is_exact_and_bound_to_terminal_progress() {
+        let frame = server_feedback_frame();
+        let summary = ServerLoopExecutionSummary {
+            tool_calls_count: 0,
+            observation_tool_calls_count: 0,
+            tools_used: Vec::new(),
+            llm_rounds: 3,
+            tool_ledger_receipt: server_summary_tool_receipt(0),
+            token_usage_coverage: None,
+            runtime_feedback: Some(frame.clone()),
+        };
+        assert_eq!(
+            summary
+                .runtime_feedback_for(
+                    Some("session-1"),
+                    Some("run-1"),
+                    Some("deepseek-v4-flash"),
+                    4,
+                )
+                .cloned(),
+            Some(frame.clone())
+        );
+
+        let mut terminal_includes_failed_attempt = summary.clone();
+        terminal_includes_failed_attempt.llm_rounds = 4;
+        assert_eq!(
+            terminal_includes_failed_attempt
+                .runtime_feedback_for(
+                    Some("session-1"),
+                    Some("run-1"),
+                    Some("deepseek-v4-flash"),
+                    4,
+                )
+                .cloned(),
+            Some(frame.clone())
+        );
+        let mut impossible_future_feedback = summary.clone();
+        impossible_future_feedback.llm_rounds = 2;
+        assert!(
+            impossible_future_feedback
+                .runtime_feedback_for(
+                    Some("session-1"),
+                    Some("run-1"),
+                    Some("deepseek-v4-flash"),
+                    4,
+                )
+                .cloned()
+                .is_none()
+        );
+        assert!(
+            summary
+                .runtime_feedback_for(
+                    Some("session-1"),
+                    Some("run-1"),
+                    Some("deepseek-v4-flash"),
+                    5,
+                )
+                .cloned()
+                .is_none()
+        );
+    }
+
+    fn dispatch_evaluation_event(accum: &mut ChatTurnSseAccum, event: &Value) {
+        dispatch_chat_turn_sse_event_block(&format!("data: {event}\n\n"), accum, &mut Vec::new());
+    }
+
+    fn terminal_evaluation_wire(status: &str) -> Value {
+        use crate::evaluation::{
+            EvalSignal, EvaluationThresholds, eval_signals_to_json_with_thresholds,
+        };
+        let mut event = astra_services::session_journal::JournalEvent::turn_evaluation(
+            Some("session"),
+            Some(9),
+            "server_runtime",
+            false,
+            matches!(status, "completed" | "delegated"),
+            0.8,
+            0.9,
+            0.0,
+            0,
+            false,
+            0,
+            eval_signals_to_json_with_thresholds(
+                &[
+                    EvalSignal::RepeatToolCall("read_file".into()),
+                    EvalSignal::StallDetected,
+                    EvalSignal::VerdictWarning,
+                    EvalSignal::ToolOutcomeFailure {
+                        class: "test_failure".into(),
+                        count: 2,
+                    },
+                    EvalSignal::BlockedToolCall { count: 1 },
+                    EvalSignal::ExplorationFamilyChurn {
+                        family: "read".into(),
+                        streak: 7,
+                    },
+                ],
+                EvaluationThresholds::default(),
+            ),
+        )
+        .with_producer_scope(Some("root"));
+        let metadata = event.metadata.as_mut().unwrap();
+        metadata["execution_owner_generation"] = serde_json::json!(4);
+        metadata["tool_evaluation_success"] = serde_json::json!(true);
+        metadata["run_status"] = serde_json::json!(status);
+        serde_json::json!({"type":"run_finished", "run_id":"root", "owner_generation":4,
+            "status":status, "turn_evaluation":event})
+    }
+
+    #[test]
+    fn root_terminal_evaluation_preserves_the_canonical_fact_and_replay_duplicate() {
+        for status in ["completed", "delegated", "failed", "cancelled", "paused"] {
+            let mut accum = ChatTurnSseAccum::default();
+            dispatch_evaluation_event(
+                &mut accum,
+                &serde_json::json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
+            );
+            let wire = terminal_evaluation_wire(status);
+            dispatch_evaluation_event(&mut accum, &wire);
+            assert_eq!(accum.error_kind, None);
+            assert_eq!(
+                serde_json::to_value(accum.turn_evaluation.as_ref().unwrap()).unwrap(),
+                wire["turn_evaluation"]
+            );
+            let signals = crate::evaluation::turn_evaluation_feedback_signals(
+                accum
+                    .turn_evaluation
+                    .as_ref()
+                    .unwrap()
+                    .metadata
+                    .as_ref()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(signals.len(), 6);
+            assert!(
+                matches!(&signals[3], crate::evaluation::EvalSignal::ToolOutcomeFailure { class, count: 2 } if class == "test_failure")
+            );
+            dispatch_evaluation_event(&mut accum, &wire);
+            assert_eq!(accum.error_kind, None);
+        }
+        let mut accum = ChatTurnSseAccum::default();
+        dispatch_evaluation_event(
+            &mut accum,
+            &serde_json::json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
+        );
+        let mut wire = terminal_evaluation_wire("completed");
+        wire["owner_generation"] = serde_json::json!(0);
+        wire["turn_evaluation"]["metadata"]["execution_owner_generation"] = serde_json::json!(0);
+        dispatch_evaluation_event(&mut accum, &wire);
+        assert_eq!(accum.error_kind, None);
+        assert!(accum.turn_evaluation.is_some());
+    }
+
+    #[test]
+    fn root_terminal_evaluation_rejects_wrong_authority_or_malformed_known_evidence() {
+        for (pointer, replacement) in [
+            ("/turn_evaluation/session_id", serde_json::json!("foreign")),
+            (
+                "/turn_evaluation/producer_scope/run_id",
+                serde_json::json!("child"),
+            ),
+            (
+                "/turn_evaluation/metadata/execution_owner_generation",
+                serde_json::json!(3),
+            ),
+            ("/owner_generation", Value::Null),
+            (
+                "/turn_evaluation/metadata/run_status",
+                serde_json::json!("failed"),
+            ),
+            ("/turn_evaluation/metadata/success", Value::Null),
+            (
+                "/turn_evaluation/metadata/signals/3/count",
+                serde_json::json!("2"),
+            ),
+            ("/turn_evaluation/metadata/signals/5/family", Value::Null),
+        ] {
+            let mut accum = ChatTurnSseAccum::default();
+            dispatch_evaluation_event(
+                &mut accum,
+                &serde_json::json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
+            );
+            let mut wire = terminal_evaluation_wire("completed");
+            *wire.pointer_mut(pointer).unwrap() = replacement;
+            dispatch_evaluation_event(&mut accum, &wire);
+            assert_eq!(
+                accum.error_kind,
+                Some(astra_core::ErrorKind::ContractViolation),
+                "{pointer}"
+            );
+            assert!(accum.turn_evaluation.is_none());
+        }
+    }
+
+    #[test]
+    fn root_terminal_evaluation_ignores_child_and_rejects_conflicting_duplicate() {
+        let mut accum = ChatTurnSseAccum::default();
+        dispatch_evaluation_event(
+            &mut accum,
+            &serde_json::json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
+        );
+        dispatch_evaluation_event(
+            &mut accum,
+            &serde_json::json!({"type":"run_finished", "run_id":"child", "status":"malformed", "turn_evaluation":false}),
+        );
+        assert!(accum.turn_evaluation.is_none());
+        assert_eq!(accum.error_kind, None);
+        let mut wire = terminal_evaluation_wire("completed");
+        dispatch_evaluation_event(&mut accum, &wire);
+        wire["turn_evaluation"]["metadata"]["quality"] = serde_json::json!(0.1);
+        dispatch_evaluation_event(&mut accum, &wire);
+        assert_eq!(
+            accum.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(accum.turn_evaluation.is_none());
+    }
+
+    #[test]
+    fn terminal_protocol_failure_keeps_evaluation_unknown_in_either_delivery_order() {
+        for malformed_first in [false, true] {
+            let mut accum = ChatTurnSseAccum::default();
+            dispatch_evaluation_event(
+                &mut accum,
+                &serde_json::json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
+            );
+            let valid = terminal_evaluation_wire("completed");
+            let invalid =
+                serde_json::json!({"type":"run_finished", "run_id":"root", "status":"invalid"});
+            for event in if malformed_first {
+                [&invalid, &valid]
+            } else {
+                [&valid, &invalid]
+            } {
+                dispatch_evaluation_event(&mut accum, event);
+            }
+            assert_eq!(
+                accum.error_kind,
+                Some(astra_core::ErrorKind::ContractViolation)
+            );
+            assert!(accum.turn_evaluation.is_none());
+        }
+    }
+
+    #[test]
+    fn root_terminal_without_evaluation_retains_unknown_quality() {
+        let mut accum = ChatTurnSseAccum::default();
+        dispatch_evaluation_event(
+            &mut accum,
+            &serde_json::json!({"type":"session_info", "session_id":"session", "run_id":"root"}),
+        );
+        dispatch_evaluation_event(
+            &mut accum,
+            &serde_json::json!({"type":"run_finished", "run_id":"root", "status":"completed", "owner_generation":4}),
+        );
+        assert_eq!(accum.error_kind, None);
+        assert!(accum.run_terminal.is_some());
+        assert!(accum.turn_evaluation.is_none());
+    }
+
     fn server_runtime_feedback_fragment(llm_rounds: u32) -> String {
         let frame = crate::introspect::test_runtime_feedback(1, llm_rounds, 8);
         format!(
@@ -1917,6 +2499,45 @@ mod tests {
         ] {
             dispatch_chat_turn_sse_event_block(&block, accum, &mut vec![]);
         }
+    }
+
+    #[test]
+    fn replayed_model_fragments_retain_each_event_identity_not_the_last_accumulator_id() {
+        let mut accum = ChatTurnSseAccum::default();
+        let mut projected = Vec::new();
+        for event in [
+            serde_json::json!({"type":"text_delta", "model_item_id":"accepted-A", "content":"same"}),
+            serde_json::json!({"type":"reasoning_delta", "model_item_id":"partial-P", "content":"partial"}),
+            serde_json::json!({"type":"text_delta", "model_item_id":"resume-B", "content":"same"}),
+            serde_json::json!({"type":"text_delta", "content":"unknown"}),
+        ] {
+            for effect in dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut Vec::new(),
+            ) {
+                match effect {
+                    SseRenderEffect::StreamText {
+                        model_item_id,
+                        text,
+                    } => projected.push(("output", model_item_id, text)),
+                    SseRenderEffect::ThinkingPreviewChunk {
+                        model_item_id,
+                        text,
+                    } => projected.push(("reasoning", model_item_id, text)),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            projected,
+            vec![
+                ("output", Some("accepted-A".into()), "same".into()),
+                ("reasoning", Some("partial-P".into()), "partial".into()),
+                ("output", Some("resume-B".into()), "same".into()),
+                ("output", None, "unknown".into()),
+            ]
+        );
     }
 
     #[test]
@@ -1993,26 +2614,7 @@ mod tests {
     /// regression again.
     #[test]
     fn signature_round_trips_from_sse_into_next_assistant_message() {
-        use crate::headless_tool_assembly::{
-            EdgeToolRoundRow, openai_assistant_with_tool_calls_message_ext,
-        };
-
-        struct Row;
-        impl EdgeToolRoundRow for Row {
-            fn tool_name(&self) -> &str {
-                "noop"
-            }
-            fn tool_args(&self) -> &Value {
-                static NULL: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-                NULL.get_or_init(|| Value::Null)
-            }
-            fn tool_output(&self) -> &str {
-                ""
-            }
-            fn tool_duration_ms(&self) -> u64 {
-                0
-            }
-        }
+        use crate::headless_tool_assembly::openai_assistant_with_tool_calls_message_ext;
 
         let mut accum = ChatTurnSseAccum::default();
         let stream = format!(
@@ -2033,9 +2635,8 @@ mod tests {
             "type": "function",
             "function": {"name": "noop", "arguments": "{}"}
         })];
-        let msg = openai_assistant_with_tool_calls_message_ext::<Row>(
+        let msg = openai_assistant_with_tool_calls_message_ext(
             &server_tool_calls,
-            &[],
             &accum.reasoning_content,
             &accum.reasoning_signature,
             true,
@@ -2061,7 +2662,7 @@ mod tests {
         let chunks: Vec<&str> = efx
             .iter()
             .filter_map(|e| match e {
-                SseRenderEffect::ThinkingPreviewChunk(s) => Some(s.as_str()),
+                SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => Some(s.as_str()),
                 _ => None,
             })
             .collect();
@@ -3155,7 +3756,7 @@ mod tests {
         assert_eq!(a.full_text, "complete answer");
         assert!(
             effects.iter().any(
-                |effect| matches!(effect, SseRenderEffect::StreamText(text) if text == "complete answer")
+                |effect| matches!(effect, SseRenderEffect::StreamText { text, .. } if text == "complete answer")
             ),
             "terminal text learned from a replay must enter the render lane"
         );
@@ -3186,7 +3787,7 @@ mod tests {
         let chunks: Vec<&str> = efx
             .iter()
             .filter_map(|e| match e {
-                SseRenderEffect::ThinkingPreviewChunk(s) => Some(s.as_str()),
+                SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => Some(s.as_str()),
                 _ => None,
             })
             .collect();
@@ -3197,7 +3798,7 @@ mod tests {
     fn tool_request_enqueues_pending() {
         let mut a = ChatTurnSseAccum::default();
         let mut pending = Vec::new();
-        let block = "data: {\"type\":\"tool_request\",\"request_id\":\"tr-1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":1700000300000,\"tool\":\" bash \",\"args\":{\"command\":\"echo x\"}}\n\n";
+        let block = "data: {\"type\":\"tool_request\",\"request_id\":\"tr-1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":1700000300000,\"tool\":\" bash \",\"args\":{\"command\":\"echo x\"}}\n\n";
         dispatch_chat_turn_sse_event_block(block, &mut a, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
@@ -3278,7 +3879,7 @@ mod tests {
         dispatch_chat_turn_sse_event_block(
             &sse(
                 "tool_request",
-                ",\"request_id\":\"r1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"tool\":\"bash\"",
+                ",\"request_id\":\"r1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"tool\":\"bash\"",
             ),
             &mut a,
             &mut pending,
@@ -3289,6 +3890,59 @@ mod tests {
             a.error_message
                 .as_deref()
                 .is_some_and(|message| message.contains("absolute execution deadline"))
+        );
+    }
+
+    #[test]
+    fn bash_request_requires_command_timeout_authority_separate_from_delivery_budget() {
+        for cap in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(0)),
+            Some(serde_json::json!(-1)),
+            Some(serde_json::json!(1.5)),
+            Some(serde_json::json!("5000")),
+            Some(serde_json::json!(30_001)),
+        ] {
+            let mut event = serde_json::json!({
+                "type": "tool_request", "request_id": "bash-cap",
+                "schema_admitted_by_server": true, "tool": "bash",
+                "args": {"command": "echo verified"}, "execution_timeout_ms": 30_000,
+                "execution_deadline_unix_ms": 1_700_000_300_000u64
+            });
+            if let Some(cap) = cap {
+                event["command_timeout_cap_ms"] = cap;
+            }
+            let mut accum = ChatTurnSseAccum::default();
+            let mut pending = Vec::new();
+            dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut pending,
+            );
+            assert!(
+                pending.is_empty(),
+                "invalid authority cannot enter local execution"
+            );
+            assert_eq!(
+                accum.error_kind,
+                Some(astra_core::ErrorKind::ContractViolation)
+            );
+        }
+        let args = serde_json::json!({"command": "echo verified", "timeout": 90});
+        let event = serde_json::json!({
+            "type": "tool_request", "request_id": "bash-cap", "schema_admitted_by_server": true,
+            "tool": "bash", "args": args, "execution_timeout_ms": 30_000,
+            "execution_deadline_unix_ms": 1_700_000_300_000u64, "command_timeout_cap_ms": 5_000
+        });
+        let mut accum = ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
+        dispatch_chat_turn_sse_event_block(&format!("data: {event}\n\n"), &mut accum, &mut pending);
+        assert!(accum.error_kind.is_none());
+        assert!(
+            matches!(pending.as_slice(), [ChatTurnEdgePending::ToolRequest {
+            command_timeout_cap_ms: Some(5_000), args: actual, ..
+        }] if actual == &args)
         );
     }
 
@@ -3844,7 +4498,7 @@ mod tests {
         dispatch_chat_turn_sse_event_block(
             &sse(
                 "tool_request",
-                ",\"request_id\":\"r1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"bash\"",
+                ",\"request_id\":\"r1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"command_timeout_cap_ms\":30000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"bash\"",
             ),
             &mut a,
             &mut pending,
@@ -4066,7 +4720,7 @@ mod tests {
         );
         assert!(
             !efx.iter()
-                .any(|e| matches!(e, SseRenderEffect::ThinkingPreviewChunk(_)))
+                .any(|e| matches!(e, SseRenderEffect::ThinkingPreviewChunk { .. }))
         );
     }
 

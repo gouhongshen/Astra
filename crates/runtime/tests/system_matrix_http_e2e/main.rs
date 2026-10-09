@@ -25,10 +25,8 @@
 
 mod harness;
 mod journey_admin_smoke_matrix;
-mod journey_branches_matrix;
 mod journey_context_decision_chain_matrix;
 mod journey_delegate_http_matrix;
-mod journey_evaluation_reads_matrix;
 mod journey_extended;
 mod journey_full;
 mod journey_full_capture_matrix;
@@ -42,25 +40,22 @@ mod journey_session_artifacts_matrix;
 mod journey_session_http_db_matrix;
 mod journey_stream_persistence;
 mod journey_tasks_runs;
-mod journey_team_crud_matrix;
-mod journey_team_data_fidelity_matrix;
-mod journey_team_http_negatives_matrix;
-mod journey_team_isolation_matrix;
-mod journey_team_snapshots_matrix;
+#[path = "../test_support.rs"]
+mod test_support;
 
 use harness::require_system_e2e_env;
 
 macro_rules! matrix_test {
     (
         $(#[$extra:meta])*
-        $name:ident, $workers:literal, $reason:literal, $runner:path
+        $name:ident, $workers:literal, $reason:literal, $runner:path $(, $arg:expr)*
     ) => {
         $(#[$extra])*
         #[tokio::test(flavor = "multi_thread", worker_threads = $workers)]
         #[ignore = $reason]
         async fn $name() {
             require_system_e2e_env();
-            $runner().await;
+            $runner($($arg),*).await;
         }
     };
 }
@@ -80,6 +75,18 @@ macro_rules! current_thread_matrix_test {
     };
 }
 
+matrix_test! {
+    e2e_matrix_stream_corrects_invalid_model_policy_before_child_execution, 2,
+    "live MatrixOne + scripted provider; real schema rejection and corrected child execution",
+    journey_stream_persistence::run_stream_corrects_invalid_model_policy_before_child_execution, false
+}
+
+matrix_test! {
+    e2e_matrix_stream_corrects_invalid_model_policy_before_child_execution_explain, 2,
+    "live MatrixOne + scripted provider; same correction/child contract with Explain enabled",
+    journey_stream_persistence::run_stream_corrects_invalid_model_policy_before_child_execution, true
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
 async fn product_matrix_api_journey_hits_multiple_tables() {
@@ -93,6 +100,11 @@ matrix_test! {
     e2e_matrix_chat_run_pause_resume_http, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_tasks_runs::run_chat_run_pause_resume_http
+}
+matrix_test! {
+    e2e_matrix_execution_handoff_resume_reaches_provider_http, 2,
+    "live MatrixOne + mock LLM; public same-turn execution handoff restoration",
+    journey_tasks_runs::run_execution_handoff_resume_reaches_provider_http
 }
 matrix_test! {
     e2e_matrix_orphan_cancel_claim_race_http, 4,
@@ -238,31 +250,6 @@ matrix_test! {
     journey_stream_persistence::run_stream_failed_fanout_settles_once_without_orphaning_children
 }
 matrix_test! {
-    e2e_matrix_team_crud_and_db, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_team_crud_matrix::run_team_crud_db
-}
-matrix_test! {
-    e2e_matrix_team_snapshots_and_db, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_team_snapshots_matrix::run_team_snapshots_db
-}
-matrix_test! {
-    e2e_matrix_team_http_negative_paths, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_team_http_negatives_matrix::run_team_http_negative_paths
-}
-matrix_test! {
-    e2e_matrix_team_http_db_fidelity, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_team_data_fidelity_matrix::run_team_http_db_fidelity
-}
-matrix_test! {
-    e2e_matrix_team_cross_user_isolation, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_team_isolation_matrix::run_team_cross_user_isolation
-}
-matrix_test! {
     e2e_matrix_meta_health, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_meta_matrix::run_meta_root_and_health
@@ -286,11 +273,6 @@ matrix_test! {
     e2e_matrix_session_artifact_latest_and_download, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_session_artifacts_matrix::run_session_artifact_latest_and_download_routes
-}
-matrix_test! {
-    e2e_matrix_failed_session_artifact_latest_and_download, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_session_artifacts_matrix::run_failed_session_artifact_latest_and_download_routes
 }
 matrix_test! {
     e2e_matrix_server_loop_block_parse_preserves_partial_without_replay, 2,
@@ -323,11 +305,6 @@ matrix_test! {
     journey_session_artifacts_matrix::run_session_artifact_latest_route_uses_stable_tiebreaker
 }
 matrix_test! {
-    e2e_matrix_evaluation_reads, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_evaluation_reads_matrix::run_evaluation_read_http_smoke
-}
-matrix_test! {
     e2e_matrix_context_decision_chain, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_context_decision_chain_matrix::run_context_decision_chain_db
@@ -337,11 +314,7 @@ matrix_test! {
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_models_matrix::run_models_smoke
 }
-matrix_test! {
-    e2e_matrix_branches_cost_estimate_http, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
-    journey_branches_matrix::run_branches_cost_estimate_http
-}
+
 matrix_test! {
     e2e_matrix_delegate_http_boundaries, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
@@ -541,26 +514,6 @@ matrix_test! {
     e2e_matrix_saas_skills_cross_user_isolation, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.4 skills isolation",
     journey_saas_platform_matrix::run_saas_skills_cross_user_isolation
-}
-matrix_test! {
-    e2e_matrix_saas_team_cross_user_isolation, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.4 team isolation",
-    journey_saas_platform_matrix::run_saas_team_cross_user_isolation
-}
-matrix_test! {
-    e2e_matrix_saas_session_replay_compare_unavailable_guardrail, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §6.1 replay compare guardrail",
-    journey_saas_platform_matrix::run_saas_session_replay_compare_unavailable_guardrail
-}
-matrix_test! {
-    e2e_matrix_saas_session_replay_post_unavailable_guardrail, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §6.1 replay POST guardrail",
-    journey_saas_platform_matrix::run_saas_session_replay_post_unavailable_guardrail
-}
-matrix_test! {
-    e2e_matrix_saas_admin_feedback_stats_rbac, 2,
-    "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §5.2 admin feedback stats",
-    journey_saas_platform_matrix::run_saas_admin_feedback_stats_rbac
 }
 matrix_test! {
     e2e_matrix_saas_run_projection_smoke, 2,

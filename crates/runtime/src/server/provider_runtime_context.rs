@@ -5,6 +5,15 @@ pub(crate) async fn inject_effective_runtime_context(
     principal: &AuthPrincipal,
     request: &mut astra_services::runs::ChatRequestData,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    request.execution_authentication = principal.execution_authentication_provenance();
+    request.model_catalog_reader = Some(
+        astra_services::models::AuthorizedModelCatalogReader::with_cache(
+            state.model_service.clone(),
+            state.auth_service.clone(),
+            principal.clone(),
+            state.model_catalog_cache.clone(),
+        ),
+    );
     if principal.is_provider_authorized_request() {
         request.provider_runtime_authorized = true;
         if let AuthPrincipalOrigin::ProviderAuthorizedRequest(ctx) = &principal.origin {
@@ -413,6 +422,7 @@ mod tests {
                 selected_model: ExternalSelectedModelResponse {
                     id: "model-requested".to_string(),
                     model: "provider-model".to_string(),
+                    source_identity: None,
                 },
                 runtime_auth: ExternalRuntimeAuthResponse {
                     auth_type: "moi_runtime_grant".to_string(),
@@ -469,6 +479,7 @@ mod tests {
                 display_name: None,
             },
             session_id: None,
+            execution_continuation: None,
             origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
                 AuthProviderAuthorizedRequestContext {
                     provider_id: "p1".to_string(),
@@ -623,6 +634,29 @@ mod tests {
             .expect("provider authorization should accept the supplied runtime context");
 
         assert!(request.provider_runtime_authorized);
+        assert_eq!(
+            serde_json::to_value(request.execution_authentication.as_ref().unwrap()).unwrap(),
+            serde_json::json!({
+                "kind": "provider_request", "user_id": "u1", "provider_id": "p1",
+                "external_subject": "s1", "provider_scope_id": "ws-1",
+                "request_authorization_id": "r1"
+            })
+        );
+        let reader = request
+            .model_catalog_reader
+            .as_ref()
+            .expect("authenticated reader binding");
+        assert_eq!(reader.user_id(), principal.user.user_id);
+        assert_eq!(
+            reader.scope(),
+            if principal.is_edge_registration() {
+                "edge_registration"
+            } else if principal.is_provider_authorized_request() {
+                "provider_scope"
+            } else {
+                "user"
+            }
+        );
         assert_eq!(
             request.provider_run_owner,
             Some(astra_services::runs::ProviderRunOwner {

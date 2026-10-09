@@ -5,6 +5,10 @@
 
 The feedback control loop turns user feedback, trace facts, eval results, and operational signals into controlled product improvement. It is the upstream system for tuning jobs and evaluation.
 
+The unused source-public online-progress policy, signals, and decision prototype
+has been retired. Runtime feedback continues through the existing authoritative
+execution path; shared turn-evaluation thresholds and telemetry remain intact.
+
 ## Principles
 
 - Feedback is evidence, not automatic truth.
@@ -12,6 +16,10 @@ The feedback control loop turns user feedback, trace facts, eval results, and op
 - Implicit feedback requires conservative interpretation.
 - Improvement proposals must pass evaluation before activation.
 - Feedback must respect privacy, consent, and deletion.
+
+The retired public learning routes retain no request/response projections or
+trigger defaults. Their absence remains an HTTP contract; real evaluation,
+lesson storage, and feedback admission keep their existing owners.
 
 ## Feedback sources
 
@@ -22,6 +30,15 @@ The feedback control loop turns user feedback, trace facts, eval results, and op
 | Tool feedback | malformed call, repeated failure, fallback, timeout. |
 | Evaluation feedback | regression failure, rubric score, human label. |
 | Operational feedback | latency, token waste, sync degraded, provider offline. |
+
+Runtime pressure and tool-health hints use the existing feedback lane and their observed sources. The retired synthetic diagnostic executor did not invoke a Skill; its fenced-output protocol, cooldowns and unobserved postconditions are removed. Manual evidence-driven diagnostic skills remain available. Retired adaptive tuner, boost/widen markers and timing configuration do not change tool admission or runtime budgets; hard restrictions and explicit tuned configuration retain their existing owners. The unused verification strictness, memory-pressure and context-window adjustment sections, experiment enrollment projections and their mutation/display surfaces are retired together; runtime settings expose execution controls rather than placeholder adaptive behavior.
+
+Typed scenario state is retained for execution intent and observation. The
+unconsumed scenario tool/strategy suggestion tables and empty CLI goal-steering
+wrapper are retired; explicit tool admission, resource limits, and shared
+runtime policy evidence retain their existing owners.
+The unused confidence-tier fallback and trend tracker are retired; tool discovery
+and admission do not automatically broaden permissions from confidence scores.
 
 ## Feedback record
 
@@ -67,3 +84,12 @@ Activation is handled through tuning jobs or explicit product changes, not direc
 - Do not use sensitive raw data without consent.
 - Do not treat low-confidence implicit feedback as a hard label.
 - Do not activate a change without rollback.
+
+## Next-turn assessment collection
+
+The existing semantic admission judges own optional response satisfaction and new-task
+difficulty/urgency observations. Their canonical source message, uncertainty,
+response-reference rules, collection coverage, and training leakage constraints
+are specified in [model-routing.md](model-routing.md#next-turn-observations-stage-2).
+These observations supplement objective/task verification; they are not success
+verdicts and do not activate routing or learning policies.

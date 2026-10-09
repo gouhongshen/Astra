@@ -185,6 +185,13 @@ pub enum SessionArtifactStoreError {
     ByteArtifactContentUnavailable { artifact_id: String },
 }
 
+/// Content-store admission and read budgets. Enforced before loading bytes,
+/// including when persisted metadata is read for recovery publication.
+pub const SESSION_ARTIFACT_MAX_CONTENT_BYTES: u64 = 64 * 1024 * 1024;
+pub const SESSION_ARTIFACT_MAX_CHUNKS: usize = 4096;
+pub const SESSION_ARTIFACT_MAX_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
+const CONTENT_CHUNK_READ_BATCH: usize = 128;
+
 pub const LOCAL_SESSION_LAYOUT_VERSION: &str = "v1";
 pub const LOCAL_SESSION_JOURNAL_FILE_SUFFIX: &str = "jsonl";
 pub const MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX: &str = "projection:";
@@ -379,6 +386,7 @@ pub enum SessionArtifactReferenceKind {
     StateItem,
     Citation,
     RecoveryPoint,
+    SessionTranscript,
 }
 
 impl SessionArtifactReferenceKind {
@@ -389,6 +397,7 @@ impl SessionArtifactReferenceKind {
             Self::StateItem => "state_item",
             Self::Citation => "citation",
             Self::RecoveryPoint => "recovery_point",
+            Self::SessionTranscript => "session_transcript",
         }
     }
 
@@ -399,6 +408,7 @@ impl SessionArtifactReferenceKind {
             "state_item" => Ok(Self::StateItem),
             "citation" => Ok(Self::Citation),
             "recovery_point" => Ok(Self::RecoveryPoint),
+            "session_transcript" => Ok(Self::SessionTranscript),
             other => Err(SessionArtifactStoreError::InvalidStoredReferenceKind(
                 other.to_string(),
             )),
@@ -460,7 +470,7 @@ impl SessionArtifactContentDescriptorV1 {
         }
     }
 
-    fn validate(&self) -> Result<(), SessionArtifactStoreError> {
+    pub fn validate(&self) -> Result<(), SessionArtifactStoreError> {
         if self.schema_version != SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION {
             return Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(
                 format!("unsupported content schema version {}", self.schema_version),
@@ -472,6 +482,13 @@ impl SessionArtifactContentDescriptorV1 {
             ));
         }
         validate_content_digest(&self.digest)?;
+        if self.byte_size > SESSION_ARTIFACT_MAX_CONTENT_BYTES
+            || self.chunk_count > SESSION_ARTIFACT_MAX_CHUNKS as u64
+        {
+            return Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(
+                "content exceeds the byte or chunk budget".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -669,7 +686,7 @@ pub trait SessionArtifactContentStore: Send + Sync {
         artifact_id: &str,
         chunks: Vec<SessionArtifactContentChunkV1>,
         references: Vec<SessionArtifactReference>,
-    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError>;
+    ) -> Result<StoredSessionArtifactContentV1, SessionArtifactStoreError>;
 
     async fn load_byte_artifact(
         &self,
@@ -900,7 +917,7 @@ impl DatabaseSessionArtifactStore {
     }
 }
 
-async fn admit_byte_artifact_session(
+async fn admit_artifact_session(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     user_id: &str,
     session_id: &str,
@@ -1036,11 +1053,38 @@ fn same_optional_json(
 fn validate_content_chunk_refs(
     chunks: &[SessionArtifactContentChunkV1],
 ) -> Result<(), SessionArtifactStoreError> {
+    if chunks.len() > SESSION_ARTIFACT_MAX_CHUNKS {
+        return Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(
+            "content exceeds the chunk budget".into(),
+        ));
+    }
+    let mut total_bytes = 0_u64;
+    let mut sizes = std::collections::BTreeMap::new();
     for (expected_index, chunk) in chunks.iter().enumerate() {
+        total_bytes = total_bytes.checked_add(chunk.byte_size).ok_or_else(|| {
+            SessionArtifactStoreError::InvalidByteArtifactMetadata(
+                "content byte size overflow".into(),
+            )
+        })?;
+        if chunk.byte_size > SESSION_ARTIFACT_MAX_CHUNK_BYTES
+            || total_bytes > SESSION_ARTIFACT_MAX_CONTENT_BYTES
+        {
+            return Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(
+                "content exceeds the byte budget".into(),
+            ));
+        }
         if chunk.chunk_index != expected_index as u64 {
             return Err(SessionArtifactStoreError::InvalidContentChunkOrder);
         }
         validate_content_digest(&chunk.digest)?;
+        if sizes
+            .insert(chunk.digest.as_str(), chunk.byte_size)
+            .is_some_and(|size| size != chunk.byte_size)
+        {
+            return Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(
+                "shared digest has conflicting byte sizes".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1050,12 +1094,20 @@ fn validate_artifact_list_limit(limit: usize) -> usize {
 }
 
 fn validate_artifact_references(
+    session_id: &str,
     references: &[SessionArtifactReference],
 ) -> Result<(), SessionArtifactStoreError> {
     let mut seen = std::collections::HashSet::with_capacity(references.len());
     for reference in references {
         let reference_id = reference.reference_id.trim();
         if reference_id.is_empty() || reference_id.len() > 128 {
+            return Err(SessionArtifactStoreError::InvalidReferenceId(
+                reference.reference_id.clone(),
+            ));
+        }
+        if reference.kind == SessionArtifactReferenceKind::SessionTranscript
+            && reference.reference_id != session_id
+        {
             return Err(SessionArtifactStoreError::InvalidReferenceId(
                 reference.reference_id.clone(),
             ));
@@ -1352,11 +1404,9 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                 record.artifact_id,
             ));
         }
-        validate_artifact_references(&record.references)?;
+        validate_artifact_references(&record.session_id, &record.references)?;
 
         let pool = self.get_pool().await?;
-        self.require_owned_session(&pool, &record.user_id, &record.session_id)
-            .await?;
         let content_json = serde_json::to_string(&record.content)?;
         let metadata_json = record
             .metadata
@@ -1366,6 +1416,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
             .then(|| (chrono::Utc::now() + chrono::Duration::days(30)).naive_utc());
         let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
         let mut tx = connection.begin().await?;
+        admit_artifact_session(&mut tx, &record.user_id, &record.session_id).await?;
         query(
             "INSERT INTO session_artifacts \
              (artifact_id, session_id, user_id, artifact_kind, source, turn, round, content_json, metadata, retention_until, created_at) \
@@ -1621,13 +1672,12 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         if is_mutable_artifact_projection_id(artifact_id) {
             return Err(SessionArtifactStoreError::MutableProjectionReferencesUnsupported);
         }
-        validate_artifact_references(std::slice::from_ref(reference))?;
+        validate_artifact_references(session_id, std::slice::from_ref(reference))?;
 
         let pool = self.get_pool().await?;
-        self.require_owned_session(&pool, user_id, session_id)
-            .await?;
         let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
         let mut tx = connection.begin().await?;
+        admit_artifact_session(&mut tx, user_id, session_id).await?;
         let row = query(
             "SELECT status FROM session_artifacts \
              WHERE user_id = ? AND session_id = ? AND artifact_id = ? FOR UPDATE",
@@ -1697,7 +1747,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
                 artifact_id.to_string(),
             ));
         }
-        validate_artifact_references(std::slice::from_ref(reference))?;
+        validate_artifact_references(session_id, std::slice::from_ref(reference))?;
 
         let pool = self.get_pool().await?;
         self.require_owned_session(&pool, user_id, session_id)
@@ -1783,7 +1833,7 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         limit: usize,
     ) -> Result<Vec<String>, SessionArtifactStoreError> {
         validate_session_id(session_id)?;
-        validate_artifact_references(std::slice::from_ref(reference))?;
+        validate_artifact_references(session_id, std::slice::from_ref(reference))?;
         let pool = self.get_pool().await?;
         self.require_owned_session(&pool, user_id, session_id)
             .await?;
@@ -1940,7 +1990,7 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
         let pool = self.get_pool().await?;
         let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
         let mut tx = connection.begin().await?;
-        admit_byte_artifact_session(&mut tx, &record.user_id, &record.session_id).await?;
+        admit_artifact_session(&mut tx, &record.user_id, &record.session_id).await?;
         // Create the single artifact-level upload lease before locking the
         // catalog row. Every later byte operation acquires this lease first,
         // which gives begin/put/seal/GC one global lock order.
@@ -2103,6 +2153,11 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
             ));
         }
         validate_content_digest(digest)?;
+        if bytes.len() as u64 > SESSION_ARTIFACT_MAX_CHUNK_BYTES {
+            return Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(
+                "content chunk exceeds the byte budget".into(),
+            ));
+        }
         let actual_digest = content_digest(&bytes);
         if actual_digest != digest {
             return Err(SessionArtifactStoreError::ContentChunkDigestMismatch {
@@ -2113,7 +2168,7 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
         let pool = self.get_pool().await?;
         let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
         let mut tx = connection.begin().await?;
-        admit_byte_artifact_session(&mut tx, user_id, session_id).await?;
+        admit_artifact_session(&mut tx, user_id, session_id).await?;
         let lease_live =
             lock_byte_artifact_upload_lease(&mut tx, user_id, session_id, artifact_id).await?;
         let artifact_row = query(
@@ -2200,17 +2255,19 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
         .rows_affected()
             > 0;
         let existing = query(
-            "SELECT byte_size, content
+            "SELECT byte_size, CASE WHEN byte_size = ? AND OCTET_LENGTH(content) = byte_size
+                    THEN content ELSE NULL END AS content
              FROM session_artifact_content_chunks
              WHERE user_id = ? AND content_digest = ? FOR UPDATE",
         )
+        .bind(byte_size)
         .bind(user_id)
         .bind(digest)
         .fetch_one(&mut *tx)
         .await?;
         let existing_size = existing.try_get::<u64, _>("byte_size")?;
-        let existing_bytes = existing.try_get::<Vec<u8>, _>("content")?;
-        if existing_size != byte_size || existing_bytes != bytes {
+        let existing_bytes = existing.try_get::<Option<Vec<u8>>, _>("content")?;
+        if existing_size != byte_size || existing_bytes.as_deref() != Some(bytes.as_slice()) {
             return Err(SessionArtifactStoreError::ContentChunkSizeMismatch {
                 digest: digest.to_string(),
             });
@@ -2243,7 +2300,7 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
         artifact_id: &str,
         chunks: Vec<SessionArtifactContentChunkV1>,
         references: Vec<SessionArtifactReference>,
-    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
+    ) -> Result<StoredSessionArtifactContentV1, SessionArtifactStoreError> {
         validate_session_id(session_id)?;
         if artifact_id.trim().is_empty() || artifact_id.len() > MAX_ARTIFACT_ID_BYTES {
             return Err(SessionArtifactStoreError::InvalidArtifactId(
@@ -2251,11 +2308,11 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
             ));
         }
         validate_content_chunk_refs(&chunks)?;
-        validate_artifact_references(&references)?;
+        validate_artifact_references(session_id, &references)?;
         let pool = self.get_pool().await?;
         let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
         let mut tx = connection.begin().await?;
-        admit_byte_artifact_session(&mut tx, user_id, session_id).await?;
+        admit_artifact_session(&mut tx, user_id, session_id).await?;
         // An unfinished upload is fenced by the artifact-level lease. Sealed
         // artifacts intentionally have no lease, but still pass through this
         // optional lock before the catalog row so concurrent GC and uploads
@@ -2331,16 +2388,21 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
             .bind(artifact_id)
             .execute(&mut *tx)
             .await?;
+            let artifact = load_byte_artifact_catalog_in_transaction(
+                &mut tx,
+                user_id,
+                session_id,
+                artifact_id,
+            )
+            .await?;
             tx.commit().await?;
             connection.release();
-            return self
-                .load_json_artifact(user_id, session_id, artifact_id)
-                .await?
-                .ok_or(SessionArtifactStoreError::ArtifactNotFound {
-                    artifact_id: artifact_id.to_string(),
-                    session_id: session_id.to_string(),
-                    user_id: user_id.to_string(),
-                });
+            return Ok(StoredSessionArtifactContentV1 {
+                artifact,
+                manifest: envelope.manifest,
+                descriptor: envelope.content,
+                chunks: stored_chunks,
+            });
         }
         if envelope.content.chunk_count != chunks.len() as u64 {
             return Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(
@@ -2386,8 +2448,8 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
         descriptor.validate()?;
         let content_json = serde_json::to_string(&ByteArtifactEnvelopeV1 {
             schema_version: SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION,
-            manifest: envelope.manifest,
-            content: descriptor,
+            manifest: envelope.manifest.clone(),
+            content: descriptor.clone(),
         })?;
         query(
             "UPDATE session_artifacts
@@ -2421,31 +2483,17 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
         .bind(artifact_id)
         .execute(&mut *tx)
         .await?;
-        let artifact = query(
-            "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round,
-                    content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy,
-                    CAST(retention_until AS CHAR) AS retention_until, status,
-                    referenced_by_manifest_count, referenced_by_state_items_count,
-                    referenced_by_citation_count,
-                    (SELECT COUNT(*) FROM session_artifact_references refs
-                     WHERE refs.user_id = session_artifacts.user_id
-                       AND refs.session_id = session_artifacts.session_id
-                       AND refs.artifact_id = session_artifacts.artifact_id)
-                       AS referenced_by_durable_count,
-                    CAST(created_at AS CHAR) AS created_at
-             FROM session_artifacts
-             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .bind(artifact_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(SessionArtifactStoreError::Database)
-        .and_then(|row| stored_artifact_from_row(&row))?;
+        let artifact =
+            load_byte_artifact_catalog_in_transaction(&mut tx, user_id, session_id, artifact_id)
+                .await?;
         tx.commit().await?;
         connection.release();
-        Ok(artifact)
+        Ok(StoredSessionArtifactContentV1 {
+            artifact,
+            manifest: envelope.manifest,
+            descriptor,
+            chunks: stored_chunks,
+        })
     }
 
     async fn load_byte_artifact(
@@ -2522,8 +2570,7 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
         self.require_owned_session(&pool, user_id, session_id)
             .await?;
         let Some(row) = query(
-            "SELECT status,
-                    JSON_UNQUOTE(JSON_EXTRACT(content_json, '$.content.sealed')) AS sealed
+            "SELECT status, content_json
              FROM session_artifacts
              WHERE user_id = ? AND session_id = ? AND artifact_id = ?
              LIMIT 1",
@@ -2541,13 +2588,24 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
                 artifact_id: artifact_id.to_string(),
             });
         }
-        if row.try_get::<Option<String>, _>("sealed")?.as_deref() != Some("true") {
+        let envelope = parse_byte_artifact_envelope(
+            artifact_id,
+            artifact_row_json(
+                &row.string_column("content_json")?,
+                artifact_id,
+                "content_json",
+            )?,
+        )?;
+        if !envelope.content.sealed {
             return Err(SessionArtifactStoreError::ByteArtifactNotSealed {
                 artifact_id: artifact_id.to_string(),
             });
         }
         let row = query(
-            "SELECT refs.chunk_index, refs.byte_size, chunks.content
+            "SELECT refs.chunk_index, refs.byte_size,
+                    CASE WHEN refs.byte_size <= ? AND chunks.byte_size = refs.byte_size
+                         AND OCTET_LENGTH(chunks.content) = refs.byte_size
+                         THEN chunks.content ELSE NULL END AS content
              FROM session_artifact_content_refs refs
              INNER JOIN session_artifact_content_chunks chunks
                ON chunks.user_id = refs.user_id
@@ -2556,6 +2614,7 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
                AND refs.content_digest = ?
              LIMIT 1",
         )
+        .bind(SESSION_ARTIFACT_MAX_CHUNK_BYTES)
         .bind(user_id)
         .bind(session_id)
         .bind(artifact_id)
@@ -2567,7 +2626,11 @@ impl SessionArtifactContentStore for DatabaseSessionArtifactStore {
         };
         let chunk_index = row.try_get::<u64, _>("chunk_index")?;
         let declared_size = row.try_get::<u64, _>("byte_size")?;
-        let bytes = row.try_get::<Vec<u8>, _>("content")?;
+        let bytes = row
+            .try_get::<Option<Vec<u8>>, _>("content")?
+            .ok_or_else(|| SessionArtifactStoreError::ContentChunkSizeMismatch {
+                digest: digest.to_string(),
+            })?;
         if declared_size != bytes.len() as u64 || content_digest(&bytes) != digest {
             return Err(SessionArtifactStoreError::ContentChunkSizeMismatch {
                 digest: digest.to_string(),
@@ -2620,6 +2683,36 @@ async fn retain_references_in_transaction(
     Ok(())
 }
 
+async fn load_byte_artifact_catalog_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    artifact_id: &str,
+) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
+    query(
+        "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round,
+                    content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy,
+                    CAST(retention_until AS CHAR) AS retention_until, status,
+                    referenced_by_manifest_count, referenced_by_state_items_count,
+                    referenced_by_citation_count,
+                    (SELECT COUNT(*) FROM session_artifact_references refs
+                     WHERE refs.user_id = session_artifacts.user_id
+                       AND refs.session_id = session_artifacts.session_id
+                       AND refs.artifact_id = session_artifacts.artifact_id)
+                       AS referenced_by_durable_count,
+                    CAST(created_at AS CHAR) AS created_at
+             FROM session_artifacts
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(artifact_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(SessionArtifactStoreError::Database)
+    .and_then(|row| stored_artifact_from_row(&row))
+}
+
 pub(crate) async fn load_content_chunk_refs(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     user_id: &str,
@@ -2631,14 +2724,17 @@ pub(crate) async fn load_content_chunk_refs(
          FROM session_artifact_content_refs
          WHERE user_id = ? AND session_id = ? AND artifact_id = ?
          ORDER BY chunk_index ASC
+         LIMIT ?
          FOR UPDATE",
     )
     .bind(user_id)
     .bind(session_id)
     .bind(artifact_id)
+    .bind((SESSION_ARTIFACT_MAX_CHUNKS + 1) as i64)
     .fetch_all(&mut **tx)
     .await?;
-    rows.into_iter()
+    let refs = rows
+        .into_iter()
         .map(|row| {
             let chunk_index = row.try_get::<u64, _>("chunk_index")?;
             let byte_size = row.try_get::<u64, _>("byte_size")?;
@@ -2650,7 +2746,9 @@ pub(crate) async fn load_content_chunk_refs(
                 byte_size,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, SessionArtifactStoreError>>()?;
+    validate_content_chunk_refs(&refs)?;
+    Ok(refs)
 }
 
 fn same_content_chunk_refs(
@@ -2753,33 +2851,63 @@ pub(crate) async fn load_and_verify_content_chunks(
     user_id: &str,
     refs: &[SessionArtifactContentChunkV1],
 ) -> Result<Vec<SessionArtifactContentChunkV1WithBytes>, SessionArtifactStoreError> {
-    // Chunks are shared across artifacts. Always acquire their row locks in a
-    // global owner+digest order, then restore logical chunk order for aggregate
-    // hashing and materialization. This prevents two seals that share blobs
-    // in opposite file order from forming a lock cycle.
+    validate_content_chunk_refs(refs)?;
+    // Shared blobs always lock in global owner+digest order. Batches preserve
+    // that order even when two artifacts have different logical chunk orders.
     let lock_order = canonical_content_chunk_lock_order(refs);
+    let mut digests = lock_order.iter().collect::<Vec<_>>();
+    digests.dedup_by(|left, right| left.digest == right.digest);
+    let mut stored = std::collections::BTreeMap::new();
+    for batch in digests.chunks(CONTENT_CHUNK_READ_BATCH) {
+        let mut statement = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "SELECT content_digest, byte_size, CASE WHEN byte_size <= ",
+        );
+        statement
+            .push_bind(SESSION_ARTIFACT_MAX_CHUNK_BYTES)
+            .push(" AND OCTET_LENGTH(content) = byte_size AND byte_size = CASE content_digest ");
+        for reference in batch {
+            statement
+                .push(" WHEN ")
+                .push_bind(&reference.digest)
+                .push(" THEN ")
+                .push_bind(reference.byte_size);
+        }
+        statement.push(" END THEN content ELSE NULL END AS content FROM session_artifact_content_chunks WHERE user_id = ")
+            .push_bind(user_id).push(" AND content_digest IN (");
+        let mut values = statement.separated(", ");
+        for reference in batch {
+            values.push_bind(&reference.digest);
+        }
+        values.push_unseparated(") ORDER BY content_digest ASC FOR UPDATE");
+        for row in statement.build().fetch_all(&mut **tx).await? {
+            let digest = row.string_column("content_digest")?;
+            let stored_size = row.try_get::<u64, _>("byte_size")?;
+            let bytes = row
+                .try_get::<Option<Vec<u8>>, _>("content")?
+                .ok_or_else(|| SessionArtifactStoreError::ContentChunkSizeMismatch {
+                    digest: digest.clone(),
+                })?;
+            if content_digest(&bytes) != digest {
+                return Err(SessionArtifactStoreError::ContentChunkSizeMismatch { digest });
+            }
+            stored.insert(digest, (stored_size, bytes));
+        }
+    }
     let mut chunks = Vec::with_capacity(refs.len());
-    for reference in &lock_order {
-        let row = query(
-            "SELECT byte_size, content
-             FROM session_artifact_content_chunks
-             WHERE user_id = ? AND content_digest = ?
-             FOR UPDATE",
-        )
-        .bind(user_id)
-        .bind(&reference.digest)
-        .fetch_optional(&mut **tx)
-        .await?
+    for (index, reference) in lock_order.iter().enumerate() {
+        let repeats = lock_order
+            .get(index + 1)
+            .is_some_and(|next| next.digest == reference.digest);
+        let (stored_size, bytes) = if repeats {
+            stored.get(&reference.digest).cloned()
+        } else {
+            stored.remove(&reference.digest)
+        }
         .ok_or_else(|| SessionArtifactStoreError::ContentChunkNotFound {
             digest: reference.digest.clone(),
             user_id: user_id.to_string(),
         })?;
-        let stored_size = row.try_get::<u64, _>("byte_size")?;
-        let bytes = row.try_get::<Vec<u8>, _>("content")?;
-        if stored_size != reference.byte_size
-            || bytes.len() as u64 != reference.byte_size
-            || content_digest(&bytes) != reference.digest
-        {
+        if stored_size != reference.byte_size || bytes.len() as u64 != reference.byte_size {
             return Err(SessionArtifactStoreError::ContentChunkSizeMismatch {
                 digest: reference.digest.clone(),
             });
@@ -2791,16 +2919,6 @@ pub(crate) async fn load_and_verify_content_chunks(
         });
     }
     chunks.sort_by_key(|chunk| chunk.chunk_index);
-    validate_content_chunk_refs(
-        &chunks
-            .iter()
-            .map(|chunk| SessionArtifactContentChunkV1 {
-                chunk_index: chunk.chunk_index,
-                digest: chunk.digest.clone(),
-                byte_size: chunk.bytes.len() as u64,
-            })
-            .collect::<Vec<_>>(),
-    )?;
     Ok(chunks)
 }
 
@@ -2915,6 +3033,58 @@ impl SessionArtifactStore for LocalSessionArtifactStore {
     fn journal_path(&self, session_id: &str) -> Result<PathBuf, String> {
         self.journal_path_for_owner(&OwnerScope::local_user(), session_id)
     }
+}
+
+/// Default bounded model-facing byte window.
+pub const DEFAULT_ARTIFACT_WINDOW_BYTES: usize = 8 * 1024;
+const MAX_WINDOW_BYTES: usize = 64 * 1024;
+const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+
+pub fn artifact_window_arguments(args: &Value) -> Result<(usize, usize), String> {
+    let offset = match args.get("offset") {
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or("offset must be a non-negative integer")?,
+        None => 0,
+    };
+    let max_bytes = match args.get("max_bytes") {
+        Some(value) => value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| (1..=MAX_WINDOW_BYTES).contains(value))
+            .ok_or_else(|| format!("max_bytes must be an integer from 1 to {MAX_WINDOW_BYTES}"))?,
+        None => DEFAULT_ARTIFACT_WINDOW_BYTES,
+    };
+    Ok((offset, max_bytes))
+}
+
+pub fn read_artifact_window(
+    content: &str,
+    offset: usize,
+    max_bytes: usize,
+) -> Result<(String, usize, usize), String> {
+    let total_bytes = content.len();
+    if total_bytes > MAX_ARTIFACT_BYTES {
+        return Err("session artifact exceeds the read bound".to_string());
+    }
+    if offset > total_bytes {
+        return Err("offset is past the end of the session artifact".to_string());
+    }
+    if offset < total_bytes && !content.is_char_boundary(offset) {
+        return Err("offset must be a UTF-8 boundary".to_string());
+    }
+    let available = total_bytes.saturating_sub(offset);
+    let mut end = (offset + available.min(max_bytes)).min(total_bytes);
+    while end > offset && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == offset && available > 0 {
+        return Err(
+            "max_bytes is too small to advance one UTF-8 character; increase max_bytes".to_string(),
+        );
+    }
+    Ok((content[offset..end].to_string(), total_bytes, end))
 }
 
 #[cfg(test)]
@@ -3260,13 +3430,57 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn session_transcript_reference_rejects_foreign_session_before_database_access() {
+        let store = DatabaseSessionArtifactStore::new(MatrixOneSettings::default());
+        let reference = SessionArtifactReference {
+            kind: SessionArtifactReferenceKind::SessionTranscript,
+            reference_id: "foreign-session".into(),
+        };
+        let mut record = projection_record("history-1");
+        record.references = vec![reference.clone()];
+        assert!(matches!(
+            store.persist_json_artifact(record).await,
+            Err(SessionArtifactStoreError::InvalidReferenceId(_))
+        ));
+        assert!(matches!(
+            store
+                .retain_json_artifact_reference("owner", "sess-123", "history-1", &reference)
+                .await,
+            Err(SessionArtifactStoreError::InvalidReferenceId(_))
+        ));
+        assert!(matches!(
+            store
+                .release_json_artifact_reference("owner", "sess-123", "history-1", &reference)
+                .await,
+            Err(SessionArtifactStoreError::InvalidReferenceId(_))
+        ));
+        assert!(matches!(
+            store
+                .list_json_artifacts_for_reference("owner", "sess-123", &reference, 10)
+                .await,
+            Err(SessionArtifactStoreError::InvalidReferenceId(_))
+        ));
+        validate_artifact_references(
+            "sess-123",
+            &[SessionArtifactReference {
+                kind: SessionArtifactReferenceKind::SessionTranscript,
+                reference_id: "sess-123".into(),
+            }],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn artifact_reference_contract_rejects_empty_oversized_and_duplicate_owners() {
         for reference_id in [String::new(), "x".repeat(129)] {
-            let error = validate_artifact_references(&[SessionArtifactReference {
-                kind: SessionArtifactReferenceKind::InvocationLedger,
-                reference_id,
-            }])
+            let error = validate_artifact_references(
+                "session",
+                &[SessionArtifactReference {
+                    kind: SessionArtifactReferenceKind::InvocationLedger,
+                    reference_id,
+                }],
+            )
             .unwrap_err();
             assert!(matches!(
                 error,
@@ -3278,7 +3492,8 @@ mod tests {
             kind: SessionArtifactReferenceKind::InvocationLedger,
             reference_id: "sha256:invocation".to_string(),
         };
-        let error = validate_artifact_references(&[reference.clone(), reference]).unwrap_err();
+        let error =
+            validate_artifact_references("session", &[reference.clone(), reference]).unwrap_err();
         assert!(matches!(
             error,
             SessionArtifactStoreError::DuplicateReference {
@@ -3518,6 +3733,62 @@ mod tests {
             SessionArtifactContentDescriptorV1::new("local-path", content_digest(b""), 0);
         assert!(matches!(
             bad_backend.validate(),
+            Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn byte_store_rejects_unbounded_content_before_database_access() {
+        let store = DatabaseSessionArtifactStore::new(MatrixOneSettings::default());
+        let digest = content_digest(b"");
+        for (count, size) in [
+            (1, SESSION_ARTIFACT_MAX_CHUNK_BYTES + 1),
+            (5, SESSION_ARTIFACT_MAX_CHUNK_BYTES),
+            (SESSION_ARTIFACT_MAX_CHUNKS + 1, 0),
+        ] {
+            let refs = (0..count)
+                .map(|index| SessionArtifactContentChunkV1 {
+                    chunk_index: index as u64,
+                    digest: digest.clone(),
+                    byte_size: size,
+                })
+                .collect();
+            assert!(matches!(
+                store
+                    .seal_byte_artifact("user", "session", "artifact", refs, Vec::new())
+                    .await,
+                Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(_))
+            ));
+        }
+        for (bytes, chunks) in [
+            (SESSION_ARTIFACT_MAX_CONTENT_BYTES + 1, 1),
+            (0, SESSION_ARTIFACT_MAX_CHUNKS as u64 + 1),
+        ] {
+            let mut descriptor = SessionArtifactContentDescriptorV1::new(
+                SESSION_ARTIFACT_CONTENT_BACKEND_MATRIXONE_CHUNKS_V1,
+                digest.clone(),
+                bytes,
+            );
+            descriptor.chunk_count = chunks;
+            assert!(matches!(
+                descriptor.validate(),
+                Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(_))
+            ));
+        }
+        let repeated = [
+            SessionArtifactContentChunkV1 {
+                chunk_index: 0,
+                digest: digest.clone(),
+                byte_size: 1,
+            },
+            SessionArtifactContentChunkV1 {
+                chunk_index: 1,
+                digest,
+                byte_size: 2,
+            },
+        ];
+        assert!(matches!(
+            validate_content_chunk_refs(&repeated),
             Err(SessionArtifactStoreError::InvalidByteArtifactMetadata(_))
         ));
     }

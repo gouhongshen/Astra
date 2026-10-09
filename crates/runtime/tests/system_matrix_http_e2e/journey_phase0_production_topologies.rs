@@ -22,7 +22,7 @@ use astra_core::history_work_baseline::{
 };
 use astra_core::{AppSettings, SharedPool};
 use astra_runtime_env::ASTRA_LOCAL_STATE_ROOT_ENV;
-use astra_services::models::{PricingData, QuirksData};
+use astra_services::models::QuirksData;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use reqwest::{Client, StatusCode};
@@ -187,7 +187,6 @@ struct SourceModel {
     input_modalities: Vec<String>,
     output_modalities: Vec<String>,
     supported_parameters: Vec<String>,
-    pricing: PricingData,
     architecture: Option<String>,
     tags: Vec<String>,
     quirks: QuirksData,
@@ -210,8 +209,6 @@ struct SourceModelWire {
     output_modalities: Vec<String>,
     #[serde(default)]
     supported_parameters: Vec<String>,
-    #[serde(default)]
-    pricing: PricingData,
     #[serde(default)]
     architecture: Option<String>,
     #[serde(default)]
@@ -273,7 +270,6 @@ fn load_source_model(path: &Path, exact_name: &str) -> AnyResult<SourceModel> {
         input_modalities: wire.input_modalities,
         output_modalities: wire.output_modalities,
         supported_parameters: wire.supported_parameters,
-        pricing: wire.pricing,
         architecture: wire.architecture,
         tags: wire.tags,
         quirks,
@@ -930,7 +926,6 @@ fn spawn_server(
         .env("no_proxy", "127.0.0.1,localhost")
         // Keep the child hermetic even when dotenv discovery finds an
         // unrelated ancestor file. dotenvy preserves explicitly-set values.
-        .env("ASTRA_OUTPUT_STYLE", "default")
         .env(
             "ASTRA_PROMPT_OVERRIDES_DIR",
             local_state_root.path().join("prompts"),
@@ -991,7 +986,6 @@ fn spawn_edge(
         .env(ASTRA_CONFIG_SOURCE_ENV, ASTRA_CONFIG_SOURCE_EXPLICIT_ENV)
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
-        .env("ASTRA_OUTPUT_STYLE", "default")
         .env(
             "ASTRA_PROMPT_OVERRIDES_DIR",
             local_state_root.path().join("prompts"),
@@ -1504,7 +1498,6 @@ async fn run_cli_turn(
         .env(ASTRA_CONFIG_SOURCE_ENV, ASTRA_CONFIG_SOURCE_EXPLICIT_ENV)
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
-        .env("ASTRA_OUTPUT_STYLE", "default")
         .env(
             "ASTRA_PROMPT_OVERRIDES_DIR",
             local_state_root.path().join("prompts"),
@@ -1695,7 +1688,6 @@ async fn create_window_offerings(
                     "input_modalities": source.input_modalities,
                     "output_modalities": source.output_modalities,
                     "supported_parameters": source.supported_parameters,
-                    "pricing": source.pricing,
                     "architecture": source.architecture,
                     "tags": source.tags,
                     "quirks": source.quirks,

@@ -3,9 +3,9 @@ mod common;
 use astra_services::work::{
     CriterionCommand, CriterionDefinition, CriterionId, CriterionSetRevision, CriterionStatement,
     DatabaseWorkRepository, GoalRevision, GraphRevision, NewWorkCriteriaProposal, WorkBranchId,
-    WorkBranchRevision, WorkChangeRef, WorkCriteriaProposalAcceptance, WorkCriteriaProposalMember,
-    WorkCriteriaProposalRejection, WorkGoal, WorkGoalChange, WorkId, WorkOwnerId, WorkProposalId,
-    WorkProposalSourceKind, WorkProposalStatus, WorkRepository, WorkRepositoryError, WorkRevision,
+    WorkBranchRevision, WorkChangeRef, WorkCriteriaProposalMember, WorkCriteriaProposalRejection,
+    WorkId, WorkOwnerId, WorkProposalId, WorkProposalSourceKind, WorkProposalStatus,
+    WorkRepository, WorkRepositoryError, WorkRevision,
 };
 use sqlx::Row;
 
@@ -50,25 +50,6 @@ fn proposal(
         members,
         source_kind: WorkProposalSourceKind::Model,
         source_ref: WorkChangeRef::parse(common::id("model-invocation")).expect("source"),
-    }
-}
-
-fn acceptance(
-    proposed: &astra_services::work::RecordedWorkCriteriaProposal,
-    resolution_ref: &str,
-) -> WorkCriteriaProposalAcceptance {
-    WorkCriteriaProposalAcceptance {
-        owner_id: proposed.proposal.owner_id.clone(),
-        work_id: proposed.proposal.work_id.clone(),
-        branch_id: proposed.proposal.branch_id.clone(),
-        proposal_id: proposed.proposal.proposal_id.clone(),
-        payload_hash: proposed.payload_hash.clone(),
-        expected_work_revision: proposed.proposal.expected_work_revision,
-        expected_goal_revision: proposed.proposal.expected_goal_revision,
-        expected_criteria_set_revision: proposed.proposal.expected_criteria_set_revision,
-        expected_branch_revision: proposed.proposal.expected_branch_revision,
-        expected_graph_revision: proposed.proposal.expected_graph_revision,
-        resolution_ref: WorkChangeRef::parse(resolution_ref).expect("resolution"),
     }
 }
 
@@ -213,7 +194,15 @@ async fn concurrent_acceptance_is_atomic_idempotent_and_keeps_branch_basis_expli
         ))
         .await
         .expect("proposal");
-    let command = acceptance(&proposed, &common::id("accept-action"));
+    let command = common::criteria_acceptance(&proposed, &common::id("accept-action"));
+    let mut forged_goal = command.clone();
+    forged_goal.expected_goal_revision = GoalRevision::new(2).expect("forged Goal revision");
+    assert!(matches!(
+        repository.accept_criteria_proposal(forged_goal).await,
+        Err(WorkRepositoryError::InvalidWorkProposalBasis {
+            resource: astra_services::work::WorkProposalBasisResource::GoalRevision
+        })
+    ));
     let (left, right) = tokio::join!(
         repository.accept_criteria_proposal(command.clone()),
         concurrent.accept_criteria_proposal(command)
@@ -296,24 +285,36 @@ async fn stale_acceptance_has_no_residue_but_exact_rejection_remains_available()
         ))
         .await
         .expect("proposal");
-    repository
-        .revise_goal(WorkGoalChange {
-            owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
-            work_id: WorkId::parse(&work_id).expect("work"),
-            expected_work_revision: WorkRevision::INITIAL,
-            expected_goal_revision: GoalRevision::INITIAL,
-            goal: WorkGoal::parse("Deliver the revised goal with explicit evidence.")
-                .expect("goal"),
-            source_ref: WorkChangeRef::parse(common::id("goal-action")).expect("source"),
-            reason: None,
-        })
+    let competing = repository
+        .propose_criteria(proposal(
+            &owner_id,
+            &work_id,
+            &branch_id,
+            &common::id("competing-proposal"),
+            vec![new_test_criterion(
+                &common::id("accepted-criterion"),
+                "The accepted criterion supersedes the pending basis.",
+            )],
+        ))
         .await
-        .expect("revise Goal");
+        .expect("competing proposal");
+    repository
+        .accept_criteria_proposal(common::criteria_acceptance(
+            &competing,
+            &common::id("accept-competing"),
+        ))
+        .await
+        .expect("accept competing criteria");
     assert!(matches!(
         repository
-            .accept_criteria_proposal(acceptance(&proposed, &common::id("stale-accept")))
+            .accept_criteria_proposal(common::criteria_acceptance(
+                &proposed,
+                &common::id("stale-accept")
+            ))
             .await,
-        Err(WorkRepositoryError::InvalidWorkProposalBasis { .. })
+        Err(WorkRepositoryError::InvalidWorkProposalBasis {
+            resource: astra_services::work::WorkProposalBasisResource::WorkRevision
+        })
     ));
     let residue = sqlx::query(
         "SELECT
@@ -327,8 +328,8 @@ async fn stale_acceptance_has_no_residue_but_exact_rejection_remains_available()
     .fetch_one(pool.get())
     .await
     .expect("residue");
-    assert_eq!(residue.try_get::<i64, _>("definitions").unwrap(), 0);
-    assert_eq!(residue.try_get::<i64, _>("sets").unwrap(), 1);
+    assert_eq!(residue.try_get::<i64, _>("definitions").unwrap(), 1);
+    assert_eq!(residue.try_get::<i64, _>("sets").unwrap(), 2);
 
     let rejected = repository
         .reject_criteria_proposal(rejection(&proposed, &common::id("reject-action")))
@@ -417,7 +418,7 @@ async fn acceptance_event_conflict_rolls_back_work_criteria_and_proposal() {
     .expect("inject criteria event identity conflict");
     assert!(matches!(
         repository
-            .accept_criteria_proposal(acceptance(&proposed, &resolution_ref))
+            .accept_criteria_proposal(common::criteria_acceptance(&proposed, &resolution_ref))
             .await,
         Err(WorkRepositoryError::Conflict {
             resource: astra_services::work::WorkConflictResource::WorkEventIdentity

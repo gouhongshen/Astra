@@ -4,25 +4,18 @@
 //! - Writing session end journal events
 //! - Finalizing workspace state
 //! - Ending observability sessions
-//! - Triggering Memoria governance and consolidation
-//! - Clearing panic guards
+//! - Running authenticated session-end governance
 //!
-//! Lessons are extracted from the L1b narrative and tool signals, then
-//! stored in Memoria as L3 durable memory (Session Memory Protocol §6.2).
+//! Signal-derived lessons are checkpointed during turns; exit performs governance.
 
 use astra_services::session_journal;
-use crossterm::style::Stylize;
 use std::time::Duration;
 use tokio::task::JoinSet;
 
-use super::session_guard::{ShutdownSignal, clear_panic_guard};
-use crate::cli::cli_config::cli_utils::clear_profile_last_session_if_matches_or_warn;
-use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
+use super::session_guard::ShutdownSignal;
 use crate::cli::session::session_state::SessionState;
-use crate::edge_tools;
 
-/// Why the interactive session is exiting. Drives two user-visible
-/// decisions in `finalize_session_exit`:
+/// Why the interactive session is exiting. The TUI uses this reason to decide:
 ///   * whether to print the "Session … saved. To resume: …" hint
 ///   * whether to clear `last_session_id` from the credentials file
 ///     (so the next `astra` launch does NOT keep offering this sid for resume)
@@ -44,51 +37,6 @@ pub(crate) enum SessionExit {
     /// Session stays addressable so the user can investigate and
     /// the next launch can still offer `/resume`.
     Error,
-}
-
-/// Run the full session-end pipeline and the user-visible exit bits
-/// (resume hint, `last_session_id` reset on EOF).
-pub(crate) async fn finalize_session_exit(
-    state: &mut SessionState,
-    profile: Option<&str>,
-    reason: SessionExit,
-) {
-    // Finalization is allowed to release process-local session state. Capture
-    // the durable identity first so exit UX and EOF profile cleanup do not
-    // depend on mutation order inside the finalizer.
-    let session_id = state.session_id.clone();
-    let resume_hint = resume_hint_for_exit(reason, session_id.as_deref());
-    finalize_session(state).await;
-
-    if let Some((label, command)) = resume_hint {
-        eprintln!();
-        if std::env::var_os("NO_COLOR").is_some()
-            || !std::io::IsTerminal::is_terminal(&std::io::stderr())
-        {
-            eprintln!("  {label}");
-            eprintln!("    {command}");
-        } else {
-            let palette = crate::tui::current_stderr_theme();
-            eprintln!(
-                "{}",
-                format!("  {label}").with(crate::tui::to_crossterm_color(palette.dim))
-            );
-            eprintln!(
-                "{}",
-                format!("    {command}").with(crate::tui::to_crossterm_color(palette.accent))
-            );
-        }
-    }
-
-    if should_clear_last_session_id(reason)
-        && let Some(ref session_id) = session_id
-    {
-        clear_profile_last_session_if_matches_or_warn(
-            profile,
-            session_id,
-            "session_cleanup:finalize_repl_exit",
-        );
-    }
 }
 
 fn should_show_resume_hint(reason: SessionExit) -> bool {
@@ -120,116 +68,36 @@ pub(crate) fn resume_hint_for_exit(
     ))
 }
 
-fn should_clear_last_session_id(reason: SessionExit) -> bool {
-    // Only true EOF clears the persisted "last session". Ctrl-C, `/exit`,
-    // budget cap, signals, and errors all leave it alone so the next
-    // `astra` launch can still offer explicit resume.
-    matches!(reason, SessionExit::Eof)
+/// Commit local session state, then run memory maintenance under one budget.
+pub(crate) async fn finalize_session(state: &mut SessionState) -> Result<(), String> {
+    finalize_session_with_budget(state, Duration::from_secs(5)).await
 }
 
-/// Finalize a session: journal end event, persist state, extract learnings.
-pub(crate) async fn finalize_session(state: &mut SessionState) {
-    // 0. Drain CLI-owned history-edit refreshes, then run session-end
-    //    governance. Per-turn extraction belongs to the canonical Server loop;
-    //    shutdown must not enqueue a second extraction of the same final turn.
-    let mut typed_memory_governance_ran = false;
-    if let Some(svc) = state.session_memory_extractor.as_ref() {
-        let leftover = svc
-            .wait_for_pending(std::time::Duration::from_secs(10))
-            .await;
-        if leftover > 0 {
-            tracing::warn!(
-                target: "session_cleanup",
-                leftover,
-                "session-memory extraction still in flight after 10s — forcing shutdown"
-            );
-        }
-        if let Some(sid) = state.session_id.as_deref() {
-            if state.turn > 0 {
-                let facts = shutdown_session_facts(state);
-                match svc.run_session_end_governance(&facts, sid).await {
-                    Ok(report) => {
-                        typed_memory_governance_ran = true;
-                        tracing::info!(
-                            target: "session_cleanup",
-                            session_id = %sid,
-                            episode_chars = report.episode_chars,
-                            purged = report.working_purged,
-                            working_retained = report.working_retained_due_to_episode_failure,
-                            scenes_stored = report.scenes_stored,
-                            "typed session-memory governance complete"
-                        );
-                    }
-                    Err(error) => tracing::warn!(
-                        target: "session_cleanup",
-                        session_id = %sid,
-                        error = %error,
-                        "typed session-memory governance failed"
-                    ),
-                }
-            }
-            svc.forget_session(sid);
-        }
-    }
-
-    finalize_session_durable_boundary(state);
-    // 3. Trigger Memoria governance + consolidation (best-effort with timeout)
+pub(crate) async fn finalize_session_with_budget(
+    state: &mut SessionState,
+    budget: Duration,
+) -> Result<(), String> {
+    finalize_session_durable_boundary(state)?;
     let mut memory_maintenance = JoinSet::new();
-    if !typed_memory_governance_ran {
-        memory_maintenance.spawn(edge_tools::memoria::memoria_governance_fire_and_forget());
-        memory_maintenance.spawn(edge_tools::memoria::memoria_consolidate_fire_and_forget());
-    }
-    // 3c. L3 knowledge backflow: promote tool/stall signal lessons to
-    //     semantic T3 (mid-session copies were working T4).
-    if state.turn > 0 {
-        let summary = match state
-            .observability_session
-            .as_ref()
-            .and_then(|arc| arc.read().ok())
-        {
-            Some(guard) => astra_runtime::learning::extractor::summarise_from_runtime(
-                &state.tool_health_entries,
-                Some(&*guard),
-            ),
-            None => astra_runtime::learning::extractor::summarise_from_runtime(
-                &state.tool_health_entries,
-                None,
-            ),
-        };
-        let signal_lessons = astra_runtime::learning::extractor::extract_lessons(
-            &summary,
-            state.ingestion_user_id.as_deref().unwrap_or("unknown"),
-            "generic",
-            None,
-        );
-        let mut all_lessons: Vec<astra_runtime::learning::synthesizer::ExtractedLesson> =
-            Vec::new();
-        for cl in signal_lessons {
-            if astra_runtime::learning::synthesizer::is_synthesized_lesson_acceptable(&cl.action) {
-                all_lessons.push(astra_runtime::learning::synthesizer::ExtractedLesson {
-                    memory_type: "semantic",
-                    content: format!("💡 LESSON: {}", cl.action),
-                    trust_tier: "T3",
-                });
+    if let (Some(port), Some(sid)) = (state.session_memory_port.clone(), state.session_id.clone()) {
+        let facts = shutdown_session_facts(state);
+        memory_maintenance.spawn(async move {
+            if let Err(error) =
+                astra_runtime::turn::cloud::session_end_governance::run_session_end_governance(
+                    &facts,
+                    &sid,
+                    port.as_ref(),
+                )
+                .await
+            {
+                tracing::warn!(session_id = %sid, %error, "session-end governance failed");
             }
-        }
-
-        if !all_lessons.is_empty() {
-            // Persist synthesized lessons. Broad topic deletion is not part of
-            // the authenticated user purge contract: it cannot prove record
-            // ownership or an exact mutation receipt, so cleanup must not
-            // issue it in the background and discard the deterministic error.
-            let session_id = state.session_id.clone();
-            memory_maintenance.spawn(async move {
-                edge_tools::memoria::memoria_store_lessons_fire_and_forget(all_lessons, session_id)
-                    .await;
-            });
-        }
+        });
     }
-    // 4. Await Memoria maintenance (bounded 5s so we don't hang on exit).
+    // Await Memoria maintenance under the shared shutdown budget.
     // A dropped JoinHandle detaches its task, so timeout must explicitly abort
     // and drain every unfinished child before releasing the session boundary.
-    let aborted = settle_memory_maintenance(&mut memory_maintenance, Duration::from_secs(5)).await;
+    let aborted = settle_memory_maintenance(&mut memory_maintenance, budget).await;
     if aborted > 0 {
         tracing::warn!(
             target: "session_cleanup",
@@ -238,6 +106,7 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
         );
     }
     finalize_session_process_boundary(state);
+    Ok(())
 }
 
 async fn settle_memory_maintenance(tasks: &mut JoinSet<()>, deadline: Duration) -> usize {
@@ -269,24 +138,25 @@ async fn settle_memory_maintenance(tasks: &mut JoinSet<()>, deadline: Duration) 
 /// optional projection service. This is idempotent so a bounded frontend can
 /// call it after timing out the full finalizer without duplicating journal
 /// state.
-pub(crate) fn finalize_session_durable_boundary(state: &mut SessionState) {
-    if let Some(ref journal) = state.journal {
-        let wrote = super::session_guard::try_write_session_end(
-            journal,
-            state.session_id.as_deref(),
-            state.turn,
+pub(crate) fn finalize_session_durable_boundary(state: &mut SessionState) -> Result<(), String> {
+    if let Some(journal) = state.journal.as_ref() {
+        journal.append_session_end(state.turn).map_err(|error| {
+            let message = format!("failed to commit session end: {error}");
+            state.session_persistence_error = Some(message.clone());
+            message
+        })?;
+        crate::cli::cloud_sync::schedule_sync_outbox_journal_ingestion_for_owner(
+            journal.owner_scope(),
+            journal.session_id(),
         );
-        if wrote {
-            let end_event =
-                session_journal::JournalEvent::session_end(state.session_id.as_deref(), state.turn);
-            enqueue_ingestion_pub(state, &end_event);
-        }
     }
     if state.turn > 0
-        && let Some(ref session_id) = state.session_id
+        && let Some(sid) = state.session_id.as_deref()
     {
-        astra_services::session_workspace::finalize_workspace_on_end(session_id);
+        astra_services::session_workspace::finalize_workspace_on_end(sid)
+            .map_err(|error| format!("failed to finalize session workspace: {error}"))?;
     }
+    Ok(())
 }
 
 /// Release process-local session state after the durable boundary is safe.
@@ -301,7 +171,6 @@ pub(crate) fn finalize_session_process_boundary(state: &mut SessionState) {
         // remaining producer state. Per-turn cleanup must stay producer-scoped.
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(sid);
     }
-    clear_panic_guard();
 }
 
 pub(crate) fn shutdown_session_facts(state: &SessionState) -> astra_runtime::SessionFacts {
@@ -390,11 +259,8 @@ pub(crate) fn shutdown_session_facts(state: &SessionState) -> astra_runtime::Ses
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionExit, finalize_session_exit, resume_hint_for_exit, settle_memory_maintenance,
-        should_clear_last_session_id, should_show_resume_hint, shutdown_session_facts,
-    };
-    use crate::cli::cli_config::cli_utils::{
-        CredentialsFile, Profile, load_credentials, save_credentials,
+        SessionExit, resume_hint_for_exit, settle_memory_maintenance, should_show_resume_hint,
+        shutdown_session_facts,
     };
     use crate::cli::session::session_guard::ShutdownSignal;
     use crate::cli::session::session_state::SessionState;
@@ -445,20 +311,6 @@ mod tests {
             ShutdownSignal::Sighup
         )));
         assert!(!should_show_resume_hint(SessionExit::Error));
-    }
-
-    #[test]
-    fn only_eof_clears_last_session_id() {
-        assert!(should_clear_last_session_id(SessionExit::Eof));
-        assert!(!should_clear_last_session_id(SessionExit::Interrupt));
-        assert!(!should_clear_last_session_id(SessionExit::Command));
-        assert!(!should_clear_last_session_id(SessionExit::Shutdown(
-            ShutdownSignal::Sigterm
-        )));
-        assert!(!should_clear_last_session_id(SessionExit::Shutdown(
-            ShutdownSignal::Sighup
-        )));
-        assert!(!should_clear_last_session_id(SessionExit::Error));
     }
 
     #[test]
@@ -554,34 +406,106 @@ mod tests {
         assert_eq!(facts.recent_tool_calls[0].name, "read_file");
         assert_eq!(facts.recent_tool_calls[0].turn, 4);
     }
-
-    #[serial_test::serial]
     #[tokio::test]
-    async fn eof_cleanup_only_clears_matching_last_session_pointer() {
-        let _creds_guard = crate::tests::isolate_credentials();
-
-        let mut creds = CredentialsFile::default();
-        creds.profiles.insert(
-            "default".to_string(),
-            Profile {
-                last_session_id: Some("sess-new".to_string()),
-                ..Default::default()
-            },
-        );
-        save_credentials(&creds).unwrap();
-
+    #[serial_test::serial]
+    async fn finalization_commits_once_across_remote_timeout_and_retry() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("end-retry-{}", uuid::Uuid::new_v4());
+        let journal = astra_services::session_journal::JournalWriter::new(&sid).unwrap();
+        let path = journal.path().clone();
         let mut state = SessionState {
-            session_id: Some("sess-old".into()),
-            turn: 1,
-            ..SessionState::default()
+            session_id: Some(sid),
+            journal: Some(journal),
+            ..Default::default()
         };
-        finalize_session_exit(&mut state, None, SessionExit::Eof).await;
+        super::finalize_session_with_budget(&mut state, Duration::ZERO)
+            .await
+            .unwrap();
+        super::finalize_session_with_budget(&mut state, Duration::ZERO)
+            .await
+            .unwrap();
+        let count = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["type"] == "session_end"
+            })
+            .count();
+        assert_eq!(count, 1);
+    }
 
-        let creds = load_credentials();
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_end_commit_remains_retryable() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("end-failure-{}", uuid::Uuid::new_v4());
+        let journal = astra_services::session_journal::JournalWriter::new(&sid).unwrap();
+        let path = journal.path().clone();
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::create_dir(&path).unwrap();
+        let mut state = SessionState {
+            session_id: Some(sid),
+            journal: Some(journal),
+            ..Default::default()
+        };
+        assert!(super::finalize_session(&mut state).await.is_err());
+        std::fs::remove_dir(&path).unwrap();
+        super::finalize_session_with_budget(&mut state, Duration::ZERO)
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn workspace_end_failure_then_another_turn_commits_a_new_end() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("end-workspace-failure-{}", uuid::Uuid::new_v4());
+        let journal = astra_services::session_journal::JournalWriter::new(&sid).unwrap();
+        let path = journal.path().clone();
+        let workspace = astra_services::session_workspace::workspace_file_path(&sid).unwrap();
+        std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+        std::fs::write(&workspace, "invalid json").unwrap();
+        let mut state = SessionState {
+            session_id: Some(sid.clone()),
+            journal: Some(journal),
+            turn: 1,
+            ..Default::default()
+        };
+        assert!(super::finalize_session(&mut state).await.is_err());
+        std::fs::remove_file(workspace).unwrap();
+        state.turn = 2;
+        state
+            .journal
+            .as_ref()
+            .unwrap()
+            .append(&JournalEvent::turn(
+                Some(&sid),
+                2,
+                None,
+                "continue",
+                "done",
+                1,
+                1,
+                1,
+                1,
+            ))
+            .unwrap();
+        super::finalize_session_with_budget(&mut state, Duration::ZERO)
+            .await
+            .unwrap();
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(
-            creds.profiles["default"].last_session_id.as_deref(),
-            Some("sess-new"),
-            "EOF cleanup must not clear a different session pointer"
+            events
+                .iter()
+                .filter(|event| event["type"] == "session_end")
+                .count(),
+            2
         );
+        assert_eq!(events.last().unwrap()["type"], "session_end");
     }
 }

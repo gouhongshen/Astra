@@ -8,15 +8,6 @@ pub(crate) fn sync_session_state_to_workspace(
 ) {
     ws.last_persistence_error = state.session_persistence_error.clone();
     ws.permission_mode = Some(state.perm_manager.mode().to_string());
-    ws.discovered_skills = state.discovered_skills.iter().cloned().collect();
-
-    if let Some(obs) = &state.observability_session {
-        if let Ok(guard) = obs.read() {
-            ws.last_scenario_change_turn = guard.last_scenario_change_turn;
-            ws.last_token_budget_direction = guard.last_token_budget_direction;
-            ws.last_token_budget_change_turn = guard.last_token_budget_change_turn;
-        }
-    }
 }
 
 pub(crate) fn context_trace_signal_from_trace(
@@ -233,22 +224,4 @@ fn sync_live_state_into_workspace(
     }
     sync_context_trace_to_workspace(state, ws);
     sync_session_state_to_workspace(state, ws);
-}
-
-pub(crate) fn persist_recovery_workspace_snapshot(
-    state: &SessionState,
-    sid: &str,
-) -> Result<(), String> {
-    let recovered = match astra_services::session_workspace::read_workspace_optional(sid) {
-        Ok(_) => None,
-        Err(error) => Some(workspace_metadata_from_live_state_after_read_failure(
-            state, sid, &error,
-        )),
-    };
-    astra_services::session_workspace::update_workspace(
-        sid,
-        || recovered.unwrap_or_else(|| fresh_workspace_metadata(state, sid)),
-        |workspace| sync_live_state_into_workspace(state, sid, workspace),
-    )
-    .map_err(|e| format!("write workspace: {e}"))
 }

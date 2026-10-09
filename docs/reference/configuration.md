@@ -33,6 +33,9 @@ Use these files as the canonical configuration references:
 ### API server
 
 - `ASTRA_API_HOST`, `ASTRA_API_PORT`, `ASTRA_CORS_ORIGINS`
+- `ASTRA_POD_ID` — unique durable execution identity for this Server instance. Set a stable identity when its managed workspace directory survives restarts; never share one identity between concurrently running instances. Without it, the process uses a fresh UUID and cannot adopt a previous instance's local workspace.
+- `ASTRA_SERVER_WORKSPACES` — base directory for the selected Server sandbox provider, captured when the lifecycle is constructed; defaults to the system temporary directory's `astra-workspaces` child. A persisted Server sandbox belongs to its recorded executor and exact session directory, not to any instance that can read the same database row.
+
 
 `ASTRA_API_HOST` defaults to `127.0.0.1`. Container deployments set
 `0.0.0.0` explicitly inside the container and control external exposure at the
@@ -136,6 +139,72 @@ Scoped credentials drive login, refresh, memory proxy, explicit tools, recall, e
 
 ### Runtime tuning (optional)
 
+`tool_policy` owns workflow guard limits and model profiles for root runs,
+children, skill runs and automatic model changes. The duplicate `tool_selection`
+configuration section is retired. The default per-round tool limit is 100;
+built-in Opus, Sonnet-4, Haiku and GPT-5 profiles use 128, 100, 48 and 128.
+Explicit `tool_policy.model_profiles` take precedence over built-in profiles.
+Each execution selects its tool policy once. Subsequent rounds and automatic
+model changes use that selected policy; edits apply to newly admitted executions.
+The execution circuit breaker uses the same admitted policy, including its
+resolved default thresholds and absolute round limit. Reassembling an active
+execution preserves its existing breaker observations.
+Child and skill executions select their own policy. This does not change the
+process-level selection of their Server execution-round ceilings.
+
+
+Runtime configuration exposes controls consumed by execution: compression,
+retrieval, tool policy and tracing. The retired `verification`,
+`memory_pressure`, `context_window` and `token_budget` sections are not supported.
+Execution input budgets belong to RuntimeLimits (`ASTRA_MAX_TURN_INPUT_TOKENS`)
+and the admitted model context window; self budget views report observed budget
+state instead of an inactive configuration cap. Model context
+window metadata and tool verification contracts retain their existing owners.
+
+Unknown top-level runtime fields are rejected by the configuration parser.
+User and project files, environment values and CLI settings apply in that order.
+The configuration editor saves user defaults under `ASTRA_LOCAL_STATE_ROOT/config/runtime.toml`
+when that root is set, otherwise under `~/.astra/config/runtime.toml`; local versions
+live in the adjacent `versions` directory. Saving defaults retains invocation CLI settings
+and any complete configuration snapshot belonging to the current session. The current
+session version identifies its effective configuration, not the saved defaults file.
+Server execution-round limits are configured on the Server; the CLI `/config`
+editor does not expose controls for the remote Server’s `runtime_limits`.
+File and JSON layers retain only explicitly supplied fields: missing fields preserve
+lower layers, while defaults, `false`, zero and empty arrays replace them. JSON `null`
+clears optional values and is rejected for non-optional fields. When a layer supplies a model-routing policy, it must declare it completely. CLI trace flags take precedence
+over `--settings`; level/category flags preserve unspecified trace fields, while
+production/dev profile flags select their complete presets. Compression presets and
+trace normalization still run after configuration selection. Non-finite environment
+compression thresholds are rejected with a warning and preserve the configured value;
+an invalid environment value cannot discard explicit CLI settings.
+`--settings` reports the parse error. A saved session configuration is a complete snapshot, not an overlay: restoring
+it replaces the execution configuration before deriving context budgets and the observability projection,
+including values equal to built-in defaults. The configuration version identifies the effective
+snapshot; an explicit `/explain --format` choice for the current CLI session retains precedence.
+Starting a new conversation with `/clear` selects the current process configuration,
+rather than inheriting a restored session snapshot. Explicit CLI Explain preferences and the
+selected model remain in effect; budgets, configuration version and observability are derived again.
+Cold startup, new conversations, no-snapshot recovery and telemetry select profile identity from the
+account identity installed at entry, not ingestion metadata. An account without stored
+preferences uses its own default profile; only a CLI without an installed account identity uses
+anonymous preferences.
+`astra self mutate preview/apply` uses the process configuration when no complete
+session snapshot exists. Applying one setting preserves the other snapshot values.
+A snapshot is cleared only when the complete result equals the process baseline.
+Profile identity, preferences and statistics do not override runtime configuration.
+Preview reports failed configuration checks without writing. Apply rejects an
+invalid candidate before changing the snapshot, revision or journal. A valid
+candidate may repair an existing invalid configuration.
+Authentication changes select preferences for the verified target account after credentials are saved;
+re-authenticating the same account without resetting its conversation retains that session configuration.
+A saved snapshot must parse and satisfy the current invariants before resume changes the active session; invalid
+snapshots remain unchanged and are not migrated or filtered. This also rejects
+full snapshots that contain the retired sections, even if their values were defaults.
+The existing disk
+configuration loader reports a warning and skips an invalid user/project layer.
+
+
 - `ASTRA_MAX_TURNS` — optional positive ordinary execution-round cap. Bounded settlement/closing allowances remain separate, so this is not an absolute cap on all model calls or cost. Unset means renewable slices without an implicit round cap; it does not disable cancellation, execution-health checks, or individual operation timeouts.
 - `ASTRA_PLAN_SUBTASK_MAX_TURNS` — optional positive plan-subtask cap; unset inherits `ASTRA_MAX_TURNS`. Explicit zero or malformed round caps are rejected, not treated as unlimited.
 - `ASTRA_TURN_TIMEOUT_S`
@@ -204,3 +273,12 @@ Server-loop Memoria observer and post-loop memory cleanup are fixed internal asy
 make dev-init
 make check
 ```
+
+Saved configuration versions are inspected locally with `astra config version`
+(`list`, `show`, `diff`, and `current`). There is no configuration cloud-pull
+command. Configuration changes retain their version IDs in the canonical
+journal; full configuration bodies remain in the local version store. The old
+cloud body mirror and its dedicated ingestion protocol are retired.
+
+The local version index uses one JSON record per nonempty line. Inspection
+reports a corrupt row instead of returning a partially decoded index.

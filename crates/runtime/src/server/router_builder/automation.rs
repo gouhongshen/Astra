@@ -58,23 +58,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(crate::service_handlers::decisions::audit_decision_handler),
         )
         .route(
-            "/triggers",
-            post(crate::service_handlers::triggers::create_trigger_handler)
-                .get(crate::service_handlers::triggers::list_triggers_handler),
-        )
-        .route(
-            "/triggers/{trigger_id}",
-            delete(crate::service_handlers::triggers::delete_trigger_handler),
-        )
-        .route(
-            "/triggers/{trigger_id}/fire",
-            post(crate::service_handlers::triggers::fire_webhook_handler),
-        )
-        .route(
-            "/workflows",
-            get(crate::service_handlers::workflows::list_workflows_handler),
-        )
-        .route(
             "/sandbox",
             post(crate::service_handlers::sandbox::create_sandbox_handler)
                 .get(crate::service_handlers::sandbox::list_sandboxes_handler),
@@ -83,23 +66,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/sandbox/{name}",
             get(crate::service_handlers::sandbox::get_sandbox_handler)
                 .delete(crate::service_handlers::sandbox::delete_sandbox_handler),
-        )
-        .route(
-            "/branches",
-            post(crate::service_handlers::branches::create_branch_handler)
-                .delete(crate::service_handlers::branches::delete_branch_handler),
-        )
-        .route(
-            "/branches/diff",
-            post(crate::service_handlers::branches::diff_branch_handler),
-        )
-        .route(
-            "/branches/merge",
-            post(crate::service_handlers::branches::merge_branch_handler),
-        )
-        .route(
-            "/branches/cost-estimate",
-            post(crate::service_handlers::branches::estimate_cost_handler),
         )
         .route(
             "/data-versioning/checkpoints",
@@ -121,9 +87,5 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/data-versioning/sandbox/{name}/checkpoint",
             post(data_layer::versioning::sandbox_checkpoint_handler),
-        )
-        .route(
-            "/data-versioning/sandbox/{name}/restore",
-            post(data_layer::versioning::sandbox_restore_handler),
         )
 }

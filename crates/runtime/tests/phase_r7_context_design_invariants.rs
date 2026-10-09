@@ -5,8 +5,7 @@
 //!   (b) long-history truncation preserves the latest assistant and never
 //!       splits an assistant+tool_call from its tool results
 //!   (c) tool_result dedup on tool_call_id collision (older wins — pinned)
-//!   (d) subrun does NOT leak parent conversation into its outgoing
-//!       LLM request
+//! Real shared-parent fork isolation is covered at ServerSkillSubRunExecutor.
 //!   (e) usage events missing `cache_read_tokens`/`cache_creation_tokens`
 //!       default to 0 (no panic, no null, not absent)
 //!
@@ -14,49 +13,10 @@
 
 #![cfg(feature = "e2e-hooks")]
 
-use std::sync::{Arc, Mutex};
-
-use astra_runtime::server::server_loop_host::ServerAgenticLoopHostBuilder;
-use astra_runtime::turn::agentic_loop::host::make_test_loop_state;
-use astra_runtime::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_turn_core::chat_turn_sse_dispatch::{
     ChatTurnEdgePending, ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
 };
 use serde_json::{Value, json};
-
-const VALID_FERNET_KEY: &str = "cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=";
-
-fn mock_matrixone() -> MatrixOneSettings {
-    MatrixOneSettings::mock()
-}
-
-fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
-    Arc::new(FernetTokenEncryptor::new(VALID_FERNET_KEY).unwrap())
-}
-
-fn tool_schema() -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "read",
-            "parameters": { "type": "object", "properties": {} },
-        }
-    })
-}
-
-fn scripted(text: &str) -> Value {
-    json!({
-        "full_text": text,
-        "tool_calls": [],
-        "usage": {
-            "prompt_tokens": 10,
-            "completion_tokens": 5,
-            "cache_read_tokens": 0,
-            "cache_creation_tokens": 0,
-        }
-    })
-}
 
 fn tool_schema_has_cache_control(tool: &Value) -> bool {
     tool.get("cache_control").is_some()
@@ -78,78 +38,82 @@ fn tool_cache_control_count(tools: &[Value]) -> usize {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
 async fn cache_breakpoint_persists_turn_over_turn() {
-    let capture = Arc::new(Mutex::new(Vec::new()));
-    let mut host = ServerAgenticLoopHostBuilder::new(
-        mock_matrixone(),
-        mock_encryptor(),
-        "u".to_string(),
-        "s".to_string(),
+    use astra_runtime::server::provider_test_support::{
+        InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+        bind_server_workspace, loop_state, server_host_builder,
+    };
+    use astra_runtime::server::tool_transport::{
+        ExecutionBindingSnapshot, ExecutorBinding, WorkspaceBinding,
+    };
+    use astra_runtime::turn::agentic_loop::finalization::run_agentic_loop_with_host;
+    let responses = (0..3).map(|i| ProviderResponse::Anthropic(json!({"id":format!("reply-{i}"),"model":"claude-sonnet-4","content":[{"type":"text","text":format!("Explanation {i} is complete.")}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}))).collect();
+    let gateway = ProviderGateway::start(vec![ProviderScript::new(
+        "three actual user turns",
+        |r| r.path == "/v1/messages" && r.body["model"] == "claude-sonnet-4",
+        responses,
+    )])
+    .await;
+    let workspace = tempfile::TempDir::new().unwrap();
+    let session = format!("cache-turns-{}", uuid::Uuid::new_v4());
+    let ledger = InferenceLedgerFixture::default();
+    let mut host = server_host_builder(
+        &gateway,
+        &ledger,
+        &session,
+        "anthropic",
+        "claude-sonnet-4",
+        None,
     )
-    .with_server_sandbox_workspace("/tmp/astra-phase-r7-context")
-    .with_edge_tools(vec![tool_schema()])
-    .with_test_llm_rounds(vec![scripted("a"), scripted("b"), scripted("c")])
-    .with_mock_provider("anthropic", "claude-sonnet-4")
-    .with_llm_request_capture(capture.clone())
+    .with_static_tool_catalog_admissible(true)
+    .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(workspace.path()),
+        ExecutorBinding::server_local(),
+    ))
     .build();
-
-    let mut state = make_test_loop_state();
-    state.max_turn_input_tokens = 200_000;
-    // Three user turns, with growing history between them.
+    let mut prefix = Vec::new();
     for i in 0..3 {
-        state.messages.push(json!({
-            "role": "user",
-            "content": format!("user turn {i}")
-        }));
-        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-        state.messages.push(json!({
-            "role": "assistant",
-            "content": format!("assistant reply {i}"),
-        }));
-    }
-
-    let g = capture.lock().unwrap();
-    assert_eq!(g.len(), 3, "three captured payloads, one per turn");
-
-    // Each turn must have Anthropic cache_control on system + exactly one tool
-    // schema. The tool marker sits at the stable always-load prefix boundary,
-    // which is not necessarily the absolute last tool once dynamic provider
-    // tools are appended.
-    for (i, c) in g.iter().enumerate() {
-        assert!(c.is_anthropic, "turn {i}: anthropic latched");
-        assert!(c.cache_enabled, "turn {i}: cache enabled");
-        assert!(
-            c.system_cache_control_count >= 1,
-            "turn {i}: system must carry cache_control (got {})",
-            c.system_cache_control_count
+        let mut state = loop_state(
+            &session,
+            prefix,
+            &format!("Explain user turn {i} without making changes."),
         );
+        bind_server_workspace(&mut state, workspace.path()).await;
+        state.skills.request_constraints.allowed_tools =
+            Some(["read_file".to_owned()].into_iter().collect());
+        run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(state.final_text, format!("Explanation {i} is complete."));
+        prefix = state.messages;
+    }
+    assert_eq!(ledger.attempt_count(), 3);
+    ledger.assert_quiescent();
+    gateway.assert_complete();
+    let requests = gateway.requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    let cached = |body: &Value| {
+        let blocks = body["system"].as_array().unwrap();
+        let boundary = blocks
+            .iter()
+            .rposition(|block| block.get("cache_control").is_some())
+            .expect("real cache boundary");
+        blocks[..=boundary].to_vec()
+    };
+    for request in requests.iter() {
+        assert!(!cached(&request.body).is_empty());
         assert_eq!(
-            tool_cache_control_count(&c.tools),
-            1,
-            "turn {i}: exactly one tool schema must carry cache_control"
+            tool_cache_control_count(request.body["tools"].as_array().unwrap()),
+            1
         );
     }
-
-    // Structural invariant: the cacheable prefix hash is BYTE-IDENTICAL
-    // across turns even as the conversation messages grow — the prefix
-    // covers only Global+Session scopes, which are stable. If the
-    // breakpoint drifts (e.g. a tool schema moves, or annotation order
-    // changes), this test fails.
-    assert_eq!(
-        g[0].cacheable_prefix_sha256, g[1].cacheable_prefix_sha256,
-        "prefix hash must be stable turn 0 → 1"
-    );
-    assert_eq!(
-        g[1].cacheable_prefix_sha256, g[2].cacheable_prefix_sha256,
-        "prefix hash must be stable turn 1 → 2"
-    );
-
-    // Structural invariant: system_cache_control_count is STABLE (same
-    // number of cache_control markers each turn — not drifting up).
-    let counts: Vec<usize> = g.iter().map(|c| c.system_cache_control_count).collect();
-    assert!(
-        counts.windows(2).all(|w| w[0] == w[1]),
-        "system_cache_control_count must be constant across turns: {counts:?}"
-    );
+    assert_eq!(cached(&requests[0].body), cached(&requests[1].body));
+    assert_eq!(cached(&requests[1].body), cached(&requests[2].body));
+    for pair in requests.windows(2) {
+        assert_eq!(pair[0].body["tools"], pair[1].body["tools"]);
+    }
+    let final_history = requests[2].body["messages"].to_string();
+    assert!(final_history.contains("Explanation 0 is complete."));
+    assert!(final_history.contains("Explanation 1 is complete."));
 }
 
 // ── (b) truncation preserves latest assistant + tool_call/result pairs ─────
@@ -336,141 +300,6 @@ fn tool_result_placeholder_is_overwritten_by_real_result() {
         tool_msg.get("content").and_then(Value::as_str),
         Some("ACTUAL_CONTENT"),
         "placeholder must be overwritten by a real result"
-    );
-}
-
-// ── (d) subrun isolation — parent tool_results must not leak into child ────
-//
-// A server-side skill sub-run constructs a FRESH `AgenticLoopState` with
-// `tool_results: Vec::new()` and a minimal [system, user] message list
-// (see `server_skill_subrun.rs:283-382`). The parent's history — no
-// matter how many tool results it accumulated — must never appear in
-// the child's outgoing LLM request.
-//
-// NOTE: This scenario is weakened from "invoke a real subrun" because
-// `ServerSkillSubRunExecutor::run_subrun` requires a live MatrixOne
-// connection for real LLM calls and is not wired to the `e2e-hooks`
-// mock path. We instead exercise the isolation contract directly: a
-// fresh host + state populated as the subrun does in production leaks no
-// parent history into its captured outgoing request.
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(prompt_cache_env)]
-async fn subrun_does_not_leak_parent_results_into_child() {
-    // ── "Parent" host — runs a turn that leaves tool_results in state ──
-    let parent_cap = Arc::new(Mutex::new(Vec::new()));
-    let mut parent_host = ServerAgenticLoopHostBuilder::new(
-        mock_matrixone(),
-        mock_encryptor(),
-        "u".to_string(),
-        "parent-session".to_string(),
-    )
-    .with_server_sandbox_workspace("/tmp/astra-phase-r7-context")
-    .with_edge_tools(vec![tool_schema()])
-    .with_test_llm_rounds(vec![scripted("parent reply")])
-    .with_mock_provider("anthropic", "claude-sonnet-4")
-    .with_llm_request_capture(parent_cap.clone())
-    .build();
-
-    let mut parent_state = make_test_loop_state();
-    parent_state.messages.push(json!({
-        "role": "user",
-        "content": "parent secret task"
-    }));
-    // Simulate parent tool interaction in history.
-    parent_state.messages.push(json!({
-        "role": "assistant",
-        "tool_calls": [{
-            "id": "parent-tc",
-            "type": "function",
-            "function": {"name": "read_file", "arguments": "{}"}
-        }]
-    }));
-    parent_state.messages.push(json!({
-        "role": "tool",
-        "tool_call_id": "parent-tc",
-        "content": "PARENT_SECRET_CONTENT"
-    }));
-    parent_host
-        .run_one_mock_turn_for_test(&mut parent_state)
-        .await
-        .unwrap();
-
-    // ── "Child" subrun — fresh host + state as subrun code does. ──
-    let child_cap = Arc::new(Mutex::new(Vec::new()));
-    let mut child_host = ServerAgenticLoopHostBuilder::new(
-        mock_matrixone(),
-        mock_encryptor(),
-        String::new(),
-        "subrun-test-session".to_string(),
-    )
-    .with_server_sandbox_workspace("/tmp/astra-phase-r7-context")
-    .with_edge_tools(vec![tool_schema()])
-    .with_test_llm_rounds(vec![scripted("child reply")])
-    .with_mock_provider("anthropic", "claude-sonnet-4")
-    .with_llm_request_capture(child_cap.clone())
-    .build();
-
-    // Subrun seed: ONLY [system, user] — exactly as server_skill_subrun does.
-    let mut child_state = make_test_loop_state();
-    child_state.messages.clear();
-    child_state.messages.push(json!({
-        "role": "system",
-        "content": "You are a narrow skill. Do only the task."
-    }));
-    child_state.messages.push(json!({
-        "role": "user",
-        "content": "child narrow task"
-    }));
-    assert!(
-        child_state.tool_results.is_empty(),
-        "subrun must start with empty tool_results"
-    );
-
-    child_host
-        .run_one_mock_turn_for_test(&mut child_state)
-        .await
-        .unwrap();
-
-    // ── Structural isolation check ────────────────────────────────────
-    let cg = child_cap.lock().unwrap();
-    assert_eq!(cg.len(), 1);
-    let child_req = &cg[0];
-
-    // No tool messages in the child outgoing request.
-    let roles: Vec<&str> = child_req
-        .messages
-        .iter()
-        .map(|m| m.get("role").and_then(Value::as_str).unwrap_or(""))
-        .collect();
-    assert!(
-        !roles.contains(&"tool"),
-        "child request must not contain any tool messages from parent; roles={roles:?}"
-    );
-
-    // No parent tool_call_ids anywhere.
-    for m in &child_req.messages {
-        if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
-            for tc in tcs {
-                let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-                assert_ne!(
-                    id, "parent-tc",
-                    "parent tool_call id must not leak into child request"
-                );
-            }
-        }
-    }
-
-    // Also check raw content: PARENT_SECRET_CONTENT must not appear in any
-    // message content (defence-in-depth beyond role-only checks).
-    let child_json = serde_json::to_string(&child_req.messages).unwrap();
-    assert!(
-        !child_json.contains("PARENT_SECRET_CONTENT"),
-        "parent tool-result content must not leak into child outgoing request",
-    );
-    assert!(
-        !child_json.contains("parent secret task"),
-        "parent user prompt must not leak into child outgoing request",
     );
 }
 

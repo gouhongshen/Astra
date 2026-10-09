@@ -417,15 +417,6 @@ pub(crate) fn history_as_messages_for(
     history_as_messages(history)
 }
 
-/// Checkpoint-derived metadata available to CSL projection.
-///
-/// This is intentionally empty: the conversation state log is prompt material,
-/// not execution policy. Runtime controls such as blocked tools, approvals,
-/// interruptions, budget pressure, and compaction counters belong to explicit
-/// heavy checkpoints and must not accumulate in CSL across turns.
-#[derive(Default)]
-pub(crate) struct CslCheckpointFields;
-
 /// Build the prompt-facing CSL state for the current turn.
 ///
 /// Runtime-control fields are intentionally reset instead of falling back to
@@ -434,8 +425,6 @@ pub(crate) struct CslCheckpointFields;
 /// durable instruction for later turns.
 pub(crate) fn build_full_session_state_compact(
     state: &SessionState,
-    _cp: CslCheckpointFields,
-    _prev_state: &astra_turn_core::conversation_log::SessionStateCompact,
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
         source_cursor: state
@@ -462,10 +451,9 @@ pub(crate) fn build_full_session_state_compact(
 #[cfg(test)]
 mod tests {
     use super::{
-        CslCheckpointFields, build_continuation_anchor, build_full_session_state_compact,
-        history_as_messages, merge_continuation_anchor_with_session_memory,
-        rebuild_continuation_anchor_from_live_state, rebuild_continuation_anchor_from_state,
-        seed_continuation_objective_from_messages,
+        build_continuation_anchor, build_full_session_state_compact, history_as_messages,
+        merge_continuation_anchor_with_session_memory, rebuild_continuation_anchor_from_live_state,
+        rebuild_continuation_anchor_from_state, seed_continuation_objective_from_messages,
     };
     use crate::cli::session::session_input::prepare_input;
     use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
@@ -735,11 +723,7 @@ mod tests {
             "Latest user input: now explain borrowing\nLatest assistant summary:\nBorrowing lets you reference data"
                 .to_string(),
         ));
-        let effective = prepare_input(
-            "continue",
-            &state,
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
+        let effective = prepare_input("continue", &state);
         assert_eq!(effective.user_message, "continue");
         assert!(effective.runtime_required_texts.is_empty());
 
@@ -917,28 +901,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let prev = astra_turn_core::conversation_log::SessionStateCompact {
-            blocked_tools: vec!["old_bash".into()],
-            deferred_tool_activations: vec![astra_turn_types::DeferredToolActivation {
-                name: "old_deferred".into(),
-                schema_digest: "sha256:old".into(),
-                descriptor: None,
-            }],
-            approval_overrides: Some(serde_json::json!({"old": true})),
-            delegation: Some(astra_turn_core::conversation_log::DelegationCompact {
-                id: "old_d".into(),
-                pattern: "old_p".into(),
-                completed_sub_runs: vec![],
-            }),
-            compaction_tracker: Some(serde_json::json!({"old": 1})),
-            budget_remaining_tokens: 99_999,
-            budget_remaining_rounds: 99,
-            consecutive_ctx_errors: 99,
-            interruption: Some(serde_json::json!({"kind": "budget_exhausted"})),
-            ..Default::default()
-        };
 
-        let result = build_full_session_state_compact(state, CslCheckpointFields, &prev);
+        let result = build_full_session_state_compact(state);
         assert_eq!(result.recent_tools, vec!["exec"]);
         assert_eq!(result.deferred_tool_activations.len(), 1);
         assert!(result.blocked_tools.is_empty());
@@ -954,19 +918,8 @@ mod tests {
     #[test]
     fn csl_projection_ignores_checkpoint_runtime_controls() {
         let state = &SessionState::default();
-        let prev = astra_turn_core::conversation_log::SessionStateCompact {
-            blocked_tools: vec!["bash".into()],
-            approval_overrides: Some(serde_json::json!({"tool": "bash"})),
-            delegation: Some(astra_turn_core::conversation_log::DelegationCompact {
-                id: "d1".into(),
-                pattern: "p1".into(),
-                completed_sub_runs: vec![],
-            }),
-            compaction_tracker: Some(serde_json::json!({"v": 1})),
-            ..Default::default()
-        };
 
-        let result = build_full_session_state_compact(state, CslCheckpointFields, &prev);
+        let result = build_full_session_state_compact(state);
         assert!(result.blocked_tools.is_empty());
         assert!(result.approval_overrides.is_none());
         assert!(result.interruption.is_none());

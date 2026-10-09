@@ -55,14 +55,26 @@ impl Binding {
         )
     }
 
-    pub(crate) fn snapshot(&self) -> Result<native::NativeSession, String> {
-        let current = self.store.current()?;
+    fn check_identity(
+        &self,
+        current: native::NativeSession,
+    ) -> Result<native::NativeSession, String> {
         if current.generation != self.session.generation
             || current.environment != self.session.environment
             || current.subject != self.session.subject
         {
             return Err("MOI account or environment changed; restart Astra".into());
         }
+        Ok(current)
+    }
+
+    /// Local identity binding does not require a usable access token.
+    pub(crate) fn account_id(&self) -> Result<String, String> {
+        Ok(self.check_identity(self.store.current()?)?.astra_user_id)
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<native::NativeSession, String> {
+        let current = self.check_identity(self.store.current()?)?;
         if current.refresh_pending {
             return Err("MOI token rotation was interrupted; run astra login".into());
         }
@@ -72,14 +84,7 @@ impl Binding {
     /// Same identity check as [`snapshot`], without failing when a rotation is pending.
     /// The file lock runs on the blocking pool.
     pub(crate) async fn snapshot_off_runtime(&self) -> Result<native::NativeSession, String> {
-        let current = self.store.current_off_runtime().await?;
-        if current.generation != self.session.generation
-            || current.environment != self.session.environment
-            || current.subject != self.session.subject
-        {
-            return Err("MOI account or environment changed; restart Astra".into());
-        }
-        Ok(current)
+        self.check_identity(self.store.current_off_runtime().await?)
     }
 
     pub(crate) async fn access_token(&self) -> Result<String, native::CredentialFailure> {
@@ -95,6 +100,22 @@ impl Binding {
         }
         Ok(credential.access_token)
     }
+}
+
+/// Resolve native auth before startup launches cloud work. The progress timer
+/// never cancels the credential future or starts another refresh.
+pub(crate) async fn startup_access_token(binding: &Binding) -> Result<String, native::AccessMiss> {
+    let pending = binding.access_token();
+    tokio::pin!(pending);
+    let result = tokio::select! {
+        biased;
+        result = &mut pending => result,
+        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+            eprintln!("Refreshing your sign-in…");
+            pending.await
+        }
+    };
+    result.map_err(|error| error.access_miss())
 }
 
 impl astra_thin_client::client::BearerProvider for Binding {
@@ -163,10 +184,9 @@ pub(crate) fn bind_after_login(
     let mut base = api.api_origin();
     let binding = bind_process(&mut base, true, None, false)?
         .ok_or("UC login did not publish credentials")?;
-    let session = binding.snapshot()?;
     crate::cli::cli_config::cli_utils::install_cli_profile_identity(
         binding.profile_name(),
-        Some(session.astra_user_id),
+        Some(binding.account_id()?),
     )?;
     Ok(api.clone().with_bearer_provider(binding))
 }
@@ -176,7 +196,7 @@ pub(crate) fn projected_credentials() -> Result<Option<astra_credentials::Creden
     let Some(binding) = active() else {
         return Ok(None);
     };
-    let session = binding.snapshot()?;
+    let session = binding.check_identity(binding.store.current()?)?;
     let name = binding.profile_name();
     // Only local session metadata lives in the old profile file. Neither a
     // refresh token nor a second persisted access token is copied there.
@@ -196,7 +216,9 @@ pub(crate) fn projected_credentials() -> Result<Option<astra_credentials::Creden
         astra_credentials::Profile {
             username: Some(session.subject),
             account_id: Some(session.astra_user_id),
-            access_token: Some(session.access_token),
+            // Resume metadata and account identity remain readable during
+            // rotation, but the unsettled access token must not escape.
+            access_token: (!session.refresh_pending).then_some(session.access_token),
             last_session_id,
             ..Default::default()
         },
@@ -232,9 +254,9 @@ pub(crate) async fn command(command: &NativeAuthCommand) -> Result<(), String> {
             let status = if !configured {
                 serde_json::json!({"version": 1, "state": "not_configured"})
             } else {
-                match store.current() {
-                    Ok(session) => {
-                        serde_json::json!({"version": 1, "state": if session.refresh_pending { "reauthentication_required" } else { "signed_in" },
+                match store.status().await {
+                    Ok((session, status)) => {
+                        serde_json::json!({"version": 1, "state": status,
                         "environment": session.environment.key(), "issuer": session.environment.issuer,
                         "astra_url": session.environment.astra_url, "moi_url": session.environment.moi_url,
                         "subject": session.subject, "generation": session.generation, "expires_at": session.expires_at,
@@ -269,11 +291,13 @@ fn render_status(status: &serde_json::Value, json: bool) -> String {
         return status.to_string();
     }
     match status["state"].as_str() {
-        Some("signed_in" | "reauthentication_required") => {
-            let heading = if status["state"] == "signed_in" {
-                "Signed in to MOI."
-            } else {
-                "Sign-in needs to be renewed. Run astra login."
+        Some("signed_in" | "refresh_in_progress" | "reauthentication_required") => {
+            let heading = match status["state"].as_str() {
+                Some("signed_in") => "Signed in to MOI.",
+                Some("refresh_in_progress") => {
+                    "Sign-in refresh is in progress. Please wait; no login is needed."
+                }
+                _ => "Sign-in needs to be renewed. Run astra login.",
             };
             format!(
                 "{heading}\nAccount: {}\nAstra: {}\nMOI: {}\nWorkspace: {}",
@@ -326,6 +350,34 @@ pub(crate) async fn logout() -> Result<(), String> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_session() -> native::NativeSession {
+    let issuer = "https://uc.example.test/realms/moi";
+    native::NativeSession {
+        environment: native::Environment {
+            issuer: issuer.into(),
+            astra_url: "https://astra.example.test".into(),
+            moi_url: "https://moi.example.test/newmoi".into(),
+            authorization_endpoint: format!("{issuer}/protocol/openid-connect/auth"),
+            token_endpoint: format!("{issuer}/protocol/openid-connect/token"),
+            revocation_endpoint: format!("{issuer}/protocol/openid-connect/revoke"),
+            jwks_uri: format!("{issuer}/protocol/openid-connect/certs"),
+        },
+        generation: String::new(),
+        subject: "account-a".into(),
+        session_id: "session-a".into(),
+        astra_user_id: "astra-a".into(),
+        moi_principal_id: "moi-a".into(),
+        catalog_user_id: "catalog-a".into(),
+        access_token: "test-access-a".into(),
+        refresh_token: "test-refresh-a".into(),
+        expires_at: native::unix_now().unwrap() + 3600,
+        workspace_id: None,
+        role_id: None,
+        refresh_pending: false,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -335,6 +387,7 @@ mod tests {
             ("not_configured", "not configured"),
             ("signed_out", "Signed out"),
             ("signed_in", "Signed in"),
+            ("refresh_in_progress", "no login is needed"),
             ("reauthentication_required", "needs to be renewed"),
         ] {
             let status = serde_json::json!({
@@ -349,7 +402,10 @@ mod tests {
             let human = render_status(&status, false);
             assert!(human.contains(expected), "{human}");
             assert!(!human.starts_with('{'));
-            if matches!(state, "signed_in" | "reauthentication_required") {
+            if matches!(
+                state,
+                "signed_in" | "refresh_in_progress" | "reauthentication_required"
+            ) {
                 assert!(human.contains("Workspace: not selected"));
                 assert!(human.contains("Account: account-a"));
             }
@@ -360,30 +416,7 @@ mod tests {
     async fn login_rebinding_does_not_retarget_existing_bearer_provider() {
         let root = tempfile::tempdir().unwrap();
         let store = NativeStore::with_directory(root.path().join("auth"));
-        let issuer = "https://uc.example.test/realms/moi";
-        let original = native::NativeSession {
-            environment: native::Environment {
-                issuer: issuer.into(),
-                astra_url: "https://astra.example.test".into(),
-                moi_url: "https://moi.example.test/newmoi".into(),
-                authorization_endpoint: format!("{issuer}/protocol/openid-connect/auth"),
-                token_endpoint: format!("{issuer}/protocol/openid-connect/token"),
-                revocation_endpoint: format!("{issuer}/protocol/openid-connect/revoke"),
-                jwks_uri: format!("{issuer}/protocol/openid-connect/certs"),
-            },
-            generation: String::new(),
-            subject: "account-a".into(),
-            session_id: "session-a".into(),
-            astra_user_id: "astra-a".into(),
-            moi_principal_id: "moi-a".into(),
-            catalog_user_id: "catalog-a".into(),
-            access_token: "test-access-a".into(),
-            refresh_token: "test-refresh-a".into(),
-            expires_at: native::unix_now().unwrap() + 3600,
-            workspace_id: None,
-            role_id: None,
-            refresh_pending: false,
-        };
+        let original = test_session();
         let (session, _) = store.publish(original.clone()).unwrap();
         let old = Binding {
             store: store.clone(),
@@ -397,9 +430,116 @@ mod tests {
         let (session, _) = store.publish(next).unwrap();
         let new = Binding { store, session };
         assert!(old.snapshot().is_err());
+        assert!(old.account_id().is_err());
         assert!(old.access_token().await.is_err());
         assert_eq!(new.access_token().await.unwrap(), "test-access-b");
         assert_ne!(old.profile_name(), new.profile_name());
+    }
+
+    #[tokio::test]
+    async fn startup_identity_accepts_pending_but_credentials_wait_for_settlement() {
+        const CHILD: &str = "ASTRA_PENDING_STARTUP_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cli::native_auth::tests::startup_identity_accepts_pending_but_credentials_wait_for_settlement", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _credentials = crate::test_utils::isolate_credentials();
+        use fs2::FileExt;
+        let root = tempfile::tempdir().unwrap();
+        let store = NativeStore::with_directory(root.path().join("auth"));
+        let (session, _) = store.publish(test_session()).unwrap();
+        let path = root.path().join("auth/auth.json");
+        let lock_path = root
+            .path()
+            .join(format!("auth/refresh-{}.lock", session.environment.key()));
+        use std::os::unix::fs::OpenOptionsExt;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(lock_path)
+            .unwrap();
+        lock.lock_exclusive().unwrap();
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        state["sessions"][session.environment.key()]["refresh_pending"] = true.into();
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let binding = Arc::new(Binding { store, session });
+        let _active = install_active_for_test(binding.clone());
+        use crate::cli::cli_config::cli_utils::{self, CliProfileIdentityAdmission};
+        cli_utils::configure_cli_profile_identity(
+            None,
+            CliProfileIdentityAdmission::RequireBoundAccount,
+        )
+        .unwrap();
+        assert!(
+            cli_utils::cli_owner_auth_snapshot()
+                .native_binding
+                .is_some()
+        );
+        let last_session = uuid::Uuid::new_v4().to_string();
+        let mut metadata = astra_credentials::CredentialsFile::default();
+        metadata.profiles.insert(
+            binding.profile_name(),
+            astra_credentials::Profile {
+                last_session_id: Some(last_session.clone()),
+                ..Default::default()
+            },
+        );
+        cli_utils::save_credentials(&metadata).unwrap();
+        let projection = projected_credentials().unwrap().unwrap();
+        assert!(
+            projection.profiles[&binding.profile_name()]
+                .access_token
+                .is_none()
+        );
+        assert_eq!(
+            projection.profiles[&binding.profile_name()]
+                .username
+                .as_deref(),
+            Some("account-a")
+        );
+        assert_eq!(cli_utils::stored_last_session_id(None), Some(last_session));
+        assert_eq!(binding.account_id().unwrap(), "astra-a");
+        assert!(
+            binding.snapshot().is_err(),
+            "pending must not expose an access token"
+        );
+        let pending = startup_access_token(&binding);
+        tokio::pin!(pending);
+        // The progress threshold must not cancel/restart the credential future.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1100), &mut pending)
+                .await
+                .is_err()
+        );
+        state["sessions"][binding.session.environment.key()]["refresh_pending"] = false.into();
+        state["sessions"][binding.session.environment.key()]["access_token"] =
+            "settled-access".into();
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        FileExt::unlock(&lock).unwrap();
+        assert_eq!(pending.await.unwrap(), "settled-access");
+
+        state["sessions"][binding.session.environment.key()]["refresh_pending"] = true.into();
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            binding.access_token().await.unwrap_err(),
+            native::CredentialFailure::RotationInterrupted
+        );
+        assert_eq!(
+            startup_access_token(&binding).await.unwrap_err(),
+            native::AccessMiss::ReauthenticationRequired
+        );
     }
 
     #[tokio::test]
@@ -526,7 +666,7 @@ mod tests {
             snapshot.native_binding.as_ref().unwrap().endpoint(),
             selected.uri()
         );
-        assert!(snapshot.access_token.is_none());
+        assert!(snapshot.access_token().await.is_none());
         Mock::given(path("/memory/health"))
             .and(header("Authorization", "Bearer synthetic-access"))
             .respond_with(ResponseTemplate::new(200).set_body_string("memory ready"))

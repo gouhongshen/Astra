@@ -11,6 +11,9 @@ make test
 # Workspace + server E2E hooks only (no online #[ignore] suites)
 make test-offline
 
+# Deterministic history-copy/serialization accounting (included in test-offline)
+make test-history-work
+
 # Online #[ignore] suites only (exports ASTRA_TEST_DB_IT=1; set ASTRA_TEST_DB_IT_TEST_THREADS=1 for serial execution)
 make test-online
 
@@ -23,6 +26,11 @@ make format-check
 make lint
 make type-check
 ```
+
+`test-history-work` enables `ASTRA_HISTORY_WORK_TRACE=1` only for the dedicated
+`compaction_work` test binary. Its ignored measurements are offline tests, not
+live database integration tests; ordinary test processes keep instrumentation
+disabled. CI runs this gate in the runtime shard.
 
 Direct `cargo` usage:
 
@@ -37,6 +45,26 @@ MCP CLI tests launch the prebuilt `mock_mcp_server` beside their test executable
 `cargo build -p astra-cli --bin mock_mcp_server` using the same target directory,
 target triple, and profile. Test processes do not run nested Cargo builds.
 
+The provider fixtures and live child-control PTY client use
+`astra_core::net::client_builder_for_target` so loopback traffic works with or
+without inherited proxies, even when `NO_PROXY` is absent.
+Remote API clients retain environment proxy routing; external provider requests
+retain the provider proxy policy. Do not globally disable proxies to fix a local
+test. Verify both environments in separate processes (including uppercase and
+lowercase proxy variables), using an unreachable proxy for the loopback lane:
+
+```bash
+cargo test -p astra-core --test proxy_routing
+env -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy \
+  -u ALL_PROXY -u all_proxy -u NO_PROXY -u no_proxy \
+  cargo test -p astra-runtime --lib server::provider_test_support::
+env -u NO_PROXY -u no_proxy HTTP_PROXY=http://127.0.0.1:9 \
+  http_proxy=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 \
+  https_proxy=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 \
+  all_proxy=http://127.0.0.1:9 \
+  cargo test -p astra-runtime --lib server::provider_test_support::
+```
+
 Live `astra-test` quality judging invokes `astra session judge --model MODEL
 --message JUDGMENT_REQUEST_JSON`. This is one tool-free `VerificationJudge`
 completion through the existing authenticated Offering and durable inference
@@ -48,14 +76,23 @@ use an explicit `null`. Omitting the Choice/Score field is malformed, not an
 implicit abstention.
 TypeSafe returns provider-native judgment values. The CLI returns normalized
 answers and execution-owned provenance; answer shape or model-name text cannot
-select the decoder. The harness requires one determined rubric category (fully
-yes, substantially yes, partial, or no), then maps it to 1.0, 0.7, 0.4, or 0.0.
-Judgment values are never scores; unknown, conflicting, and malformed rubric
-judgments fail without format repair. Rubric wire IDs are descriptive strings
-(`rubric_fully_yes`, `rubric_substantially_yes`, `rubric_partial`,
-`rubric_no`), not numeric indices. Missing, extra, duplicate, and wrongly typed
-answers remain invalid, not coerced. Criterion thresholds and quorum
-aggregation remain unchanged. Each judgment and quorum vote creates its own
+select the decoder. Required `hard_judger` assertions ask one
+`criterion_accepted` Noul question: does the evidence meet the criterion's own
+rules at its declared threshold? A determined answer is a verdict, not a
+numeric grade, and is not compared to that threshold again. Native Noul values
+at or below 0.2 mean no, at or above 0.8 mean yes; the middle range and explicit
+unknown answers are inconclusive. Quality `judger` criteria retain the four
+rubric categories mapped to 1.0, 0.7, 0.4, or 0.0; external command judgers
+retain their numeric score protocol and threshold comparison. Provider
+probabilities are never evaluation scores. Missing, extra, duplicate, wrongly
+typed, uncertain, and conflicting answers fail without format repair.
+
+Quorum keeps numeric aggregation for grades. Acceptance verdicts use strict
+majority for median (a tie is inconclusive), all votes for min, and any vote
+for max; mean is invalid for verdicts because averaging already-thresholded
+answers cannot recover the original grade mean. Required judgments fail if
+any vote is missing or errors, rather than discarding that vote. Mixed grades
+and verdicts are invalid. Each judgment and quorum vote creates its own
 session; its real usage is separate from the measured agent session. The CLI
 closes the evaluation session after a completed response or client-error rejection.
 Uncertain gateway and transport failures retain the session identity for diagnosis without
@@ -107,6 +144,13 @@ own invocations, not another turn's accumulated output. Protocol failures,
 missing terminal identity, and outer harness timeouts cannot be accepted this
 way. An explicitly expected nonzero code suppresses automatic rate-limit retry;
 session identity, durable evidence, and subsystem-health checks still apply.
+Before starting a follow-up, the root must have succeeded or already proved its
+expected negative terminal; a session ID alone does not authorize continuation.
+Journal-dependent negative expectations use the current root run and invocation
+time range and honor the configured subsystem settlement budget. After any turn
+loses lifecycle validity, the harness records its evidence and cost, stops later
+steps, and runs the shared cleanup and teardown. A normal assertion failure or
+an explicitly expected negative terminal does not stop the sequence by itself.
 
 Capability probes distinguish a disabled optional capability from an enabled
 capability without owner credentials. A child allowlist cannot enable a parent
@@ -144,13 +188,55 @@ targets and requests for an explicit deferred replacement use separate cases.
 - SaaS capability test plan: [`docs/testing/saas-test-plan.md`](../testing/saas-test-plan.md) (`make test-saas`; Rust HTTP E2E plus optional remote `@astra/sdk` coverage).
 - Coverage matrix (what replaced stub tests, large-binary audit): [`docs/testing/coverage-matrix.md`](../testing/coverage-matrix.md).
 
+The opt-in live Work PTY journey uses ordinary multiagent conversation. Set
+`ASTRA_TUI_LIVE_API_URL`, `ASTRA_TUI_LIVE_MODEL`, and
+`ASTRA_TUI_LIVE_ACCESS_TOKEN` for an isolated Server and account with a
+configured real provider. Two child agents produce a customer master and
+dependent invoice exceptions through actual Edge file reads and writes.
+Successful launch receipts, durable child identities and typed Explain
+terminals must agree; every invoice child must follow an observed completed
+customer-master child, including corrective runs. Root Work receipts and one
+task-graph read per round verify two dependent primary assignments and exact
+delivered settlements. After a CLI restart and `/resume`, ordinary input
+changes the duplicate rule: Work, branch and task identities stay stable,
+revisions increase, and attempts change through an accepted graph proposal.
+Both versions' JSON artifacts are checked exactly. Session audit must retain
+physical-attempt usage and either a finite cost estimate or an explicit
+unavailable reason. API reads verify execution; the TUI creates the Work and
+launches the children. This journey covers revision between settled runs,
+not recovery of an active run or transfer to another Edge.
+
+```bash
+cargo test -p astra-cli --test tui_pty_journey \
+  live_agent_delivers_dependent_work_items_and_reworks_after_client_restart \
+  -- --ignored --exact
+```
+
+The opt-in live child-control PTY journey uses ordinary conversation and
+an explicitly requested child model. Set `ASTRA_TUI_LIVE_API_URL`,
+`ASTRA_TUI_LIVE_MODEL`, `ASTRA_TUI_LIVE_MEMBER_MODEL` and
+`ASTRA_TUI_LIVE_ACCESS_TOKEN` for an isolated Server and account. The oracle
+checks the actual child Offering, same-run pause/guidance/resume, successful
+fresh Edge reads and the parent's final adopted answer. API reads verify
+execution; they do not create or substitute a child launch.
+
+```bash
+cargo test -p astra-cli --test tui_pty_journey \
+  live_child_pause_guidance_resume_preserves_execution_identity \
+  -- --ignored --exact
+```
+
 ## Terminal resize and reflow
 
 The inline TUI regression drives the real binary through a controlling PTY and
 xterm.js's headless terminal (including native reflow). It checks repeated
 narrow/wide and short/tall transitions, draft input, rapid resizes with delayed
 cursor replies, one live footer/composer across the entire buffer, and
-preservation of pre-existing and committed startup history. It uses a
+preservation of pre-existing and committed startup history. A held reply also
+outlasts the real cursor-query deadline: paste must remain responsive, no second
+query may overlap the expired request, and releasing its reply must allow a
+fresh resize without damaging history. The initialization cursor getter and
+resize queries share the same reader and outstanding-request ownership. It uses a
 synthetic token and an unavailable loopback endpoint; no model or real account
 is needed. Python 3 and the repository's Node.js version are required.
 
@@ -160,11 +246,35 @@ npm ci --ignore-scripts --prefix scripts/tui-reflow
 ASTRA_TEST_BINARY="$PWD/target/debug/astra" npm test --prefix scripts/tui-reflow
 ```
 
-The `terminal-pty` CI lane runs it on Linux and macOS. The Rust terminal-reader
-PTY tests also verify that a resize cursor query preserves keyboard/paste
-input and times out when the terminal does not answer.
+CI runs the default terminal reader, `use-dev-tty` reader, and reflow binary in
+three parallel jobs on each of Linux and macOS. Separate builds keep dev-tty
+feature unification out of the default-reader checks. The existing
+`Test: terminal PTY (ubuntu-latest)` and `Test: terminal PTY (macos-15)` required
+checks aggregate the full terminal matrix; a failed, cancelled, or unexpectedly
+skipped shard cannot pass either gate. Unaffected changes skip the heavy jobs.
+Push runs populate the terminal dependency cache once per OS and the separate
+macOS workspace-coordination cache. The Rust terminal-reader PTY tests also
+verify that a resize cursor query preserves keyboard/paste input and times out
+when the terminal does not answer.
 
 ## Live MatrixOne system E2E
+
+CI runs four independent online jobs: `core-runtime`, `core-turn-core`,
+`core-services`, and `integration`. Each runner starts its own MatrixOne and
+Memoria stack and keeps `ASTRA_TEST_DB_IT_TEST_THREADS=1`. The core shards use
+distinct database suffixes as well. This parallelizes package builds and test
+execution without increasing contention on a shared database. The required
+`Test: online (core)` check aggregates all selected online jobs; the integration
+job retains `Test: online (integration)`.
+
+`make test-online` still runs the complete suite, and `ASTRA_ONLINE_LANE=core`
+still runs all three core groups. To reproduce a CI shard, choose
+`ASTRA_ONLINE_LANE=core-runtime`, `core-turn-core`, `core-services`, or
+`integration` and run `make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci`
+with `ASTRA_TEST_DB_IT_TEST_THREADS=1`. Parallel CI isolation comes from separate
+service stacks; distinct database names alone do not remove shared-host load.
+All existing test selections, features, exclusions, and per-test deadlines are
+retained.
 
 Memoria identity/credential fixtures require `ASTRA_TEST_DB_IT=1` and an
 explicit `ASTRA_TEST_DATABASE` matching the effective database name. The normal
@@ -285,7 +395,7 @@ cargo nextest run -p astra-services \
   -E 'test(collision_receipts_bound_distinct_hashes_and_isolate_owners) | test(canonical_transition_wal_is_linear_and_recoverable_across_many_rounds)'
 ```
 
-The scale mode retains the same 30-second hard deadline and fails on timeout;
+The scale mode retains the same 60-second online hard deadline and fails on timeout;
 it is not enabled by ordinary integration CI. Keep source, database, machine,
 test profile and workload identical for before/after comparisons. A same-row
 contention result is not a multi-session capacity result; batching does not

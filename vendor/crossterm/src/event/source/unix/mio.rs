@@ -23,6 +23,7 @@ const TTY_BUFFER_SIZE: usize = 1_024;
 pub(crate) struct UnixInternalEventSource {
     poll: Poll,
     events: Events,
+    next_readiness: usize,
     parser: Parser,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
@@ -53,6 +54,7 @@ impl UnixInternalEventSource {
         Ok(UnixInternalEventSource {
             poll,
             events: Events::with_capacity(3),
+            next_readiness: 0,
             parser: Parser::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
@@ -69,6 +71,16 @@ impl EventSource for UnixInternalEventSource {
     }
 
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
+        // A previous readiness batch may also have contained TTY input and
+        // returned that event first. Drain WINCH without requiring a new edge.
+        if self
+            .signals
+            .pending()
+            .any(|signal| signal == signal_hook::consts::SIGWINCH)
+        {
+            let (width, height) = crate::terminal::size()?;
+            return Ok(Some(InternalEvent::Event(Event::Resize(width, height))));
+        }
         if let Some(event) = self.parser.next() {
             return Ok(Some(event));
         }
@@ -79,19 +91,24 @@ impl EventSource for UnixInternalEventSource {
             if let Some(event) = self.parser.next() {
                 return Ok(Some(event));
             }
-            if let Err(e) = self.poll.poll(
-                &mut self.events,
-                self.parser.poll_timeout(timeout.leftover()),
-            ) {
-                // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
-                // Previous versions of Mio (< 0.7) would automatically retry the poll call if it was interrupted (if EINTR was returned).
-                // https://docs.rs/mio/0.7.0/mio/struct.Poll.html#notes
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                } else {
-                    return Err(e);
+            // Returning input must not discard another token in this batch:
+            // an edge-triggered wake may be the reader handoff's only signal.
+            if self.events.iter().nth(self.next_readiness).is_none() {
+                if let Err(e) = self.poll.poll(
+                    &mut self.events,
+                    self.parser.poll_timeout(timeout.leftover()),
+                ) {
+                    // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
+                    // Previous versions of Mio (< 0.7) would automatically retry the poll call if it was interrupted (if EINTR was returned).
+                    // https://docs.rs/mio/0.7.0/mio/struct.Poll.html#notes
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    } else {
+                        return Err(e);
+                    }
                 }
-            };
+                self.next_readiness = 0;
+            }
 
             if self.events.is_empty() {
                 // No readiness events = timeout
@@ -101,7 +118,12 @@ impl EventSource for UnixInternalEventSource {
                 continue;
             }
 
-            for token in self.events.iter().map(|x| x.token()) {
+            while let Some(token) = self
+                .events
+                .iter()
+                .nth(self.next_readiness)
+                .map(|x| x.token())
+            {
                 match token {
                     TTY_TOKEN => {
                         loop {
@@ -120,6 +142,7 @@ impl EventSource for UnixInternalEventSource {
                                 Err(e) => {
                                     // No more data to read at the moment. We will receive another event
                                     if e.kind() == io::ErrorKind::WouldBlock {
+                                        self.next_readiness += 1;
                                         break;
                                     }
                                     // once more data is available to read.
@@ -140,6 +163,7 @@ impl EventSource for UnixInternalEventSource {
                         }
                     }
                     SIGNAL_TOKEN => {
+                        self.next_readiness += 1;
                         if self.signals.pending().next() == Some(signal_hook::consts::SIGWINCH) {
                             // TODO Should we remove tput?
                             //
@@ -156,6 +180,7 @@ impl EventSource for UnixInternalEventSource {
                     }
                     #[cfg(feature = "event-stream")]
                     WAKE_TOKEN => {
+                        self.next_readiness += 1;
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::Interrupted,
                             "Poll operation was woken up by `Waker::wake`",
@@ -175,5 +200,52 @@ impl EventSource for UnixInternalEventSource {
     #[cfg(feature = "event-stream")]
     fn waker(&self) -> Waker {
         self.waker.clone()
+    }
+}
+
+#[cfg(all(test, feature = "event-stream"))]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn cursor_input_does_not_discard_a_batched_reader_wake() {
+        let (input, mut writer) = UnixStream::pair().unwrap();
+        input.set_nonblocking(true).unwrap();
+        #[cfg(feature = "libc")]
+        let input = {
+            use std::os::fd::IntoRawFd;
+            FileDesc::new(input.into_raw_fd(), true)
+        };
+        #[cfg(not(feature = "libc"))]
+        let input = FileDesc::Owned(input.into());
+        let mut source = UnixInternalEventSource::from_file_descriptor(input).unwrap();
+        source.set_startup_query(true);
+        writer.write_all(b"\x1b[8;1R").unwrap();
+        source.waker().wake().unwrap();
+        // Establish the real simultaneous readiness batch, independently of
+        // token order. A new poll must not replace its unconsumed entries.
+        source
+            .poll
+            .poll(&mut source.events, Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(source.events.iter().any(|event| event.token() == TTY_TOKEN));
+        assert!(source
+            .events
+            .iter()
+            .any(|event| event.token() == WAKE_TOKEN));
+
+        let mut cursor = false;
+        let mut wake = false;
+        for _ in 0..2 {
+            match source.try_read(Some(Duration::ZERO)) {
+                Ok(Some(InternalEvent::CursorPosition(0, 7))) => cursor = true,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => wake = true,
+                other => panic!("batched input or wake was lost: {other:?}"),
+            }
+        }
+        assert!(cursor && wake, "both input and handoff wake must survive");
+        assert!(matches!(source.try_read(Some(Duration::ZERO)), Ok(None)));
     }
 }

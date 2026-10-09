@@ -17,7 +17,7 @@ use super::harness::{
     revoke_astra_admin_role, seed_pending_approval, wait_for_agent_event_types,
 };
 use super::journey_tasks_runs;
-use astra_services::ADMIN_CONFIG_KEY_REASONING_OFFERING;
+use astra_services::{ADMIN_CONFIG_KEY_REASONING_OFFERING, RunStateStore};
 
 struct E2eUserAuth {
     auth_header: String,
@@ -1354,218 +1354,6 @@ pub async fn run_saas_skills_cross_user_isolation() {
     ctx.close().await;
 }
 
-/// Team isolation — delegates to shared journey (§5.4).
-pub async fn run_saas_team_cross_user_isolation() {
-    super::journey_team_isolation_matrix::run_team_cross_user_isolation().await;
-}
-
-/// GET /sessions/{id}/replay/compare fails closed after chat activity (§6.1).
-pub async fn run_saas_session_replay_compare_unavailable_guardrail() {
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let session_id = ctx.session_id.as_str();
-    let model_offering_id = ctx.model_offering_id.clone();
-
-    let (st_chat, chat_j) = post_json(
-        app,
-        "/chat",
-        Some(auth),
-        json!({
-            "message": "replay compare probe",
-            "session_id": session_id,
-            "model_selection": model_selection(model_offering_id.clone()),
-            "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
-        }),
-    )
-    .await;
-    assert_eq!(st_chat, StatusCode::OK, "chat for replay: {chat_j}");
-
-    let (st_cmp, cmp_j) = get_json(
-        app,
-        &format!("/sessions/{session_id}/replay/compare"),
-        Some(auth),
-        &[],
-    )
-    .await;
-    assert_eq!(
-        st_cmp,
-        StatusCode::NOT_IMPLEMENTED,
-        "replay compare must remain unavailable: {cmp_j}"
-    );
-    assert!(
-        cmp_j["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("replay") && detail.contains("unavailable")),
-        "replay compare should explain the unavailable capability: {cmp_j}"
-    );
-    let replay_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND event_type = 'replay'",
-    )
-    .bind(session_id)
-    .bind(&ctx.user_id)
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("replay rows after unavailable compare");
-    assert_eq!(
-        replay_rows, 0,
-        "compare guardrail must not write replay rows"
-    );
-
-    let (auth_b, _, _, _) = register_fresh_user(app, "replay_compare_iso_b").await;
-    let (st_foreign, foreign_j) = get_json(
-        app,
-        &format!("/sessions/{session_id}/replay/compare"),
-        Some(&auth_b),
-        &[],
-    )
-    .await;
-    assert_eq!(
-        st_foreign,
-        StatusCode::NOT_FOUND,
-        "foreign user compare must remain owner-oblivious: {foreign_j}"
-    );
-
-    ctx.close().await;
-}
-
-/// POST /sessions/{id}/replay fails closed after chat activity (§6.1).
-pub async fn run_saas_session_replay_post_unavailable_guardrail() {
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let session_id = ctx.session_id.as_str();
-    let model_offering_id = ctx.model_offering_id.clone();
-
-    let (st_chat, chat_j) = post_json(
-        app,
-        "/chat",
-        Some(auth),
-        json!({
-            "message": "replay post probe",
-            "session_id": session_id,
-            "model_selection": model_selection(model_offering_id.clone()),
-            "execution_budget": { "initial_turns": 1, "hard_turn_limit": 1 }
-        }),
-    )
-    .await;
-    assert_eq!(st_chat, StatusCode::OK, "chat for replay post: {chat_j}");
-
-    let (st_rep, rep_j) = post_json(
-        app,
-        &format!("/sessions/{session_id}/replay"),
-        Some(auth),
-        json!({ "mock_mode": true, "sandbox_name": "saas-e2e" }),
-    )
-    .await;
-    assert_eq!(
-        st_rep,
-        StatusCode::NOT_IMPLEMENTED,
-        "replay post must remain unavailable: {rep_j}"
-    );
-    assert!(
-        rep_j["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("replay") && detail.contains("unavailable")),
-        "replay post should explain the unavailable capability: {rep_j}"
-    );
-
-    let (st_rep_no_mock, rep_no_mock_j) = post_json(
-        app,
-        &format!("/sessions/{session_id}/replay"),
-        Some(auth),
-        json!({ "mock_mode": false, "sandbox_name": "saas-e2e-no-mock" }),
-    )
-    .await;
-    assert_eq!(
-        st_rep_no_mock,
-        StatusCode::NOT_IMPLEMENTED,
-        "replay post with mock_mode=false must remain unavailable: {rep_no_mock_j}"
-    );
-    assert!(
-        rep_no_mock_j["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("replay") && detail.contains("unavailable")),
-        "replay post with mock_mode=false should explain the unavailable capability: {rep_no_mock_j}"
-    );
-
-    let replay_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND event_type = 'replay'",
-    )
-    .bind(session_id)
-    .bind(&ctx.user_id)
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("replay rows after unavailable post");
-    assert_eq!(replay_rows, 0, "post guardrail must not write replay rows");
-
-    let (auth_b, _, _, _) = register_fresh_user(app, "replay_iso_b").await;
-    let (st_forbid, forbid_j) = post_json(
-        app,
-        &format!("/sessions/{session_id}/replay"),
-        Some(&auth_b),
-        json!({ "mock_mode": true }),
-    )
-    .await;
-    assert_eq!(
-        st_forbid,
-        StatusCode::NOT_FOUND,
-        "foreign user replay: {forbid_j}"
-    );
-    let (st_forbid_compare, forbid_compare_j) = get_json(
-        app,
-        &format!("/sessions/{session_id}/replay/compare"),
-        Some(&auth_b),
-        &[],
-    )
-    .await;
-    assert_eq!(
-        st_forbid_compare,
-        StatusCode::NOT_FOUND,
-        "foreign user compare: {forbid_compare_j}"
-    );
-
-    ctx.close().await;
-}
-
-/// GET /admin/feedback/stats RBAC + filter query (§5.2).
-pub async fn run_saas_admin_feedback_stats_rbac() {
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let user_id = ctx.user_id.as_str();
-
-    revoke_astra_admin_role(pool, user_id).await;
-    let (st_denied, _) = get_json(app, "/admin/feedback/stats", Some(auth), &[]).await;
-    assert_eq!(
-        st_denied,
-        StatusCode::FORBIDDEN,
-        "feedback stats without admin"
-    );
-
-    grant_astra_admin_role(pool, user_id).await;
-    let (st_ok, stats_j) = get_json(app, "/admin/feedback/stats", Some(auth), &[]).await;
-    assert_eq!(st_ok, StatusCode::OK, "feedback stats: {stats_j}");
-    assert!(stats_j.get("total_feedback").is_some(), "shape: {stats_j}");
-
-    let (st_filt, filt_j) = get_json(
-        app,
-        "/admin/feedback/stats?agent_id=saas-e2e-agent&since=2020-01-01%2000:00:00",
-        Some(auth),
-        &[],
-    )
-    .await;
-    assert_eq!(st_filt, StatusCode::OK, "filtered stats: {filt_j}");
-
-    ctx.close().await;
-}
-
 /// GET /chat/runs/{id}/projection after POST /chat (§4.3).
 pub async fn run_saas_run_projection_smoke() {
     let b = bootstrap().await;
@@ -1625,13 +1413,68 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
     .await;
     assert_eq!(st_chat, StatusCode::OK, "chat for audit: {chat_j}");
 
+    wait_for_agent_event_types(
+        &ctx.pool,
+        &ctx.user_id,
+        session_id,
+        &["user_query"],
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+
+    // Audit reads the canonical LONGTEXT event payload, not a CHAR cast
+    // whose default length can truncate otherwise valid large UTF-8 JSON.
+    let run_id = chat_j["run_id"].as_str().expect("run_id");
+    let large_output = "审计 boundary output ".repeat(8_000);
+    assert!(large_output.len() > 65_535);
+    astra_services::DatabaseRunStateStore::new(ctx.shared_pool.clone())
+        .append_events_batch(
+            &ctx.user_id,
+            session_id,
+            run_id,
+            &[
+                json!({"event_type": "tool_call", "data": {
+                    "id": "large-audit-call", "name": "read_file", "arguments": {"path": "fixture.txt"}
+                }}),
+                json!({"event_type": "tool_call_end", "data": {
+                    "id": "large-audit-call", "name": "read_file", "success": true,
+                    "result": large_output
+                }}),
+                json!({"event_type": "run_error", "data": {
+                    "error": format!("large-audit-error-fixture:{large_output}"), "sentinel": "complete-json-tail"
+                }}),
+            ],
+        )
+        .await
+        .expect("persist large canonical audit events");
+
     for path in [
         format!("/sessions/{session_id}/audit/summary"),
         format!("/sessions/{session_id}/audit/turns?page=1&per_page=10"),
         format!("/sessions/{session_id}/audit/tools"),
+        format!("/sessions/{session_id}/audit/errors"),
+        format!("/sessions/{session_id}/audit/turns/1"),
+        "/audit/stats".to_string(),
+        "/audit/tools".to_string(),
     ] {
         let (st, body) = get_json(app, &path, Some(auth), &[]).await;
         assert_eq!(st, StatusCode::OK, "GET {path}: {body}");
+        if path.ends_with("/errors") {
+            let error = body["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| {
+                    entry["event_type"] == "run_error"
+                        && entry["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("large-audit-error-fixture:"))
+                })
+                .expect("durable error included in audit");
+            let payload: Value = serde_json::from_str(error["content"].as_str().unwrap())
+                .expect("large durable error must remain complete JSON");
+            assert_eq!(payload["data"]["sentinel"], "complete-json-tail");
+        }
     }
 
     ctx.close().await;

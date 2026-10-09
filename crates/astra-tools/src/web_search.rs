@@ -110,9 +110,13 @@ pub fn web_search(args: &Value) -> String {
 /// Provider admission decides whether this runs on a network-capable server or
 /// a bound edge. This function only performs the already-admitted network work;
 /// it does not alter capability routing or availability.
-pub async fn perform_web_search(args: &Value, cache_scope: &str) -> ToolResult {
+pub async fn perform_web_search(
+    args: &Value,
+    cache_scope: &str,
+    transport: crate::web_fetch::FetchTransport,
+) -> ToolResult {
     perform_web_search_with(args, |fetch_args| async move {
-        crate::web_fetch::fetch_with_cache_scope(&fetch_args, cache_scope).await
+        crate::web_fetch::fetch_with_cache_scope(&fetch_args, cache_scope, transport).await
     })
     .await
 }
@@ -120,7 +124,7 @@ pub async fn perform_web_search(args: &Value, cache_scope: &str) -> ToolResult {
 async fn perform_web_search_with<F, Fut>(args: &Value, fetch: F) -> ToolResult
 where
     F: FnOnce(Value) -> Fut,
-    Fut: std::future::Future<Output = String>,
+    Fut: std::future::Future<Output = ToolResult>,
 {
     let route = web_search(args);
     let Ok(mut route_json) = serde_json::from_str::<Value>(&route) else {
@@ -146,19 +150,20 @@ where
         "timeout": args.get("timeout").and_then(Value::as_u64).unwrap_or(20),
     });
     let fetched = fetch(fetch_args).await;
-    let fetched_json = serde_json::from_str::<Value>(&fetched).unwrap_or_else(|_| {
+    let fetched_json = serde_json::from_str::<Value>(&fetched.output).unwrap_or_else(|_| {
         serde_json::json!({
             "error": "Search provider returned an unreadable response",
-            "detail": fetched,
+            "detail": fetched.output,
         })
     });
-    if fetched_json.get("error").is_some()
+    if fetched.is_error
+        || fetched_json.get("error").is_some()
         || fetched_json
             .get("success")
             .and_then(Value::as_bool)
             .is_some_and(|success| !success)
     {
-        return ToolResult::error(
+        let mut result = ToolResult::error(
             serde_json::json!({
                 "query": route_json.get("query"),
                 "engine": route_json.get("engine"),
@@ -167,6 +172,8 @@ where
             })
             .to_string(),
         );
+        result.metadata = fetched.metadata;
+        return result;
     }
 
     let Some(route_object) = route_json.as_object_mut() else {
@@ -267,12 +274,14 @@ mod tests {
                         .is_some_and(|url| url.contains("bing.com/search"))
                 );
                 assert_eq!(fetch_args["max_links"], 2);
-                json!({
-                    "status": 200,
-                    "content": "[Astra](https://example.com/astra)",
-                    "links": [{"text": "Astra", "url": "https://example.com/astra"}],
-                })
-                .to_string()
+                ToolResult::text(
+                    json!({
+                        "status": 200,
+                        "content": "[Astra](https://example.com/astra)",
+                        "links": [{"text": "Astra", "url": "https://example.com/astra"}],
+                    })
+                    .to_string(),
+                )
             },
         )
         .await;
@@ -282,5 +291,27 @@ mod tests {
         assert_eq!(output["engine"], "Bing");
         assert_eq!(output["results"]["status"], 200);
         assert_eq!(output["results"]["links"][0]["text"], "Astra");
+    }
+
+    #[tokio::test]
+    async fn search_preserves_transport_failure_evidence() {
+        let result = perform_web_search_with(&json!({"query": "anything"}), |_| async {
+            ToolResult::error(
+                json!({"error": "HTTP request timed out", "error_kind": "tool_timeout"})
+                    .to_string(),
+            )
+            .with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
+                astra_core::ErrorKind::ToolTimeout,
+            ))
+        })
+        .await;
+        assert!(result.is_error);
+        assert_eq!(result.metadata.unwrap()["error_kind"], "tool_timeout");
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["provider_response"]["error_kind"], "tool_timeout");
+        assert_eq!(
+            output["provider_response"]["error"],
+            "HTTP request timed out"
+        );
     }
 }

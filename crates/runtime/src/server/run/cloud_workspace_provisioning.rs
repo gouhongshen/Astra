@@ -1333,6 +1333,7 @@ mod tests {
             .expect("scratch");
         record.kind = WorkspaceBindingKind::ServerSandbox;
         record.source = WorkspaceSource::ServerSandbox {
+            executor_id: "test-executor".into(),
             session_id: "session-1".to_string(),
         };
 

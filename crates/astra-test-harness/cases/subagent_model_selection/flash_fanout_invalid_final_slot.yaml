@@ -1,0 +1,44 @@
+name: flash_fanout_invalid_final_slot
+description: |
+  Live fail-closed smoke: a group containing an invalid final-slot Offering
+  must never start an earlier valid slot when the group is rejected. This
+  smoke test does not identify which admission layer rejected the group.
+prompt: |
+  Call agent_fanout.start exactly once with target_count 2. Use description
+  "first slot" for slot 0 and "second slot" for slot 1. Slot 0 asks for
+  the exact reply FLASH-VALID-SLOT and inherits your model. Slot 1 asks for
+  FLASH-INVALID-SLOT and explicitly sets requested_model_policy to
+  {"mode":"fixed","selector":{"kind":"offering_id","offering_id":"invalid-offering-no-such-id"}}.
+  Both slots are explore.
+  Do not retry, replace, or launch separate agents. Report the admission
+  failure without claiming either slot ran. Do not call Reflect or any other
+  diagnostic tool.
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: execution_tool_count
+    name: agent_fanout
+    min: 1
+    max: 1
+    root_only: true
+  - type: execution_tool_count
+    name: agent_fanout
+    min: 1
+    max: 1
+    root_only: true
+    ok: false
+    predicates:
+      - {document: arguments, path: /action, equals: start}
+      - {document: arguments, path: /target_count, equals: 2}
+      - {document: arguments, path: /slots/0/description, equals: first slot}
+      - {document: arguments, path: /slots/1/requested_model_policy/selector/offering_id, equals: invalid-offering-no-such-id}
+  - type: execution_child_count
+    min: 0
+    max: 0
+  - type: execution_tool_count
+    name: reflect
+    min: 0
+    max: 0

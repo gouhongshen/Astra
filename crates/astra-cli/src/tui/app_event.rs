@@ -4,6 +4,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RestoreInputRequest {
     pub(crate) text: String,
+    pub(crate) continuation: Option<crate::tui::event_loop::SessionContinuationTarget>,
     pub(crate) session_id: Option<String>,
     /// Stable identity for one rejected submission. The event loop uses it
     /// to make delivery idempotent when a queued event and the fallback lane
@@ -18,6 +19,8 @@ pub(crate) type RestoreInputQueue =
 /// into the main TUI event loop.
 #[derive(Debug, Clone)]
 pub(crate) enum TuiAppEvent {
+    /// Local installation notice; never a conversation/transcript event.
+    ClientUpdateNotice(Option<String>),
     // ── Mapped from StreamEvent (one-layer bridge) ──────────────────────
     /// The accepted stream established the canonical session identity.
     ///
@@ -34,10 +37,16 @@ pub(crate) enum TuiAppEvent {
     ContextSystemPromptTokens(u32),
     ContextWindowMeasured(Option<u64>),
     RequestTokenUsage(Option<astra_turn_types::RequestTokenUsage>),
-    Token(String),
+    Token {
+        model_item_id: Option<String>,
+        text: String,
+    },
     ThinkingStarted,
     ThinkingStopped,
-    ThinkingChunk(String),
+    ThinkingChunk {
+        model_item_id: Option<String>,
+        text: String,
+    },
     ToolStarted {
         name: String,
         description: String,

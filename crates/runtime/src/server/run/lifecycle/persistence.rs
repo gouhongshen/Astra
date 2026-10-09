@@ -42,10 +42,7 @@ use crate::data_layer::storage::trace_event_payload_hash;
 use crate::server::run::engine::{RunOwnerLeaseTerminalAuthority, RunOwnerLeaseTerminalOperation};
 use crate::turn::agentic_loop::host::AgenticLoopState;
 use crate::turn::services::TraceEventPersistOutcome;
-use crate::{
-    DatabaseEvaluationService, DatabaseEventService, DatabaseTraceEventWriter,
-    EventCreateRequestData, EventService,
-};
+use crate::{DatabaseEventService, DatabaseTraceEventWriter, EventCreateRequestData, EventService};
 use astra_services::storage::admit_session_event_write;
 
 use super::{
@@ -503,9 +500,14 @@ impl PostLoopPersistContext {
             self.model_name.as_deref(),
             turn_started_at,
         );
-        let outcome = DatabaseTraceEventWriter::write_many_in_tx(&mut tx, events)
-            .await
-            .map_err(|error| error.to_string())?;
+        let outcome = DatabaseTraceEventWriter::write_many_in_admitted_tx(
+            &mut tx,
+            &self.user_id,
+            &self.session_id,
+            events,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         if let Some((delta, last_event_id)) = outcome
             .session_event_deltas
             .get(&(self.user_id.clone(), self.session_id.clone()))
@@ -1189,7 +1191,14 @@ async fn persist_server_loop_canonical_append_inner(
         append.model_name,
         execution_started_at,
     ));
-    let capture_outcome = match DatabaseTraceEventWriter::write_many_in_tx(&mut tx, events).await {
+    let capture_outcome = match DatabaseTraceEventWriter::write_many_in_admitted_tx(
+        &mut tx,
+        append.user_id,
+        append.session_id,
+        events,
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(error) => {
             let msg = format!("canonical events tx failed: {}", error);
@@ -1454,7 +1463,22 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
     restored: astra_pipeline::step_restore::RestoredSession,
     current_date: &str,
     loop_state: &mut AgenticLoopState,
-) {
+) -> Result<(), astra_core::ClassifiedError> {
+    // This entrypoint restores advisory session state, not execution custody.
+    // The recovery scanner preserves/pauses handoffs but has no reconstructed
+    // executor consumer. Do not erase a same-run fence by accepting its history
+    // into fresh MessagingState. A claimed newer generation is still the same
+    // execution and requires the real adoption/frontier proof, not an equality
+    // check against the old producer generation.
+    if let Some(astra_pipeline::step_protocol::RunExecutionBudget::V1 { run_id, .. }) =
+        &restored.run_execution_budget
+        && loop_state.current_run_id.as_deref() == Some(run_id.as_str())
+    {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "same-run checkpoint requires validated execution reconstruction; session warm-start cannot restore its completion fence",
+        ));
+    }
     loop_state.deferred_tool_activations =
         astra_turn_core::tool::deferred_activation::merged_deferred_tool_activations(
             &restored.messages,
@@ -1526,6 +1550,7 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
             ),
         );
     }
+    Ok(())
 }
 
 pub(crate) fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {
@@ -1544,16 +1569,24 @@ pub(crate) fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {
         let already_has_final = messages
             .last()
             .and_then(|message| {
+                if let Some(id) = state.final_text_model_item_id.as_deref() {
+                    return Some(astra_turn_types::model_item_id(message) == Some(id));
+                }
                 let role = message.get("role")?.as_str()?;
                 let content = message.get("content")?.as_str()?;
                 Some(role == "assistant" && content.trim() == final_text)
             })
             .unwrap_or(false);
         if !already_has_final {
-            messages.push(json!({
+            let mut message = json!({
                 "role": "assistant",
                 "content": final_text,
-            }));
+            });
+            astra_turn_types::mark_model_message(
+                &mut message,
+                state.final_text_model_item_id.as_deref(),
+            );
+            messages.push(message);
         }
     }
     messages
@@ -1914,6 +1947,8 @@ pub(crate) struct TranscriptPersistItem {
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TranscriptPersistPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) model_item_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2016,17 +2051,11 @@ fn transcript_items_from_server_loop(
         });
         let result_content =
             transcript_tool_text(record.result_full.as_ref(), record.result_preview.as_ref());
-        let mut result_content = if result_content.is_empty() && !record.ok {
+        let result_content = if result_content.is_empty() && !record.ok {
             transcript_tool_text(record.error.as_ref(), None)
         } else {
             result_content
         };
-        // Transcript tool rows are display-only. Prompt recovery uses canonical
-        // history; keep the journal's result_full document unmodified.
-        astra_turn_core::tool::result::advisory::append_display_guidance(
-            &mut result_content,
-            &record.runtime_advisories,
-        );
         core_items.push(TranscriptPersistItem {
             run_id: Some(run_id.to_string()),
             role: "tool",
@@ -2034,6 +2063,7 @@ fn transcript_items_from_server_loop(
             payload: Some(TranscriptPersistPayload {
                 tool_result: Some(astra_thin_client::SessionTranscriptToolResult {
                     tool_use_id: call_id.clone(),
+                    runtime_advisories: record.runtime_advisories.clone(),
                     name: Some(tool_name),
                     status: Some(
                         record
@@ -2075,7 +2105,13 @@ fn terminal_assistant_transcript_item(
         run_id: Some(run_id.to_string()),
         role: "assistant",
         content: state.final_text.clone(),
-        payload: None,
+        payload: state
+            .final_text_model_item_id
+            .as_ref()
+            .map(|id| TranscriptPersistPayload {
+                model_item_id: Some(id.clone()),
+                ..Default::default()
+            }),
         source_event_id: trace_event_id("response", &[run_id, &trace.turn_id]),
     })
 }
@@ -2157,19 +2193,24 @@ pub(crate) async fn persist_session_transcript_items(
 
 #[derive(Clone, Debug, Default)]
 struct TranscriptReasoningProjection {
+    model_item_id: Option<String>,
     text: String,
     done: bool,
 }
 
 impl TranscriptReasoningProjection {
     fn append_delta(&mut self, delta: &str) {
-        if !delta.is_empty() && !self.text.ends_with(delta) {
+        if !delta.is_empty() {
             self.text.push_str(delta);
         }
     }
 
     fn is_empty(&self) -> bool {
         self.text.is_empty() && !self.done
+    }
+
+    fn matches_payload(&self, payload: Option<&TranscriptPersistPayload>) -> bool {
+        payload.and_then(|payload| payload.model_item_id.as_ref()) == self.model_item_id.as_ref()
     }
 }
 
@@ -2178,6 +2219,9 @@ fn payload_with_reasoning_projection(
     reasoning: &TranscriptReasoningProjection,
 ) -> Option<TranscriptPersistPayload> {
     if reasoning.is_empty() {
+        return payload;
+    }
+    if !reasoning.matches_payload(payload.as_ref()) {
         return payload;
     }
     let mut payload = payload.unwrap_or_default();
@@ -2262,6 +2306,28 @@ fn apply_reasoning_event_payload(projection: &mut TranscriptReasoningProjection,
         .get("event_type")
         .or_else(|| payload.get("type"))
         .and_then(Value::as_str);
+    if matches!(
+        event_type,
+        Some(
+            "reasoning_delta"
+                | "thinking_delta"
+                | "reasoning_message_content"
+                | "reasoning_done"
+                | "thinking_done"
+        )
+    ) {
+        let model_item_id = payload
+            .get("model_item_id")
+            .or_else(|| payload.pointer("/data/model_item_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if projection.model_item_id != model_item_id {
+            *projection = TranscriptReasoningProjection {
+                model_item_id,
+                ..Default::default()
+            };
+        }
+    }
     match event_type {
         Some("reasoning_delta" | "thinking_delta" | "reasoning_message_content") => {
             let content = payload
@@ -2402,8 +2468,13 @@ async fn update_run_assistant_transcript_reasoning_in_tx(
                 "decode stored transcript payload for run {run_id}: {error}"
             ))
         })?;
-    let payload = payload_with_reasoning_projection(payload, reasoning)
-        .expect("non-empty reasoning always materializes a transcript payload");
+    if !reasoning.matches_payload(payload.as_ref()) {
+        return Ok(());
+    }
+    let Some(payload) = payload_with_reasoning_projection(payload, reasoning) else {
+        // Reasoning from another model item cannot materialize this row.
+        return Ok(());
+    };
     let payload_json = serde_json::to_string(&payload).map_err(|error| {
         sqlx::Error::Protocol(format!(
             "serialize transcript reasoning for run {run_id}: {error}"
@@ -3003,6 +3074,8 @@ pub(crate) fn build_tool_trace_events(
         terminal.metadata = json!({
             "ok": record.ok,
             "disposition": disposition,
+            "result_class": record.result_class,
+            "exit_semantics": record.exit_semantics,
             "action": action,
             "args_preview": record.args_preview,
             "result_preview": record.result_preview,
@@ -3243,46 +3316,29 @@ async fn persist_server_loop_hook_events(
     user_message: &str,
     state: &AgenticLoopState,
 ) -> Result<(), String> {
-    // Use the telemetry accumulator — state.telemetry.all_tools_used tracks every
-    // tool name across all rounds.  state.messages does NOT carry assistant
-    // tool_call objects in the server loop path.
-    let tool_call_names: Vec<String> = state.telemetry.all_tools_used.iter().cloned().collect();
+    // Skill selection is an explicit judgment, not an inference from ordinary
+    // tool execution. Tool lifecycle and result facts are already persisted by
+    // the canonical trace path; duplicating tool names as skill selections
+    // adds a write and corrupts skill metrics.
     let selected_skills = state.telemetry.all_selected_skills.clone();
-    let skill_selection = if let Some(first_skill) = selected_skills.first() {
-        Some(TurnSkillSelectionRecord {
+    let Some(skill_name) = selected_skills.first().cloned() else {
+        return Ok(());
+    };
+    let plan = TurnHookDbPersistPlan {
+        skill_selection: Some(TurnSkillSelectionRecord {
             event_id: Uuid::now_v7().to_string(),
             session_id: session_id.to_string(),
             user_id: user_id.to_string(),
             agent_id: None,
             user_query: truncate_for_audit(user_message, 2000),
-            selected_skills: selected_skills.clone(),
-            skill_name: first_skill.clone(),
+            selected_skills,
+            skill_name,
             skill_version: None,
             selection_method: "llm_skill_choice".to_string(),
             execution_success: Some(1),
             execution_time_ms: None,
-        })
-    } else {
-        tool_call_names
-            .first()
-            .map(|first_tool| TurnSkillSelectionRecord {
-                event_id: Uuid::now_v7().to_string(),
-                session_id: session_id.to_string(),
-                user_id: user_id.to_string(),
-                agent_id: None,
-                user_query: truncate_for_audit(user_message, 2000),
-                selected_skills: tool_call_names.clone(),
-                skill_name: first_tool.clone(),
-                skill_version: None,
-                selection_method: "llm_tool_choice".to_string(),
-                execution_success: Some(1),
-                execution_time_ms: None,
-            })
+        }),
     };
-    if skill_selection.is_none() {
-        return Ok(());
-    }
-    let plan = TurnHookDbPersistPlan { skill_selection };
 
     hook_db_writer
         .persist(plan)
@@ -3755,10 +3811,14 @@ mod tests {
         let writer = CaptureHookDbWriter::default();
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "Ordinary answer".into();
+        state.telemetry.all_tools_used.insert("read_file".into());
         persist_server_loop_hook_events(&writer, "user-1", "session-1", "work", &state)
             .await
-            .expect("empty hook succeeds");
-        assert!(writer.plans.lock().expect("capture lock").is_empty());
+            .expect("ordinary tools do not need a hook write");
+        assert!(
+            writer.plans.lock().expect("capture lock").is_empty(),
+            "ordinary tools must not be persisted as skill selection"
+        );
 
         state.telemetry.all_selected_skills.push("review".into());
         persist_server_loop_hook_events(&writer, "user-1", "session-1", "work", &state)
@@ -5121,6 +5181,12 @@ mod tests {
     #[test]
     fn canonical_run_transcript_preserves_rejected_tool_error_evidence() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        let result_document = serde_json::json!({
+            "status": "failed",
+            "error_kind": "invalid_request",
+            "error": "Unknown tool 'web_search' for the current capability binding"
+        })
+        .to_string();
         state
             .stall
             .tool_call_records
@@ -5128,6 +5194,8 @@ mod tests {
                 tool_call_id: Some("call-rejected".to_string()),
                 name: "web_search".to_string(),
                 ok: false,
+                result_full: Some(result_document.clone()),
+                runtime_advisories: vec!["Use the authorized tool surface.".into()],
                 error: Some("Unknown tool 'web_search' for the current capability binding".into()),
                 disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
                 ..Default::default()
@@ -5148,6 +5216,26 @@ mod tests {
             .expect("rejected tool result");
 
         assert!(tool_result.content.contains("Unknown tool 'web_search'"));
+        assert_eq!(tool_result.content, result_document);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&tool_result.content).unwrap()["error_kind"],
+            "invalid_request"
+        );
+        assert_eq!(
+            tool_result
+                .payload
+                .as_ref()
+                .unwrap()
+                .tool_result
+                .as_ref()
+                .unwrap()
+                .runtime_advisories,
+            vec!["Use the authorized tool surface."]
+        );
+        assert_eq!(
+            state.stall.tool_call_records[0].result_full.as_deref(),
+            Some(result_document.as_str())
+        );
         assert_eq!(
             tool_result
                 .payload
@@ -5211,6 +5299,68 @@ mod tests {
     }
 
     #[test]
+    fn terminal_model_item_identity_covers_only_accepted_item_and_matching_reasoning() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.final_text = "same answer".into();
+        state.final_text_model_item_id = Some("accepted-A".into());
+        state.current_model_item_id = Some("partial-P".into());
+        let accepted =
+            terminal_assistant_transcript_item("u", "s", "run", None, "", &state).unwrap();
+        let payload = accepted.payload.as_ref().unwrap();
+        assert_eq!(payload.model_item_id.as_deref(), Some("accepted-A"));
+        assert!(payload.reasoning.is_none());
+        assert_ne!(accepted.source_event_id, "accepted-A");
+
+        let mut reasoning = TranscriptReasoningProjection::default();
+        apply_reasoning_event_payload(
+            &mut reasoning,
+            &json!({"type":"reasoning_delta", "model_item_id":"partial-P", "content":"unfinished reasoning"}),
+        );
+        assert!(!reasoning.matches_payload(None));
+        assert!(!reasoning.matches_payload(accepted.payload.as_ref()));
+        let projected =
+            payload_with_reasoning_projection(accepted.payload.clone(), &reasoning).unwrap();
+        assert_eq!(projected.model_item_id.as_deref(), Some("accepted-A"));
+        assert!(
+            projected.reasoning.is_none(),
+            "another response cannot claim reasoning coverage"
+        );
+
+        apply_reasoning_event_payload(
+            &mut reasoning,
+            &json!({"type":"reasoning_delta", "model_item_id":"accepted-A", "content":"echo"}),
+        );
+        assert!(reasoning.matches_payload(accepted.payload.as_ref()));
+        apply_reasoning_event_payload(
+            &mut reasoning,
+            &json!({"type":"reasoning_delta", "model_item_id":"accepted-A", "content":"echo"}),
+        );
+        let projected =
+            payload_with_reasoning_projection(accepted.payload.clone(), &reasoning).unwrap();
+        assert_eq!(
+            projected.reasoning.as_deref(),
+            Some("echoecho"),
+            "equal fragments are distinct, not text-deduplicated"
+        );
+
+        state.final_text_model_item_id = Some("resume-B".into());
+        let resumed =
+            terminal_assistant_transcript_item("u", "s", "run", None, "", &state).unwrap();
+        assert_eq!(resumed.content, accepted.content);
+        let stale = stored_transcript_fixture(&accepted, accepted.payload.clone());
+        assert!(
+            !stored_transcript_matches_canonical_or_reasoning_projection(
+                &resumed,
+                &stale,
+                "run",
+                Some(&accepted.source_event_id),
+                &TranscriptReasoningProjection::default()
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn durable_run_evidence_and_reasoning_keep_typed_identity() {
         let mut reasoning = TranscriptReasoningProjection::default();
         apply_reasoning_event_payload(
@@ -5263,7 +5413,6 @@ mod tests {
                 "payload_kind": payload_kind,
                 "summary": "bounded summary",
                 "timestamp_ms": 42,
-                "requires_ack": false
             })
         };
         assert_eq!(
@@ -5335,6 +5484,7 @@ mod tests {
         );
 
         let reasoning = TranscriptReasoningProjection {
+            model_item_id: None,
             text: "checked the invariant".to_string(),
             done: true,
         };
@@ -5363,6 +5513,7 @@ mod tests {
             source_event_id: "response-1".to_string(),
         };
         let reasoning = TranscriptReasoningProjection {
+            model_item_id: None,
             text: "checked the invariant".to_string(),
             done: true,
         };

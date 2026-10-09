@@ -7,10 +7,8 @@ use astra_turn_types::{StopHook, ToolInvocationCompletionRef};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum VerificationRecoveryError {
-    #[cfg(test)]
     #[error("verification checkpoint evidence is invalid")]
     InvalidEvidence,
-    #[cfg(test)]
     #[error("verification checkpoint belongs to a different execution or contract")]
     ScopeMismatch,
     #[cfg(test)]
@@ -38,7 +36,6 @@ impl Evidence {
         })
     }
 
-    #[cfg(test)]
     fn restore(evidence: &astra_turn_types::VerificationEvidence) -> Self {
         Self {
             ordinal: evidence.ordinal,
@@ -64,7 +61,6 @@ impl MutationSource {
         })
     }
 
-    #[cfg(test)]
     fn restore(source: &astra_turn_types::WorkspaceMutationSource) -> Self {
         Self {
             evidence: Evidence::restore(&source.evidence),
@@ -195,7 +191,6 @@ impl WorkspaceObservationFacts {
         })
     }
 
-    #[cfg(test)]
     fn restore(snapshot: &astra_turn_types::BoundWorkspaceObservation) -> Self {
         Self {
             barrier: snapshot.barrier.as_ref().map(Evidence::restore),
@@ -215,6 +210,7 @@ fn workspace_mutation_risk(record: &ToolCallRecord, root: Option<&str>) -> bool 
             super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
         )
         && !super::lifecycle::is_authoritative_unchanged_bash_observation_record(record)
+        && !super::lifecycle::record_has_full_scope_explicit_workspace_verification_receipt(record)
         && !super::execution_phase::record_is_proven_external_scratch_mutation(root, record)
 }
 
@@ -257,7 +253,7 @@ pub(crate) mod tests {
             working_dir: None,
             depends_on: vec![],
             timeout_secs: None,
-            cache_key: None,
+
             authoritative: true,
         }
     }
@@ -282,7 +278,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn task_resolution_recovered_workspace_proof_cannot_cross_later_writer() {
+    fn recovered_workspace_observation_cannot_cross_later_writer() {
         let mut ledger = astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
         let read = executed_with_args(
             &mut ledger,
@@ -296,54 +292,19 @@ pub(crate) mod tests {
             "write_file",
             serde_json::json!({"path": "/app/artifact", "content": "changed"}),
         );
-        let reference = read.execution_completion.clone().unwrap();
         let records = vec![read, write];
         let mut frontier = VerificationFrontier::default();
         frontier.advance(Some("/app"), &[], &records).unwrap();
         assert!(
             !frontier
-                .task_resolution_workspace_evidence_is_current(
-                    Some("/app"),
-                    &[],
-                    &records,
-                    std::slice::from_ref(&reference)
-                )
+                .evaluate_workspace_observation(Some("/app"), &[], &records)
                 .unwrap()
         );
-        // Both policy scope and frontier ordinals must survive real recovery.
-        frontier = restore_from_ledger(&frontier, &records, &ledger);
-        let mut policy = crate::turn::runtime_policy::RuntimePolicyEvaluationState::default();
-        crate::turn::runtime_policy::evaluate_tool_boundary(
-            &mut policy,
-            astra_turn_core::context_feedback::RuntimePolicySubject::Run,
-            &records,
-            2,
-        )
-        .unwrap();
-        let policy =
-            crate::turn::runtime_policy::RuntimePolicyEvaluationState::deserialize_continuation(
-                policy
-                    .serialize_continuation(serde_json::value::Serializer)
-                    .unwrap(),
-            )
-            .unwrap();
-        let workspace_refs = policy.task_resolution_workspace_evidence(&["read".into()]);
-        assert_eq!(workspace_refs, vec![reference]);
+        let restored = restore_from_ledger(&frontier, &records, &ledger);
         assert!(
-            !frontier
-                .task_resolution_workspace_evidence_is_current(
-                    Some("/app"),
-                    &[],
-                    &[],
-                    &workspace_refs
-                )
+            !restored
+                .evaluate_workspace_observation(Some("/app"), &[], &[])
                 .unwrap()
-        );
-        assert!(
-            frontier
-                .task_resolution_workspace_evidence_is_current(Some("/app"), &[], &[], &[])
-                .unwrap(),
-            "external evidence does not acquire an implicit workspace obligation"
         );
     }
 
@@ -588,17 +549,6 @@ pub(crate) mod tests {
                     .unwrap(),
                 "batch ledger order cannot establish a happens-after relation"
             );
-            assert!(
-                !frontier
-                    .task_resolution_workspace_evidence_is_current(
-                        Some("/app"),
-                        &[],
-                        &records,
-                        &[read.execution_completion.clone().unwrap()],
-                    )
-                    .unwrap(),
-                "reconciliation cannot use a concurrent read as fresh evidence"
-            );
             records.push(later_read.clone());
             frontier.advance(Some("/app"), &[], &records).unwrap();
             assert!(
@@ -607,37 +557,75 @@ pub(crate) mod tests {
                     .unwrap(),
                 "a separate later read may close the observation debt"
             );
-            assert!(
-                frontier
-                    .task_resolution_workspace_evidence_is_current(
-                        Some("/app"),
-                        &[],
-                        &records,
-                        &[later_read.execution_completion.clone().unwrap()],
-                    )
-                    .unwrap()
-            );
             let restored = restore_from_ledger(&frontier, &records, &ledger);
             assert!(
                 restored
-                    .task_resolution_workspace_evidence_is_current(
-                        Some("/app"),
-                        &[],
-                        &[],
-                        &[later_read.execution_completion.clone().unwrap()],
-                    )
+                    .evaluate_workspace_observation(Some("/app"), &[], &[])
                     .unwrap()
             );
-            assert!(
-                !restored
-                    .task_resolution_workspace_evidence_is_current(
-                        Some("/app"),
-                        &[],
-                        &[],
-                        &[read.execution_completion.clone().unwrap()],
-                    )
-                    .unwrap()
+        }
+    }
+
+    #[test]
+    fn parallel_verify_receipts_require_live_parameters_and_unchanged_owner_facts() {
+        use astra_tools::workspace_observation as observation;
+        for invalid in [
+            None,
+            Some("mode"),
+            Some("ownership"),
+            Some("mutation"),
+            Some("failure"),
+        ] {
+            let mut ledger =
+                astra_turn_core::invocation_ledger::InMemoryInvocationLedger::default();
+            let writer = executed_with_args(
+                &mut ledger,
+                "writer",
+                "write_file",
+                serde_json::json!({"path": "/app/answer.txt", "content": "new"}),
             );
+            let hooks = [hook("./a"), hook("./b")];
+            let mut records = vec![writer];
+            for (i, command) in ["./a", "./b"].into_iter().enumerate() {
+                let mut args = serde_json::json!({"command": command, "mode": "verify"});
+                if i == 0 && invalid == Some("mode") {
+                    args.as_object_mut().unwrap().remove("mode");
+                }
+                let mut verifier =
+                    executed_with_args(&mut ledger, &format!("verify-{i}"), "bash", args);
+                let fields = observation::explicit_workspace_verification_receipt();
+                verifier.workspace_mutation_scope = Some(observation::BOUND_WORKSPACE_SCOPE.into());
+                verifier.workspace_mutation_receipt =
+                    fields.get(observation::OBSERVATION_RECEIPT_FIELD).cloned();
+                verifier.batch_id = Some("verify-batch".into());
+                verifier.parallel = Some(true);
+                if i == 0 {
+                    match invalid {
+                        Some("ownership") => {
+                            verifier.workspace_mutation_receipt.as_mut().unwrap()["ownership"] =
+                                serde_json::json!(observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+                        }
+                        Some("mutation") => verifier.workspace_mutation_observed = Some(true),
+                        Some("failure") => verifier.ok = false,
+                        _ => {}
+                    }
+                }
+                records.push(verifier);
+            }
+            let mut frontier = VerificationFrontier::default();
+            frontier.advance(Some("/app"), &hooks, &records).unwrap();
+            assert_eq!(
+                frontier.missing().unwrap().is_empty(),
+                invalid.is_none(),
+                "{invalid:?}"
+            );
+            if invalid.is_none() {
+                assert!(
+                    frontier
+                        .evaluate_workspace_observation(Some("/app"), &hooks, &records)
+                        .unwrap()
+                );
+            }
         }
     }
 
@@ -650,7 +638,18 @@ pub(crate) mod tests {
             "write_file",
             serde_json::json!({"path": "/app/answer.txt", "content": "new"}),
         );
-        let mut verifier = executed(&mut ledger, "verifier", "bash", "./verify");
+        let mut verifier = executed_with_args(
+            &mut ledger,
+            "verifier",
+            "bash",
+            serde_json::json!({"command": "./verify", "mode": "verify"}),
+        );
+        verifier.workspace_mutation_scope =
+            Some(astra_tools::workspace_observation::BOUND_WORKSPACE_SCOPE.into());
+        verifier.workspace_mutation_receipt =
+            astra_tools::workspace_observation::explicit_workspace_verification_receipt()
+                .get(astra_tools::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                .cloned();
         writer.batch_id = Some("parallel-verify".into());
         verifier.batch_id = writer.batch_id.clone();
         let hooks = [hook("./verify")];
@@ -1031,6 +1030,38 @@ pub(crate) mod tests {
         );
         assert_eq!(restored.cursor, 0);
         assert_eq!(restored.processed_through, 2);
+        let paired = history
+            .iter()
+            .map(
+                |record| crate::server::server_loop_host::HistoricalToolCallContinuation {
+                    record: record.clone(),
+                    completion: record.execution_completion.clone(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let cursor = VerificationFrontier::adopted_history_cursor(
+            &snapshot, &paired, "user", "session", "run", "chain",
+        )
+        .unwrap();
+        let mut complete_history =
+            VerificationFrontier::restore_bound_snapshot(None, &snapshot, "chain", &hooks, cursor)
+                .unwrap();
+        complete_history.advance(None, &hooks, &history).unwrap();
+        assert_eq!(complete_history.processed_through, 2);
+        assert_eq!(complete_history.missing(), uninterrupted.missing());
+        let mut changed_prefix = paired.clone();
+        changed_prefix[1].completion = None;
+        assert!(
+            VerificationFrontier::adopted_history_cursor(
+                &snapshot,
+                &changed_prefix,
+                "user",
+                "session",
+                "run",
+                "chain",
+            )
+            .is_err()
+        );
         assert!(
             VerificationFrontier::restore(
                 None, &snapshot, "other", "session", "run", "chain", &hooks, &rows
@@ -1074,7 +1105,12 @@ pub(crate) mod tests {
         );
         let suffix = vec![executed(&mut ledger, "check-b", "bash", "./b")];
         history.extend(suffix.clone());
+        complete_history.advance(None, &hooks, &history).unwrap();
+        assert_eq!(complete_history.processed_through, 3);
+        complete_history.advance(None, &hooks, &history).unwrap();
+        assert_eq!(complete_history.processed_through, 3);
         uninterrupted.advance(None, &hooks, &history).unwrap();
+        assert_eq!(complete_history.missing(), uninterrupted.missing());
         restored.advance(None, &hooks, &suffix).unwrap();
         assert_eq!(restored.missing(), uninterrupted.missing());
         assert_eq!(restored.processed_through, uninterrupted.processed_through);
@@ -1293,18 +1329,16 @@ impl Default for VerificationFrontier {
 }
 
 impl VerificationFrontier {
-    /// Semantic association comes from the immutable owner checkpoint;
-    /// terminal authenticity comes from these exact invocation ledger rows.
-    #[cfg(test)]
-    pub(crate) fn restore(
+    /// Rebuild the reducer from a semantically scoped snapshot. The caller is
+    /// responsible for proving the snapshot's provenance; this helper owns the
+    /// invariant checks and the one reconstruction path shared by raw tests
+    /// and atomically adopted execution handoffs.
+    fn restore_bound_snapshot(
         workspace_root: Option<&str>,
         snapshot: &astra_turn_types::BoundVerificationFrontier,
-        user_id: &str,
-        session_id: &str,
-        run_id: &str,
         turn_chain_id: &str,
         hooks: &[StopHook],
-        records: &[astra_turn_types::ToolInvocationRecord],
+        cursor: usize,
     ) -> Result<Self, VerificationRecoveryError> {
         snapshot
             .validate()
@@ -1318,6 +1352,152 @@ impl VerificationFrontier {
         {
             return Err(VerificationRecoveryError::ScopeMismatch);
         }
+        for source in snapshot.workspace.latest_source.iter().chain(
+            snapshot
+                .workspace
+                .proof
+                .iter()
+                .filter_map(|proof| proof.literal_source.as_ref()),
+        ) {
+            if let Some(path) = &source.delivered_path {
+                if super::lifecycle::normalize_workspace_path(path, workspace_root).as_deref()
+                    != Some(std::path::Path::new(path))
+                {
+                    return Err(VerificationRecoveryError::ScopeMismatch);
+                }
+            }
+        }
+        Ok(Self {
+            contract: snapshot.contract.clone(),
+            workspace_root: snapshot.workspace_root.clone(),
+            observation: WorkspaceObservationFacts::restore(&snapshot.workspace),
+            cursor,
+            processed_through: snapshot.processed_through,
+            mutation: snapshot.mutation.as_ref().map(Evidence::restore),
+            proofs: snapshot
+                .proofs
+                .iter()
+                .map(|proof| proof.as_ref().map(Evidence::restore))
+                .collect(),
+            historical_prefix: snapshot.processed_through != 0,
+        })
+    }
+
+    fn adopted_history_cursor(
+        snapshot: &astra_turn_types::BoundVerificationFrontier,
+        history: &[crate::server::server_loop_host::HistoricalToolCallContinuation],
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        turn_chain_id: &str,
+    ) -> Result<usize, VerificationRecoveryError> {
+        let history_len = u64::try_from(history.len())
+            .map_err(|_| VerificationRecoveryError::OrdinalExhausted)?;
+        if snapshot.processed_through != history_len {
+            return Err(VerificationRecoveryError::InvalidEvidence);
+        }
+        for evidence in snapshot.evidence() {
+            let identity = &evidence.invocation.identity;
+            if identity.user_id != user_id
+                || identity.session_id != session_id
+                || identity.run_id != run_id
+                || identity.turn_chain_id != turn_chain_id
+            {
+                return Err(VerificationRecoveryError::ScopeMismatch);
+            }
+            let index = usize::try_from(
+                evidence
+                    .ordinal
+                    .checked_sub(1)
+                    .ok_or(VerificationRecoveryError::InvalidEvidence)?,
+            )
+            .map_err(|_| VerificationRecoveryError::OrdinalExhausted)?;
+            let Some(entry) = history.get(index) else {
+                return Err(VerificationRecoveryError::InvalidEvidence);
+            };
+            if !entry.record.was_executed()
+                || entry
+                    .completion
+                    .as_ref()
+                    .and_then(|completion| completion.as_invocation())
+                    != Some(&evidence.invocation)
+            {
+                return Err(VerificationRecoveryError::InvalidEvidence);
+            }
+        }
+        Ok(history.len())
+    }
+
+    /// Restore only the verification prefix carried by an atomically adopted
+    /// execution handoff. `AdoptedExecutionHandoff` is deliberately not
+    /// deserializable: its locked checkpoint and receipt are the provenance
+    /// boundary. This method therefore accepts no arbitrary snapshot, no
+    /// trusted flag, and no historical ledger rows.
+    ///
+    /// The current workspace and hook contract are required to match the
+    /// retained prefix. This restores observation facts only; current tool,
+    /// Work, and execution permissions remain owned by their live admission
+    /// paths. In particular, an `OutcomeUnknown` invocation is copied with its
+    /// original state and is never promoted to a successful outcome.
+    pub(crate) fn restore_from_adopted_handoff(
+        workspace_root: Option<&str>,
+        hooks: &[StopHook],
+        adopted: &astra_services::session_context_coordinator::ResumedExecutionTurn,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        turn_chain_id: &str,
+    ) -> Result<Self, VerificationRecoveryError> {
+        let receipt = adopted.receipt();
+        let checkpoint = adopted.checkpoint();
+        if checkpoint.checkpoint_kind != "execution_handoff"
+            || checkpoint.checkpoint_version != "execution_handoff_v1"
+            || checkpoint.user_id != user_id
+            || checkpoint.session_id != session_id
+            || checkpoint.run_id != run_id
+            || receipt.run_id != run_id
+        {
+            return Err(VerificationRecoveryError::ScopeMismatch);
+        }
+
+        let payload =
+            crate::server::server_loop_host::RuntimeExecutionHandoff::from_adopted(adopted)
+                .map_err(|_| VerificationRecoveryError::InvalidEvidence)?;
+        if payload.original_facts.canonical_turn_chain_id.as_deref() != Some(turn_chain_id) {
+            return Err(VerificationRecoveryError::ScopeMismatch);
+        }
+        let snapshot = match &payload.verification {
+            astra_turn_types::VerificationHandoff::Bound { snapshot } => snapshot.as_ref(),
+            astra_turn_types::VerificationHandoff::Unavailable { .. } => {
+                return Err(VerificationRecoveryError::HistoryUnavailable);
+            }
+        };
+        let cursor = Self::adopted_history_cursor(
+            snapshot,
+            &payload.tool_history,
+            user_id,
+            session_id,
+            run_id,
+            turn_chain_id,
+        )?;
+        Self::restore_bound_snapshot(workspace_root, snapshot, turn_chain_id, hooks, cursor)
+    }
+
+    /// Semantic association comes from the immutable owner checkpoint;
+    /// terminal authenticity comes from these exact invocation ledger rows.
+    #[cfg(test)]
+    pub(crate) fn restore(
+        workspace_root: Option<&str>,
+        snapshot: &astra_turn_types::BoundVerificationFrontier,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        turn_chain_id: &str,
+        hooks: &[StopHook],
+        records: &[astra_turn_types::ToolInvocationRecord],
+    ) -> Result<Self, VerificationRecoveryError> {
+        let restored =
+            Self::restore_bound_snapshot(workspace_root, snapshot, turn_chain_id, hooks, 0)?;
         let mut actual = std::collections::BTreeMap::new();
         for record in records {
             let reference = ToolInvocationCompletionRef::from_record(record)
@@ -1348,35 +1528,7 @@ impl VerificationFrontier {
         if expected.len() != actual.len() {
             return Err(VerificationRecoveryError::LedgerMismatch);
         }
-        for source in snapshot.workspace.latest_source.iter().chain(
-            snapshot
-                .workspace
-                .proof
-                .iter()
-                .filter_map(|proof| proof.literal_source.as_ref()),
-        ) {
-            if let Some(path) = &source.delivered_path {
-                if super::lifecycle::normalize_workspace_path(path, workspace_root).as_deref()
-                    != Some(std::path::Path::new(path))
-                {
-                    return Err(VerificationRecoveryError::ScopeMismatch);
-                }
-            }
-        }
-        Ok(Self {
-            contract: snapshot.contract.clone(),
-            workspace_root: snapshot.workspace_root.clone(),
-            observation: WorkspaceObservationFacts::restore(&snapshot.workspace),
-            cursor: 0,
-            processed_through: snapshot.processed_through,
-            mutation: snapshot.mutation.as_ref().map(Evidence::restore),
-            proofs: snapshot
-                .proofs
-                .iter()
-                .map(|proof| proof.as_ref().map(Evidence::restore))
-                .collect(),
-            historical_prefix: snapshot.processed_through != 0,
-        })
+        Ok(restored)
     }
 
     pub(crate) fn export(
@@ -1496,53 +1648,6 @@ impl VerificationFrontier {
         let mut view = self.clone();
         view.advance(workspace_root, hooks, records)?;
         Ok(view.observation.is_satisfied())
-    }
-
-    /// An assessment may interpret a different observer as satisfying a task,
-    /// but may not reuse a workspace observation across a later known writer.
-    /// External evidence has no implicit workspace-freshness requirement.
-    pub(crate) fn task_resolution_workspace_evidence_is_current(
-        &self,
-        workspace_root: Option<&str>,
-        hooks: &[StopHook],
-        records: &[ToolCallRecord],
-        workspace_evidence: &[astra_turn_types::task_resolution::ToolExecutionEvidenceRef],
-    ) -> Result<bool, VerificationRecoveryError> {
-        let mut view = self.clone();
-        view.advance(workspace_root, hooks, records)?;
-        let Some(barrier) = view.observation.barrier.as_ref() else {
-            return Ok(true);
-        };
-        let base = view.processed_through.saturating_sub(records.len() as u64);
-        let parallel_mutators = parallel_mutator_batches(records, workspace_root);
-        for reference in workspace_evidence {
-            let local = records
-                .iter()
-                .position(|record| record.execution_completion.as_ref() == Some(reference))
-                .map(|index| (index, base + index as u64 + 1));
-            let ordinal = if let Some((index, ordinal)) = local {
-                if has_parallel_mutating_peer(&records[index], index, &parallel_mutators) {
-                    return Ok(false);
-                }
-                Some(ordinal)
-            } else {
-                // Restored history retains only actual observation proof. A
-                // barrier identity is not itself an observation, and an
-                // unretained concurrent read cannot become fresh by citation.
-                view.observation.proof.as_ref().and_then(|proof| {
-                    reference.as_invocation().and_then(|reference| {
-                        (proof.evidence.invocation.as_ref() == Some(reference))
-                            .then_some(proof.evidence.ordinal)
-                    })
-                })
-            };
-            if ordinal.is_none_or(|ordinal| ordinal < barrier.ordinal) {
-                // A restored prefix must use retained bound ordinals, never
-                // the absence of a local record as evidence of freshness.
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     pub(crate) fn advance(

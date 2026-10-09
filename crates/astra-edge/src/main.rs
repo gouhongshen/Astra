@@ -1040,13 +1040,14 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     }
 
     let session_id = format!("edge-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let executor = Arc::new(astra_tools::executor::DefaultToolExecutor::for_workspace(
-        &workspace,
-        config.edge_id.clone(),
-        session_id,
-        "astra-edge/0.1",
-        Duration::from_secs(30),
-    ));
+    let executor = Arc::new(
+        astra_tools::executor::DefaultToolExecutor::for_workspace(
+            &workspace,
+            config.edge_id.clone(),
+            session_id,
+        )
+        .with_local_network(),
+    );
     let (completed_tx, mut completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(1_024);
     let execution_budget = EdgeExecutionBudget::new();
     let mut invocations = EdgeInvocationTracker::default();

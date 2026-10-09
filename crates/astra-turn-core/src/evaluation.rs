@@ -18,8 +18,6 @@ use crate::orchestration::agent_result_wire::{
 use astra_services::session_journal::{JournalEvent, ToolCallRecord};
 use serde_json::{Value, json};
 
-pub mod task_resolution;
-
 /// Signals detected during evaluation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalSignal {
@@ -126,7 +124,6 @@ pub const REDUNDANT_VALIDATION_RETRIES_THRESHOLD: usize = 2;
 /// typed low-yield observation also proves that a long turn is not progressing.
 pub const LLM_ROUND_CHURN_THRESHOLD: usize = 8;
 pub const EXPLORATION_FAMILY_CHURN_THRESHOLD: usize = 3;
-pub const ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE: usize = 2;
 pub const PROMPT_GROWTH_CHURN_MIN_ROUNDS: u32 = 4;
 pub const PROMPT_GROWTH_CHURN_MIN_DELTA_TOKENS: u64 = 8_000;
 pub const PROMPT_GROWTH_CHURN_MIN_RATIO_NUMERATOR: u64 = 2;
@@ -135,7 +132,8 @@ const HIGH_COST_TOOL_CALL_THRESHOLD: usize = 16;
 /// Post-mortem evaluation thresholds. Defaults mirror the calibrated compile-
 /// time constants above, but runtime callers may override them from config so
 /// passive eval signals can be tuned without a rebuild.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluationThresholds {
     pub redundant_overlapping_reads: usize,
     pub search_fanout: usize,
@@ -162,75 +160,6 @@ pub struct TurnEvaluationTelemetry {
     pub prompt_tokens: Option<u64>,
     pub first_round_prompt_tokens: Option<u64>,
     pub max_round_prompt_tokens: Option<u64>,
-}
-
-/// Conservative mid-loop progress policy.
-///
-/// This is intentionally narrower than post-mortem turn evaluation: it does
-/// not infer task intent from user prose, does not parse tool output text, and
-/// never hard-stops a turn. It only recommends low-risk advisory evidence when
-/// structured observations show repeated low-yield work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OnlineProgressPolicy {
-    pub redundant_overlapping_reads_threshold: usize,
-    pub min_tool_calls_before_nudge: usize,
-}
-
-impl Default for OnlineProgressPolicy {
-    fn default() -> Self {
-        Self {
-            redundant_overlapping_reads_threshold: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
-            min_tool_calls_before_nudge: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct OnlineProgressSignals {
-    pub tool_calls: usize,
-    pub redundant_overlapping_reads: usize,
-    pub stronger_advisory_emitted: bool,
-    pub advisory_already_emitted: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OnlineProgressDecision {
-    Continue,
-    ReuseKnownContext { redundant_overlapping_reads: usize },
-}
-
-impl OnlineProgressDecision {
-    const fn continue_turn() -> Self {
-        Self::Continue
-    }
-}
-
-pub fn decide_online_progress(
-    signals: OnlineProgressSignals,
-    policy: OnlineProgressPolicy,
-) -> OnlineProgressDecision {
-    if signals.stronger_advisory_emitted || signals.advisory_already_emitted {
-        return OnlineProgressDecision::continue_turn();
-    }
-
-    if signals.tool_calls < policy.min_tool_calls_before_nudge {
-        return OnlineProgressDecision::continue_turn();
-    }
-
-    if threshold_reached(
-        signals.redundant_overlapping_reads,
-        policy.redundant_overlapping_reads_threshold,
-    ) {
-        return OnlineProgressDecision::ReuseKnownContext {
-            redundant_overlapping_reads: signals.redundant_overlapping_reads,
-        };
-    }
-
-    OnlineProgressDecision::continue_turn()
-}
-
-const fn threshold_reached(count: usize, threshold: usize) -> bool {
-    threshold > 0 && count >= threshold
 }
 
 /// Result of evaluating a turn's success and quality.
@@ -312,8 +241,11 @@ pub fn tool_outcome_requires_terminal_attention(
     let args = record
         .authoritative_args_full()
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
-    if normalize_validation_prefix(&record.name, record.authoritative_args_full().unwrap_or(""))
-        .is_some()
+    if normalize_validation_attempt_prefix(
+        &record.name,
+        record.authoritative_args_full().unwrap_or(""),
+    )
+    .is_some()
     {
         return true;
     }
@@ -622,6 +554,34 @@ pub fn evaluate_tool_call_records_with_thresholds(
 
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
+    input: &str,
+    recent_tools: &[String],
+    tool_call_records: &[ToolCallRecord],
+    stall_count: usize,
+    verdict_warning: bool,
+    budget_pressure: f64,
+    thresholds: EvaluationThresholds,
+    telemetry: TurnEvaluationTelemetry,
+) -> TurnEvaluation {
+    evaluate_tool_call_records_with_resolved_children(
+        input,
+        recent_tools,
+        tool_call_records,
+        stall_count,
+        verdict_warning,
+        budget_pressure,
+        thresholds,
+        telemetry,
+        &[],
+    )
+}
+
+/// Final-turn evaluation can consume producer-owned child completions that
+/// supersede earlier nonterminal agent receipts. The execution records remain
+/// unchanged for audit; only this quality projection treats proven receipts
+/// as settled. Callers must validate the child identity and delivery first.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_tool_call_records_with_resolved_children(
     _input: &str,
     _recent_tools: &[String],
     tool_call_records: &[ToolCallRecord],
@@ -630,6 +590,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     budget_pressure: f64,
     thresholds: EvaluationThresholds,
     telemetry: TurnEvaluationTelemetry,
+    resolved_children: &[astra_turn_types::task_resolution::ToolExecutionEvidenceRef],
 ) -> TurnEvaluation {
     // Execution health is computed only from calls that reached an executor.
     // Rejected, reused, suppressed, and deferred requests remain available as
@@ -795,7 +756,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
     revoke_all_tools_healthy_when_quality_signals_disagree(&mut eval, &tool_calls);
     align_high_cost_low_yield_verdict(&mut eval, &tool_calls, telemetry);
     apply_blocked_tool_failures(&mut eval, tool_call_records);
-    apply_unresolved_tool_outcome_failures(&mut eval, tool_call_records);
+    apply_unresolved_tool_outcome_failures(&mut eval, tool_call_records, resolved_children);
     calibrate_confidence_after_quality_penalties(&mut eval);
 
     eval
@@ -1072,11 +1033,32 @@ fn operation_identity_key(record: &ToolCallRecord) -> Option<String> {
 
 fn unresolved_tool_outcome_failure_counts(
     records: &[ToolCallRecord],
+    resolved_children: &[astra_turn_types::task_resolution::ToolExecutionEvidenceRef],
 ) -> std::collections::BTreeMap<String, usize> {
     unresolved_tool_outcome_fact_counts(
         &records
             .iter()
-            .map(ToolEvaluationFact::from_record)
+            .map(|record| {
+                let mut fact = ToolEvaluationFact::from_record(record);
+                if matches!(
+                    (record.name.as_str(), fact.effective_result_class.as_deref()),
+                    ("agent", Some(RESULT_CLASS_AGENT_INCOMPLETE))
+                        | ("agent_fanout", Some(RESULT_CLASS_FANOUT_INCOMPLETE))
+                ) && record.ok
+                    && record
+                        .execution_completion
+                        .as_ref()
+                        .is_some_and(|reference| {
+                            resolved_children
+                                .iter()
+                                .any(|resolved| resolved == reference)
+                        })
+                {
+                    fact.effective_result_class = Some("success".into());
+                    fact.non_failure_outcome = true;
+                }
+                fact
+            })
             .collect::<Vec<_>>(),
     )
 }
@@ -1350,7 +1332,7 @@ pub fn rejected_operation_key(record: &ToolCallRecord) -> Option<String> {
 /// result for the same operation removes the earlier failure, so runtime
 /// feedback does not keep advising about a problem the agent already fixed.
 pub fn count_unresolved_tool_outcome_failures(records: &[ToolCallRecord]) -> usize {
-    unresolved_tool_outcome_failure_counts(records)
+    unresolved_tool_outcome_failure_counts(records, &[])
         .values()
         .copied()
         .sum()
@@ -1371,6 +1353,17 @@ pub fn tool_outcome_is_positive_success(record: &ToolCallRecord) -> bool {
 }
 
 fn effective_tool_result_class(record: &ToolCallRecord) -> Option<String> {
+    if matches!(record.name.as_str(), "agent" | "agent_fanout") {
+        if let Some(class) = record
+            .result_class
+            .as_deref()
+            .map(str::trim)
+            .filter(|class| !class.is_empty() && *class != "success")
+        {
+            return Some(class.to_string());
+        }
+        return structured_tool_result_class(record).map(str::to_string);
+    }
     if let Some(class) = record
         .result_class
         .as_deref()
@@ -1384,7 +1377,13 @@ fn effective_tool_result_class(record: &ToolCallRecord) -> Option<String> {
 }
 
 fn structured_tool_result_class(record: &ToolCallRecord) -> Option<&'static str> {
-    let value = parse_structured_tool_result(record)?;
+    let Some(value) = parse_structured_tool_result(record) else {
+        return matches!(record.name.as_str(), "agent" | "agent_fanout")
+            .then_some(RESULT_CLASS_AGENT_INCOMPLETE);
+    };
+    if value.get("result_family").is_some() {
+        return agent_tool_structured_result_class(&value);
+    }
     if record.name == "agent_fanout" || agent_fanout_result_looks_like(&value) {
         return agent_fanout_structured_result_class(&value);
     }
@@ -1470,8 +1469,12 @@ fn record_is_rejected_attempt(record: &ToolCallRecord) -> bool {
             || record.was_blocked_by_policy())
 }
 
-fn apply_unresolved_tool_outcome_failures(eval: &mut TurnEvaluation, records: &[ToolCallRecord]) {
-    let counts = unresolved_tool_outcome_failure_counts(records);
+fn apply_unresolved_tool_outcome_failures(
+    eval: &mut TurnEvaluation,
+    records: &[ToolCallRecord],
+    resolved_children: &[astra_turn_types::task_resolution::ToolExecutionEvidenceRef],
+) {
+    let counts = unresolved_tool_outcome_failure_counts(records, resolved_children);
     let total: usize = counts.values().sum();
     if total == 0 {
         return;
@@ -1691,10 +1694,6 @@ pub struct ToolEvaluationFact {
     /// policy window. Absence never authorizes a guessed recovery reference.
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     execution_completion: Option<astra_turn_types::task_resolution::ToolExecutionEvidenceRef>,
-    /// Runtime-owned workspace observer classification. Kept with the fact so
-    /// recovery need not infer scope from a tool name or a command preview.
-    workspace_observation_candidate: bool,
-    assessment_observation_candidate: bool,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     operation_identity: Option<EvaluationIdentity>,
     /// False when the outcome key used only a preview or other partial evidence.
@@ -1703,6 +1702,9 @@ pub struct ToolEvaluationFact {
     effective_result_class: Option<String>,
     non_failure_outcome: bool,
     is_rejected_attempt: bool,
+    /// A terminal rejection prevents repair; invalid arguments instead need
+    /// a corrected invocation, even though the original call is not retryable.
+    rejection_non_retryable: bool,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub round: Option<u32>,
     pub disposition: astra_services::session_journal::ToolCallDisposition,
@@ -1839,6 +1841,9 @@ impl ToolEvaluationFact {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.rejection_non_retryable && !self.is_rejected_attempt {
+            return Err("non-retryable rejection without rejected attempt");
+        }
         if self.operation_identity_complete && self.operation_identity.is_none() {
             return Err("complete operation evidence without identity");
         }
@@ -1862,16 +1867,23 @@ impl ToolEvaluationFact {
         Self {
             tool_name: record.name.clone(),
             execution_completion: record.execution_completion.clone(),
-            workspace_observation_candidate: false,
-            assessment_observation_candidate: task_resolution::is_assessment_observation_candidate(
-                record,
-            ),
             operation_identity: operation_identity_key(record)
                 .map(|key| EvaluationIdentity::new(b"operation", &key)),
             operation_identity_complete: !args.trim().is_empty(),
             effective_result_class: effective_tool_result_class(record),
             non_failure_outcome: record_is_non_failure_outcome(record),
             is_rejected_attempt: record_is_rejected_attempt(record),
+            rejection_non_retryable: record_is_rejected_attempt(record)
+                && record.error_kind != Some(astra_core::ErrorKind::ToolInvalidArgs)
+                && record
+                    .runtime_model_result_full
+                    .as_deref()
+                    .or(record.result_full.as_deref())
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .and_then(|result| {
+                        result.get("retryable").and_then(serde_json::Value::as_bool)
+                    })
+                    == Some(false),
             round: record.round,
             disposition: record.effective_disposition(),
             ok: record.ok,
@@ -1884,7 +1896,7 @@ impl ToolEvaluationFact {
                 ReadInvalidation::None
             },
             read_target: extract_read_target(&record.name, args),
-            validation_prefix: normalize_validation_prefix(&record.name, args)
+            validation_prefix: normalize_validation_attempt_prefix(&record.name, args)
                 .map(|prefix| EvaluationIdentity::new(b"validation", &prefix)),
             observation_request_identity,
             observation_result_identity,
@@ -1901,20 +1913,6 @@ impl ToolEvaluationFact {
         &self,
     ) -> Option<&astra_turn_types::task_resolution::ToolExecutionEvidenceRef> {
         self.execution_completion.as_ref()
-    }
-
-    pub fn with_workspace_observation_candidate(mut self, observed: bool) -> Self {
-        self.workspace_observation_candidate = observed;
-        self
-    }
-
-    /// This is an observation-scope fact, not a successful verifier receipt.
-    pub fn is_workspace_observation_candidate(&self) -> bool {
-        self.workspace_observation_candidate
-    }
-
-    pub fn is_assessment_observation_candidate(&self) -> bool {
-        self.assessment_observation_candidate
     }
 
     fn outcome_key(&self, index: usize) -> EvaluationOutcomeKey {
@@ -1995,9 +1993,7 @@ fn observation_evidence_identities(
         return (None, None);
     };
     let result_key = if record.name == "introspect"
-        && args_value
-            .as_ref()
-            .is_some_and(|args| args.get("artifact").is_none() && args.get("explain").is_none())
+        && args_value.as_ref().is_some_and(is_live_snapshot_request)
     {
         let result = delivered_model_result(record).filter(|value| !value.is_empty());
         let Some(result) = result else {
@@ -2025,6 +2021,10 @@ fn observation_evidence_identities(
     )
 }
 
+fn is_live_snapshot_request(args: &serde_json::Value) -> bool {
+    args.get("artifact").is_none() && args.get("explain").is_none()
+}
+
 fn observation_coverage(record: &ToolCallRecord) -> Option<Vec<String>> {
     if record.name != "introspect"
         || !record.ok
@@ -2041,7 +2041,7 @@ fn observation_coverage(record: &ToolCallRecord) -> Option<Vec<String>> {
         return None;
     }
     let args = serde_json::from_str::<serde_json::Value>(args).ok()?;
-    if args.get("artifact").is_some() || args.get("explain").is_some() {
+    if !is_live_snapshot_request(&args) {
         return None;
     }
     let result = delivered_model_result(record).filter(|value| !value.is_empty())?;
@@ -2090,7 +2090,7 @@ fn observation_scope(record: &ToolCallRecord) -> Option<ObservationScope> {
         return None;
     }
     let args = serde_json::from_str::<serde_json::Value>(args).ok()?;
-    if args.get("artifact").is_some() || args.get("explain").is_some() {
+    if !is_live_snapshot_request(&args) {
         return None;
     }
     Some(ObservationScope::from_request(
@@ -2114,7 +2114,7 @@ fn observation_request_key(
     let Some(args) = args else {
         return operation_identity_key(record);
     };
-    if args.get("artifact").is_some() || args.get("explain").is_some() {
+    if !is_live_snapshot_request(args) {
         return operation_identity_key(record);
     }
     let request = crate::introspect::IntrospectRequest::from_args(args);
@@ -2231,6 +2231,19 @@ pub fn active_rejected_fact_keys(
             fact.outcome_key(index),
         )
     }))
+}
+
+/// Retain explicit non-retryability through policy-window compaction and
+/// recovery. Only an authoritative success for the same operation clears it.
+pub fn has_active_non_retryable_rejection(facts: &[ToolEvaluationFact]) -> bool {
+    !active_rejected_keys(facts.iter().enumerate().map(|(index, fact)| {
+        (
+            fact.is_rejected_attempt && fact.rejection_non_retryable,
+            fact.was_executed() && fact.ok,
+            fact.outcome_key(index),
+        )
+    }))
+    .is_empty()
 }
 
 pub fn count_unresolved_tool_outcome_fact_failures(facts: &[ToolEvaluationFact]) -> usize {
@@ -2630,6 +2643,16 @@ fn top_level_shell_delimiters(
 /// a successful `python3 -m pytest`/`cargo test` receipt cannot be mistaken for
 /// an opaque, potentially mutating shell call.
 pub fn normalize_validation_prefix(name: &str, args: &str) -> Option<String> {
+    normalize_validation_prefix_kind(name, args, true)
+}
+
+/// A failed validator-shaped invocation retains debt even when its arguments
+/// cannot prove that a successful invocation actually validated the project.
+pub fn normalize_validation_attempt_prefix(name: &str, args: &str) -> Option<String> {
+    normalize_validation_prefix_kind(name, args, false)
+}
+
+fn normalize_validation_prefix_kind(name: &str, args: &str, require_proof: bool) -> Option<String> {
     if name != "bash" {
         return None;
     }
@@ -2638,52 +2661,181 @@ pub fn normalize_validation_prefix(name: &str, args: &str) -> Option<String> {
     if command.is_empty() {
         return None;
     }
-    bash_command_post_mutation_validation_prefix(command)
+    bash_command_post_mutation_validation_prefix_kind(command, require_proof)
 }
 
-fn normalized_validation_segment(segment: &str) -> Option<String> {
+struct ValidationCandidate {
+    operation: String,
+    proof_eligible: bool,
+}
+
+fn typescript_option_may_skip_validation(word: &str) -> bool {
+    let Some(name) = word.strip_prefix("--").or_else(|| word.strip_prefix('-')) else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "h" | "?"
+            | "help"
+            | "v"
+            | "version"
+            | "all"
+            | "showconfig"
+            | "listfilesonly"
+            | "init"
+            | "nocheck"
+            | "w"
+            | "watch"
+    )
+}
+
+/// TypeScript expands `@file` only at the top level of argv, after an option
+/// has had the chance to consume its operand. These are the CLI-admitted
+/// non-Boolean compiler/watch options; an unknown option does not grant proof.
+fn typescript_option_value_kind(word: &str) -> Option<bool> {
+    let name = word.strip_prefix("--").or_else(|| word.strip_prefix('-'))?;
+    let name = name.to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        "lib"
+            | "typeroots"
+            | "types"
+            | "modulesuffixes"
+            | "customconditions"
+            | "excludedirectories"
+            | "excludefiles"
+    ) {
+        return Some(true); // List: a following switch is not consumed.
+    }
+    matches!(
+        name.as_str(),
+        "generatecpuprofile"
+            | "generatetrace"
+            | "locale"
+            | "project"
+            | "p"
+            | "target"
+            | "t"
+            | "module"
+            | "m"
+            | "jsx"
+            | "outfile"
+            | "outdir"
+            | "rootdir"
+            | "tsbuildinfofile"
+            | "importsnotusedasvalues"
+            | "moduleresolution"
+            | "baseurl"
+            | "sourceroot"
+            | "maproot"
+            | "jsxfactory"
+            | "jsxfragmentfactory"
+            | "jsximportsource"
+            | "out"
+            | "reactnamespace"
+            | "charset"
+            | "newline"
+            | "declarationdir"
+            | "maxnodemodulejsdepth"
+            | "moduledetection"
+            | "ignoredeprecations"
+            | "watchfile"
+            | "watchdirectory"
+            | "fallbackpolling"
+    )
+    .then_some(false)
+}
+
+fn typescript_args_prove_validation(words: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(word) = words.get(index) {
+        if word.starts_with('@') {
+            return false;
+        }
+        if let Some(is_list) = typescript_option_value_kind(word) {
+            let Some(value) = words.get(index + 1) else {
+                return false;
+            };
+            // TypeScript leaves an option-looking token after a list option
+            // for the outer argv parser (e.g. `--types --help`).
+            index += if is_list && value.starts_with('-') {
+                1
+            } else {
+                2
+            };
+            continue;
+        }
+        if typescript_option_may_skip_validation(word) {
+            if words.get(index + 1).is_none_or(|value| value != "false") {
+                return false;
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    true
+}
+
+fn normalized_validation_segment(segment: &str) -> Option<ValidationCandidate> {
+    // Shell command names, subcommands and module names are case-sensitive.
+    // TypeScript's --noEmit option is not: canonicalize only that option for
+    // exact-operation recovery, preserving paths and other arguments.
+    let typescript = ["tsc ", "npx tsc "].into_iter().find_map(|prefix| {
+        let args = segment.strip_prefix(prefix)?;
+        let option_end = args.find(' ').unwrap_or(args.len());
+        if !args[..option_end].eq_ignore_ascii_case("--noEmit") {
+            return None;
+        }
+        let words = split_static_shell_words(args)?;
+        Some(ValidationCandidate {
+            operation: format!("{prefix}--noEmit{}", &args[option_end..]),
+            proof_eligible: typescript_args_prove_validation(&words[1..]),
+        })
+    });
+    if typescript.is_some() {
+        return typescript;
+    }
     if validation_segment_has_meta_option(segment) {
         return None;
     }
-    let lower = segment.to_ascii_lowercase();
-    let recognized = lower.starts_with("cargo check ")
-        || lower == "cargo check"
-        || lower.starts_with("cargo test ")
-        || lower == "cargo test"
-        || lower.starts_with("cargo build ")
-        || lower == "cargo build"
-        || lower.starts_with("npx tsc --noemit")
-        || lower == "tsc --noemit"
-        || lower.starts_with("tsc --noemit ")
-        || lower == "pytest"
-        || lower.starts_with("pytest ")
-        || lower == "python -m pytest"
-        || lower.starts_with("python -m pytest ")
-        || lower == "python3 -m pytest"
-        || lower.starts_with("python3 -m pytest ")
-        || lower == "python -m unittest"
-        || lower.starts_with("python -m unittest ")
-        || lower == "python3 -m unittest"
-        || lower.starts_with("python3 -m unittest ")
-        || lower == "python -m build"
-        || lower.starts_with("python -m build ")
-        || lower == "python3 -m build"
-        || lower.starts_with("python3 -m build ")
-        || lower.starts_with("python setup.py build ")
-        || lower == "python setup.py build"
-        || lower.starts_with("python setup.py build_ext ")
-        || lower == "python setup.py build_ext"
-        || lower.starts_with("python3 setup.py build ")
-        || lower == "python3 setup.py build"
-        || lower.starts_with("python3 setup.py build_ext ")
-        || lower == "python3 setup.py build_ext"
-        || lower == "npm test"
-        || lower.starts_with("npm test ")
-        || lower == "npm run build"
-        || lower.starts_with("npm run build ")
-        || lower == "go test"
-        || lower.starts_with("go test ");
-    recognized.then_some(segment.to_string())
+    let recognized = segment.starts_with("cargo check ")
+        || segment == "cargo check"
+        || segment.starts_with("cargo test ")
+        || segment == "cargo test"
+        || segment.starts_with("cargo build ")
+        || segment == "cargo build"
+        || segment == "pytest"
+        || segment.starts_with("pytest ")
+        || segment == "python -m pytest"
+        || segment.starts_with("python -m pytest ")
+        || segment == "python3 -m pytest"
+        || segment.starts_with("python3 -m pytest ")
+        || segment == "python -m unittest"
+        || segment.starts_with("python -m unittest ")
+        || segment == "python3 -m unittest"
+        || segment.starts_with("python3 -m unittest ")
+        || segment == "python -m build"
+        || segment.starts_with("python -m build ")
+        || segment == "python3 -m build"
+        || segment.starts_with("python3 -m build ")
+        || segment.starts_with("python setup.py build ")
+        || segment == "python setup.py build"
+        || segment.starts_with("python setup.py build_ext ")
+        || segment == "python setup.py build_ext"
+        || segment.starts_with("python3 setup.py build ")
+        || segment == "python3 setup.py build"
+        || segment.starts_with("python3 setup.py build_ext ")
+        || segment == "python3 setup.py build_ext"
+        || segment == "npm test"
+        || segment.starts_with("npm test ")
+        || segment == "npm run build"
+        || segment.starts_with("npm run build ")
+        || segment == "go test"
+        || segment.starts_with("go test ");
+    recognized.then(|| ValidationCandidate {
+        operation: segment.to_string(),
+        proof_eligible: true,
+    })
 }
 
 /// A framework command's help/version mode is an informational query, not a
@@ -2740,6 +2892,13 @@ fn validation_segment_has_meta_option(segment: &str) -> bool {
 /// writer is deliberately not returned; callers must not combine an old
 /// project-wide prefix with a new, weaker observation.
 pub fn bash_command_post_mutation_validation_prefix(command: &str) -> Option<String> {
+    bash_command_post_mutation_validation_prefix_kind(command, true)
+}
+
+fn bash_command_post_mutation_validation_prefix_kind(
+    command: &str,
+    require_proof: bool,
+) -> Option<String> {
     let mut latest = None;
     let control_segments = split_shell_control_segments_with_ops(command)?;
     for (segment_index, (raw_segment, op_after)) in control_segments.iter().enumerate() {
@@ -2767,8 +2926,12 @@ pub fn bash_command_post_mutation_validation_prefix(command: &str) -> Option<Str
             if is_shell_control_segment(&normalized) {
                 continue;
             }
-            if let Some(prefix) = normalized_validation_segment(&normalized) {
-                pipeline_latest = Some(prefix);
+            if let Some(candidate) = normalized_validation_segment(&normalized) {
+                if require_proof && !candidate.proof_eligible {
+                    pipeline_blocked = true;
+                    break;
+                }
+                pipeline_latest = Some(candidate.operation);
                 continue;
             }
             if is_positive_validation_segment(&normalized)
@@ -2855,7 +3018,11 @@ pub fn bash_command_has_post_mutation_validation(command: &str) -> bool {
             if is_shell_control_segment(&normalized) {
                 continue;
             }
-            if normalized_validation_segment(&normalized).is_some() {
+            if let Some(candidate) = normalized_validation_segment(&normalized) {
+                if !candidate.proof_eligible {
+                    pipeline_blocked = true;
+                    break;
+                }
                 pipeline_validation = Some(true);
                 continue;
             }
@@ -3092,6 +3259,21 @@ fn is_shell_control_segment(segment: &str) -> bool {
         || lower.starts_with("set -o pipefail ")
         || lower.starts_with("cd ")
         || lower == "cd"
+}
+
+/// A known shell control with no dynamic expansion or output redirection.
+/// Consumers may treat this as neutral while checking a compound diagnostic,
+/// but an unchecked `set`/`cd` prefix is not itself proof of no side effect.
+pub fn shell_control_segment_is_static_and_neutral(segment: &str) -> bool {
+    let segment = segment.trim();
+    let Some(words) = split_static_shell_words(segment) else {
+        return false;
+    };
+    words
+        .first()
+        .is_some_and(|command| command.chars().all(|ch| !ch.is_ascii_uppercase()))
+        && is_shell_control_segment(&words.join(" "))
+        && !shell_segment_has_non_benign_redirect(segment)
 }
 
 fn is_positive_validation_segment(segment: &str) -> bool {
@@ -3674,6 +3856,131 @@ pub fn eval_signals_to_json_with_thresholds(
         .collect()
 }
 
+/// Project only the feedback signals the runtime currently consumes. The
+/// canonical journal retains every signal, including kinds this consumer does
+/// not act on; malformed known signals never acquire invented counts or names.
+pub fn turn_evaluation_feedback_signals(metadata: &Value) -> Result<Vec<EvalSignal>, &'static str> {
+    let signals = metadata
+        .get("signals")
+        .and_then(Value::as_array)
+        .ok_or("missing evaluation signals")?;
+    let text = |value: &Value, key| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or("invalid evaluation signal text")
+    };
+    let count = |value: &Value, key| {
+        value
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or("invalid evaluation signal count")
+    };
+    signals
+        .iter()
+        .filter_map(|signal| {
+            let kind = match signal.get("kind").and_then(Value::as_str) {
+                Some(kind) => kind,
+                None => return Some(Err("missing evaluation signal kind")),
+            };
+            Some(match kind {
+                "repeat_tool_call" => text(signal, "tool").map(EvalSignal::RepeatToolCall),
+                "stall_detected" => Ok(EvalSignal::StallDetected),
+                "verdict_warning" => Ok(EvalSignal::VerdictWarning),
+                "tool_outcome_failure" => text(signal, "class").and_then(|class| {
+                    count(signal, "count")
+                        .map(|count| EvalSignal::ToolOutcomeFailure { class, count })
+                }),
+                "blocked_tool_call" => {
+                    count(signal, "count").map(|count| EvalSignal::BlockedToolCall { count })
+                }
+                "exploration_family_churn" => text(signal, "family").and_then(|family| {
+                    count(signal, "streak")
+                        .map(|streak| EvalSignal::ExplorationFamilyChurn { family, streak })
+                }),
+                _ => return None,
+            })
+        })
+        .collect()
+}
+
+/// Accept an evaluation only as an exact root terminal's immutable fact. This
+/// validates the existing JournalEvent wire format, without evaluating partial
+/// client observations or constructing another representation of the outcome.
+pub fn turn_evaluation_from_terminal(
+    value: &Value,
+    session_id: Option<&str>,
+    run_id: &str,
+    owner_generation: Option<u64>,
+    status: &str,
+) -> Result<JournalEvent, &'static str> {
+    let event: JournalEvent =
+        serde_json::from_value(value.clone()).map_err(|_| "malformed evaluation journal event")?;
+    let session_id = session_id
+        .filter(|id| !id.is_empty())
+        .ok_or("evaluation has no stream session identity")?;
+    let generation = owner_generation.ok_or("evaluation has no terminal execution generation")?;
+    if event.event_type != astra_services::session_journal::JournalEventType::TurnEvaluation
+        || event.session_id.as_deref() != Some(session_id)
+        || event
+            .producer_scope
+            .as_ref()
+            .map(|scope| scope.run_id.as_str())
+            != Some(run_id)
+        || event.turn.is_none()
+        || event.ts.is_empty()
+    {
+        return Err("evaluation identity does not match the root terminal");
+    }
+    let metadata = event
+        .metadata
+        .as_ref()
+        .ok_or("missing evaluation metadata")?;
+    if metadata
+        .get("execution_owner_generation")
+        .and_then(Value::as_u64)
+        != Some(generation)
+        || metadata.get("run_status").and_then(Value::as_str) != Some(status)
+        || !matches!(
+            metadata.get("source").and_then(Value::as_str),
+            Some("server_runtime" | "server_subrun")
+        )
+    {
+        return Err("evaluation authority does not match the root terminal");
+    }
+    let success = metadata
+        .get("success")
+        .and_then(Value::as_bool)
+        .ok_or("missing evaluation success")?;
+    let tool_success = metadata
+        .get("tool_evaluation_success")
+        .and_then(Value::as_bool)
+        .ok_or("missing tool evaluation success")?;
+    if success != (tool_success && matches!(status, "completed" | "delegated")) {
+        return Err("evaluation contradicts terminal outcome");
+    }
+    for key in ["quality", "confidence"] {
+        if !metadata
+            .get(key)
+            .and_then(Value::as_f64)
+            .is_some_and(|value| (0.0..=1.0).contains(&value))
+        {
+            return Err("invalid evaluation quality or confidence");
+        }
+    }
+    if metadata
+        .get("status_notice")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err("invalid evaluation status notice");
+    }
+    turn_evaluation_feedback_signals(metadata)?;
+    Ok(event)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_turn_evaluation_journal_event(
     session_id: Option<&str>,
@@ -4057,6 +4364,122 @@ mod tests {
             0
         );
         assert!(active_execution_failure_operation_keys(&[record]).is_empty());
+    }
+
+    #[test]
+    fn admitted_coordination_is_not_a_failed_child_execution_or_validation() {
+        let mut record = journal_ok_call("agent");
+        record.tool_call_id = Some("wait-call".into());
+        record.args_full =
+            Some(serde_json::json!({"action":"wait","timeout_ms":120000}).to_string());
+        record.result_full = Some(
+            serde_json::json!({
+                "result_family":"control_receipt", "action":"wait", "success":true,
+                "status":"wait_admitted",
+                "wait_request":{"parent_run_id":"parent","tool_call_id":record.tool_call_id,
+                    "timeout_ms":120000}
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(std::slice::from_ref(&record)),
+            0
+        );
+        assert!(
+            !tool_outcome_is_positive_success(&record),
+            "coordination admission is not evidence that child work or validation succeeded"
+        );
+        let mut annotated = record.clone();
+        annotated.result_class = Some("success".into());
+        annotated.exit_semantics = Some("success".into());
+        assert!(
+            !tool_outcome_is_positive_success(&annotated),
+            "generic success metadata cannot promote a coordination receipt to validation"
+        );
+        let receipt: Value = serde_json::from_str(record.result_full.as_deref().unwrap()).unwrap();
+        let mut opaque = record.clone();
+        opaque.result_full = Some("opaque executor failure".into());
+        opaque.result_class = Some("execution_error".into());
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(std::slice::from_ref(&opaque)),
+            1
+        );
+        opaque.result_class = None;
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(std::slice::from_ref(&opaque)),
+            1
+        );
+        opaque.ok = false;
+        opaque.disposition = Some(astra_services::session_journal::ToolCallDisposition::Rejected);
+        opaque.result_class = Some("execution_error".into());
+        assert_eq!(
+            effective_tool_result_class(&opaque).as_deref(),
+            Some("execution_error"),
+            "a rejected non-JSON executor error must retain its failure classification"
+        );
+        assert_eq!(terminal_rejected_attempt_count(&[opaque]), 1);
+        let mut disguised = record.clone();
+        let mut envelope = receipt.clone();
+        envelope["result_family"] = serde_json::json!("unknown");
+        envelope["group_id"] = serde_json::json!("group");
+        envelope["results"] = serde_json::json!([]);
+        disguised.result_full = Some(envelope.to_string());
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(std::slice::from_ref(&disguised)),
+            1
+        );
+        for invalid_field in ["result_family", "success", "wait_request"] {
+            let mut malformed = receipt.clone();
+            malformed.as_object_mut().unwrap().remove(invalid_field);
+            let mut rejected = record.clone();
+            rejected.result_full = Some(malformed.to_string());
+            assert_eq!(
+                count_unresolved_tool_outcome_failures(std::slice::from_ref(&rejected)),
+                1,
+                "missing {invalid_field} cannot acquire coordination authority"
+            );
+            assert!(!tool_outcome_is_positive_success(&rejected));
+        }
+        for (field, value) in [
+            ("result_family", serde_json::json!("unknown")),
+            ("success", serde_json::json!(false)),
+            ("incomplete", serde_json::json!(true)),
+        ] {
+            let mut malformed = receipt.clone();
+            malformed[field] = value;
+            let mut rejected = record.clone();
+            rejected.result_full = Some(malformed.to_string());
+            assert_eq!(
+                count_unresolved_tool_outcome_failures(std::slice::from_ref(&rejected)),
+                1
+            );
+        }
+        let mut verifier = journal_ok_call("bash");
+        verifier.ok = false;
+        verifier.args_full = Some(serde_json::json!({"command":"cargo test"}).to_string());
+        verifier.result_class = Some("test_failure".into());
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(&[verifier, record.clone()]),
+            1,
+            "a successful coordination receipt must not erase a failed verifier"
+        );
+        for output in [
+            serde_json::json!({"status":"completed","agent_id":"child","result":""}),
+            serde_json::json!({"status":"interrupted","agent_id":"child"}),
+            serde_json::json!({"status":"unknown_status","agent_id":"child"}),
+        ] {
+            let mut incomplete = record.clone();
+            incomplete.args_full =
+                Some(serde_json::json!({"action":"get_result","agent_id":"child"}).to_string());
+            let mut output = output;
+            output["result_family"] = serde_json::json!("child_result");
+            incomplete.result_full = Some(output.to_string());
+            assert_eq!(
+                count_unresolved_tool_outcome_failures(std::slice::from_ref(&incomplete)),
+                1
+            );
+            assert!(!tool_outcome_is_positive_success(&incomplete));
+        }
     }
 
     #[test]
@@ -4536,6 +4959,26 @@ mod tests {
     }
 
     #[test]
+    fn model_catalog_pages_do_not_collapse_into_one_live_snapshot_request() {
+        let mut first = journal_ok_call("model_catalog");
+        first.args_full = Some(serde_json::json!({}).to_string());
+        first.result_full = Some("first complete JSON page".into());
+        let mut second = first.clone();
+        second.args_full =
+            Some(serde_json::json!({"cursor":"next","catalog_revision":"revision"}).to_string());
+        second.result_full = Some("second complete JSON page".into());
+        assert!(observation_scope(&first).is_none());
+        assert!(observation_scope(&second).is_none());
+        let a: serde_json::Value = serde_json::from_str(first.args_full.as_ref().unwrap()).unwrap();
+        let b: serde_json::Value =
+            serde_json::from_str(second.args_full.as_ref().unwrap()).unwrap();
+        assert_ne!(
+            observation_request_key(&first, Some(&a)),
+            observation_request_key(&second, Some(&b))
+        );
+    }
+
+    #[test]
     fn validation_recovery_does_not_cross_working_directories() {
         for (failed_args, success_args) in [
             (
@@ -4902,68 +5345,6 @@ mod tests {
     }
 
     #[test]
-    fn online_progress_continues_when_signal_is_below_threshold() {
-        let decision = decide_online_progress(
-            OnlineProgressSignals {
-                tool_calls: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE,
-                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD - 1,
-                ..OnlineProgressSignals::default()
-            },
-            OnlineProgressPolicy::default(),
-        );
-
-        assert_eq!(decision, OnlineProgressDecision::Continue);
-    }
-
-    #[test]
-    fn online_progress_requires_minimum_observation_volume() {
-        let decision = decide_online_progress(
-            OnlineProgressSignals {
-                tool_calls: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE - 1,
-                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
-                ..OnlineProgressSignals::default()
-            },
-            OnlineProgressPolicy::default(),
-        );
-
-        assert_eq!(decision, OnlineProgressDecision::Continue);
-    }
-
-    #[test]
-    fn online_progress_nudges_on_structured_redundant_reads_only_after_threshold() {
-        let decision = decide_online_progress(
-            OnlineProgressSignals {
-                tool_calls: ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE,
-                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD,
-                ..OnlineProgressSignals::default()
-            },
-            OnlineProgressPolicy::default(),
-        );
-
-        assert_eq!(
-            decision,
-            OnlineProgressDecision::ReuseKnownContext {
-                redundant_overlapping_reads: REDUNDANT_OVERLAPPING_READS_THRESHOLD
-            }
-        );
-    }
-
-    #[test]
-    fn online_progress_does_not_stack_on_existing_intervention() {
-        let decision = decide_online_progress(
-            OnlineProgressSignals {
-                tool_calls: 100,
-                redundant_overlapping_reads: 100,
-                stronger_advisory_emitted: true,
-                ..OnlineProgressSignals::default()
-            },
-            OnlineProgressPolicy::default(),
-        );
-
-        assert_eq!(decision, OnlineProgressDecision::Continue);
-    }
-
-    #[test]
     fn evaluate_tool_call_records_marks_unresolved_outcome_failure_unsuccessful() {
         let mut record = journal_ok_call("bash");
         record.args_full = Some(
@@ -5183,6 +5564,7 @@ mod tests {
             serde_json::json!({
                 "status": "interrupted",
                 "agent_id": "reviewer@abc",
+                "result_family": "child_result",
                 "finish_reason": "empty_completion",
                 "incomplete": true,
                 "result": "partial review"
@@ -5210,6 +5592,7 @@ mod tests {
         active.result_full = Some(
             serde_json::json!({
                 "status": "still_running",
+                "result_family": "child_result",
                 "agent_id": "reviewer@abc"
             })
             .to_string(),
@@ -5236,6 +5619,7 @@ mod tests {
             serde_json::json!({
                 "status": "interrupted",
                 "agent_id": "reviewer@abc",
+                "result_family": "child_result",
                 "incomplete": true
             })
             .to_string(),
@@ -5246,6 +5630,7 @@ mod tests {
             serde_json::json!({
                 "status": "completed",
                 "agent_id": "reviewer@abc",
+                "result_family": "child_result",
                 "result": "done"
             })
             .to_string(),
@@ -5286,6 +5671,7 @@ mod tests {
                     "agent_id": "reviewer@abc",
                     "result": {
                         "status": "interrupted",
+                        "result_family": "child_result",
                         "agent_id": "reviewer@abc",
                         "incomplete": true
                     }
@@ -5318,6 +5704,7 @@ mod tests {
                     "agent_id": "reviewer@abc",
                     "result": {
                         "status": "still_running",
+                        "result_family": "child_result",
                         "agent_id": "reviewer@abc"
                     }
                 }]
@@ -5354,6 +5741,7 @@ mod tests {
                     "agent_id": "reviewer@abc",
                     "result": {
                         "status": "still_running",
+                        "result_family": "child_result",
                         "agent_id": "reviewer@abc"
                     },
                     "recovery": {
@@ -7298,6 +7686,17 @@ mod tests {
             None
         );
         assert!(bash_command_post_mutation_validation_prefix("npx tsc --noEmit").is_some());
+        for command in [
+            "CARGO TEST",
+            "cargo TEST",
+            "python3 -m PYTEST",
+            "npm run BUILD",
+        ] {
+            assert!(
+                bash_command_post_mutation_validation_prefix(command).is_none(),
+                "case-sensitive executable or subcommand cannot prove validation: {command}"
+            );
+        }
         assert!(bash_command_post_mutation_validation_prefix("npm run build").is_some());
         assert!(
             bash_command_post_mutation_validation_prefix("python setup.py build_ext --inplace")
@@ -7379,6 +7778,118 @@ mod tests {
         assert!(split_static_shell_words("cp $DEST source").is_none());
         assert!(split_static_shell_words("cp src 'unterminated").is_none());
         assert!(split_static_shell_words("cp src | tee out").is_none());
+    }
+
+    #[test]
+    fn typescript_validation_separates_attempt_from_positive_proof() {
+        for (command, operation) in [
+            ("tsc --noEmit", "tsc --noEmit"),
+            ("tsc --noemit false", "tsc --noEmit false"),
+            (
+                "npx tsc --NOEMIT src/CaseSensitive.ts",
+                "npx tsc --noEmit src/CaseSensitive.ts",
+            ),
+            ("tsc --noEmit --project .", "tsc --noEmit --project ."),
+            ("tsc --noEmit --strict", "tsc --noEmit --strict"),
+            ("tsc --noEmit --pretty false", "tsc --noEmit --pretty false"),
+            (
+                "tsc --noEmit --noCheck false",
+                "tsc --noEmit --noCheck false",
+            ),
+            ("tsc --noEmit --watch false", "tsc --noEmit --watch false"),
+            ("tsc --noEmit --HELP false", "tsc --noEmit --HELP false"),
+            (
+                "tsc --noEmit --types @scope/custom index.ts",
+                "tsc --noEmit --types @scope/custom index.ts",
+            ),
+            (
+                "npx tsc --NOEMIT --typeRoots @scope/types index.ts",
+                "npx tsc --noEmit --typeRoots @scope/types index.ts",
+            ),
+            (
+                "tsc --noEmit --types --help false",
+                "tsc --noEmit --types --help false",
+            ),
+            (
+                "tsc --noEmit -p @config.json",
+                "tsc --noEmit -p @config.json",
+            ),
+            (
+                "tsc --noEmit --outDir --help false",
+                "tsc --noEmit --outDir --help false",
+            ),
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            assert_eq!(
+                normalize_validation_attempt_prefix("bash", &args),
+                Some(operation.into())
+            );
+            assert_eq!(
+                normalize_validation_prefix("bash", &args),
+                Some(operation.into())
+            );
+        }
+        for (command, operation) in [
+            ("tsc --noemit --HELP null", "tsc --noEmit --HELP null"),
+            (
+                "tsc --noemit --help '-?' false",
+                "tsc --noEmit --help '-?' false",
+            ),
+            (
+                "tsc --noEmit --help --outDir --help false",
+                "tsc --noEmit --help --outDir --help false",
+            ),
+            ("tsc --noEmit --noCheck", "tsc --noEmit --noCheck"),
+            ("tsc --noEmit --types --help", "tsc --noEmit --types --help"),
+            ("tsc --noEmit @args.rsp", "tsc --noEmit @args.rsp"),
+            (
+                "tsc --noEmit --strict @args.rsp",
+                "tsc --noEmit --strict @args.rsp",
+            ),
+            (
+                "tsc --noEmit --types @scope/custom @args.rsp",
+                "tsc --noEmit --types @scope/custom @args.rsp",
+            ),
+            (
+                "tsc --noEmit --types --strict @args.rsp",
+                "tsc --noEmit --types --strict @args.rsp",
+            ),
+            (
+                "tsc --noEmit --types --outDir --types @args.rsp",
+                "tsc --noEmit --types --outDir --types @args.rsp",
+            ),
+            ("tsc --noEmit --types", "tsc --noEmit --types"),
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            assert_eq!(
+                normalize_validation_attempt_prefix("bash", &args),
+                Some(operation.into())
+            );
+            assert!(
+                normalize_validation_prefix("bash", &args).is_none(),
+                "{command}"
+            );
+            assert!(
+                !bash_command_has_post_mutation_validation(command),
+                "{command}"
+            );
+        }
+        for command in [
+            "TSC --noemit",
+            "npx TSC --noemit",
+            "tsc --noEmitExtra",
+            "tsc --noemit $FLAGS",
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            assert!(
+                normalize_validation_attempt_prefix("bash", &args).is_none(),
+                "{command}"
+            );
+            assert!(
+                normalize_validation_prefix("bash", &args).is_none(),
+                "{command}"
+            );
+        }
     }
 
     #[test]

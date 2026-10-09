@@ -4,6 +4,57 @@ use astra_services::session_journal::{
     BLOCKED_TOOL_RESULT_CLASS, NOOP_OR_CACHED_RESULT_CLASS, ToolCallDisposition, ToolCallRecord,
 };
 
+/// Audit an already settled provider callback. This does not issue execution
+/// authority or synthesize a durable invocation receipt.
+#[must_use]
+pub fn journal_record_edge_tool_result(
+    result: &crate::sse_stream_host::EdgeToolExecResult,
+) -> ToolCallRecord {
+    let args = result.args.to_string();
+    let content = crate::edge_ledger::tool_content_from_callback_output(
+        &result.status,
+        result.output.clone(),
+    );
+    let output = crate::tool_result_sanitize::tool_result_content_for_model_unbounded(
+        &result.tool,
+        &content,
+    );
+    let mut record = journal_record_executed_tool_call(
+        result.tool.clone(),
+        astra_tools::tool_result_status::ToolResultStatusKind::from_status_str(&result.status)
+            .is_failure(),
+        result.duration_ms,
+        u32::try_from(args.len()).unwrap_or(u32::MAX),
+        &output,
+        None,
+        None,
+        Some(args),
+    );
+    record.tool_call_id = Some(result.request_id.clone());
+    record.execution_completion = result.execution_completion.clone();
+    let fields = result.tool_result_fields.as_ref();
+    record.disposition = Some(
+        fields
+            .and_then(|fields| fields.get("disposition"))
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or(ToolCallDisposition::Executed),
+    );
+    record.error_kind = fields
+        .and_then(|fields| fields.get("error_kind"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(astra_core::ErrorKind::parse_tag);
+    record.exit_semantics = fields
+        .and_then(|fields| fields.get("exit_semantics"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    record.result_class = fields
+        .and_then(|fields| fields.get("result_class"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    record
+}
+
 #[must_use]
 pub fn journal_record_duplicate_within_turn(
     tool_call_id: String,
@@ -394,6 +445,90 @@ fn bounded_journal_result(result: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callback_audit_matches_remote_content_for_each_terminal_status() {
+        for (tool, status, output, expected, failed) in [
+            (
+                "read_file",
+                "completed",
+                "read result",
+                "read result",
+                false,
+            ),
+            (
+                "read_file",
+                "failed",
+                "Denied by policy",
+                "status=failed\nDenied by policy",
+                true,
+            ),
+            (
+                "read_file",
+                "cancelled",
+                "Stopped",
+                "status=cancelled\nStopped",
+                true,
+            ),
+            (
+                "read_file",
+                "failed",
+                r#"{"error":"denied"}"#,
+                r#"{"error":"denied"}"#,
+                true,
+            ),
+            ("read_file", "failed", "", r#"{"status":"failed"}"#, true),
+            (
+                "write_file",
+                "completed",
+                r#"{"message":"written","_cli_diff":"display only"}"#,
+                r#"{"message":"written"}"#,
+                false,
+            ),
+            (
+                "str_replace",
+                "failed",
+                "Conflict\n<<<ASTRA_UNIFIED_DIFF>>>\ndisplay only\n<<<END_ASTRA_UNIFIED_DIFF>>>\n",
+                "status=failed\nConflict",
+                true,
+            ),
+        ] {
+            let result = crate::sse_stream_host::EdgeToolExecResult {
+                request_id: "call-1".into(),
+                tool: tool.into(),
+                args: serde_json::json!({"path": "document.txt"}),
+                output: output.into(),
+                status: status.into(),
+                duration_ms: 1,
+                tool_result_fields: None,
+                execution_completion: None,
+            };
+            let local = journal_record_edge_tool_result(&result);
+            let remote_content = crate::edge_ledger::tool_content_from_ledger_entry(
+                &serde_json::json!({"body": {"status": status, "output": output}}),
+            );
+            let remote_content =
+                crate::tool_result_sanitize::tool_result_content_for_model_unbounded(
+                    tool,
+                    &remote_content,
+                );
+            let remote = journal_record_executed_tool_call(
+                tool.into(),
+                failed,
+                1,
+                0,
+                &remote_content,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(local.result_full.as_deref(), Some(expected));
+            assert_eq!(local.result_full, remote.result_full);
+            assert_eq!(local.error, remote.error);
+            assert_eq!(local.ok, !failed);
+            assert_eq!(local.tool_call_id.as_deref(), Some("call-1"));
+        }
+    }
 
     #[test]
     fn duplicate_record_fields() {

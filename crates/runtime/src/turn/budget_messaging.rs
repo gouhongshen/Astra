@@ -17,7 +17,7 @@
 
 /// Advisory posted when measured input tokens still exceed
 /// `max_turn_input_tokens` AFTER the aggressive compression pipeline and
-/// spill-to-disk have both run. Pure fact: states the measured pressure
+/// artifact spill have both run. Pure fact: states the measured pressure
 /// and the runtime actions already taken. The agent's action space is
 /// unconstrained; the latest user request remains authoritative.
 pub const BUDGET_REACHED_ADVISORY: &str = "Context note: input tokens reached the configured \

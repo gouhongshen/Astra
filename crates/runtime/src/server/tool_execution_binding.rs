@@ -192,6 +192,10 @@ pub(crate) fn runtime_execution_provider_id_for_executor(executor: &ExecutorBind
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ToolPolicySnapshot {
+    /// Invocation-local monotonic admission cutoff selected from the admitted
+    /// run authority. Never a provider permission or a serialized deadline.
+    #[serde(skip)]
+    pub admission_deadline: Option<std::time::Instant>,
     pub allowed_tools: Vec<String>,
     pub approval_policy: Option<String>,
     pub network_policy: Option<String>,
@@ -218,6 +222,10 @@ pub struct ToolPolicySnapshot {
     /// route execution, preventing policy TOCTOU within one invocation.
     #[serde(skip)]
     pub admission_snapshot: Option<ToolExecutionAdmissionSnapshot>,
+    /// Trusted, invocation-local delegation instruction. The durable decision
+    /// persists this separately; provider/tool arguments must never carry it.
+    #[serde(skip)]
+    pub delegation_model_admission: Option<astra_turn_types::DelegationModelAdmission>,
     /// Server-derived Session provider-selection generation. It is runtime
     /// authority only and is deliberately omitted from serialized provider
     /// requests and durable tool decisions.
@@ -228,14 +236,18 @@ pub struct ToolPolicySnapshot {
     /// never serialized to an external executor or accepted from tool args.
     #[serde(skip)]
     pub expected_control_epoch: Option<i64>,
-    /// Request-local completion authority; never accepted from serialized input.
-    #[serde(skip)]
-    pub task_resolution_authority:
-        Option<astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     /// Concrete, trusted revision facts for one semantic pure-read decision.
     /// Eligibility in the provider descriptor is insufficient without this.
     #[serde(skip)]
     pub semantic_read_freshness: Option<astra_turn_types::SemanticReadFreshnessResolution>,
+}
+
+impl ToolPolicySnapshot {
+    /// Fence only new dispatch. Already-started execution keeps its existing
+    /// completion owner and drains its result under the total bound.
+    pub(crate) fn dispatch_deadline_rejection(&self) -> Option<astra_tools::ToolResult> {
+        astra_tools::dispatch_deadline_result(self.admission_deadline, false)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -634,13 +646,17 @@ mod tests {
     fn durable_control_epoch_is_not_a_provider_wire_field() {
         let mut policy = ToolPolicySnapshot {
             expected_control_epoch: Some(7),
+            admission_deadline: Some(std::time::Instant::now()),
             ..ToolPolicySnapshot::default()
         };
         let mut wire = serde_json::to_value(&policy).expect("serialize policy wire");
         assert!(wire.get("expected_control_epoch").is_none());
+        assert!(wire.get("admission_deadline").is_none());
 
         wire["expected_control_epoch"] = json!(99);
+        wire["admission_deadline"] = json!("unbounded");
         policy = serde_json::from_value(wire).expect("decode provider-shaped policy");
+        assert!(policy.admission_deadline.is_none());
         assert_eq!(
             policy.expected_control_epoch, None,
             "external/provider bytes cannot manufacture action-admission authority"

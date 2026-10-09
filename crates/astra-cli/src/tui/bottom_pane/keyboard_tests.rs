@@ -18,6 +18,82 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 
 #[test]
+fn binding_retained_root_preserves_child_and_navigator_focus() {
+    for durable in [false, true] {
+        for child_visible in [false, true] {
+            let mut pane = BottomPane::new();
+            if durable {
+                pane.ensure_durable_root_transcript("session".into(), 80, 24);
+            } else {
+                pane.push_view(Box::new(TranscriptView::from_snapshot(
+                    TranscriptSnapshot::new(vec![]),
+                    24,
+                    80,
+                )));
+            }
+            if child_visible {
+                pane.push_view(Box::new(AgentTranscriptView::live_unbound(
+                    "child".into(),
+                    "Child".into(),
+                    "child-run".into(),
+                    None,
+                    "agents",
+                    80,
+                    24,
+                )));
+            } else {
+                pane.push_view(Box::new(InFlightAgentsView::new(Vec::<AgentRow>::new())));
+            }
+            let focused = pane.active_conversation_tab_id();
+            let view_count = pane.view_stack.len();
+            assert_eq!(
+                pane.promote_open_root_transcript_to_durable("session".into(), 80, 24),
+                !durable,
+            );
+            assert_eq!(pane.active_conversation_tab_id(), focused);
+            assert_eq!(pane.view_stack.len(), view_count);
+            assert!(!pane.promote_open_root_transcript_to_durable("session".into(), 80, 24));
+            assert_eq!(pane.active_conversation_tab_id(), focused);
+            assert!(!pane.ensure_durable_root_transcript("session".into(), 80, 24));
+            assert_eq!(
+                pane.active_conversation_tab_id(),
+                Some(super::view::ConversationTabId::Root)
+            );
+        }
+    }
+}
+
+#[test]
+fn retained_root_page_completion_dispatches_one_pending_reload_without_a_keypress() {
+    use super::root_transcript_view::{RootTranscriptSource, RootTranscriptUpdate};
+
+    let mut pane = BottomPane::new();
+    pane.ensure_durable_root_transcript("session".into(), 80, 24);
+    pane.push_view(Box::new(InFlightAgentsView::new(Vec::<AgentRow>::new())));
+    let focused = pane.active_conversation_tab_id();
+    assert!(pane.refresh_root_transcript_committed("session"));
+    assert!(pane.take_projection_action().is_none());
+    assert!(pane.refresh_root_transcript(RootTranscriptUpdate::Loaded {
+        session_id: "session".into(),
+        page: astra_thin_client::SessionTranscriptPage {
+            session_id: "session".into(),
+            items: vec![],
+            next_before_seq: None,
+            has_more: false,
+        },
+        replace: true,
+        source: RootTranscriptSource::DurableServer,
+    }));
+    assert!(matches!(
+        pane.take_projection_action(),
+        Some(BottomPaneViewAction::LoadRootTranscript { session_id, before_seq: None, .. })
+            if session_id == "session"
+    ));
+    assert!(pane.take_projection_action().is_none());
+    assert_eq!(pane.active_conversation_tab_id(), focused);
+}
+
+#[test]
 fn cancelling_task_status_ignores_late_activity_until_terminal_settlement() {
     let mut pane = BottomPane::new();
     let started_at = Instant::now();
@@ -101,6 +177,7 @@ fn backtab_stays_with_an_active_permission_picker() {
 fn terminal_agent_workbench_remains_until_explicit_close() {
     let mut pane = BottomPane::new();
     pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
+        kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
         agent_id: "reviewer@done".into(),
         name: "reviewer".into(),
         spawn_tool_call_id: None,
@@ -134,6 +211,7 @@ fn terminal_agent_workbench_remains_until_explicit_close() {
 fn typed_inspect_action_keeps_run_navigator_as_transcript_parent() {
     let mut pane = BottomPane::new();
     pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
+        kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
         spawn_tool_call_id: None,
@@ -249,6 +327,7 @@ fn expanded_transcript_routes_down_to_its_last_detail_row() {
 fn returning_to_run_tree_preserves_agent_conversation_tab() {
     let mut pane = BottomPane::new();
     pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
+        kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
         spawn_tool_call_id: None,
@@ -373,6 +452,7 @@ fn conversation_tabs_cycle_in_stable_workspace_order() {
 #[test]
 fn hidden_run_tree_receives_updates_while_an_agent_transcript_is_focused() {
     let row = AgentRow {
+        kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
         spawn_tool_call_id: None,
@@ -418,7 +498,15 @@ fn hidden_run_tree_receives_updates_while_an_agent_transcript_is_focused() {
     let mut buffer = Buffer::empty(area);
     pane.render(area, &mut buffer);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
+    assert!(rendered.contains("No active agent runs"), "{rendered}");
+    assert!(rendered.contains("H history"), "{rendered}");
+
+    pane.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+    let mut buffer = Buffer::empty(area);
+    pane.render(area, &mut buffer);
+    let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(rendered.contains("done"), "{rendered}");
+    assert!(rendered.contains("reviewer"), "{rendered}");
 }
 
 #[test]
@@ -439,6 +527,7 @@ fn transcript_location_refresh_emits_one_typed_durable_load_action() {
     );
 
     let row = AgentRow {
+        kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
         spawn_tool_call_id: None,
@@ -494,7 +583,10 @@ fn hidden_agent_conversation_keeps_receiving_typed_live_events() {
     assert!(pane.refresh_agent_live_event(&AgentLiveEvent {
         agent_id: "agent-reviewer".into(),
         run_id: "run-reviewer".into(),
-        kind: AgentLiveEventKind::OutputDelta("completed finding".into()),
+        kind: AgentLiveEventKind::OutputDelta {
+            model_item_id: Some("test-model-item".into()),
+            text: "completed finding".into()
+        },
     }));
     assert!(pane.close_active_view());
 
@@ -512,6 +604,7 @@ fn hidden_agent_conversation_keeps_receiving_typed_live_events() {
 fn typed_cancel_action_keeps_owning_view_open() {
     let mut pane = BottomPane::new();
     pane.push_view(Box::new(InFlightAgentsView::new(vec![AgentRow {
+        kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
         agent_id: "reviewer@active".into(),
         name: "reviewer".into(),
         spawn_tool_call_id: None,

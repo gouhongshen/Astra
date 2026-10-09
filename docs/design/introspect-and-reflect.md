@@ -1,7 +1,7 @@
 # Introspect and reflect
 
 > Status: target design contract.
-> Last updated: 2026-07-07.
+> Last updated: 2026-09-28.
 
 Introspect and reflect are first-class backbone capabilities. They are not debug-only tools and not prompt decorations.
 
@@ -30,11 +30,66 @@ Introspect reports system facts. Reflect reasons over those facts.
 
 Introspection must be factual, structured, and bounded. Reflection may synthesize strategy, uncertainty, and next actions, but should not mutate state by itself.
 
-Explain snapshots are discovered lazily through the same `introspect` tool:
-`explain={target:"previous"}` excludes the current server root, while
-`explain={target:"run",run_id:"…"}` selects an exact authorized root in the
-active session. Discovery returns the first bounded window and a fixed opaque
-artifact handle for subsequent pages. Ordinary server chat preparation does
+The errors facet includes current-run pre-dispatch refusals from the existing
+tool records, explicitly marked `admission_rejected`, separately from execution
+failures. It does not increment executor health or infer a dispatch. Records
+without captured wall-clock time show unknown age rather than a fabricated
+timestamp. The bounded projection retains the rejection's call and round
+identity and credential-safe reason, without another storage read.
+
+## On-demand authorized model discovery
+
+`model_catalog({"limit":16})` discovers authorized active Chat models as JSON.
+It is a deferred tool discoverable through `tool_search(select:model_catalog)`;
+resident introspect points to it. Its only optional inputs are `limit`, `cursor`,
+and `catalog_revision`. Unknown inputs and invalid pagination are typed errors.
+Introspect retains its observation, Explain, and artifact-recovery selectors,
+but model discovery no longer shares those diagnostic parameters.
+
+Authentication binds an inert, non-serialized reader, inherited by dynamic
+children and skill forks. HTTP and introspection share the authorization owner:
+normal principals use `ModelService::user_model_catalog`; restricted Edge
+registrations use `AuthService::external_catalog_by_scope`, never the owner's
+full catalog. Chat/WebSocket and Work turns retain the authenticated principal.
+Missing bindings (including local CLI) return `unsupported`; owner mismatches
+return `unauthorized`. Reconstruction requires a fresh authenticated binding.
+
+Only explicit discovery reads the catalog: one service read, potentially multiple
+SQL queries, with a five-second deadline. Ordinary turns and other facets add
+zero catalog/filesystem reads. Discovery bypasses diagnostic reads and never
+searches local configuration. No cache, background refresh or admission grant
+is created; execution still revalidates authorization and provider capabilities.
+
+The top-level page carries Chat purpose, scope, time, revision,
+items, total, returned count, cursor and coverage. Its allowlisted items expose
+Offering/name/provider/access identities, placement, context limits and nullable
+thinking capability/pricing—not descriptions, raw configuration, keys or endpoints.
+Unknown prices remain null; configuration timestamps are not billing facts.
+
+Pages default to 16, maximum 32 entries and 16 KiB for the complete envelope.
+Continue with `cursor=next_cursor` and the same `catalog_revision`.
+Sorting, revision and pagination use the one loaded snapshot; cursors identify
+the last returned row and must exist in the current authorized set. A changed
+revision returns `catalog_changed` and requires restarting. Oversized or unsafe
+rows fail explicitly; source-bounded presentation preserves full inline JSON.
+`complete` means the whole catalog fits this response; continuation pages remain
+`page`. Empty success has total zero; failure has null total and a fixed typed
+error with reason-specific retryability, never raw backend error text.
+
+## Runtime and artifact observations
+
+Historical execution is read lazily through the same `introspect` tool:
+`explain={target:"previous"}` selects the latest root strictly before the trusted
+current server root's `(created_at, run_id)` admission key for the authenticated
+user in the active session. A missing, foreign, or non-root current fails closed;
+later-admitted roots are never previous. Selection is ordered by created time
+then run ID descending. Child runs, later updates, and Explain
+eligibility do not affect that choice; unavailable evidence never selects an
+older run. `explain={target:"run",run_id:"…"}` selects an exact authorized run
+in the active session, including a child. Both selectors return the existing
+bounded durable projection for ordinary runs without creating an artifact.
+Runs that requested Explain retain the artifact summary/window and fixed opaque
+handle for subsequent pages. Ordinary server chat preparation does
 not discover or recover reports. Local CLI/Edge selectors explicitly report
 unsupported; existing local handles remain usable through their local reader.
 Identity, physical-absence-only recovery, capture completeness and window
@@ -48,10 +103,36 @@ visible with incomplete token coverage; it is never a zero-token call. Explain
 uses the same ledger at turn scope. Classification confidence and reflection's
 inferred confidence are distinct; neither proves that a direction was applied
 or that Work was delivered.
+
+Reflect also summarizes its existing bounded request-context window by run,
+agent, Offering, provider, configured/upstream model, and purpose. Physical
+retries count separately; repeated terminal request facts count once. At most
+eight identity groups are rendered, with an explicit omitted-group count.
+Deduplication uses the canonical physical request ID, not a second composite
+identity derived from the attempt index. Conflicting terminal facts for that
+ID count as one unknown request; their usage and model attribution are excluded
+and the conflict count is visible. Input order cannot decide which conflicting
+identity or usage wins.
+The aggregate covers captured terminal requests, not complete session billing.
+Exact, partial, unavailable, and unknown usage remain separate. Missing usage
+renders unknown; a reported zero remains zero. Cache percentage is shown only
+when every captured terminal request has an exact usage payload, the producer
+reports cache coverage for every positive-input request, and the input
+denominator is positive. Incomplete usage retains known token counts without
+claiming a cache percentage. Display identities are bounded and escaped.
 The session view covers the supported judgment operations (request admission,
-skill routing, memory relevance/feedback, tool-result selection, verification,
+skill routing, memory relevance/feedback, completion-proxy tool-result rerank, verification,
 and completion-proxy turn intent), not every auxiliary model call. Routine hint/summary projections
 bound group detail and report how many groups were omitted.
+
+The typed `model_requests` section reports ledger-window coverage separately
+from terminal usage: accepted rows do not establish dispatch, a missing
+provider-response ID does not establish that no request reached the provider,
+and `delivery_unknown` remains distinct from failure or cancellation. Child
+groups retain `parent_run_id`; an unavailable, empty, or capped capture never
+means zero child inference or complete session billing. Execution facts may
+include a scoped tool's disposition and typed result class, but not its prompt,
+arguments, output preview, or arbitrary metadata.
 
 Runtime introspection also exposes typed `judgment_usage` in its snapshot and
 session/overview/recent/trace reports, using the same owner/session-scoped
@@ -117,26 +198,19 @@ Their zero-length intervals mark observation instants, not inference latency;
 measured provider duration and usage retain their existing owners. Labels are
 derived from the typed facts and are never parsed back into semantic state.
 
-Historical tool-result selection observations retain a separate shared read
-projection for explicit `facet=trace` introspection and reflection; routine
-overview, recent, and session views omit this historical source without querying
-it. Omission is not evidence that no historical judgments exist. The agent loop no longer evaluates
-or applies new tool-result selection decisions: the optional semantic rerank did
-not demonstrate a reliable reduction of the final provider context, while even
-the no-auxiliary route scanned candidates and read frozen decisions. Trace
-decoding remains for historical audit; the unused recommendation builder and
-trace producer are removed rather than kept as a dormant execution path.
-Historical evaluation traces describe recommendations, and immutable receipts
-describe
-what an earlier provider wire contained; neither is evidence of a new runtime
-selection. A recommendation without a receipt has unconfirmed application. A
-receipt without a trace is valid historical application evidence but does not
-recover the missing evaluation rationale. A `Started` trace without a terminal
-trace is reported as missing terminal evidence, not inferred to be a
-cancellation or interruption. Evaluation and application capture have
-independent bounded-coverage states; conflicting identities are quarantined
-without discarding unrelated facts. Default text is a compact outcome summary;
-hashes, ranges and internal identities remain diagnostic details.
+Tool-result selection and its dedicated historical projection are retired. The
+runtime does not evaluate selection recommendations, freeze projection decisions,
+or publish application receipts. Introspection and reflection retain current
+semantic observations, provider usage and generic trace evidence; they do not
+query or decode a special historical selector source. The fresh schema contract
+excludes the retired decision/receipt tables and event field. Old databases are
+not accepted by this contract, and no compatibility decoder or migration is
+provided. Provider-wire identity, canonical history, admission ownership and
+current accepted-to-terminal recovery retain their existing contracts.
+
+Runtime tool fallback permitted by source policy uses the populated runtime snapshot.
+The unused `InspectionService` journal-derived summary path is retired; missing runtime evidence
+remains unknown rather than being reconstructed as zero or task progress.
 
 ## Goals
 
@@ -191,7 +265,14 @@ succeeds; requesting valid parameters alone does not prove observations were
 obtained.
 
 Routine self-diagnosis starts with a summary overview (or hint for a quick
-check), reusing applicable observations. System guidance, tool descriptions,
+check), reusing applicable observations. Current-state questions use Introspect;
+persisted execution questions can use resident Reflect directly, without a
+mandatory live observation first. Keep each fact's run/turn scope separate from
+the observing invocation: current snapshot counters are not previous-run totals,
+and waiting duration is not the child's execution duration. Captured execution
+does not establish independent task verification; verification is warranted by
+an unmet acceptance condition or counter-evidence, not delegation alone.
+System guidance, tool descriptions,
 and bundled workflows must agree on this default. A concrete evidence gap or
 an explicit deep-audit request can justify deeper inspection; no fixed call
 quota limits recovery. Snapshot claims must exclude later diagnostic calls,
@@ -238,22 +319,49 @@ It should not dump the whole prompt unless explicit debug permission allows it.
 
 Routine reflection defaults to `summary`. `hint` and `summary` return bounded
 observations, supporting evidence, and prioritized actions without expanding
-the causal graph. Omitted material is reported through the result budget;
+the full causal graph. Summary may retain a bounded, run-scoped execution spine
+from the existing event window: spawning, waiting, termination, and result
+adoption are distinct facts, not interchangeable completion verdicts. Typed run
+and agent identities establish attribution; missing, conflicting, redacted, or
+budgeted-away facts remain unknown. Absence of a `get_result` call does not prove
+that no result was delivered. This projection adds no database queries or
+lifecycle authority. Reflect and Introspect share support-aware evidence
+selection, keeping selected observations and their evidence together.
+Omitted material is reported through the result budget;
 retained observations and actions must not contain dangling evidence references.
 Explicit `diagnostic` and `forensic` requests retain deeper evidence and graph
 inspection. This is progressive disclosure, not a usage quota or tool disablement.
 Server-backed and local-journal reflection share the same report projection.
 
-CLI reflection also projects typed semantic judgment traces from an explicitly
-owner-local journal window through the shared strict decoder/projector. The
-scope is `local_journal_at_read`, not server history or the requested time
-horizon. Reads retain at most 512 journal records and read at most 256 KiB;
-boundary records may be conservatively omitted. Truncation, malformed records,
-and session/turn mismatches remain coverage gaps. Missing or unreadable journals
-have unavailable counts, not known zero judgments. Even an empty existing
-journal cannot establish that no judgments occurred upstream.
+CLI reflection and introspection resolve the profile-local and attached
+authenticated-account journal owners from one CLI identity snapshot; a
+conversation cursor is lineage, never read authority. Each authorized source
+uses the same bounded observation reader (at most 512 records / 256 KiB per
+source), with session identity checked before merging and duplicate run/round
+facts counted once. Account runtime rounds and trace spans can therefore be
+observed even when the root conversation is profile-local. Conflicting rounds
+are excluded and reported, not attributed by file order. Typed semantic
+judgments from both authorized sources use one canonical deduplication and
+conflict projection; an empty account window cannot hide a local fact. This is bounded historical
+evidence (`local_journal_at_read`), not complete session history or a billing
+ledger. Missing sources, truncation, malformed records and identity mismatches
+remain explicit coverage gaps; an empty window does not prove no judgment ran.
+These reads are local files only and do not add database or network calls.
+An I/O error in either journal degrades that source's coverage without
+discarding valid observations from the other authorized source; a
+session-identity mismatch still fails closed. Default CLI reflection reuses this already-read bounded window for
+local evidence, while retaining its existing cloud snapshot lookup; it does
+not reread the entire local journal for presentation.
+Execution reflection can report the count and slowest duration of captured
+LLM rounds plus the longest captured trace span; overlapping spans are not
+summed into wall time. Preview metadata is an allowlist, not raw trace attrs.
 
 `local_only` CLI reflection bypasses cloud restoration entirely. CLI reflection
+with `cloud_only` reads only the cloud snapshot, not local workspace or journal;
+`live_only` has no live CLI observation source and reports unavailable without
+falling back to persisted state. `auto`, `live_first`, and `durable_first`
+reuse the bounded local window and the existing cloud snapshot lookup.
+CLI reflection
 and introspection can read physical judgment usage from the latest owner-local
 typed Explain artifact, bounded to 4 MiB with a 16 KiB index. The reader checks
 handle, checksum, size, schema and session/run/turn identity, then uses the

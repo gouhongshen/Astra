@@ -74,3 +74,14 @@ Nightly/PR matrix tests remain the authority for auth, persistence, HTTP
 boundaries, cross-user isolation, and concurrent Edge callbacks. The harness
 inventory prevents a new capability from being considered complete unless it
 also adds an unhappy-path contract and names the system-level proof.
+
+Trace recording and privacy remain owned by `SessionTrace` and `RecordingKernel`;
+contract checks remain in the capability matrix and verifiers. The unused standalone
+`forensics` summary and per-turn projection APIs have been retired. Harness reports
+continue to use their pipeline analysis and report rendering entrypoints.
+
+CLI stream observation uses its existing snapshot sink directly through
+`StandardKernel`; the workbench inspector reads that same sink. The unused
+CLI `harness_trace` copy and `RecordingKernel` wrapper are retired. Shared
+recorded traces, privacy projection and whole-session contract validation remain
+available to the execution harness.

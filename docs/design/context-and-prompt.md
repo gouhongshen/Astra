@@ -12,7 +12,11 @@ coarse projection budgets; context assembly owns actual request budgeting.
 The `post_compaction` reason describes a call after compaction state was recorded;
 multiple subsequent calls can carry it. Trace-gated, best-effort manifests are
 not one-per-compaction certificates, and their count does not prove preservation.
-Preservation belongs at acceptance of a canonical rewrite. Retrieval-stage
+Preservation belongs at acceptance of a canonical rewrite. Request-time manifest
+diagnostics retain only message/tool-result token totals across provider inference;
+they do not retain another transcript copy. These estimates are skipped unless
+context-assembly persistence has an owner and database, and the host must still
+confirm the authoritative session/run identity after inference. Retrieval-stage
 metadata describes runtime facts, but does not itself execute retrieval. Synthetic
 confidence, expiry, seven-child rendering, and 10GB retrieval assertions are not
 evidence that those policies or execution paths are implemented.
@@ -76,6 +80,14 @@ facts before rendering. User text and wrapper-like strings never grant authority
 Platform integrations must put invariant rules in `stable_runtime_system_prompt`
 and per-turn data in `runtime_system_prompt`. Switching a runtime policy can
 change the system prefix; changing round facts must not.
+
+Semantic mailbox input and terminal child results survive temporary delivery
+retirement for the current human turn. They use the existing typed canonical
+runtime history, deduplication, checkpoint and compaction path independently of
+provider cache placement. Other layouts re-home those frames into their required
+context lane; they do not turn them into human requests. Transport acceptance
+and model observation remain distinct, and retries do not consume an unanswered
+question's obligation before the matching answer is observed.
 
 The explicitly selected append-only layout keeps its existing runtime-owned
 user frames, lifetimes, and durable history protocol. It is already a single-
@@ -149,6 +161,14 @@ Memory is injected as evidence with provenance and confidence. It should not ove
 
 Memory loading belongs to this domain. Memory storage and lifecycle belong to [memory.md](memory.md).
 
+The unused source-public grouped memory renderer and collection helpers are
+retired. Runtime prefetch supplies validated, identified compact entries to the
+context binder, which owns scored and budgeted prompt rendering. Tagged memory
+parsing, layered views, and CLI summaries remain supported. The unused JSON
+payload builders, provenance convenience type, and their source/tier constants
+are also retired; owner-scoped storage/retrieval and HTTP/SDK contracts retain
+their existing entrypoints and provenance enforcement.
+
 ## ForkPrefix
 
 ForkPrefix is a prompt-cache and diagnostic optimization. It is not a recovery correctness mechanism.
@@ -178,3 +198,27 @@ The prompt should not re-describe all tools every time a provider state changes.
 - Provider offline changes compact provider state, not the whole prompt contract.
 - Compaction preserves active tasks and pending blocked reasons.
 - Memory conflict is represented explicitly.
+
+History summaries and artifact-backed spills share prefix-boundary selection: the
+latest human request, active append-only authority suffix, and paired tool calls
+remain live. A replacement must reduce the full estimated context, including its
+summary and reference. Artifact storage must succeed before the canonical rewrite;
+a failure or cancellation preserves the original history. The selected host must
+provide a durable session artifact writer and an admitted introspect reader.
+
+The unused local output-style registry, environment selector and custom style
+file loader are retired. Prompt overrides and admitted profile instructions
+retain their existing owners; request assembly does not infer a style from
+process-local placeholder state.
+
+Serialization consumes `ContextOptimized` and its supplied cache markers.
+The source-only `serialize_prompt_sections` path, which inferred section kinds
+and chose its own markers, is retired. Marker selection remains with the
+optimizer; serialization remaps markers after empty sections are filtered and
+preserves the optimized messages and tool schemas. The duplicate, source-only
+`detect_project_languages` helper is also retired; Edge workspace context
+continues to use `detect_workspace_context`.
+
+The unused `theme::strip_ansi` source API is retired. Terminal rendering tests
+use the same ANSI parser as production width calculation; rendering and
+terminal-control behavior remain unchanged.

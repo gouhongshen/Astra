@@ -2,6 +2,8 @@
 //! profiles because rotation intent, account CAS and logout tombstones are
 //! part of this protocol, not optional legacy profile attributes.
 use fs2::FileExt;
+mod diagnostics;
+use diagnostics::{RotationDiagnostic, response_request_id, transport_cause};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -123,6 +125,15 @@ struct State {
 #[derive(Clone, Debug)]
 pub struct NativeStore {
     root: PathBuf,
+}
+
+/// Read-only local status; observing it never sends a refresh request.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInStatus {
+    SignedIn,
+    RefreshInProgress,
+    ReauthenticationRequired,
 }
 
 impl NativeStore {
@@ -543,6 +554,24 @@ pub enum AccessMiss {
 }
 
 impl AccessMiss {
+    /// Before the workbench exists, recovery commands must be shell commands.
+    pub fn startup_warning(self) -> &'static str {
+        match self {
+            Self::NotLoggedIn => "You are not signed in. Run astra login.",
+            Self::NetworkUnavailable => {
+                "Cannot connect to the sign-in service. Your saved sign-in is unchanged; retry when the network is back."
+            }
+            Self::ReauthenticationRequired => {
+                "Your sign-in could not be renewed. Run astra login to continue."
+            }
+            Self::RefreshInProgress => {
+                "Your sign-in is still being refreshed. Try starting Astra again shortly; you do not need to log in again."
+            }
+            Self::AccountChanged => "Your sign-in changed. Restart Astra.",
+            Self::Unavailable => "Cannot use your saved sign-in. Try starting Astra again.",
+        }
+    }
+
     pub fn user_warning(self) -> &'static str {
         match self {
             Self::NotLoggedIn => "  Not logged in. Use /login to authenticate.",
@@ -613,6 +642,64 @@ impl NativeStore {
         self.blocking(|store| store.current()).await
     }
 
+    fn rotation_lock(
+        &self,
+        key: &str,
+        wait: std::time::Duration,
+    ) -> Result<std::sync::Arc<File>, CredentialFailure> {
+        let rotation = private_open(&self.root.join(format!("refresh-{key}.lock")), true)
+            .map_err(CredentialFailure::Unavailable)?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match FileExt::try_lock_exclusive(&rotation) {
+                Ok(()) => return Ok(std::sync::Arc::new(rotation)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(CredentialFailure::RefreshInProgress);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(_) => {
+                    return Err(CredentialFailure::Unavailable(
+                        "cannot lock native credential refresh".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    pub async fn status(&self) -> Result<(NativeSession, SignInStatus), String> {
+        self.blocking(|store| {
+            let previous = store.current()?;
+            if !previous.refresh_pending {
+                return Ok((previous, SignInStatus::SignedIn));
+            }
+            // Hold the same lock used by credential() while re-reading pending.
+            // A free lock is not evidence that an old refresh token is reusable.
+            let rotation =
+                match store.rotation_lock(&previous.environment.key(), std::time::Duration::ZERO) {
+                    Ok(lock) => Some(lock),
+                    Err(CredentialFailure::RefreshInProgress) => None,
+                    Err(error) => return Err(error.into()),
+                };
+            let current = store.current()?;
+            if current.generation != previous.generation
+                || current.environment != previous.environment
+            {
+                return Err(CredentialFailure::AccountChanged.into());
+            }
+            let status = if !current.refresh_pending {
+                SignInStatus::SignedIn
+            } else if rotation.is_some() {
+                SignInStatus::ReauthenticationRequired
+            } else {
+                SignInStatus::RefreshInProgress
+            };
+            Ok((current, status))
+        })
+        .await
+    }
+
     pub async fn credential(
         &self,
         target: &str,
@@ -652,38 +739,38 @@ impl NativeStore {
         // logout/account changes on the short global state transaction.
         // Fresh credentials need only a shared state read, not the rotation
         // lock. Pending intent still has to wait for its in-flight owner.
-        let rotation = if frozen.expires_at
+        let diagnostic = if frozen.expires_at
             <= unix_now().map_err(CredentialFailure::Unavailable)? + 60
             || frozen.refresh_pending
         {
+            Some(RotationDiagnostic::new(self, &frozen))
+        } else {
+            None
+        };
+        let rotation = if let Some(diagnostic) = &diagnostic {
             let key = frozen.environment.key();
-            Some(
-                self.blocking(move |store| {
-                    let rotation =
-                        private_open(&store.root.join(format!("refresh-{key}.lock")), true)?;
-                    let deadline = std::time::Instant::now() + lock_wait;
-                    loop {
-                        match FileExt::try_lock_exclusive(&rotation) {
-                            Ok(()) => return Ok(std::sync::Arc::new(rotation)),
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                if std::time::Instant::now() >= deadline {
-                                    return Err(CredentialFailure::RefreshInProgress.to_string());
-                                }
-                                std::thread::sleep(std::time::Duration::from_millis(25));
-                            }
-                            Err(_) => return Err("cannot lock native credential refresh".into()),
-                        }
-                    }
-                })
+            diagnostic.record("lock", "waiting", None, None, None).await;
+            let result = self
+                .blocking(move |store| Ok(store.rotation_lock(&key, lock_wait)))
                 .await
-                .map_err(|error| {
-                    if error == CredentialFailure::RefreshInProgress.to_string() {
-                        CredentialFailure::RefreshInProgress
+                .map_err(CredentialFailure::Unavailable)?;
+            match result {
+                Ok(rotation) => {
+                    diagnostic
+                        .record("lock", "acquired", None, None, None)
+                        .await;
+                    Some(rotation)
+                }
+                Err(error) => {
+                    let reason = if error == CredentialFailure::RefreshInProgress {
+                        "lock_wait_timeout"
                     } else {
-                        CredentialFailure::Unavailable(error)
-                    }
-                })?,
-            )
+                        "lock_failed"
+                    };
+                    diagnostic.record("lock", reason, None, None, None).await;
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
@@ -698,10 +785,18 @@ impl NativeStore {
             return Err(CredentialFailure::AccountChanged);
         }
         if current.refresh_pending {
+            if let Some(diagnostic) = &diagnostic {
+                diagnostic
+                    .record("pending", "previous_rotation_unsettled", None, None, None)
+                    .await;
+            }
             return Err(CredentialFailure::RotationInterrupted);
         }
         let now = unix_now().map_err(CredentialFailure::Unavailable)?;
-        if let Some(rotation) = rotation.filter(|_| current.expires_at <= now + 60) {
+        if let Some((rotation, diagnostic)) = rotation
+            .zip(diagnostic)
+            .filter(|_| current.expires_at <= now + 60)
+        {
             let client = http_client().map_err(CredentialFailure::Unavailable)?;
             let request = client
                 .post(&current.environment.token_endpoint)
@@ -721,7 +816,7 @@ impl NativeStore {
             // not abandon an in-flight rotation or clear a token that may
             // already have been consumed.
             let settlement = tokio::spawn(async move {
-                settle_token_rotation(store, expected, client, request, rotation).await
+                settle_token_rotation(store, expected, client, request, rotation, diagnostic).await
             });
             current = settlement.await.map_err(|_| {
                 tracing::warn!("native token rotation task panicked before settlement");
@@ -756,10 +851,14 @@ async fn settle_token_rotation(
     client: reqwest::Client,
     request: reqwest::Request,
     rotation: std::sync::Arc<std::fs::File>,
+    diagnostic: RotationDiagnostic,
 ) -> Result<NativeSession, CredentialFailure> {
+    diagnostic
+        .record("pending_write", "started", None, None, None)
+        .await;
     let write_guard = rotation.clone();
     let pending_expected = expected.clone();
-    store
+    let pending = store
         .blocking(move |store| {
             // spawn_blocking outlives cancellation of its awaiting task.
             // Retain rotation ownership until the durable write finishes.
@@ -769,17 +868,34 @@ async fn settle_token_rotation(
                 Ok(())
             })
         })
-        .await
-        .map_err(CredentialFailure::Unavailable)?;
+        .await;
+    if let Err(error) = pending {
+        diagnostic
+            .record("pending_write", "storage_failed", None, None, Some(&error))
+            .await;
+        return Err(CredentialFailure::Unavailable(error));
+    }
+    diagnostic
+        .record("http", "request_started", None, None, None)
+        .await;
     // After sending, any failure may hide a successful rotation. Keep the
     // intent; never automatically replay the previous refresh token. Only a
     // connect error proves the request never reached the issuer.
     let response = match client.execute(request).await {
         Ok(response) => response,
         Err(error) if error.is_connect() => {
+            diagnostic
+                .record(
+                    "http",
+                    "connect_failed",
+                    None,
+                    None,
+                    Some(&transport_cause(error)),
+                )
+                .await;
             let expected = expected.clone();
             let write_guard = rotation.clone();
-            store
+            let cleared = store
                 .blocking(move |store| {
                     let _write_guard = write_guard;
                     store.update(&expected, |session| {
@@ -787,17 +903,61 @@ async fn settle_token_rotation(
                         Ok(())
                     })
                 })
-                .await
-                .map_err(CredentialFailure::Unavailable)?;
+                .await;
+            if let Err(error) = cleared {
+                diagnostic
+                    .record("pending_clear", "storage_failed", None, None, Some(&error))
+                    .await;
+                return Err(CredentialFailure::Unavailable(error));
+            }
+            diagnostic
+                .record(
+                    "settled",
+                    "connection_failure_preserved_session",
+                    None,
+                    None,
+                    None,
+                )
+                .await;
             return Err(log_rotation_failure(CredentialFailure::NetworkUnavailable));
         }
-        Err(_) => return Err(log_rotation_failure(CredentialFailure::RotationUnconfirmed)),
+        Err(error) => {
+            let reason = if error.is_timeout() {
+                "request_timeout"
+            } else {
+                "transport_failed"
+            };
+            diagnostic
+                .record("http", reason, None, None, Some(&transport_cause(error)))
+                .await;
+            return Err(log_rotation_failure(CredentialFailure::RotationUnconfirmed));
+        }
     };
+    let status = response.status().as_u16();
+    let request_id = response_request_id(&response);
     if !response.status().is_success() {
         // Even a 5xx can be generated by a proxy or after the issuer
         // committed rotation. HTTP status is not proof of non-consumption.
+        diagnostic
+            .record(
+                "http",
+                "http_rejected",
+                Some(status),
+                request_id.as_deref(),
+                None,
+            )
+            .await;
         return Err(log_rotation_failure(CredentialFailure::RotationRejected));
     }
+    diagnostic
+        .record(
+            "response",
+            "received",
+            Some(status),
+            request_id.as_deref(),
+            None,
+        )
+        .await;
     let token: TokenResponse = match bounded_json(response).await {
         Ok(token) => token,
         Err(error) => {
@@ -805,6 +965,15 @@ async fn settle_token_rotation(
             // body is not proof the issuer rejected the refresh, and the old
             // refresh token must not be replayed.
             tracing::warn!(error = %error, "native token rotation response was unreadable");
+            diagnostic
+                .record(
+                    "response",
+                    "invalid_response",
+                    Some(status),
+                    request_id.as_deref(),
+                    Some(&error),
+                )
+                .await;
             return Err(log_rotation_failure(CredentialFailure::RotationUnconfirmed));
         }
     };
@@ -814,9 +983,36 @@ async fn settle_token_rotation(
         || token.expires_in > 86400
         || !token.token_type.eq_ignore_ascii_case("bearer")
     {
+        diagnostic
+            .record(
+                "response",
+                "invalid_token_fields",
+                Some(status),
+                request_id.as_deref(),
+                None,
+            )
+            .await;
         return Err(log_rotation_failure(CredentialFailure::RotationUnconfirmed));
     }
-    if let Err(error) = verify_rotated_identity(&expected, &token.access_token).await {
+    diagnostic
+        .record(
+            "identity",
+            "verification_started",
+            Some(status),
+            request_id.as_deref(),
+            None,
+        )
+        .await;
+    if let Err(error) = verify_rotated_identity(&expected, &token.access_token, &diagnostic).await {
+        diagnostic
+            .record(
+                "identity",
+                "verification_failed",
+                Some(status),
+                request_id.as_deref(),
+                Some(&error),
+            )
+            .await;
         let _ = revoke(&expected.environment, &token.refresh_token).await;
         tracing::warn!(error = %error, "rotated token identity check failed");
         return Err(log_rotation_failure(CredentialFailure::RotationUnconfirmed));
@@ -826,6 +1022,9 @@ async fn settle_token_rotation(
     let expires_in = token.expires_in;
     let write_guard = rotation;
     let saved = expected.clone();
+    diagnostic
+        .record("save", "started", Some(status), request_id.as_deref(), None)
+        .await;
     if let Err(error) = store
         .blocking(move |store| {
             let _write_guard = write_guard;
@@ -839,10 +1038,28 @@ async fn settle_token_rotation(
         })
         .await
     {
+        diagnostic
+            .record(
+                "save",
+                "storage_failed",
+                Some(status),
+                request_id.as_deref(),
+                Some(&error),
+            )
+            .await;
         let _ = revoke(&expected.environment, &token.refresh_token).await;
         tracing::warn!(cause = %error, "rotated token could not be saved");
         return Err(log_rotation_failure(classify_post_rotation_save(error)));
     }
+    diagnostic
+        .record(
+            "settled",
+            "success",
+            Some(status),
+            request_id.as_deref(),
+            None,
+        )
+        .await;
     store
         .blocking(|store| store.current())
         .await
@@ -864,7 +1081,11 @@ fn log_rotation_failure(error: CredentialFailure) -> CredentialFailure {
     error
 }
 
-async fn verify_rotated_identity(current: &NativeSession, token: &str) -> Result<(), String> {
+async fn verify_rotated_identity(
+    current: &NativeSession,
+    token: &str,
+    diagnostic: &RotationDiagnostic,
+) -> Result<(), String> {
     use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
     if token.len() > 16 * 1024 {
         return Err("rotated UC token exceeds size limit".into());
@@ -877,8 +1098,36 @@ async fn verify_rotated_identity(current: &NativeSession, token: &str) -> Result
     let response = http_client()?
         .get(&current.environment.jwks_uri)
         .send()
-        .await
-        .map_err(|_| "UC signing keys unavailable")?;
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            let reason = if error.is_timeout() {
+                "request_timeout"
+            } else {
+                "transport_failed"
+            };
+            diagnostic
+                .record(
+                    "signing_keys",
+                    reason,
+                    None,
+                    None,
+                    Some(&transport_cause(error)),
+                )
+                .await;
+            return Err("UC signing keys unavailable".into());
+        }
+    };
+    diagnostic
+        .record(
+            "signing_keys",
+            "received",
+            Some(response.status().as_u16()),
+            response_request_id(&response).as_deref(),
+            None,
+        )
+        .await;
     if !response.status().is_success() {
         return Err("UC signing keys unavailable".into());
     }
@@ -967,6 +1216,30 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    async fn wait_for_diagnostics(store: &NativeStore, required: &[(&str, &str)]) -> String {
+        let path = store.root.join("auth-refresh.jsonl");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let log = fs::read_to_string(&path).unwrap_or_default();
+                if let Ok(events) = log
+                    .lines()
+                    .map(serde_json::from_str::<serde_json::Value>)
+                    .collect::<Result<Vec<_>, _>>()
+                    && required.iter().all(|(stage, reason)| {
+                        events
+                            .iter()
+                            .any(|event| event["stage"] == *stage && event["reason"] == *reason)
+                    })
+                {
+                    return log;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("refresh diagnostic was not written")
+    }
+
     struct RotationFixture {
         environment: Environment,
         rotations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1049,6 +1322,135 @@ mod tests {
             release,
             server,
         }
+    }
+
+    #[tokio::test]
+    async fn account_switch_while_waiting_for_refresh_does_not_return_new_accounts_token() {
+        let (_directory, store) = store();
+        let (published, _) = store.publish(session("A")).unwrap();
+        let lock = store
+            .rotation_lock(&published.environment.key(), std::time::Duration::ZERO)
+            .unwrap();
+        store
+            .update(&published, |current| {
+                current.refresh_pending = true;
+                Ok(())
+            })
+            .unwrap();
+        let pending = store.credential("astra", Some(&published.generation));
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(80), &mut pending)
+                .await
+                .is_err()
+        );
+        let (replacement, _) = store.publish(session("B")).unwrap();
+        drop(lock);
+        assert_eq!(
+            pending.await.unwrap_err(),
+            CredentialFailure::AccountChanged
+        );
+        assert_eq!(store.current().unwrap().generation, replacement.generation);
+        assert!(!store.current().unwrap().refresh_pending);
+    }
+
+    #[tokio::test]
+    async fn status_observes_live_rotation_without_refreshing_or_requiring_login() {
+        use std::sync::atomic::Ordering;
+        let fixture = rotation_fixture("A").await;
+        let (_directory, store) = store();
+        let mut expiring = session("A");
+        expiring.environment = fixture.environment.clone();
+        expiring.expires_at = unix_now().unwrap();
+        store.publish(expiring).unwrap();
+        assert_eq!(store.status().await.unwrap().1, SignInStatus::SignedIn);
+        assert_eq!(fixture.rotations.load(Ordering::SeqCst), 0);
+        let clone = store.clone();
+        let helper = tokio::spawn(async move { clone.credential("astra", None).await });
+        fixture.entered.notified().await;
+        assert_eq!(
+            store.status().await.unwrap().1,
+            SignInStatus::RefreshInProgress
+        );
+        assert_eq!(fixture.rotations.load(Ordering::SeqCst), 1);
+        fixture.release.notify_one();
+        helper.await.unwrap().unwrap();
+        assert_eq!(store.status().await.unwrap().1, SignInStatus::SignedIn);
+        assert_eq!(fixture.rotations.load(Ordering::SeqCst), 1);
+        let log = wait_for_diagnostics(
+            &store,
+            &[("signing_keys", "received"), ("settled", "success")],
+        )
+        .await;
+        let events: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(events.iter().any(|event| event["reason"] == "success"));
+        assert!(events.iter().any(|event| event["stage"] == "signing_keys"));
+        assert!(!log.contains("synthetic-refresh"));
+        assert!(!log.contains("synthetic-rotated"));
+        assert!(!log.contains(&store.current().unwrap().access_token));
+    }
+
+    #[test]
+    fn killed_refresh_owner_releases_lock_but_does_not_authorize_replay() {
+        const CHILD: &str = "ASTRA_REFRESH_CRASH_FIXTURE_DIR";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let store = NativeStore::with_directory(root.into());
+            let session = store.current().unwrap();
+            let _rotation = store
+                .rotation_lock(&session.environment.key(), std::time::Duration::ZERO)
+                .unwrap();
+            store
+                .update(&session, |current| {
+                    current.refresh_pending = true;
+                    Ok(())
+                })
+                .unwrap();
+            std::fs::write(store.root.join("child-ready"), b"ready").unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        let (_directory, store) = store();
+        store.publish(session("A")).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native::tests::killed_refresh_owner_releases_lock_but_does_not_authorize_replay",
+            ])
+            .env(CHILD, &store.root)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !store.root.join("child-ready").exists() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not acquire refresh lock");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            assert_eq!(
+                store.status().await.unwrap().1,
+                SignInStatus::ReauthenticationRequired
+            );
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                store.credential("astra", None),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.unwrap_err(), CredentialFailure::RotationInterrupted);
+        });
+        assert!(store.current().unwrap().refresh_pending);
+        assert_eq!(store.current().unwrap().refresh_token, "synthetic-refresh");
     }
 
     #[tokio::test]
@@ -1582,7 +1984,7 @@ mod tests {
                 String::from_utf8_lossy(&input[..len])
                     .starts_with("POST /realms/moi/protocol/openid-connect/token ")
             );
-            stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{{\"error\":\"invalid_grant\"}}").as_bytes()).await.unwrap();
+            stream.write_all(format!("HTTP/1.1 {status}\r\nX-Request-ID: test-request-1\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{{\"error\":\"invalid_grant\"}}").as_bytes()).await.unwrap();
         });
         let (_directory, store) = store();
         let mut expiring = session("A");
@@ -1596,15 +1998,25 @@ mod tests {
         };
         expiring.expires_at = unix_now().unwrap();
         store.publish(expiring).unwrap();
-        assert!(
-            store
-                .credential("moi", None)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("rotation rejected")
+        assert_eq!(
+            store.credential("moi", None).await.unwrap_err(),
+            CredentialFailure::RotationRejected
         );
         request.await.unwrap();
+        let log = wait_for_diagnostics(&store, &[("http", "http_rejected")]).await;
+        let rejected: serde_json::Value = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .find(|event: &serde_json::Value| event["reason"] == "http_rejected")
+            .unwrap();
+        assert_eq!(rejected["http_status"], status[..3].parse::<u16>().unwrap());
+        assert_eq!(rejected["request_id"], "test-request-1");
+        assert!(
+            !log.contains("invalid_grant"),
+            "response bodies are not diagnostics"
+        );
+        assert!(!log.contains("synthetic-refresh"));
+        assert!(!log.contains("synthetic-access"));
         assert!(store.current().unwrap().refresh_pending);
         // No server remains; this must fail from persisted intent, not retry.
         assert!(

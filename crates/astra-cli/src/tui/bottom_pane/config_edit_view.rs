@@ -18,9 +18,8 @@
 //!
 //! Writing the resolved config back to disk is the caller's job — the
 //! view merely reports a `ConfigEditAction` via `pending_action()`.
-//! The routing layer in `tui/mod.rs` reads that, writes the TOML to
-//! the chosen scope (via the same helper `slash_config` uses in
-//! line-mode), and reloads the process-wide overlay.
+//! `tui/config_edit_router.rs` resolves the typed completion, writes TOML
+//! to the selected scope, and reloads the process-wide overlay.
 
 use astra_config::config_overlay::{
     SettingItem, SettingKind, apply_edit, build_settings_catalog, filter_settings,
@@ -590,7 +589,7 @@ fn render_value_short(v: &Value) -> String {
 
 /// Drop the dotted prefix so the list row fits comfortably in the
 /// 55% list column. Keep the tail segment, which is the human-readable
-/// leaf name (`max_turn_input_tokens`, `adaptive_budget_reduction`).
+/// leaf name (`max_turn_input_tokens`, `llm_exchanges`).
 fn short_id(id: &str) -> String {
     match id.rsplit_once('.') {
         Some((_, tail)) => tail.to_string(),
@@ -1077,13 +1076,10 @@ enum SavePromptOutcome {
     BackToEdit,
 }
 
-/// Resolve scope labels. User path uses the conventional `~/.astra/...`
-/// because home is stable across shell cwds; project path is resolved
-/// against the CURRENT working directory so the user sees the real
-/// filename, not the `./` sugar that hid the actual destination.
+/// Show the same resolved paths used by configuration loading and saving.
 fn user_path_label() -> String {
-    dirs::home_dir()
-        .map(|h| h.join(".astra/config/runtime.toml").display().to_string())
+    astra_config::runtime_config::user_runtime_config_path()
+        .map(|path| path.display().to_string())
         .unwrap_or_else(|| "~/.astra/config/runtime.toml".to_string())
 }
 

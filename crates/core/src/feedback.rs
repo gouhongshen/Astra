@@ -131,46 +131,6 @@ pub enum Sentiment {
     Negative,
 }
 
-/// A hint derived from feedback signal analysis for downstream adaptation.
-///
-/// These are pure observations — the store reports facts, it does not
-/// decide what the runtime should do about them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdaptationHint {
-    /// Hint category: "high_retry_rate", "elevated_failure_rate", etc.
-    pub kind: String,
-    /// Human-readable detail for logging or prompt injection.
-    pub detail: String,
-    /// Severity: "info", "warning", "critical".
-    pub severity: String,
-}
-
-/// Aggregate statistics for streaming speculative tool execution.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamingSpeculationStats {
-    /// Total speculations spawned across all reports.
-    pub started: u64,
-    /// Total hits merged back into real batches.
-    pub hit: u64,
-    /// Total discards.
-    pub discarded: u64,
-    /// Sum of per-hit overlap durations in ms.
-    pub total_saved_ms: u64,
-    /// Number of report batches merged into this aggregate.
-    pub reports: u64,
-}
-
-impl StreamingSpeculationStats {
-    /// Hit rate in [0.0, 1.0]. Returns 0.0 if no speculations started.
-    pub fn hit_rate(&self) -> f64 {
-        if self.started == 0 {
-            0.0
-        } else {
-            self.hit as f64 / self.started as f64
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct FeedbackBuffer {
     signals: VecDeque<FeedbackSignal>,
@@ -183,11 +143,10 @@ struct FeedbackBuffer {
 /// To reduce filesystem pressure, `record()` buffers signals in memory
 /// and only persists every [`BATCH_PERSIST_INTERVAL`] signals (default 10).
 /// Call [`flush`] to force an immediate write (e.g., on shutdown or
-/// before reading signals for adaptation).
+/// before inspecting retained signals).
 pub struct FeedbackSignalStore {
     buffer: RwLock<FeedbackBuffer>,
     max_signals: usize,
-    streaming_spec: RwLock<StreamingSpeculationStats>,
     storage_path: Option<PathBuf>,
     /// Number of signals recorded since last persist.
     dirty_count: RwLock<usize>,
@@ -209,7 +168,6 @@ impl FeedbackSignalStore {
         Self {
             buffer: RwLock::new(FeedbackBuffer::default()),
             max_signals: DEFAULT_MAX_SIGNALS,
-            streaming_spec: RwLock::new(StreamingSpeculationStats::default()),
             storage_path: None,
             dirty_count: RwLock::new(0),
         }
@@ -232,7 +190,6 @@ impl FeedbackSignalStore {
         Self {
             buffer: RwLock::new(buffer),
             max_signals: DEFAULT_MAX_SIGNALS,
-            streaming_spec: RwLock::new(StreamingSpeculationStats::default()),
             storage_path: Some(path),
             dirty_count: RwLock::new(0),
         }
@@ -262,89 +219,6 @@ impl FeedbackSignalStore {
         buffer.signals.iter().cloned().collect()
     }
 
-    /// Record one batch of streaming-speculation metrics.
-    pub fn record_streaming_speculation(
-        &self,
-        started: u64,
-        hit: u64,
-        discarded: u64,
-        total_saved_ms: u64,
-    ) {
-        let mut stats = self
-            .streaming_spec
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        stats.started = stats.started.saturating_add(started);
-        stats.hit = stats.hit.saturating_add(hit);
-        stats.discarded = stats.discarded.saturating_add(discarded);
-        stats.total_saved_ms = stats.total_saved_ms.saturating_add(total_saved_ms);
-        stats.reports = stats.reports.saturating_add(1);
-    }
-
-    /// Read aggregated streaming-speculation stats.
-    pub fn streaming_speculation_stats(&self) -> StreamingSpeculationStats {
-        self.streaming_spec
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    /// Analyze recent feedback signals and produce adaptation hints.
-    ///
-    /// Returns a summary of the most frequent signal types and their
-    /// sentiment distribution. Callers (e.g., RuntimePolicy or SelfModel)
-    /// can use these hints to adjust behavior — the store only reports
-    /// facts, it does not decide what to do with them.
-    pub fn adaptation_hints(&self) -> Vec<AdaptationHint> {
-        let signals = self.recent_signals();
-        if signals.is_empty() {
-            return Vec::new();
-        }
-        let mut hints = Vec::new();
-        let total = signals.len() as f64;
-
-        // Repeated retries suggest the current approach is failing
-        let retry_count = signals
-            .iter()
-            .filter(|signal| matches!(signal.signal_type, SignalType::Retry { .. }))
-            .count();
-        if retry_count as f64 / total > 0.3 {
-            hints.push(AdaptationHint {
-                kind: "high_retry_rate".to_string(),
-                detail: format!(
-                    "{} retry signals in {} feedback events — consider changing approach",
-                    retry_count,
-                    signals.len()
-                ),
-                severity: if retry_count > 5 {
-                    "critical"
-                } else {
-                    "warning"
-                }
-                .to_string(),
-            });
-        }
-
-        // High error rate signals
-        let error_count = signals
-            .iter()
-            .filter(|signal| matches!(signal.signal_type, SignalType::TaskFailure { .. }))
-            .count();
-        if error_count > 0 && error_count as f64 / total > 0.2 {
-            hints.push(AdaptationHint {
-                kind: "elevated_failure_rate".to_string(),
-                detail: format!(
-                    "{} task failures in {} feedback events",
-                    error_count,
-                    signals.len()
-                ),
-                severity: "warning".to_string(),
-            });
-        }
-
-        hints
-    }
-
     /// Count of unpersisted signals since last flush/persist.
     pub fn dirty_count(&self) -> usize {
         *self.dirty_count.read().unwrap_or_else(|e| e.into_inner())
@@ -353,7 +227,7 @@ impl FeedbackSignalStore {
     /// Force immediate persistence of all buffered signals.
     ///
     /// Resets the dirty counter. Call this before shutdown, before reading
-    /// signals for adaptation analysis, or after a burst of high-value signals.
+    /// retained signals, or after a burst of high-value signals.
     pub fn flush(&self) -> std::io::Result<()> {
         self.persist()?;
         let mut dirty = self.dirty_count.write().unwrap_or_else(|e| e.into_inner());
@@ -408,62 +282,6 @@ mod tests {
     }
 
     #[test]
-    fn adaptation_hints_are_derived_from_typed_signals() {
-        let store = FeedbackSignalStore::new();
-        for _ in 0..4 {
-            store.record(FeedbackSignal::new(SignalType::Retry { count: 1 }));
-        }
-        for _ in 0..2 {
-            store.record(FeedbackSignal::new(SignalType::TaskFailure {
-                reason: "provider failed".to_string(),
-            }));
-        }
-
-        let hints = store.adaptation_hints();
-        assert!(
-            hints.iter().any(|hint| hint.kind == "high_retry_rate"),
-            "{hints:?}"
-        );
-        assert!(
-            hints
-                .iter()
-                .any(|hint| hint.kind == "elevated_failure_rate"),
-            "{hints:?}"
-        );
-    }
-
-    #[test]
-    fn adaptation_hints_are_empty_without_signals() {
-        let store = FeedbackSignalStore::new();
-
-        assert!(store.adaptation_hints().is_empty());
-    }
-
-    #[test]
-    fn adaptation_hints_do_not_trigger_at_exclusive_thresholds() {
-        let store = FeedbackSignalStore::new();
-        store.record(FeedbackSignal::new(SignalType::Retry { count: 1 }));
-        store.record(FeedbackSignal::new(SignalType::TaskFailure {
-            reason: "provider failed".to_string(),
-        }));
-        for _ in 0..3 {
-            store.record(FeedbackSignal::new(SignalType::Acceptance));
-        }
-
-        let hints = store.adaptation_hints();
-        assert!(
-            !hints.iter().any(|hint| hint.kind == "high_retry_rate"),
-            "20% retry rate must stay below the exclusive 30% threshold: {hints:?}"
-        );
-        assert!(
-            !hints
-                .iter()
-                .any(|hint| hint.kind == "elevated_failure_rate"),
-            "20% failure rate is the exclusive threshold and must not trigger: {hints:?}"
-        );
-    }
-
-    #[test]
     fn persists_and_reloads_feedback_signals() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("feedback-signals.json");
@@ -505,21 +323,5 @@ mod tests {
             signals[0].signal_type,
             SignalType::TaskFailure { ref reason } if reason == "bad output"
         ));
-    }
-
-    #[test]
-    fn streaming_speculation_metrics_are_observational_only() {
-        let store = FeedbackSignalStore::new();
-
-        store.record_streaming_speculation(10, 5, 1, 120);
-        store.record_streaming_speculation(4, 2, 0, 30);
-
-        let stats = store.streaming_speculation_stats();
-        assert_eq!(stats.started, 14);
-        assert_eq!(stats.hit, 7);
-        assert_eq!(stats.discarded, 1);
-        assert_eq!(stats.total_saved_ms, 150);
-        assert_eq!(stats.reports, 2);
-        assert!((stats.hit_rate() - 0.5).abs() < f64::EPSILON);
     }
 }

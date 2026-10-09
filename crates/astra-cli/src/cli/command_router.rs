@@ -1,11 +1,9 @@
 use crate::cli::arg_render::{
     apply_system_prompt, render_agent_args, render_bug_args, render_debug_args, render_diff_args,
-    render_grep_args, render_memory_args, render_messaging_args, render_permissions_args,
-    render_review_args, render_team_args,
+    render_grep_args, render_memory_args, render_permissions_args, render_review_args,
 };
 use crate::cli::auth_flow::{
     clear_profile_auth, do_login, do_memoria_login_with_key, do_register, is_auth_error,
-    parse_auth_tokens, save_refreshed_profile_tokens,
 };
 use crate::cli::cli_config::cli_args::{
     AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
@@ -40,17 +38,13 @@ use crate::cli::skill_catalog::{
 };
 use crate::cli::slash::slash_bug::handle_bug_command;
 use crate::cli::slash::slash_debug::handle_debug_command;
-use crate::cli::slash::slash_info::handle_info_command;
 use crate::cli::slash::slash_memory::handle_memory_domain_command;
-use crate::cli::slash::slash_messaging::handle_messaging_command;
-use crate::cli::slash::{slash_agent, slash_team, slash_telemetry};
+use crate::cli::slash::{slash_agent, slash_telemetry};
 use crate::cli::stream::streaming_types::{
-    StreamResult, format_background_agent_results, stream_result_from_resumable_turn_failure,
+    StreamResult, stream_result_from_resumable_turn_failure,
 };
-use crate::cli::{
-    agent_loader, delegate_subrun, diff_presenter, journal_diff, journal_digest, journal_tree,
-    theme,
-};
+use crate::cli::workspace_inspection::{handle_grep_command, handle_review_command};
+use crate::cli::{diff_presenter, journal_diff, journal_digest, journal_tree, theme};
 use astra_thin_client::paths;
 use clap::CommandFactory;
 use crossterm::{style::Stylize, terminal};
@@ -105,6 +99,218 @@ fn durable_run_is_terminal(status: Option<&str>) -> bool {
     matches!(status, Some("completed" | "failed" | "cancelled"))
 }
 
+/// Inspection only: two existing Server reads under one captured owner and
+/// deadline. Neither partial output nor a local journal substitutes for a
+/// failed read. This is not a transactional snapshot; both source coverages
+/// and timestamps remain in the returned envelope.
+async fn capture_session_execution(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    session_id: &str,
+    include_transcript: bool,
+    include_run_events: bool,
+) -> Result<serde_json::Value, String> {
+    const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_CAPTURE_BYTES: usize = 5 * 1024 * 1024;
+    let (_, selected_profile, selected, token) = get_profile_and_token(profile)?;
+    let auth = cli_utils::cli_owner_auth_snapshot();
+    if !auth.is_current()
+        || auth.profile_name.as_deref() != Some(selected_profile.as_str())
+        || auth.server_account_id.is_none()
+        || auth.server_account_id != selected.account_id
+    {
+        return Err("execution capture requires the attached signed-in account".into());
+    }
+    let owner = crate::cli::stream::stream_events_writer::StreamEventOwner::capture(api)?;
+    if owner.account_id != auth.server_account_id || owner.profile_name != auth.profile_name {
+        return Err("execution capture owner changed before dispatch".into());
+    }
+    let api = match &auth.native_binding {
+        Some(binding) => api.clone().with_bearer_provider(binding.clone()),
+        None => api.clone().without_bearer_provider(),
+    };
+    let read = async {
+        let tree: astra_server_types::SessionRunTreeSnapshot = api
+            .get_authed_json_bounded(
+                &token,
+                &format!("{}?limit=200", paths::session_runs(session_id)),
+                MAX_SOURCE_BYTES,
+            )
+            .await
+            .map_err(map_thin_err)?;
+        if !auth.is_current() {
+            return Err("execution capture owner changed between reads".into());
+        }
+        let reflection: astra_services::reflect::ReflectReport = api
+            .get_authed_json_bounded(
+                &token,
+                &format!(
+                    "{}?topic=execution&facet=trace&depth=forensic&horizon=session",
+                    paths::chat_session_reflect(session_id)
+                ),
+                MAX_SOURCE_BYTES,
+            )
+            .await
+            .map_err(map_thin_err)?;
+        if tree.schema_version != astra_server_types::SESSION_RUN_TREE_SCHEMA_VERSION
+            || reflection.schema_version != 2
+            || tree.session_id != session_id
+            || reflection.session_id != session_id
+            || !auth.is_current()
+        {
+            return Err("execution capture identity or source schema changed".to_string());
+        }
+        let run_ids: Vec<_> = if include_run_events {
+            tree.runs.iter().map(|run| run.run_id.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        if include_run_events
+            && (tree.truncated
+                || run_ids.len() > 200
+                || run_ids.iter().any(String::is_empty)
+                || run_ids
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != run_ids.len())
+        {
+            return Err("run event capture requires a complete bounded run tree".into());
+        }
+        let mut capture = serde_json::json!({
+            "schema_version": 1,
+            "session_id": session_id,
+            "owner": owner,
+            "run_tree": tree,
+            "reflection": reflection,
+        });
+        if include_run_events {
+            let mut projections = Vec::new();
+            let mut retained_bytes = serde_json::to_vec(&capture)
+                .map_err(|e| e.to_string())?
+                .len();
+            for batch in run_ids.chunks(4) {
+                // The existing projection is an authenticated, sanitized recent
+                // tail. Preserve its watermark; absence is not historical proof.
+                let reads = batch.iter().map(|run_id| async {
+                    if !auth.is_current() {
+                        return Err("execution capture owner changed during run event read".into());
+                    }
+                    let projection: serde_json::Value = api
+                        .get_authed_json_bounded(
+                            &token,
+                            &format!("{}/projection?recent_limit=500", paths::chat_run(run_id)),
+                            MAX_SOURCE_BYTES,
+                        )
+                        .await
+                        .map_err(map_thin_err)?;
+                    if projection["session_id"].as_str() != Some(session_id)
+                        || projection["run_id"].as_str() != Some(run_id.as_str())
+                        || !projection["recent_events"].is_array()
+                        || projection["run_event_high_watermark"].as_i64().is_none()
+                        || !auth.is_current()
+                    {
+                        return Err(
+                            "execution run projection identity or coverage unavailable".into()
+                        );
+                    }
+                    Ok::<_, String>(projection)
+                });
+                for result in futures_util::future::join_all(reads).await {
+                    let projection = result?;
+                    retained_bytes += serde_json::to_vec(&projection)
+                        .map_err(|e| e.to_string())?
+                        .len();
+                    if retained_bytes >= MAX_CAPTURE_BYTES {
+                        return Err(
+                            "execution run projections exceeded the capture byte limit".into()
+                        );
+                    }
+                    projections.push(projection);
+                }
+            }
+            capture["run_projections"] = serde_json::Value::Array(projections);
+        }
+        if include_transcript {
+            let mut items = Vec::new();
+            let mut before = None;
+            let mut retained_bytes = 0usize;
+            loop {
+                if !auth.is_current() {
+                    return Err("execution capture owner changed during transcript read".into());
+                }
+                let mut route = format!("{}?limit=200", paths::session_transcript(session_id));
+                if let Some(cursor) = before {
+                    route.push_str(&format!("&before_seq={cursor}"));
+                }
+                let page: astra_thin_client::SessionTranscriptPage = api
+                    .get_authed_json_bounded(&token, &route, MAX_SOURCE_BYTES)
+                    .await
+                    .map_err(map_thin_err)?;
+                retained_bytes += serde_json::to_vec(&page).map_err(|e| e.to_string())?.len();
+                if page.session_id != session_id
+                    || retained_bytes > MAX_SOURCE_BYTES
+                    || items.len() + page.items.len() > 4096
+                    || !auth.is_current()
+                    || page.items.iter().any(|item| {
+                        item.session_id != session_id
+                            || item.item_seq <= 0
+                            || before.is_some_and(|cursor| item.item_seq >= cursor)
+                    })
+                {
+                    return Err("execution transcript identity or capacity boundary failed".into());
+                }
+                let oldest = page.items.iter().map(|item| item.item_seq).min();
+                items.extend(page.items);
+                if !page.has_more {
+                    if page.next_before_seq.is_some() && page.next_before_seq != oldest {
+                        return Err(
+                            "execution transcript has a contradictory terminal cursor".into()
+                        );
+                    }
+                    break;
+                }
+                let cursor = page
+                    .next_before_seq
+                    .ok_or("execution transcript is missing its cursor")?;
+                if oldest != Some(cursor) || before.is_some_and(|prior| cursor >= prior) {
+                    return Err("execution transcript cursor did not advance".into());
+                }
+                before = Some(cursor);
+            }
+            items.sort_by_key(|item| item.item_seq);
+            if items
+                .windows(2)
+                .any(|pair| pair[0].item_seq == pair[1].item_seq)
+            {
+                return Err("execution transcript has duplicate item identities".into());
+            }
+            capture["transcript"] =
+                serde_json::to_value(astra_thin_client::SessionTranscriptPage {
+                    session_id: session_id.to_string(),
+                    items,
+                    next_before_seq: None,
+                    has_more: false,
+                })
+                .map_err(|e| e.to_string())?;
+        }
+        if serde_json::to_vec(&capture)
+            .map_err(|e| e.to_string())?
+            .len()
+            > MAX_CAPTURE_BYTES
+        {
+            return Err("execution capture exceeded its output byte limit".into());
+        }
+        if !auth.is_current() {
+            return Err("execution capture owner changed before publication".into());
+        }
+        Ok(capture)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(15), read)
+        .await
+        .map_err(|_| "execution capture exceeded its total read deadline".to_string())?
+}
+
 async fn start_http_server(host: &str, port: u16) -> Result<(), String> {
     let addr: std::net::SocketAddr = format!("{host}:{port}")
         .parse()
@@ -132,10 +338,7 @@ async fn fresh_access_token_or_error(
 }
 
 fn repl_bridge_command_requires_access_token(slash_cmd: &str) -> bool {
-    matches!(
-        slash_cmd,
-        "/team" | "/memory" | "/plan" | "/review" | "/grep"
-    )
+    matches!(slash_cmd, "/memory" | "/plan" | "/review" | "/grep")
 }
 
 async fn repl_bridge_access_token(
@@ -183,36 +386,6 @@ async fn delete_session_and_local_history(
         format!("session {session_id} was deleted on the server, but local history cleanup failed: {error}")
     })?;
     Ok(body)
-}
-
-fn maybe_wire_delegation_engine(
-    state: &mut SessionState,
-    api: &astra_thin_client::ThinClient,
-    token: &str,
-) {
-    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let executor = delegate_subrun::CliDelegateSubRunExecutor::new(
-        api.clone(),
-        token.to_string(),
-        state.model.clone(),
-        project_root.clone(),
-        state.perm_manager.inherited_permissions_for_child(true),
-        None,
-    );
-    let mut registry = astra_services::AgentProfileRegistry::new();
-    delegate_subrun::register_default_agents(&mut registry);
-    let _ = agent_loader::load_and_merge(&project_root, &mut registry);
-    let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
-    let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
-    let engine = astra_runtime::server::delegation::engine::DelegationEngine::with_executor(
-        registry,
-        std::sync::Arc::new(astra_runtime::server::run::engine::RunEngine::new(
-            run_store,
-        )),
-        std::sync::Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new()),
-        std::sync::Arc::new(executor),
-    );
-    state.delegation_engine = Some(std::sync::Arc::new(engine));
 }
 
 fn record_stream_persistence_error(sr: &mut StreamResult, detail: impl Into<String>) {
@@ -801,23 +974,20 @@ async fn execute_repl_bridge_command_impl(
     try_silent_auth(api, profile).await;
 
     let mut state = initialize_session_state(profile, global_model, cli_context);
-    if slash_cmd == "/messaging" {
-        handle_messaging_command(arg, &state).await;
+    // Local journal diagnostics do not consume tools or remote skill catalogs.
+    if slash_cmd == "/debug" {
+        handle_debug_command(arg, &state);
         return Ok(ExitCode::Success);
     }
     maybe_load_project_instructions(&mut state);
 
-    let pipeline_modules = create_pipeline_modules(api, profile);
+    let pipeline_modules = create_pipeline_modules(api, profile).await;
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
     let token = repl_bridge_access_token(slash_cmd, api, profile).await?;
-    if let Some(ref tok) = token {
-        maybe_wire_delegation_engine(&mut state, api, tok);
-    }
 
     match slash_cmd {
-        "/team" => slash_team::handle_team_command(arg, api, profile, &mut state).await,
         "/telemetry" => slash_telemetry::handle_telemetry_command(arg, &state),
         "/memory" => {
             handle_memory_domain_command("/memory", arg, api, &mut state, token.as_deref()).await?
@@ -832,9 +1002,8 @@ async fn execute_repl_bridge_command_impl(
             )
             .await?
         }
-        "/review" | "/grep" => {
-            handle_info_command(slash_cmd, arg, api, &mut state, profile, token.as_deref()).await?
-        }
+        "/review" => handle_review_command(arg, api, &mut state, profile, token.as_deref()).await?,
+        "/grep" => handle_grep_command(arg).await?,
         "/diff" => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             diff_presenter::run_diff_command(&root, arg, cli_utils::terminal_width_usize());
@@ -842,7 +1011,6 @@ async fn execute_repl_bridge_command_impl(
         "/allow" => {
             handle_permission_command(arg, &mut state);
         }
-        "/debug" => handle_debug_command(arg, &state),
         "/bug" => handle_bug_command(arg, &state),
         "/agent" => {
             let ctx = slash_agent::AgentCommandContext {
@@ -851,7 +1019,6 @@ async fn execute_repl_bridge_command_impl(
             };
             slash_agent::handle_agent_command(arg, &ctx).await;
         }
-        "/messaging" => handle_messaging_command(arg, &state).await,
         _ => return Err(format!("unsupported bridged command: {slash_cmd}")),
     }
 
@@ -951,7 +1118,7 @@ mod token_refresh_error_tests {
 
     #[test]
     fn repl_bridge_auth_policy_matches_command_capabilities() {
-        for command in ["/team", "/memory", "/plan", "/review", "/grep"] {
+        for command in ["/memory", "/plan", "/review", "/grep"] {
             assert!(
                 repl_bridge_command_requires_access_token(command),
                 "{command} needs cloud auth or delegation wiring and must fail fast"
@@ -1043,6 +1210,310 @@ mod token_refresh_error_tests {
             "gateway auth must advance past local-profile admission: {error}"
         );
         assert!(!error.contains("no profile"), "{error}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn execution_capture_keeps_one_owner_and_rejects_partial_or_foreign_sources() {
+        const CHILD: &str = "ASTRA_EXECUTION_CAPTURE_CONTRACT_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cli::command_router::token_refresh_error_tests::execution_capture_keeps_one_owner_and_rejects_partial_or_foreign_sources", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        use crate::cli::cli_config::cli_utils;
+        use wiremock::matchers::{header, query_param};
+
+        let _creds = crate::tests::isolate_credentials();
+        let _token = EnvVarGuard::remove("ASTRA_ACCESS_TOKEN");
+        let mut credentials = astra_credentials::CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            astra_credentials::Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("inspection-token".into()),
+                ..Default::default()
+            },
+        );
+        cli_utils::save_credentials(&credentials).unwrap();
+        let _identity =
+            cli_utils::install_cli_profile_identity_for_test("default", Some("owner")).unwrap();
+        let mut valid_sources = None;
+        for (
+            tree_session,
+            reflect_session,
+            reflect_schema,
+            reflect_status,
+            transcript_fault,
+            valid,
+        ) in [
+            ("session", "session", 2, 200, None, true),
+            ("foreign", "session", 2, 200, None, false),
+            ("session", "foreign", 2, 200, None, false),
+            ("session", "session", 1, 200, None, false),
+            ("session", "session", 2, 503, None, false),
+            ("session", "session", 2, 200, Some("foreign"), false),
+            ("session", "session", 2, 200, Some("cursor"), false),
+        ] {
+            let server = MockServer::start().await;
+            let tree = serde_json::json!({
+                "schema_version": astra_server_types::SESSION_RUN_TREE_SCHEMA_VERSION,
+                "session_id": tree_session, "snapshot_revision": "revision",
+                "observed_at": "2026-10-07T00:00:00Z", "node_limit": 200,
+                "truncated": false, "runs": [],
+            });
+            let reflection = serde_json::json!({
+                "schema_version": reflect_schema, "tool": "reflect",
+                "session_id": reflect_session, "analysis_view": "execution_trace",
+                "topic": "execution", "facet": "trace", "depth": "forensic",
+                "horizon": "session", "source_policy": "local_first", "include_context": false,
+                "data_coverage": {"source": "server", "events": 0, "decisions": 0},
+                "model_requests": astra_services::reflect::ModelRequestCapture::default(),
+            });
+            if valid {
+                valid_sources = Some((tree.clone(), reflection.clone()));
+            }
+            for (route, status, body) in [
+                ("/sessions/session/runs", 200, tree),
+                ("/chat/session/session/reflect", reflect_status, reflection),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(route))
+                    .and(header("authorization", "Bearer inspection-token"))
+                    .and(query_param(
+                        if route.ends_with("/runs") {
+                            "limit"
+                        } else {
+                            "depth"
+                        },
+                        if route.ends_with("/runs") {
+                            "200"
+                        } else {
+                            "forensic"
+                        },
+                    ))
+                    .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            if valid || transcript_fault.is_some() {
+                for (before, seq, has_more) in [(None, 2, true), (Some("2"), 1, false)] {
+                    let mut mock = Mock::given(method("GET"))
+                        .and(path("/sessions/session/transcript"))
+                        .and(header("authorization", "Bearer inspection-token"))
+                        .and(query_param("limit", "200"));
+                    if let Some(before) = before {
+                        mock = mock.and(query_param("before_seq", before));
+                    } else {
+                        mock = mock.and(wiremock::matchers::query_param_is_missing("before_seq"));
+                    }
+                    mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "session_id":if transcript_fault == Some("foreign") { "foreign" } else { "session" },
+                        "has_more":has_more,
+                        "next_before_seq":if transcript_fault == Some("cursor") { seq + 1 } else { seq },
+                        "items":[{"session_id":"session", "item_seq":seq, "run_id":"root",
+                            "role":"user", "content":"test", "created_at":"2026-10-07T00:00:00Z"}],
+                    }))).expect(1).mount(&server).await;
+                    if transcript_fault.is_some() {
+                        break;
+                    }
+                }
+            }
+            let api =
+                astra_thin_client::ThinClient::new(&server.uri(), Some("wrong-default".into()))
+                    .unwrap();
+            let result = super::capture_session_execution(
+                &api,
+                Some("default"),
+                "session",
+                valid || transcript_fault.is_some(),
+                false,
+            )
+            .await;
+            assert_eq!(result.is_ok(), valid, "{result:?}");
+            if let Ok(capture) = result {
+                assert_eq!(capture["owner"]["account_id"], "owner");
+                assert_eq!(capture["owner"]["profile_name"], "default");
+                assert_eq!(capture["transcript"]["has_more"], false);
+                assert_eq!(capture["transcript"]["items"][0]["item_seq"], 1);
+                assert_eq!(capture["transcript"]["items"][1]["item_seq"], 2);
+                assert_eq!(capture["owner"]["api_origin"], api.api_origin());
+                assert_eq!(capture["run_tree"]["session_id"], "session");
+                assert_eq!(capture["reflection"]["schema_version"], 2);
+            }
+            server.verify().await;
+        }
+        let (tree, reflection) = valid_sources.unwrap();
+        for (projection_session, projection_run, truncated, valid) in [
+            ("session", "root", false, true),
+            ("foreign", "root", false, false),
+            ("session", "foreign", false, false),
+            ("session", "root", true, false),
+        ] {
+            let server = MockServer::start().await;
+            let mut event_tree = tree.clone();
+            event_tree["truncated"] = truncated.into();
+            event_tree["runs"] = serde_json::json!([{
+                "run_id":"root", "root_run_id":"root", "depth":0,
+                "status":"completed", "run_event_high_watermark":7,
+                "total_tool_calls":0, "runtime":{}, "available_actions":[],
+                "created_at":"2026-10-07T00:00:00Z", "updated_at":"2026-10-07T00:00:00Z",
+            }]);
+            for (route, body, expected) in [
+                ("/sessions/session/runs", event_tree, 1),
+                ("/chat/session/session/reflect", reflection.clone(), 1),
+                (
+                    "/chat/runs/root/projection",
+                    serde_json::json!({
+                        "run_id":projection_run, "session_id":projection_session,
+                        "run_event_high_watermark":7, "projection_event_idx":7,
+                        "recent_events":[{"index":7,"type":"run_finished"}],
+                    }),
+                    u64::from(!truncated),
+                ),
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(route))
+                    .and(header("authorization", "Bearer inspection-token"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .expect(expected)
+                    .mount(&server)
+                    .await;
+            }
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let result =
+                super::capture_session_execution(&api, Some("default"), "session", false, true)
+                    .await;
+            assert_eq!(result.is_ok(), valid, "{result:?}");
+            if let Ok(capture) = result {
+                assert_eq!(capture["run_projections"][0]["run_event_high_watermark"], 7);
+                assert_eq!(
+                    capture["run_projections"][0]["recent_events"][0]["index"],
+                    7
+                );
+                assert!(capture.get("transcript").is_none());
+                let requests = server.received_requests().await.unwrap();
+                assert!(
+                    requests
+                        .iter()
+                        .any(|request| request.url.query() == Some("recent_limit=500"))
+                );
+            }
+            server.verify().await;
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sessions/session/runs"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&tree)
+                    .set_delay(std::time::Duration::from_millis(100)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/chat/session/session/reflect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&reflection))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let replace = async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while server.received_requests().await.unwrap().is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            cli_utils::install_cli_profile_identity_for_test("other", Some("other-owner")).unwrap()
+        };
+        let (result, replacement) = tokio::join!(
+            super::capture_session_execution(&api, Some("default"), "session", false, false),
+            replace
+        );
+        assert!(result.unwrap_err().contains("between reads"));
+        server.verify().await;
+        drop(replacement);
+
+        // A native binding replaces even a valid but unrelated ambient provider.
+        let server = MockServer::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            astra_credentials::native::NativeStore::with_directory(root.path().join("native"));
+        let mut session = crate::cli::native_auth::test_session();
+        session.environment.astra_url = server.uri();
+        let (mut session, _) = store.publish(session.clone()).unwrap();
+        let binding = crate::cli::native_auth::binding_for_test(store, session.clone());
+        let _active = crate::cli::native_auth::install_active_for_test(binding.clone());
+        let _native_identity = cli_utils::install_cli_profile_identity_for_test(
+            &binding.profile_name(),
+            Some("astra-a"),
+        )
+        .unwrap();
+        let other_store =
+            astra_credentials::native::NativeStore::with_directory(root.path().join("other"));
+        session.access_token = "wrong-provider".into();
+        let (session, _) = other_store.publish(session).unwrap();
+        let other = crate::cli::native_auth::binding_for_test(other_store, session);
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None)
+            .unwrap()
+            .with_bearer_provider(other);
+        for (route, body) in [
+            ("/sessions/session/runs", tree),
+            ("/chat/session/session/reflect", reflection),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .and(header("authorization", "Bearer test-access-a"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let capture = super::capture_session_execution(
+            &api,
+            Some(&binding.profile_name()),
+            "session",
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(capture["owner"]["account_id"], "astra-a");
+        server.verify().await;
+        assert!(
+            Cli::try_parse_from(["astra", "session", "show", "session", "--execution"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "astra",
+                "session",
+                "show",
+                "session",
+                "--execution",
+                "--run-events",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["astra", "session", "show", "session", "--run-events",]).is_err()
+        );
+        for mutation in ["close", "cancel", "delete"] {
+            assert!(
+                Cli::try_parse_from(["astra", "session", mutation, "session", "--execution"])
+                    .is_err()
+            );
+        }
     }
 }
 
@@ -1245,7 +1716,12 @@ async fn execute_cli_command_impl(
             let resolved_model = resolve_one_shot_model(
                 api,
                 &token,
-                None,
+                global_model.as_deref().filter(|_| {
+                    matches!(
+                        cli_context.requested_model_policy,
+                        Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
+                    )
+                }),
                 session_routing.restored_model(),
                 global_model.as_deref(),
             )
@@ -1260,14 +1736,15 @@ async fn execute_cli_command_impl(
             )?;
             let (mut continuation_messages, deferred_tool_activations) =
                 session_routing.continuation_turn_inputs()?;
-            let _pipeline = create_pipeline_modules(api, profile.as_deref());
+            let _pipeline = create_pipeline_modules(api, profile.as_deref()).await;
             let mut pm = PermissionManager::with_load_policy(
                 effective_permission_mode,
                 &std::env::current_dir().unwrap_or_default(),
                 &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
             );
-            let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
+                mcp_manager: Some(_pipeline.mcp_manager.clone()),
                 api,
                 auth_profile: profile.as_deref(),
                 message: &message,
@@ -1275,9 +1752,7 @@ async fn execute_cli_command_impl(
                 offering_id: effective_offering_id.as_deref(),
                 provider: None,
                 explain: ExplainMode::Off,
-                explain_report_format: astra_config::runtime_config::RuntimeConfig::load()
-                    .explain
-                    .effective_report_format(),
+                runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::load()),
                 render_md: terminal::size().is_ok(),
                 verbose_mode: true,
                 render_policy: crate::cli::stream::stream_render::RenderPolicy::Stream,
@@ -1292,10 +1767,7 @@ async fn execute_cli_command_impl(
                 stream_json_emitter: None,
                 #[cfg(feature = "harness")]
                 harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
-                #[cfg(feature = "harness")]
-                harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(
-                    astra_harness::SessionTrace::new(None),
-                ))),
+
                 #[cfg(feature = "harness")]
                 benchmark_profile: None,
             };
@@ -1311,9 +1783,7 @@ async fn execute_cli_command_impl(
                 &chat_ctx,
                 &token,
                 session_id.as_deref(),
-                profile.as_deref(),
                 &mut pm,
-                &mut skill_qt,
                 turn_options.clone(),
             )
             .await
@@ -1335,9 +1805,7 @@ async fn execute_cli_command_impl(
                                 &chat_ctx,
                                 &new_token,
                                 session_id.as_deref(),
-                                profile.as_deref(),
                                 &mut pm,
-                                &mut skill_qt,
                                 turn_options.clone(),
                             )
                             .await
@@ -1455,15 +1923,16 @@ async fn execute_cli_command_impl(
                 .get(&name)
                 .cloned()
                 .ok_or_else(|| format!("no profile '{name}'"))?;
-            let refresh_token = saved_profile
-                .refresh_token
-                .ok_or_else(|| format!("profile '{name}' has no refresh token"))?;
-            let body = api
-                .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
+            if saved_profile
+                .account_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty())
+            {
+                return Err("refresh requires a server-issued account_id; log in again".into());
+            }
+            session_runtime::try_refresh_token(api, &name, &saved_profile, None)
                 .await
-                .map_err(map_thin_err)?;
-            let tokens = parse_auth_tokens(&body)?;
-            save_refreshed_profile_tokens(profile.as_deref(), &tokens)?;
+                .map_err(|error| format!("refresh failed: {error:?}"))?;
             stdout_println!("  {} {}", theme::icon_ok(), "Token refreshed".green());
             Ok(ExitCode::Success)
         }
@@ -1503,18 +1972,6 @@ async fn execute_cli_command_impl(
                     ExitCode::ApiError
                 },
             )
-        }
-
-        Some(Command::Team(args)) => {
-            execute_repl_bridge_command(
-                "/team",
-                &render_team_args(&args),
-                profile.as_deref(),
-                global_model.as_deref(),
-                api,
-                cli_context,
-            )
-            .await
         }
 
         Some(Command::Work(command)) => {
@@ -1618,18 +2075,6 @@ async fn execute_cli_command_impl(
             .await
         }
 
-        Some(Command::Messaging(args)) => {
-            execute_repl_bridge_command(
-                "/messaging",
-                &render_messaging_args(&args),
-                profile.as_deref(),
-                global_model.as_deref(),
-                api,
-                cli_context,
-            )
-            .await
-        }
-
         Some(Command::Context(ctx_cmd)) => {
             // Forensic `/context dump` — reads a persisted journal
             // and writes a snapshot JSON file (or prints a
@@ -1678,6 +2123,11 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Chat(args)) => {
+            let mut chat_context = cli_context.clone();
+            if let Some(model) = args.model.as_deref() {
+                chat_context.select_model(Some(model));
+            }
+            let cli_context = &chat_context;
             // Anchor before any token/session/model/spawner await so the
             // process-level deadline covers the complete one-shot lifecycle.
             let one_shot_terminal_deadline = args.max_wall_time_seconds.map(|seconds| {
@@ -1807,7 +2257,14 @@ async fn execute_cli_command_impl(
             let model_future = resolve_one_shot_model(
                 api,
                 &token,
-                args.model.as_deref(),
+                args.model.as_deref().or_else(|| {
+                    global_model.as_deref().filter(|_| {
+                        matches!(
+                            cli_context.requested_model_policy,
+                            Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
+                        )
+                    })
+                }),
                 session_routing.restored_model(),
                 global_model.as_deref(),
             );
@@ -1831,7 +2288,7 @@ async fn execute_cli_command_impl(
             let (mut continuation_messages, deferred_tool_activations) =
                 session_routing.continuation_turn_inputs()?;
             let is_tty = terminal::size().is_ok();
-            let _pipeline = create_pipeline_modules(api, profile.as_deref());
+            let _pipeline = create_pipeline_modules(api, profile.as_deref()).await;
             let mut pm = {
                 let project_root = std::env::current_dir().unwrap_or_default();
                 PermissionManager::with_load_policy(
@@ -1847,60 +2304,35 @@ async fn execute_cli_command_impl(
             // When quiet, don't render markdown (no terminal formatting)
             let render_md = is_tty && !quiet;
 
-            let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
             let render_policy = if quiet {
                 crate::cli::stream::stream_render::RenderPolicy::Silent
             } else {
                 crate::cli::stream::stream_render::RenderPolicy::Stream
             };
 
-            // One-shot chat uses the same local agent spawner wiring as the
-            // REPL so agent(action='spawn', ...) has the same behavior.
-            let root_agent_id = format!("root-{}", uuid::Uuid::new_v4());
-            let spawner_future = super::agent_runtime::build_one_shot_spawner(
-                api,
-                token.clone(),
-                astra_runtime::skills::default_unified_registry().clone(),
-                session_id.clone(),
-                effective_model.clone(),
-            );
-            let one_shot_spawner = if let Some(deadline) = one_shot_terminal_deadline {
-                tokio::time::timeout_at(deadline, spawner_future)
-                    .await
-                    .map_err(|_| "request wall deadline expired during agent setup".to_string())?
-            } else {
-                spawner_future.await
-            };
-
-            // Keep a clone of the Arc so we can drain background
-            // spawned children before process exit — otherwise
-            // background tasks (the default background-agent mode) get
-            // aborted when main returns, which silently drops any
-            // ForkCacheEvent / child telemetry they would have
-            // emitted on their first response.
-            let spawner_handle_for_drain = one_shot_spawner.clone();
             let (stream_event_tx, stream_event_writer) = if let Some(path) =
                 args.stream_events.as_deref()
             {
                 let (tx, rx) = crate::cli::chat_stream::stream_event_channel();
-                let handle = crate::cli::stream::stream_events_writer::spawn_file_writer(rx, path)
-                    .map_err(|error| {
-                        format!(
-                            "failed to open stream-event file {}: {error}",
-                            path.display()
-                        )
-                    })?;
+                let owner =
+                    crate::cli::stream::stream_events_writer::StreamEventOwner::capture(api)?;
+                let handle =
+                    crate::cli::stream::stream_events_writer::spawn_file_writer(rx, path, owner)
+                        .map_err(|error| {
+                            format!(
+                                "failed to open stream-event file {}: {error}",
+                                path.display()
+                            )
+                        })?;
                 (Some(tx), Some(handle))
             } else {
                 (None, None)
             };
             #[cfg(feature = "harness")]
             let harness_sink = astra_harness::InMemorySnapshotSink::arc();
-            #[cfg(feature = "harness")]
-            let harness_trace = std::sync::Arc::new(std::sync::RwLock::new(
-                astra_harness::SessionTrace::new(None),
-            ));
+
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
+                mcp_manager: Some(_pipeline.mcp_manager.clone()),
                 api,
                 auth_profile: profile.as_deref(),
                 message: &message,
@@ -1908,16 +2340,14 @@ async fn execute_cli_command_impl(
                 offering_id: effective_offering_id.as_deref(),
                 provider: None,
                 explain: explain_mode,
-                explain_report_format: astra_config::runtime_config::RuntimeConfig::load()
-                    .explain
-                    .effective_report_format(),
+                runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::load()),
                 render_md,
                 verbose_mode: !quiet,
                 render_policy,
                 cli_context: Some(cli_context),
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
-                agent_spawner: Some(one_shot_spawner),
-                root_agent_id: Some(&root_agent_id),
+                agent_spawner: None,
+                root_agent_id: None,
                 bg_task_commands: None,
                 bg_task_list_cache: None,
                 bash_detach_slot: None,
@@ -1925,8 +2355,7 @@ async fn execute_cli_command_impl(
                 stream_json_emitter: None,
                 #[cfg(feature = "harness")]
                 harness_sink: Some(harness_sink.clone()),
-                #[cfg(feature = "harness")]
-                harness_trace: Some(harness_trace),
+
                 #[cfg(feature = "harness")]
                 benchmark_profile: args.benchmark_profile,
             };
@@ -1943,7 +2372,6 @@ async fn execute_cli_command_impl(
                 deferred_tool_activations,
                 append_system_prompt: args.append_system_prompt.clone(),
                 execution_time_budget: one_shot_execution_time_budget,
-                disable_session_not_found_retry: args.no_resume || args.session_id.is_some(),
                 turn_index: Some(session_routing.next_server_turn_index()),
                 cancel_token: wall_deadline_cancel_token.clone(),
                 incremental_state: wall_deadline_incremental_state.clone(),
@@ -1962,9 +2390,7 @@ async fn execute_cli_command_impl(
                     &chat_ctx,
                     &token,
                     session_id.as_deref(),
-                    profile.as_deref(),
                     &mut pm,
-                    &mut skill_qt,
                     turn_options,
                 );
                 tokio::pin!(turn_future);
@@ -2094,38 +2520,7 @@ async fn execute_cli_command_impl(
                 }
             };
 
-            // Drain any background-spawned child agents before
-            // returning. Without this, background tasks (the
-            // default background-agent mode) are aborted when main
-            // returns, which silently drops any ForkCacheEvent /
-            // child output they would have emitted. Deadline is
-            // bounded so a misbehaving child can't hang the CLI;
-            // tasks exceeding it are aborted with a log warning.
-            //
-            // We drain BEFORE writing result to stdout so the
-            // [fork-cache] stderr lines (if any) appear before the
-            // JSON/text result — operators grepping stderr don't
-            // see the order swap.
-            let mut terminal_settlement_error = None;
-            let background_agent_results = if wall_deadline_reached
-                && spawner_handle_for_drain.background_task_count() > 0
-            {
-                terminal_settlement_error = Some(
-                    "request wall deadline reached with background agents still active".to_string(),
-                );
-                Vec::new()
-            } else if wall_deadline_reached {
-                // No task owns a background execution resource, so there is
-                // nothing to drain and no unbounded cancellation tail.
-                Vec::new()
-            } else {
-                spawner_handle_for_drain
-                    .shutdown_and_wait(std::time::Duration::from_secs(30))
-                    .await
-            };
-
-            // Child progress shares the root stream. Close and flush it only
-            // after every terminal child event has had a chance to arrive.
+            // Flush the completed Server stream before publishing the result.
             drop(chat_ctx);
             settle_one_shot_stream_event_writer(stream_event_writer, terminal_deadline).await?;
 
@@ -2136,8 +2531,6 @@ async fn execute_cli_command_impl(
                 }
                 Err(e) => {
                     if let Some(mut sr) = stream_result_from_resumable_turn_failure(&e) {
-                        sr.background_agent_results = background_agent_results.clone();
-                        let background_agent_section = sr.integrate_background_agent_results();
                         let exit_code = finalize_one_shot_stream_result_with_request_lease(
                             profile.as_deref(),
                             effective_model.as_deref(),
@@ -2155,18 +2548,6 @@ async fn execute_cli_command_impl(
                                     "context_ms".to_string(),
                                     serde_json::json!(sr.context_ms),
                                 );
-                                obj.insert(
-                                    "background_agent_results".to_string(),
-                                    serde_json::json!(
-                                        sr.background_agent_results
-                                            .iter()
-                                            .map(|(id, text)| serde_json::json!({
-                                                "agent_id": id,
-                                                "result": text
-                                            }))
-                                            .collect::<Vec<_>>()
-                                    ),
-                                );
                             }
                             write_headless_stdout_line(
                                 &serde_json::to_string_pretty(&json_output).unwrap_or_default(),
@@ -2175,20 +2556,19 @@ async fn execute_cli_command_impl(
                         }
                         if quiet {
                             write_headless_stdout_line(&sr.full_text)?;
-                        } else if let Some(section) = background_agent_section {
-                            write_headless_stdout_line(&format!("\n\n{section}"))?;
                         }
                         print_one_shot_completion_warning(&sr, exit_code, args.json);
                         return Ok(exit_code);
                     }
-                    let mut error = e.error;
-                    if let Some(section) =
-                        format_background_agent_results(&background_agent_results)
-                    {
-                        error.push_str("\n\n");
-                        error.push_str(&section);
+                    if args.json {
+                        let error = e.error.clone();
+                        write_headless_stdout_line(
+                            &serde_json::to_string_pretty(&hard_failure_json_output(e))
+                                .map_err(|error| error.to_string())?,
+                        )?;
+                        return Err(error);
                     }
-                    return Err(error);
+                    return Err(e.error);
                 }
             };
             if wall_deadline_reached {
@@ -2197,14 +2577,9 @@ async fn execute_cli_command_impl(
                         "request wall deadline ended without root execution settlement".to_string(),
                     );
                 }
-                if let Some(error) = terminal_settlement_error {
-                    return Err(error);
-                }
                 apply_wall_deadline_interruption(&mut sr, wall_deadline_server_terminal_settled);
                 retain_wall_deadline_partial_canonical_messages(&mut sr, &message);
             }
-            sr.background_agent_results = background_agent_results;
-            let background_agent_section = sr.integrate_background_agent_results();
 
             let exit_code = finalize_one_shot_stream_result_with_request_lease(
                 profile.as_deref(),
@@ -2222,17 +2597,6 @@ async fn execute_cli_command_impl(
                 if let Some(obj) = json_output.as_object_mut() {
                     obj.insert("ttft_ms".to_string(), serde_json::json!(sr.ttft_ms));
                     obj.insert("context_ms".to_string(), serde_json::json!(sr.context_ms));
-                    obj.insert(
-                        "background_agent_results".to_string(),
-                        serde_json::json!(
-                            sr.background_agent_results
-                                .iter()
-                                .map(
-                                    |(id, text)| serde_json::json!({"agent_id": id, "result": text})
-                                )
-                                .collect::<Vec<_>>()
-                        ),
-                    );
                 }
                 write_headless_stdout_line(
                     &serde_json::to_string_pretty(&json_output).unwrap_or_default(),
@@ -2241,41 +2605,12 @@ async fn execute_cli_command_impl(
             } else if quiet {
                 // Quiet mode: just print the text without formatting
                 write_headless_stdout_line(&sr.full_text)?;
-            } else if let Some(section) = background_agent_section {
-                // The primary assistant response was already streamed. Surface
-                // only the newly reconciled child section here.
-                write_headless_stdout_line(&format!("\n\n{section}"))?;
             }
             // Normal mode output is already handled by stream_chat_sse
 
             print_one_shot_completion_warning(&sr, exit_code, args.json);
 
             Ok(exit_code)
-        }
-
-        Some(Command::Replay(args)) => {
-            let session_id = validated_cli_session_arg(&args.session_id)?;
-            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let replay_body = api
-                .post_session_replay_json(
-                    &token,
-                    session_id,
-                    &serde_json::json!({
-                        "sandbox_name": args.sandbox_name,
-                        "mock_mode": args.mock_mode
-                    }),
-                )
-                .await
-                .map_err(map_thin_err)?;
-            print_json_or_raw(&replay_body);
-            if args.compare {
-                let compare_body = api
-                    .get_session_replay_compare_text(&token, session_id)
-                    .await
-                    .map_err(map_thin_err)?;
-                print_json_or_raw(&compare_body);
-            }
-            Ok(ExitCode::Success)
         }
 
         Some(Command::Session(SessionCmd::Judge(args))) => {
@@ -2324,6 +2659,21 @@ async fn execute_cli_command_impl(
 
         Some(Command::Session(SessionCmd::Show(args))) => {
             let session_id = validated_cli_session_arg(&args.session_id)?;
+            if args.execution {
+                let capture = capture_session_execution(
+                    api,
+                    profile.as_deref(),
+                    session_id,
+                    args.transcript,
+                    args.run_events,
+                )
+                .await?;
+                stdout_println!(
+                    "{}",
+                    serde_json::to_string(&capture).map_err(|e| e.to_string())?
+                );
+                return Ok(ExitCode::Success);
+            }
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .get_session_text(&token, session_id)
@@ -2625,7 +2975,7 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Skill(SkillCmd::List(args))) => {
-            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref());
+            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref()).await;
             let filter = SkillCatalogFilter {
                 query: (!args.query.is_empty()).then(|| args.query.join(" ").to_lowercase()),
                 source: args
@@ -2650,7 +3000,7 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Skill(SkillCmd::Show(args))) => {
-            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref());
+            let pipeline_modules = create_pipeline_modules_quiet(api, profile.as_deref()).await;
             let body = serde_json::to_string(
                 &load_skill_record_from_registry(
                     &pipeline_modules.unified_skill_registry,
@@ -2996,6 +3346,50 @@ fn final_json_output(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Valu
     final_json_output_with_context(sr, exit_code, trace_id, request_id)
 }
 
+/// Project observed failure facts without committing a successful turn or
+/// inferring a durable terminal from a transport error. Run identity comes
+/// only from the physical stream's validated root binding.
+fn hard_failure_json_output(failure: crate::TurnFailure) -> serde_json::Value {
+    let partial = failure.partial;
+    let classes = partial
+        .tool_outcomes
+        .as_ref()
+        .filter(|outcomes| outcomes.is_consistent())
+        .map(|outcomes| {
+            serde_json::json!({
+                "succeeded": outcomes.succeeded,
+                "failed": outcomes.failed,
+                "rejected": outcomes.rejected,
+                "reused": outcomes.reused,
+                "suppressed": outcomes.suppressed,
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({}));
+    let result = StreamResult {
+        session_id: partial.session_id,
+        run_id: partial.run_id,
+        full_text: partial.partial_text,
+        prompt_tokens: partial.prompt_tokens,
+        completion_tokens: partial.completion_tokens,
+        cache_read_tokens: partial.cache_read_tokens,
+        cache_creation_tokens: partial.cache_creation_tokens,
+        token_usage_coverage: partial.token_usage_coverage,
+        llm_rounds: partial.llm_rounds,
+        tool_calls_count: partial.tool_calls_count,
+        tools_used: partial.tools_used,
+        final_state: "failed".to_string(),
+        server_terminal_unverified: true,
+        tool_record_coverage_partial: true,
+        ..Default::default()
+    };
+    let mut output = final_json_output(&result, ExitCode::ApiError);
+    output["tool_result_class_counts"] = classes;
+    output["error"] = serde_json::json!(failure.error);
+    output["error_code"] = serde_json::json!(partial.error_code);
+    output["error_metadata"] = serde_json::json!(partial.error_metadata);
+    output
+}
+
 fn final_stream_json_result(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Value {
     let mut result = final_json_output(sr, exit_code);
     if let Some(object) = result.as_object_mut() {
@@ -3131,8 +3525,19 @@ pub(crate) async fn run_print_mode(
         }
     }
     let session_id = session_routing.server_session_id.clone();
-    let resolved_model =
-        resolve_one_shot_model(api, &token, None, session_routing.restored_model(), model).await?;
+    let resolved_model = resolve_one_shot_model(
+        api,
+        &token,
+        model.filter(|_| {
+            matches!(
+                cli_context.requested_model_policy,
+                Some(astra_turn_types::RequestedModelPolicy::Fixed { .. })
+            )
+        }),
+        session_routing.restored_model(),
+        model,
+    )
+    .await?;
     let effective_model = resolved_model.model;
     let effective_offering_id = resolved_model.offering_id;
     let effective_permission_mode = effective_one_shot_permission_mode(
@@ -3143,7 +3548,7 @@ pub(crate) async fn run_print_mode(
     )?;
     let (mut continuation_messages, deferred_tool_activations) =
         session_routing.continuation_turn_inputs()?;
-    let _pipeline = create_pipeline_modules(api, profile);
+    let _pipeline = create_pipeline_modules(api, profile).await;
     // Print mode is non-interactive. Restored session mode wins when present;
     // otherwise Auto is the headless fallback.
     // Issue #326 P5b: print mode is headless — strip project
@@ -3165,7 +3570,6 @@ pub(crate) async fn run_print_mode(
         }
         return Ok(ExitCode::ToolFailure);
     }
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
     let session_turn = session_routing.next_server_turn_index();
     let stream_json_emitter = if output_format == "stream-json" {
@@ -3177,6 +3581,7 @@ pub(crate) async fn run_print_mode(
     };
 
     let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
+        mcp_manager: Some(_pipeline.mcp_manager.clone()),
         api,
         auth_profile: profile,
         message: &message,
@@ -3184,9 +3589,7 @@ pub(crate) async fn run_print_mode(
         offering_id: effective_offering_id.as_deref(),
         provider: None,
         explain: ExplainMode::Off,
-        explain_report_format: astra_config::runtime_config::RuntimeConfig::load()
-            .explain
-            .effective_report_format(),
+        runtime_config: std::sync::Arc::new(astra_config::RuntimeConfig::load()),
         render_md: false,
         verbose_mode: false,
         render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
@@ -3201,10 +3604,7 @@ pub(crate) async fn run_print_mode(
         stream_json_emitter: stream_json_emitter.clone(),
         #[cfg(feature = "harness")]
         harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
-        #[cfg(feature = "harness")]
-        harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(
-            astra_harness::SessionTrace::new(None),
-        ))),
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     };
@@ -3221,9 +3621,7 @@ pub(crate) async fn run_print_mode(
         &chat_ctx,
         &token,
         session_id.as_deref(),
-        profile,
         &mut pm,
-        &mut skill_qt,
         turn_options,
     )
     .await
@@ -3233,45 +3631,25 @@ pub(crate) async fn run_print_mode(
             return Ok(ExitCode::Success);
         }
         Err(e) => {
-            let error = e.error;
-            let partial = e.partial;
-            if let Some(emitter) = stream_json_emitter.as_ref() {
-                let total_prompt_tokens = astra_turn_types::NormalizedPromptCacheUsage::new(
-                    partial.prompt_tokens,
-                    partial.cache_read_tokens,
-                    partial.cache_creation_tokens,
-                )
-                .total_input_tokens();
-                let result_session_id = partial.session_id.clone().or_else(|| session_id.clone());
-                let (trace_id, request_id) = gateway_env_context();
-                emitter.emit_result(
-                    result_session_id.as_deref(),
-                    serde_json::json!({
-                        "trace_id": trace_id,
-                        "request_id": request_id,
-                        "session_id": partial.session_id,
-                        "text": partial.partial_text,
-                        "final_state": "failed",
-                        "interruption_kind": serde_json::Value::Null,
-                        "prompt_tokens": total_prompt_tokens,
-                        "fresh_prompt_tokens": partial.prompt_tokens,
-                        "cache": {
-                            "hit": partial.cache_read_tokens > 0,
-                            "read_tokens": partial.cache_read_tokens,
-                            "creation_tokens": partial.cache_creation_tokens,
-                        },
-                        "completion_tokens": partial.completion_tokens,
-                        "tool_calls_count": partial.tool_calls_count,
-                        "tools_used": partial.tools_used,
-                        "persistence_error": serde_json::Value::Null,
-                        "exit_code": serde_json::Value::Null,
-                        "success": false,
-                        "error_kind": serde_json::Value::Null,
-                        "error": &error,
-                    }),
-                )?;
+            if output_format == "json" || stream_json_emitter.is_some() {
+                let error = e.error.clone();
+                let mut output = hard_failure_json_output(e);
+                if let Some(emitter) = stream_json_emitter.as_ref() {
+                    let result_session_id = output["session_id"].as_str().map(str::to_string);
+                    output
+                        .as_object_mut()
+                        .expect("terminal projection is an object")
+                        .remove("run_id");
+                    emitter.emit_result(result_session_id.as_deref(), output)?;
+                } else {
+                    write_headless_stdout_line(
+                        &serde_json::to_string_pretty(&output)
+                            .map_err(|error| error.to_string())?,
+                    )?;
+                }
+                return Err(error);
             }
-            return Err(error);
+            return Err(e.error);
         }
     };
 
@@ -4791,6 +5169,7 @@ mod one_shot_persistence_tests {
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let mut sr = StreamResult {
+            turn_evaluation: None,
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
@@ -4811,7 +5190,6 @@ mod one_shot_persistence_tests {
             budget_pressure: 0.0,
             stall_events: Vec::new(),
             verdict_events: Vec::new(),
-            step_recorder_summary: None,
             tool_health_export: Vec::new(),
             last_heavy_checkpoint: None,
             ttft_ms: None,
@@ -4833,7 +5211,6 @@ mod one_shot_persistence_tests {
             deferred_tool_activations: Vec::new(),
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
-            background_agent_results: Vec::new(),
         };
 
         let settlement = persist_headless_session_state(
@@ -4926,6 +5303,7 @@ mod one_shot_persistence_tests {
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let mut sr = StreamResult {
+            turn_evaluation: None,
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
@@ -4946,7 +5324,6 @@ mod one_shot_persistence_tests {
             budget_pressure: 0.0,
             stall_events: Vec::new(),
             verdict_events: Vec::new(),
-            step_recorder_summary: None,
             tool_health_export: Vec::new(),
             last_heavy_checkpoint: None,
             ttft_ms: None,
@@ -4968,7 +5345,6 @@ mod one_shot_persistence_tests {
             deferred_tool_activations: Vec::new(),
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
-            background_agent_results: Vec::new(),
         };
 
         let exit_code = finalize_one_shot_stream_result_with_request_lease(

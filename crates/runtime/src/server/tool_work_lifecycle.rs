@@ -2056,6 +2056,11 @@ pub(super) async fn execute_settle_work_item(
     args: &Value,
     invocation: ToolInvocationMetadata<'_>,
 ) -> ToolResult {
+    if !executor.has_assigned_work_item_attempt() {
+        return ToolResult::error(
+            "settle_work_item rejected: no canonical WorkItem attempt is assigned to this run; waiting for an ordinary child agent is not blocked Work".to_string(),
+        );
+    }
     let Some(run_id) = invocation.run_id.map(str::trim).filter(|id| !id.is_empty()) else {
         return ToolResult::error(
             "settle_work_item requires the exact current durable run identity".to_string(),
@@ -2414,8 +2419,9 @@ mod tests {
         board_settled_task, canonical_settlement_transition, canonical_start_work_payload,
         compile_initial_task_graph, confirmed_assignment,
         decode_canonical_work_establishment_payload, execute_run_next_work_item,
-        execute_start_work, initial_declared_tasks, start_work_operation_id,
-        task_board_display_text, task_graph_execution_status, validate_initial_task_list,
+        execute_settle_work_item, execute_start_work, initial_declared_tasks,
+        start_work_operation_id, task_board_display_text, task_graph_execution_status,
+        validate_initial_task_list,
     };
     use crate::server::runtime_tool_executor::ActivePrimaryWorkAttempt;
     use crate::server::runtime_tool_executor::RuntimeToolExecutor;
@@ -2515,6 +2521,7 @@ mod tests {
 
     fn replacement_admission_decision(goal: &str) -> astra_services::WorkAdmissionDecision {
         astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -2648,6 +2655,7 @@ mod tests {
             }],
         };
         let decision = astra_services::WorkAdmissionDecision::Required {
+            assessment: None,
             domain: None,
             workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
             mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
@@ -3107,6 +3115,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unassigned_settlement_fails_before_storage_access() {
+        let temp = TempDir::new().expect("workspace");
+        let executor = RuntimeToolExecutor::new(
+            temp.path().to_path_buf(),
+            "owner".to_string(),
+            "session".to_string(),
+            None,
+            None,
+        );
+        let result = execute_settle_work_item(
+            &executor,
+            &json!({"outcome":"blocked","summary":"waiting for child","blocker_kind":"dependency_blocked"}),
+            ToolInvocationMetadata {
+                run_id: Some("run"),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("no canonical WorkItem attempt"));
+        assert!(!result.output.contains("storage"));
+    }
+
+    #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn terminal_establishment_replay_preserves_mutations_and_assignment_once() {
         let pool = setup_pool().await;
@@ -3159,12 +3191,14 @@ mod tests {
                 }]
             }),
             ToolInvocationMetadata {
+                admission_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("turn-2"),
                 tool_call_id: Some("physical-1"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
-                task_resolution_authority: None,
+                command_timeout_cap_ms: None,
+                delegation_model_admission: None,
             },
         )
         .await;
@@ -3174,12 +3208,14 @@ mod tests {
             &executor,
             &args,
             ToolInvocationMetadata {
+                admission_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("turn-2"),
                 tool_call_id: Some("physical-1"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
-                task_resolution_authority: None,
+                command_timeout_cap_ms: None,
+                delegation_model_admission: None,
             },
         )
         .await;
@@ -3195,12 +3231,14 @@ mod tests {
             &executor,
             &args,
             ToolInvocationMetadata {
+                admission_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("turn-2"),
                 tool_call_id: Some("physical-2"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
-                task_resolution_authority: None,
+                command_timeout_cap_ms: None,
+                delegation_model_admission: None,
             },
         )
         .await;
@@ -3245,12 +3283,14 @@ mod tests {
                 }]
             }),
             ToolInvocationMetadata {
+                admission_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("later-turn"),
                 tool_call_id: Some("untrusted-later-start"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
-                task_resolution_authority: None,
+                command_timeout_cap_ms: None,
+                delegation_model_admission: None,
             },
         )
         .await;
@@ -3342,12 +3382,14 @@ mod tests {
             &deferred_executor,
             &deferred_args,
             ToolInvocationMetadata {
+                admission_deadline: None,
                 run_id: Some(&deferred_run_id),
                 turn_chain_id: Some("turn-4"),
                 tool_call_id: Some("physical-defer"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
-                task_resolution_authority: None,
+                command_timeout_cap_ms: None,
+                delegation_model_admission: None,
             },
         )
         .await;
@@ -3393,12 +3435,14 @@ mod tests {
             &deferred_executor,
             &deferred_args,
             ToolInvocationMetadata {
+                admission_deadline: None,
                 run_id: Some(&deferred_run_id),
                 turn_chain_id: Some("turn-after-restart"),
                 tool_call_id: Some("physical-plan-only"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
-                task_resolution_authority: None,
+                command_timeout_cap_ms: None,
+                delegation_model_admission: None,
             },
         )
         .await;
@@ -3448,12 +3492,14 @@ mod tests {
             &executor,
             &args,
             ToolInvocationMetadata {
+                admission_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("turn-5"),
                 tool_call_id: Some("physical-active-defer"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
-                task_resolution_authority: None,
+                command_timeout_cap_ms: None,
+                delegation_model_admission: None,
             },
         )
         .await;
@@ -3476,12 +3522,14 @@ mod tests {
             &executor,
             &args,
             ToolInvocationMetadata {
+                admission_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("turn-6"),
                 tool_call_id: Some("physical-assignment-replay"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
-                task_resolution_authority: None,
+                command_timeout_cap_ms: None,
+                delegation_model_admission: None,
             },
         )
         .await;
@@ -3597,12 +3645,14 @@ mod tests {
                 &executor,
                 &args,
                 ToolInvocationMetadata {
+                    admission_deadline: None,
                     run_id: Some(&run_id),
                     turn_chain_id: Some("recovery-turn"),
                     tool_call_id: Some(&physical_call_id),
                     admission_source: Some(ToolInvocationAdmissionSource::Policy),
                     expected_control_epoch: None,
-                    task_resolution_authority: None,
+                    command_timeout_cap_ms: None,
+                    delegation_model_admission: None,
                 },
             )
             .await;
@@ -3708,12 +3758,14 @@ mod tests {
             &executor,
             &args,
             ToolInvocationMetadata {
+                admission_deadline: None,
                 run_id: Some(&run_id),
                 turn_chain_id: Some("recovery-turn"),
                 tool_call_id: Some("physical-foreign-fence"),
                 admission_source: Some(ToolInvocationAdmissionSource::Policy),
                 expected_control_epoch: None,
-                task_resolution_authority: None,
+                command_timeout_cap_ms: None,
+                delegation_model_admission: None,
             },
         )
         .await;

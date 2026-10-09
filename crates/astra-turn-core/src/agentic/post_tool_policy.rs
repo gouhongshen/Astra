@@ -27,6 +27,8 @@ pub struct AgenticPostToolPolicyRequest<'a> {
     pub step_recorder: &'a mut StepRecorder,
     pub current_user_id: Option<&'a String>,
     pub current_session_id: Option<&'a String>,
+    /// Only the root execution may publish the session recovery timeline.
+    pub owns_session_composite_snapshot: bool,
     /// Sticky workspace safety state that must accompany any warning-driven
     /// heavy checkpoint written by this policy.  The policy is not an
     /// authority source; it only preserves the runtime's existing state.
@@ -51,6 +53,7 @@ pub fn apply_agentic_post_tool_policy(ctx: AgenticPostToolPolicyRequest<'_>) {
         step_recorder,
         current_user_id,
         current_session_id,
+        owns_session_composite_snapshot,
         workspace_observation_quarantine,
         max_turns,
         run_execution_budget,
@@ -155,12 +158,19 @@ pub fn apply_agentic_post_tool_policy(ctx: AgenticPostToolPolicyRequest<'_>) {
                     heavy.workspace_observation_quarantine =
                         workspace_observation_quarantine.cloned();
                 }
-                let _ = step_checkpoint::write_step_checkpoint(
-                    current_user_id.map(|s| s.as_str()).unwrap_or(""),
-                    sid,
-                    step_recorder.summary().checkpoints,
-                    &cp,
-                );
+                if owns_session_composite_snapshot {
+                    let user_id = current_user_id.map(|s| s.as_str()).unwrap_or("");
+                    let result =
+                        step_checkpoint::next_checkpoint_number(user_id, sid).and_then(|number| {
+                            step_checkpoint::write_step_checkpoint(user_id, sid, number, &cp)
+                        });
+                    if let Err(error) = result {
+                        astra_core::agent_warn!(
+                            "checkpoint",
+                            "Failed to persist warning checkpoint for {sid}: {error}"
+                        );
+                    }
+                }
                 *last_heavy_checkpoint = Some(cp);
             }
         }
@@ -204,6 +214,7 @@ mod tests {
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
             current_user_id: None,
+            owns_session_composite_snapshot: true,
             current_session_id: None,
             workspace_observation_quarantine: None,
             max_turns: 8,
@@ -253,6 +264,7 @@ mod tests {
                 remaining_turns: &mut remaining_turns,
                 step_recorder: &mut step_recorder,
                 current_user_id: Some(&user_id),
+                owns_session_composite_snapshot: true,
                 current_session_id: Some(&session_id),
                 workspace_observation_quarantine: None,
                 max_turns: 128,
@@ -299,6 +311,7 @@ mod tests {
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
             current_user_id: None,
+            owns_session_composite_snapshot: true,
             current_session_id: None,
             workspace_observation_quarantine: None,
             max_turns: 8,
@@ -331,6 +344,13 @@ mod tests {
             .as_nanos();
         let user_id = format!("uid-{suffix}");
         let session_id = format!("post-tool-policy-{suffix}");
+        let earlier = StepCheckpoint::heavy(
+            "earlier-root-step".into(),
+            "earlier-root-task".into(),
+            session_id.clone(),
+            astra_pipeline::step_protocol::ExecutionCursor::default(),
+        );
+        step_checkpoint::write_step_checkpoint(&user_id, &session_id, 5, &earlier).unwrap();
         let mut step_recorder =
             StepRecorder::with_persistence_for_run(&user_id, &session_id, "tid", "test-run");
         step_recorder.begin_turn(0);
@@ -353,8 +373,13 @@ mod tests {
             effective_hard_turn_limit: None,
         };
 
-        let control = astra_pipeline::step_protocol::RunExecutionControl::V2 {
+        let control = astra_pipeline::step_protocol::RunExecutionControl::V4 {
             hook_obligations: astra_turn_types::StopHookObligations::default(),
+            reply_obligations: astra_turn_types::ReplyObligationsSnapshotV1 {
+                run_id: "test-run".into(),
+                producer_owner_generation: 3,
+                pending: Vec::new(),
+            },
             completion_settlement: astra_turn_types::CompletionSettlementState {
                 work_settlement_only: true,
                 textless_response_retries: 1,
@@ -374,6 +399,7 @@ mod tests {
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
             current_user_id: Some(&user_id),
+            owns_session_composite_snapshot: true,
             current_session_id: Some(&session_id),
             workspace_observation_quarantine: Some(&quarantine),
             max_turns: 20,
@@ -399,8 +425,61 @@ mod tests {
         assert_eq!(heavy.run_execution_control, Some(control));
         assert_eq!(
             heavy.workspace_observation_quarantine,
-            Some(quarantine),
+            Some(quarantine.clone()),
             "warning checkpoint must not erase sticky workspace quarantine"
+        );
+
+        let parent_artifacts = step_checkpoint::list_checkpoints(&user_id, &session_id)
+            .expect("root warning checkpoint listing");
+        assert_eq!(parent_artifacts.len(), 2);
+        assert_eq!(
+            parent_artifacts
+                .iter()
+                .map(|(number, _)| *number)
+                .collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+        let parent_checkpoint = serde_json::to_value(checkpoint).expect("checkpoint JSON");
+        messages.push(json!({"role": "assistant", "content": "child-only state"}));
+        last_heavy_checkpoint = None;
+        let mut turn_guard = TurnGuard::new();
+        for _ in 0..3 {
+            turn_guard.record_failed_tool_result_with_kind("write_file", None);
+        }
+        apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            run_execution_budget: None,
+            run_execution_control: None,
+            turn_index: 1,
+            messages: &mut messages,
+            turn_guard: &mut turn_guard,
+            verdict_events: &mut verdict_events,
+            restricted_tools: &mut restricted_tools,
+            remaining_turns: &mut remaining_turns,
+            step_recorder: &mut step_recorder,
+            current_user_id: Some(&user_id),
+            current_session_id: Some(&session_id),
+            owns_session_composite_snapshot: false,
+            workspace_observation_quarantine: Some(&quarantine),
+            max_turns: 20,
+            recent_tools: &[],
+            last_heavy_checkpoint: &mut last_heavy_checkpoint,
+            interaction_mode: TurnInteractionMode::Prompt,
+        });
+        assert!(
+            last_heavy_checkpoint.is_some(),
+            "delegated recovery remains in memory"
+        );
+        assert_eq!(verdict_events.len(), 2);
+        assert_eq!(
+            step_checkpoint::list_checkpoints(&user_id, &session_id).unwrap(),
+            parent_artifacts
+        );
+        let persisted = step_checkpoint::read_latest_heavy_checkpoint(&user_id, &session_id)
+            .expect("read parent checkpoint")
+            .expect("parent checkpoint remains");
+        assert_eq!(
+            serde_json::to_value(StepCheckpoint::Heavy(Box::new(persisted))).unwrap(),
+            parent_checkpoint
         );
     }
 
@@ -440,6 +519,7 @@ mod tests {
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
             current_user_id: Some(&user_id),
+            owns_session_composite_snapshot: true,
             current_session_id: Some(&session_id),
             workspace_observation_quarantine: None,
             max_turns: 8,
@@ -501,6 +581,7 @@ mod tests {
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
             current_user_id: None,
+            owns_session_composite_snapshot: true,
             current_session_id: None,
             workspace_observation_quarantine: None,
             max_turns: 8,
@@ -557,6 +638,7 @@ mod tests {
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
             current_user_id: None,
+            owns_session_composite_snapshot: true,
             current_session_id: None,
             workspace_observation_quarantine: None,
             max_turns: 8,
@@ -610,6 +692,7 @@ mod tests {
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
             current_user_id: None,
+            owns_session_composite_snapshot: true,
             current_session_id: None,
             workspace_observation_quarantine: None,
             max_turns: 8,

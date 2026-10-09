@@ -213,14 +213,14 @@ pub use proposal::{
 };
 pub use proposal_identity::WorkProposalInvocationIdentity;
 pub use recovery_point::{
-    DatabaseWorkRecoveryPointRepository, NewWorkRecoveryPoint, WORK_RECOVERY_POINT_SCHEMA_VERSION,
+    DatabaseWorkRecoveryPointRepository, WORK_RECOVERY_POINT_SCHEMA_VERSION,
     WorkRecoveryPointCaptureRequest, WorkRecoveryPointCursor, WorkRecoveryPointPage,
     WorkRecoveryPointQuery, WorkRecoveryPointRecord, WorkRecoveryPointStatus,
     WorkWorkspaceRecoveryPointCaptureRequest,
 };
 pub use repository::{
     CreatedWork, DatabaseWorkRepository, WorkAcceptanceBasisResource, WorkCheckBasisResource,
-    WorkConflictResource, WorkGenesis, WorkGenesisParts, WorkGoalChange, WorkProposalBasisResource,
+    WorkConflictResource, WorkGenesis, WorkGenesisParts, WorkProposalBasisResource,
     WorkRecoveryPointBlocker, WorkRepository, WorkRepositoryError,
 };
 pub use runtime_event_outbox::{
@@ -782,7 +782,7 @@ pub(crate) const WORK_PATCH_MATERIALIZATION_OPERATIONS_CREATE_SQL: &str =
       (apply_invocation_ref IS NOT NULL AND observed_subject_revision IS NULL
        AND apply_outcome = 'not_applied'
        AND failure_code IN ('provider_unavailable', 'authorization_denied',
-                            'workspace_unavailable', 'patch_rejected',
+                            'workspace_unavailable', 'invalid_workspace', 'patch_rejected',
                             'invocation_cancelled', 'provider_internal')
        AND operation_state = 'failed' AND operation_phase = 'complete')
     ),
@@ -1270,7 +1270,7 @@ pub(crate) const WORK_EVENTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work
     INDEX idx_work_events_branch_seq (owner_id, work_id, branch_id, event_seq),
     CONSTRAINT chk_work_event_seq CHECK (event_seq > 0),
     CONSTRAINT chk_work_event_kind CHECK (event_kind IN (
-        'work_created', 'goal_revised', 'criteria_accepted', 'branch_basis_adopted',
+        'work_created', 'criteria_accepted', 'branch_basis_adopted',
         'graph_replaced', 'delivery_branch_selected', 'branch_archived', 'branch_restored',
         'subject_changed', 'patch_artifact_exported',
         'plan_proposed', 'criteria_proposed', 'proposal_rejected',

@@ -1,0 +1,40 @@
+name: ordinary_previous_run
+description: |
+  Ordinary conversations do not require an Explain capture to inspect their
+  previous execution. Exercise the same CLI mode as normal interactive use,
+  and verify persisted tool evidence rather than the assistant's self-report.
+prompt: "计算 13×17，只回答整数，不使用工具。"
+debug_log: true
+capability: "custom:runtime_observation_recovery"
+timeout_seconds: 120
+extra_cli_args: ["--explain=off"]
+steps:
+  - prompt: |
+      查看刚才那一轮的实际执行记录。告诉我实际使用的模型、是否调用了工具，
+      并区分记录能够证明的事实和缺失的观测；不要重新执行刚才的任务。
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_json
+    name: introspect
+    document: arguments
+    path: /explain/target
+    equals: previous
+  - type: journal_tool_json_contains
+    name: introspect
+    document: result
+    path: ""
+    contains: durable_event_projection
+  - type: journal_tool_outcome_count
+    name: introspect
+    ok: false
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: introspect
+    min: 1
+    max: 1
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0

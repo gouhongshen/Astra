@@ -24,7 +24,7 @@ pub enum CompletionOperation {
 impl CompletionOperation {
     #[must_use]
     pub const fn is_typed_judgment(self) -> bool {
-        !matches!(self, Self::MemoryExtraction)
+        !self.accepts_free_form_output()
     }
 
     #[must_use]
@@ -51,6 +51,11 @@ impl CompletionOperation {
             Self::SkillAutoRoute => "completion_proxy:skill_auto_route",
             Self::VerificationJudge => "completion_proxy:verification_judge",
         }
+    }
+
+    #[must_use]
+    pub const fn accepts_free_form_output(self) -> bool {
+        matches!(self, Self::MemoryExtraction)
     }
 }
 
@@ -329,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn only_free_form_memory_extraction_skips_typed_output_contract() {
+    fn free_form_operations_skip_typed_output_contract() {
         assert!(!CompletionOperation::MemoryExtraction.is_typed_judgment());
         for operation in [
             CompletionOperation::MemoryRetrievalRerank,

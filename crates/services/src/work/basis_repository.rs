@@ -81,11 +81,6 @@ pub(super) async fn adopt_branch_basis(
     let mut transaction = repository.pool.get().begin().await.map_err(|source| {
         WorkRepositoryError::persistence("begin Work branch basis transaction", source)
     })?;
-    let current = load_current_basis(&mut transaction, &change).await?;
-    if current.archived {
-        return Err(WorkRepositoryError::Archived);
-    }
-
     let replay = query(
         "SELECT branch_id, goal_revision, criterion_set_revision, branch_revision
          FROM work_events
@@ -98,6 +93,12 @@ pub(super) async fn adopt_branch_basis(
     .fetch_optional(&mut *transaction)
     .await
     .map_err(|source| WorkRepositoryError::persistence("load branch basis replay", source))?;
+    // Observe the receipt first: loading a basis before a concurrent commit
+    // and its receipt afterwards mixes pre-commit state with post-commit proof.
+    let current = load_current_basis(&mut transaction, &change).await?;
+    if current.archived {
+        return Err(WorkRepositoryError::Archived);
+    }
     if let Some(replay) = replay {
         let exact = replay
             .try_get::<Option<String>, _>("branch_id")

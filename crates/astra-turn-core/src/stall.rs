@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -179,11 +179,9 @@ pub const CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL: usize = 5;
 /// Same for **warning** severity.
 pub const CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING: usize = 2;
 
-/// Per-round signature set and tool-name set for astra flat `tool_calls` rows (`name` + `arguments` JSON).
-pub fn round_tool_call_sig_and_names(
-    tool_calls: &[Value],
-) -> (BTreeSet<crate::stall::StallSignature>, HashSet<String>) {
-    let sig_set: BTreeSet<crate::stall::StallSignature> = tool_calls
+/// Per-round canonical signatures for tool calls (`name` + arguments).
+pub fn round_tool_call_signatures(tool_calls: &[Value]) -> BTreeSet<crate::stall::StallSignature> {
+    tool_calls
         .iter()
         .map(|tc| {
             let name = tool_call_name(tc).unwrap_or("");
@@ -193,12 +191,7 @@ pub fn round_tool_call_sig_and_names(
                 serde_json::to_vec(&normalized).expect("JSON values serialize without failure");
             StallSignature::new(&name, &canonical)
         })
-        .collect();
-    let name_set: HashSet<String> = tool_calls
-        .iter()
-        .map(|tc| tool_call_name(tc).unwrap_or("").to_string())
-        .collect();
-    (sig_set, name_set)
+        .collect()
 }
 
 /// True when the last `window` rounds have **identical** tool-call signatures
@@ -389,7 +382,7 @@ mod tests {
             .collect();
         let round_new: Vec<_> = calls
             .iter()
-            .map(|call| round_tool_call_sig_and_names(std::slice::from_ref(call)).0)
+            .map(|call| round_tool_call_signatures(std::slice::from_ref(call)))
             .collect();
         let round_old: Vec<_> = calls
             .iter()
@@ -481,28 +474,26 @@ mod tests {
     // ── CLI agentic: sig/name helpers + name-only stall ──
 
     #[test]
-    fn round_tool_call_sig_and_names_records_exact_canonical_calls() {
+    fn round_tool_call_signatures_records_exact_canonical_calls() {
         let c1 = vec![serde_json::json!({
             "id": "call_1", "type": "function",
             "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
         })];
-        let (sigs, names) = round_tool_call_sig_and_names(&c1);
+        let sigs = round_tool_call_signatures(&c1);
         assert_eq!(
             sigs,
             BTreeSet::from([StallSignature::new("read_file", br#"{"path":"a.rs"}"#)])
         );
-        assert!(names.contains("read_file"));
 
         let c2 = vec![serde_json::json!({
             "id": "call_2", "type": "function",
             "function": {"name": "read_file", "arguments": "{\"path\":\"b.rs\"}"}
         })];
-        let (sigs, names) = round_tool_call_sig_and_names(&c2);
+        let sigs = round_tool_call_signatures(&c2);
         assert_eq!(
             sigs,
             BTreeSet::from([StallSignature::new("read_file", br#"{"path":"b.rs"}"#)])
         );
-        assert!(names.contains("read_file"));
     }
 
     #[test]
@@ -524,12 +515,10 @@ mod tests {
             }
         })];
 
-        let (bash_sigs, bash_names) = round_tool_call_sig_and_names(&bash);
-        let (structured_sigs, structured_names) = round_tool_call_sig_and_names(&structured);
+        let bash_sigs = round_tool_call_signatures(&bash);
+        let structured_sigs = round_tool_call_signatures(&structured);
 
         assert_eq!(bash_sigs, structured_sigs);
-        assert!(bash_names.contains("bash"));
-        assert!(structured_names.contains("bash"));
     }
 
     // ── assess_progress (general progress-aware stall) ──

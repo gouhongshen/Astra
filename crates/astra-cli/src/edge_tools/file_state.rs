@@ -7,11 +7,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 
 use sha2::{Digest, Sha256};
 
-use super::{ToolExecutor, passive_cargo_check, passive_tsc_check};
+use super::ToolExecutor;
 
 /// Maximum number of entries in the file state cache. When exceeded, the
 /// entry with the oldest timestamp is evicted.
@@ -49,8 +48,6 @@ pub(crate) struct FileState {
     /// True if the last operation was a read (not a write/edit).
     /// Read-before-write validation only accepts a preceding read.
     pub(super) from_read: bool,
-    /// True if the last read was a partial view (outline, line range).
-    pub(super) is_partial: bool,
     /// Whether the current content identity is known in full.  This is
     /// monotonic across partial reads of the same bytes: a range read must not
     /// erase authority established by a complete read or content-bearing
@@ -286,7 +283,6 @@ impl ToolExecutor {
                 FileState {
                     timestamp_ms: ts,
                     from_read: true,
-                    is_partial,
                     full_content_known,
                     delivered_line_ranges,
                     cached_content,
@@ -299,12 +295,6 @@ impl ToolExecutor {
     }
 
     fn record_write_impl(&self, path: &Path, content: Option<&str>) {
-        if passive_cargo_check::should_schedule_passive_cargo(&self.project_root, path) {
-            self.passive_cargo_pending.store(true, Ordering::SeqCst);
-        }
-        if passive_tsc_check::should_schedule_passive_tsc(&self.project_root, path) {
-            self.passive_tsc_pending.store(true, Ordering::SeqCst);
-        }
         match content {
             Some(text) => {
                 self.passive_lsp
@@ -326,7 +316,6 @@ impl ToolExecutor {
                 FileState {
                     timestamp_ms: ts,
                     from_read: false,
-                    is_partial: false,
                     full_content_known: content_sha256.is_some(),
                     delivered_line_ranges: Vec::new(),
                     cached_content,
@@ -410,26 +399,25 @@ impl ToolExecutor {
     /// Try to retrieve cached file content. Returns `Some(content)` if:
     /// - The file was previously read or written with content caching
     /// - The content was small enough to be cached
-    /// - The file mtime hasn't changed since caching
+    /// - Both file mtime and content digest still match
     ///
-    /// This avoids disk I/O for repeated reads of unchanged files while still
-    /// returning the requested content to every caller.
+    /// A cache miss does not hash the file. A possible hit still reads its bytes
+    /// to verify content identity, including same-mtime external edits.
     pub(super) fn get_cached_content(&self, path: &Path) -> Option<String> {
         let current_ts = Self::file_mtime_ms(path);
         if current_ts == 0 {
             return None;
         }
-        let current_sha256 = file_content_sha256(path)?;
         let key = self.file_state_key(path);
-        self.file_state.lock().ok().and_then(|s| {
-            s.get(&key).and_then(|fs| {
-                if fs.timestamp_ms == current_ts && Some(current_sha256) == fs.content_sha256 {
-                    fs.cached_content.clone()
-                } else {
-                    None
-                }
-            })
-        })
+        let (expected_sha256, content) = {
+            let state = self.file_state.lock().ok()?;
+            let entry = state.get(&key)?;
+            if entry.timestamp_ms != current_ts {
+                return None;
+            }
+            (entry.content_sha256?, entry.cached_content.clone()?)
+        };
+        (file_content_sha256(path)? == expected_sha256).then_some(content)
     }
 
     /// Clear staleness and content-cache state after a workspace baseline reset.

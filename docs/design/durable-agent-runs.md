@@ -13,6 +13,48 @@ Durable agent runs define how agent execution survives long tasks, reconnects, c
 - Terminal outcomes must be explicit.
 - Sub-runs and delegation preserve lineage.
 
+Background creation and incremental streaming share one owned execution runner.
+Streaming supplies its existing bounded delivery bridges; background execution
+does not allocate an unused observer channel. The durable fanout acknowledgement,
+not first-hop queue admission, determines which streamed tool terminals require
+settlement repair. Both paths retain generation-fenced settlement, cancellation,
+usage accounting and shutdown ownership independently of observer attachment.
+
+Semantic run usage updates require the execution's captured owner generation;
+the unfenced `update_run_usage` and `persist_usage` APIs are retired. Each token
+and tool-call count is an absolute cumulative snapshot and retains its own
+high-water mark, so duplicate or delayed updates cannot reduce known totals.
+Failed or cancelled runs may still record usage already consumed by their exact
+owner. This aggregate does not replace append-only physical provider accounting.
+The in-memory store keeps its existing action fence through projection publication
+while releasing the run-map write lock before awaiting that publication.
+
+New background and streaming requests use the same preparation owner. Exact
+stream replays attach to frozen run facts before mutable model or capability
+admission. A fresh request wins the durable session slot and activates its lease
+before provisioning a workspace. Actual workspace/executor facts are committed
+as one immutable, generation-fenced binding pair before execution or delivery;
+status/list projections leave unmaterialized bindings absent.
+
+Every preparation failure after durable admission is settled by that owner,
+including state and history reconstruction errors. Its heartbeat remains alive
+through terminal commit. Workspace cleanup requires a confirmed terminal owned
+by that generation; superseded or unconfirmed authority leaves resources to
+recovery. Local projection removal checks the execution token, and failed stream
+preparation closes its own bridges. A local publication conflict after durable
+admission is an activation failure, never a pre-admission rejection.
+
+Composite checkpoint publication writes the heavy artifact and its current
+index under the existing owner/session lock. Once that index is durable,
+unreferenced-artifact cleanup failures are reported without turning the committed
+receipt into a publication failure. Failures before durable index publication
+still fail the commit. Referenced historical artifacts remain available; this
+cleanup does not impose a history-retention limit.
+The unused `heavy_checkpoint_exists`, external-index prune wrapper, and
+`completed_slots` helpers are retired; recovery and debug use the validated
+canonical artifact readers. Debug rejects invalid preceding artifacts instead
+of presenting a fabricated delta from empty history.
+
 ## Run record
 
 A run should capture:
@@ -36,6 +78,24 @@ updated_at
 
 ## Checkpoint contract
 
+The execution checkpoint reader accepts only the exact current protocol version.
+Same-major versions are not implicitly compatible; a mismatch fails restoration
+before execution. There is no version-negotiation or migration path.
+
+Checkpoint scheduling belongs to the actual execution hooks. The unused
+`CheckpointTrigger` source API has been retired; it did not drive scheduling.
+The unused per-file `delete_step_checkpoint` API has also been retired; composite
+index retention and session deletion continue to own checkpoint cleanup.
+Local persistence accepts heavy recovery checkpoints only. Tool completion is
+recorded in the event journal; its cursor remains embedded in the next heavy
+checkpoint. Standalone light files, their reader and pruning have been retired.
+The unused Step Protocol retry-policy APIs have also been retired. Provider retry
+and tool idempotency remain owned by their actual execution paths.
+Step scheduling retains the headless tool-round budget, checked between batches.
+Unused priority,
+per-tool timeout, backoff and retry-attempt fields have been retired; they did not
+control current execution. This changes source-level Step JSON, not heavy checkpoints.
+
 Checkpoint must include enough information to resume safely:
 
 - current stage;
@@ -47,10 +107,31 @@ Checkpoint must include enough information to resume safely:
 - last durable event cursor;
 - cancellation/resume policy.
 
+The run checkpoint owner limits each complete JSON checkpoint to 8 MiB,
+including all sections and encoding overhead. A bounded handoff encoder is
+available; production storage and recovery check the budget before parsing.
+Writer integration of bounded encoding remains part of the recovery work.
+Exceeding the budget
+rejects the whole continuation:
+never trim deny rules, messages, or obligations, replace the last valid
+checkpoint, or release unconfirmed execution custody. These are snapshot
+retention limits, not task deadlines, total-history or process-memory bounds,
+or evidence that same-run recovery is implemented.
+
 ## Lease and ownership
 
 - Only the owner may advance active execution.
+- Execution status and audit events commit through the owner-fenced transition
+  boundary. Control-plane status changes use an explicit expected-state CAS;
+  there is no unconditional status writer. Cancellation requires its existing
+  typed authority and settlement flow, never a status-only write.
 - Lease expiry enables recovery.
+- Start activation whose owner renewal no longer matches returns HTTP 409 with
+  `execution_authority_not_current`. This does not prove lease expiry: owner,
+  generation, status, cancellation, or lease predicates may have changed.
+  The persisted run remains subject to durable recovery, not pre-admission
+  rejection. Logs identify the activation stage, session, run and expected
+  generation; clients should inspect session status before another submission.
 - A local owner-lease deadline bounds an unconfirmed terminal attempt. If the
   store response stalls, the exact-generation durable status and event receipt
   are checked before reporting failure. The heartbeat allows this bounded
@@ -89,6 +170,23 @@ it must not retry the stale wire request or terminalize the Work attempt solely
 because guidance arrived. Missing guidance, failed acknowledgement, cancellation,
 and owner loss remain fail-closed. Ambiguous admission is reconciled before
 continuation, preserving exact settlement custody.
+
+A paused run that retains its waiting obligation and live execution lease may
+accept guidance without resuming. Acceptance records custody; application waits
+for the existing pause control to clear and retries the same acknowledgement,
+without advancing the input cursor or creating another execution. Released or
+expired owners cannot accept new guidance. The live attachment stays open for a
+retained pause and closes when that owner is released or the run settles.
+Client observation remains cancellable during a pause: detaching the owning
+session retires observation, not the accepted input. Its application timeout
+counts active execution after the matching acceptance event, not paused time.
+
+A paused child remains a nonterminal dependency of its live parent. Waiting
+releases execution capacity but retains both owners; the child's pause alone
+must not publish a parent terminal outcome or remove the child's resume action.
+Observation timeouts do not buy inference while that dependency is paused.
+Parent guidance and messages still use ordinary input admission. Cancellation,
+lease loss, handoff and the original execution deadline remain authoritative.
 
 Turn-evaluation journals report settled `run_status` and separate
 `tool_evaluation_success` from overall `success`. Healthy tools do not promote
@@ -174,6 +272,14 @@ must not be interpreted as permission to use Server defaults. Credentials are
 not persisted in this descriptor.
 This record is not complete reconstruction authorization; restoring consumed
 rounds and automatically reconstructing the same run remain unimplemented.
+The initial `run_started` event also records effective generation controls:
+reasoning mode, an explicitly nullable first-round output cap, and whether
+the host preserves the effective control against runtime overrides. Root
+omission and explicit `Off` are distinct. Child retries compare these controls
+against the already loaded event and reject drift; execution uses the recorded
+controls. This is an admission snapshot, not authorization to replay an
+in-flight inference or
+to reset round position during recovery.
 Execution heavy checkpoints additionally carry versioned run-budget facts:
 producer run and owner generation, actual charged iterations, current grant,
 remaining iterations, and an explicitly present nullable effective hard limit.
@@ -185,11 +291,15 @@ frontier reconciliation, and settlement-only control restoration remain required
 Execution checkpoints also carry versioned control facts using the canonical
 completion-settlement type: terminal action windows, their consumed attempts,
 retry counters, pagination obligations, and settlement-only restrictions, plus
-the loop's wrap-up flag and ignored-round count. Control V2 also requires both
-sets of stop-hook obligations and their consumed execution counts. It contains
+the loop's wrap-up flag and ignored-round count. Control V4 also requires the
+complete declarations for both completion-check phases and the selected phase, plus the
+run/producer-generation-bound question obligations (at most 16 exact request
+identities and canonical responders). It contains
 no request headers or model credentials. Missing obligations cannot decode as
-an empty set, and V1 is not upgraded by supplying defaults. All execution writers use one
-projection; restore passes it through without granting execution. These controls
+an empty set, and earlier versions are not upgraded by supplying defaults. All execution writers use one
+projection; restore selects checks using the frozen task profile and restores the
+original verification frontier, without rereading workspace configuration or
+granting execution. These controls
 must be validated at the same frontier as budget consumption before a recovery
 owner may authorize another action. Missing control state must not default to
 ordinary execution. Only a validated reconstructable snapshot proceeds
@@ -209,15 +319,28 @@ terminal settlement must not run merely because the process is stopping.
 An unresolved tool, failed snapshot construction, or unconfirmed write cannot
 produce an exact handoff. A previously cached snapshot is not a substitute.
 
+For roots bound to cooperative handoff, the same shutdown token wakes an idle
+agent-input or capacity wait, rather than
+waiting for another child/message event. Explicit cancellation and wait deadlines
+retain their precedence. An in-flight durable input transaction is not interrupted
+by that wake; its existing settlement completes before the next handoff boundary.
+This improves checkpoint capture during shutdown, not durable parking or restart
+execution admission.
+
 The handoff's runtime payload pairs the heavy snapshot with the original turn
 reservation and a canonical WAL continuation transition. The existing transition
 already identifies its committed base and parent result; these are not duplicated
 in another log. Its pending suffix includes the last settled tool results. Writing
 this payload neither invents an inference attempt nor commits a completed user
 turn. In particular, an absent committed conversation cursor must not be replaced
-with a fabricated cursor. Recovery validates and replays the existing WAL plus
-this continuation, and compares the reconstructed durable history with the heavy
-snapshot. The old reservation is identity evidence, not renewed authority.
+with a fabricated cursor. The payload retains the existing WAL continuation
+and heavy snapshot for checkpoint custody. The old reservation is identity
+evidence, not renewed authority. Explicit same-run resume obtains a renewed
+writer/reservation pair and checkpoint custody in one coordinator transaction
+before reconstructing execution through the existing background loop.
+The payload preserves the raw submitted user text and original audit timestamp,
+separately from the loop's current input, which steering may replace. Restoration
+must not reconstruct either immutable audit fact from the mutable prompt state.
 
 Original execution facts also retain the original TurnGuard. Its owning module
 validates both checkpoint serialization and restoration; recovery does not import
@@ -251,12 +374,18 @@ constraints. Reassembly installs those facts without activating the skill again
 or replacing delivered instructions with a newer catalog version. A saved sandbox
 does not authorize a different workspace or restore environment variable values.
 
-The shared loop owns an explicit entry cursor: before its preamble, or at an
-iteration boundary with the next round identity and consumed harness recovery
-count. Neither the last tool step nor charged budget can reconstruct this cursor.
-A restored iteration boundary skips SessionStart effects and preserves compression
-tracking; every new host still installs its local skill schema. A returned loop
-resets the entry for a subsequent user turn; a frozen handoff does not return.
+The shared loop owns an explicit entry cursor: before its preamble, at an
+iteration boundary, or waiting for runtime input after the previous round's
+existing postlude. The latter two preserve the next round identity and consumed
+harness recovery count. Neither the last tool step nor charged budget can
+reconstruct this cursor. Input wait uses the common message/child barrier before
+preparation or another budget charge; observation waits retain their original
+absolute cutoff. A paused input wait retains this entry when the same live state
+is continued, without replaying the postlude. This is not durable parking or
+same-run reconstruction after restart. A restored boundary skips SessionStart
+effects and preserves compression tracking; every new host still installs its
+local skill schema. Terminal returns reset the entry for a subsequent user turn;
+a frozen handoff does not return.
 This does not authorize a preamble checkpoint with no current step or with a step
 left over from another logical turn; actual recovery must verify the reservation
 and frontier together.
@@ -277,11 +406,11 @@ pending/unconfirmed asynchronous effects or an applied hook environment preserve
 custody but is explicitly unavailable for execution. A process-global environment
 overlay is not an authorized reconstruction source for another user or session.
 Actual recovery activation must restore these facts before starting the executor;
-the production recovery activation path remains unfinished. The runtime replay
-entrypoint is currently exercised only by contract tests, including real
-database adoption across owner generations. The atomic adoption API returns the
-locked checkpoint with its committed receipt, binding both producer and current
-owner generations; a serialized receipt alone is not fresh execution authority.
+the production recovery activation path remains unfinished. Contract tests
+exercise real checkpoint persistence, consecutive recovery claims, owner fencing,
+and canonical pause reconciliation. These paths preserve the immutable producer
+checkpoint without installing new turn execution authority or reconstructing the
+original executor.
 
 Completion evidence is summarized by one incremental frontier. Explicit
 verification retains the latest source mutation and at most one subsequent
@@ -360,21 +489,51 @@ the checkpoint payload.
 Implementation boundary: owner-fenced storage, fresh snapshot construction and
 cooperative Server shutdown are connected. The recovery scanner preserves valid
 handoff material through the atomic recovery-association path; it does
-not launch an executor. Full replay currently has deterministic test coverage,
-not a production recovery consumer. It requires the original generation,
-reservation, committed history and real WAL receipts. Automatic execution takeover
-and restoration of all execution obligations remain unimplemented. After shutdown
+not launch an executor. Contract tests exercise checkpoint persistence,
+cross-generation custody claims, cancellation and fencing through these
+production entries. Explicit reconstruction currently supports root,
+catalog-offering, Server-managed execution without a primary Work binding.
+It reauthorizes the original session grant and offering, preserves the original
+turn, WAL continuation, deadline and loop facts, and resolves the existing
+workspace identity. Other execution providers and Work-bound continuations are
+rejected rather than given fresh admission or substituted workspace authority.
+Preparation failure preserves checkpoint custody through existing recovery
+reconciliation; an unknown commit acknowledgement is not reported as rollback.
+Automatic execution takeover remains unimplemented. After shutdown
 begins, the shared request preparation entry rejects new chat admission with a
 structured `server_shutting_down` response instead of creating a run that would
 immediately freeze.
 
 Custody and execution decoding are separate: an owner-fenced handoff whose
 inner control schema is unsupported still retains its original bytes and the
-explicit continuation path. Recovery reports whether the runtime can decode
-that state, without claiming it reconstructed execution. Cancellation still
-wins. Control V2 is not yet a complete reconstruction contract: ledger-verified
-tool evidence, intent and remaining execution obligations must be restored
-before an automatic executor may run.
+explicit continuation path. Recovery preserves that opaque checkpoint and
+reports custody without claiming it decoded or reconstructed execution.
+Cancellation still wins. A new run may continue canonical session history under
+its own admission; custody claims do not authorize saved execution. Control
+V3 reconstruction validates ledger-verified tool evidence, intent and remaining
+execution obligations before the supported explicit resume may dispatch.
+
+Question obligations are captured by the shared control projection, not by a
+second messaging ledger. Staged answers remain in the original loop facts'
+bounded pending context, carrying typed `Response.request_id` and canonical
+sender identity independently of optional envelope correlation. Only a
+successful provider decision consuming that exact context lease clears the
+obligation; failed attempts, staging and transport acknowledgement do not.
+The ordinary session warm-start entrypoint rejects same-run execution facts
+before executor wiring, including when a claim advanced the generation. It
+cannot replace execution authority/frontier validation with a fresh messaging
+owner. The recovery scanner continues to preserve and pause handoff custody;
+automatic reconstructed execution is not supplied by this contract; supported
+explicit resume uses the separate same-turn custody proof, not warm-start.
+
+Queued and delivery-unknown question outcomes contain the exact pending-reply
+identity, including the resolved responder even when the display target is
+`parent`. Existing durable invocation outcomes may retain that evidence, but
+a send can precede outcome persistence and a checkpoint can precede observation.
+Without existing owner-fenced evidence, dispatched/outcome-unknown custody
+remains unresolved: do not infer a UUID, re-resolve a parent or resend with a
+new identity. This adds no tables, database reads or separate send-time writes,
+and does not claim recovery of volatile in-process envelopes after process loss.
 
 ## Test obligations
 

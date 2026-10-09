@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use super::{filter::Filter, lock_internal_event_reader, InternalEvent};
+use super::{filter::Filter, lock_internal_event_reader, InternalEvent, KeyboardEnhancementFlags};
 
 /// Raw responses to a bounded, one-shot terminal startup query.
 #[derive(Debug, Default)]
@@ -14,6 +14,13 @@ pub struct StartupAttributes {
     pub background: Option<String>,
     /// DA1 parameters, including the terminal class as the first parameter.
     pub device_attributes: Option<Vec<u16>>,
+    /// Present only if a keyboard-enhancement reply arrived before DA1, per
+    /// <https://sw.kovidgoyal.net/kitty/keyboard-protocol/#detection-of-support-for-this-protocol>.
+    /// `None` means unsupported (or a reply lost to the same bounded
+    /// deadline as the other fields here) -- never re-queried on its own,
+    /// for the same reason a missing DA1 is not retried: a second `CSI ?u`
+    /// would be a competing query outside this one bounded round trip.
+    pub keyboard_enhancement_flags: Option<KeyboardEnhancementFlags>,
 }
 
 static DEVICE_ATTRIBUTES: OnceLock<Vec<u16>> = OnceLock::new();
@@ -33,16 +40,27 @@ impl Filter for StartupFilter {
     fn eval(&self, event: &InternalEvent) -> bool {
         matches!(
             event,
-            InternalEvent::OscResponse(_) | InternalEvent::PrimaryDeviceAttributes(_)
+            InternalEvent::OscResponse(_)
+                | InternalEvent::PrimaryDeviceAttributes(_)
+                | InternalEvent::KeyboardEnhancementFlags(_)
         )
     }
 }
 
-/// Query colors (optionally) and DA1 through the existing input reader.
+/// Query colors (optionally), keyboard-enhancement support, and DA1 through
+/// the existing input reader.
 ///
 /// Call in raw mode, before creating an EventStream. Unrelated events remain
 /// queued in their original order. Late replies remain internal events.
 /// The caller owns terminal modes and decides how to handle missing responses.
+///
+/// `CSI ?u` is written before `CSI c` and shares DA1 as its completion
+/// sentinel, exactly like the recommended detection method in the Kitty
+/// keyboard-protocol spec: a supporting terminal answers `?u` at or before
+/// its DA1 reply, so once DA1 arrives, a still-missing flags reply means the
+/// terminal does not support the protocol. This keeps every startup query in
+/// the same single bounded round trip instead of a second `CSI ?u`/`CSI c`
+/// pair racing this one.
 pub fn query_startup_attributes(colors: bool, timeout: Duration) -> io::Result<StartupAttributes> {
     let mut reader = lock_internal_event_reader();
     reader.set_startup_query(true);
@@ -51,7 +69,7 @@ pub fn query_startup_attributes(colors: bool, timeout: Duration) -> io::Result<S
         if colors {
             stdout.write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\")?;
         }
-        stdout.write_all(b"\x1b[c")?;
+        stdout.write_all(b"\x1b[?u\x1b[c")?;
         stdout.flush()?;
         drop(stdout);
 
@@ -71,6 +89,9 @@ pub fn query_startup_attributes(colors: bool, timeout: Duration) -> io::Result<S
                 }
                 InternalEvent::PrimaryDeviceAttributes(params) => {
                     result.device_attributes = Some(params);
+                }
+                InternalEvent::KeyboardEnhancementFlags(flags) => {
+                    result.keyboard_enhancement_flags = Some(flags);
                 }
                 _ => {}
             }
@@ -125,8 +146,20 @@ pub fn query_cursor_position(timeout: Duration) -> io::Result<CursorPositionRepo
         }
         while reader.poll(Some(Duration::ZERO), &CursorPositionFilter)? {
             reader.read(&CursorPositionFilter)?;
+            reader.cursor_query_pending = false;
         }
         let size = crate::terminal::size()?;
+        // CPR has no request identifier. A reply still in flight after a
+        // deadline cannot be attributed to a new query. Keep the one existing
+        // request outstanding until its reply has been consumed above.
+        if reader.cursor_query_pending {
+            return Ok(CursorPositionReport {
+                size,
+                position: None,
+                interrupted: reader.poll(Some(Duration::ZERO), &ResizeFilter)?,
+            });
+        }
+        reader.cursor_query_pending = true;
         let mut stdout = io::stdout().lock();
         stdout.write_all(b"\x1b[6n")?;
         stdout.flush()?;
@@ -136,6 +169,7 @@ pub fn query_cursor_position(timeout: Duration) -> io::Result<CursorPositionRepo
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             if reader.poll(Some(remaining), &CursorPositionFilter)? {
                 if let InternalEvent::CursorPosition(x, y) = reader.read(&CursorPositionFilter)? {
+                    reader.cursor_query_pending = false;
                     return Ok(CursorPositionReport {
                         size,
                         position: Some((x, y)),

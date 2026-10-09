@@ -66,7 +66,13 @@ fn preflight_and_cases_share_binary_and_inherited_proxy_policy() {
 [ "${{NO_PROXY-unset}}" = "$EXPECTED_UPPER" ] || exit 91
 [ "${{no_proxy-unset}}" = "$EXPECTED_LOWER" ] || exit 92
 printf '%s\n' "$*" >> "$CALLS"
-[ "$1" = --profile ] && shift 2
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --profile|--model) shift 2 ;;
+    -y) shift ;;
+    *) break ;;
+  esac
+done
 case "$1" in
 health) printf '%s' '{{"status":"healthy","database":"connected","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","build_git_dirty":false}}' ;;
 chat)
@@ -157,12 +163,19 @@ esac
                 "admin register",
                 "admin login",
                 "chat -m ping",
-                "chat -m case-prompt",
                 "session cancel",
                 "session delete",
             ] {
                 assert!(log.contains(expected), "missing {expected}: {log}");
             }
+            assert!(
+                log.lines().any(|line| line
+                    .split_ascii_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|pair| pair == ["-m", "case-prompt"])),
+                "missing case invocation: {log}"
+            );
             assert!(!log.contains("wrong-binary"), "{log}");
             assert_eq!(log.matches("chat -m ping").count(), 2, "{log}");
             assert!(

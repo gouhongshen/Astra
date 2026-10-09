@@ -13,7 +13,6 @@ type DefaultCase<'a> = (&'a str, Box<dyn Fn() -> String>);
 #[test]
 fn default_functions_return_expected_values() {
     let cases: &[DefaultCase] = &[
-        ("days", Box::new(|| default_days().to_string())),
         (
             "admin_scope",
             Box::new(|| default_admin_scope().to_string()),
@@ -34,20 +33,8 @@ fn default_functions_return_expected_values() {
             "admin_audit_limit",
             Box::new(|| default_admin_audit_limit().to_string()),
         ),
-        (
-            "signal_types",
-            Box::new(|| format!("{:?}", default_signal_types())),
-        ),
     ];
-    let expected = &[
-        "7",
-        "global",
-        "50",
-        "compression",
-        "jsonl",
-        "100",
-        r#"["wrong_skill"]"#,
-    ];
+    let expected = &["global", "50", "compression", "jsonl", "100"];
     for ((label, f), exp) in cases.iter().zip(expected) {
         assert_eq!(f(), *exp, "default_{label}");
     }
@@ -118,11 +105,6 @@ fn deserialization_applies_defaults() {
     assert_eq!(q.limit, 50);
     assert!(q.after_updated_at.is_none());
     assert!(q.after_run_id.is_none());
-
-    // LearningTriggerRequest
-    let req: LearningTriggerRequest = serde_json::from_str("{}").unwrap();
-    assert_eq!(req.days, 7);
-    assert!(!req.force);
 
     // AdminTokenCreateRequest
     let req: AdminTokenCreateRequest = serde_json::from_str(r#"{"token_type":"api_key"}"#).unwrap();
@@ -431,22 +413,6 @@ fn auth_register_request_without_display_name() {
     });
     let req: AuthRegisterRequest = serde_json::from_value(input).unwrap();
     assert!(req.display_name.is_none());
-}
-
-#[test]
-fn learning_trigger_request_all_fields() {
-    let input = json!({
-        "days": 14,
-        "force": true,
-        "signal_types": ["slow_execution", "high_cost"],
-        "weights": {"alpha": 0.5}
-    });
-    let req: LearningTriggerRequest = serde_json::from_value(input).unwrap();
-    assert_eq!(req.days, 14);
-    assert!(req.force);
-    assert_eq!(req.signal_types, vec!["slow_execution", "high_cost"]);
-    let w = req.weights.unwrap();
-    assert_eq!(w.get("alpha").unwrap(), &json!(0.5));
 }
 
 #[test]
@@ -842,23 +808,6 @@ fn admin_init_response_serializes() {
 }
 
 #[test]
-fn admin_feedback_stats_response_serializes() {
-    let mut by_type = Map::new();
-    by_type.insert("thumbs_up".into(), json!(10));
-    let resp = AdminFeedbackStatsResponse {
-        total_feedback: 20,
-        positive_feedback: 15,
-        negative_feedback: 5,
-        avg_rating: Some(4.2),
-        feedback_by_type: by_type,
-    };
-    let v = serde_json::to_value(&resp).unwrap();
-    assert_eq!(v["total_feedback"], 20);
-    assert_eq!(v["avg_rating"], 4.2);
-    assert_eq!(v["feedback_by_type"]["thumbs_up"], 10);
-}
-
-#[test]
 fn admin_user_role_response_serializes() {
     let resp = AdminUserRoleResponse {
         username: "alice".into(),
@@ -943,34 +892,6 @@ fn admin_audit_record_to_response() {
     let resp: AdminAuditResponse = record.into();
     assert!(resp.resource_id.is_none());
     assert!(resp.details.is_none());
-}
-
-#[test]
-fn admin_feedback_stats_record_to_response() {
-    // with avg_rating
-    let mut by_type = Map::new();
-    by_type.insert("rating".into(), json!(10));
-    let record = AdminFeedbackStatsRecord {
-        total_feedback: 100,
-        positive_feedback: 80,
-        negative_feedback: 20,
-        avg_rating: Some(4.5),
-        feedback_by_type: by_type.clone(),
-    };
-    let resp: AdminFeedbackStatsResponse = record.into();
-    assert_eq!(resp.total_feedback, 100);
-    assert_eq!(resp.avg_rating, Some(4.5));
-
-    // none avg_rating
-    let record = AdminFeedbackStatsRecord {
-        total_feedback: 0,
-        positive_feedback: 0,
-        negative_feedback: 0,
-        avg_rating: None,
-        feedback_by_type: Map::new(),
-    };
-    let resp: AdminFeedbackStatsResponse = record.into();
-    assert!(resp.avg_rating.is_none());
 }
 
 #[test]
@@ -1095,6 +1016,7 @@ fn run_list_record_to_response_preserves_optional_total_and_cursor() {
     let record = RunListRecord {
         runs: vec![RunStatusRecord {
             artifact_publication: None,
+            explain_requested: false,
             run_id: "run-1".into(),
             session_id: "session-1".into(),
             parent_run_id: None,
@@ -1164,6 +1086,7 @@ fn run_status_record_to_response() {
     // with waiting_for
     let record = RunStatusRecord {
         artifact_publication: None,
+        explain_requested: false,
         run_id: "r1".into(),
         session_id: "s1".into(),
         parent_run_id: Some("root".into()),
@@ -1188,6 +1111,7 @@ fn run_status_record_to_response() {
     // without waiting_for
     let record = RunStatusRecord {
         artifact_publication: None,
+        explain_requested: false,
         run_id: "r2".into(),
         session_id: "s2".into(),
         parent_run_id: None,
@@ -1551,9 +1475,20 @@ fn work_task_graph_query_is_an_exact_pinned_pagination_contract() {
 
 #[test]
 fn chat_request_into_data_maps_all_fields() {
+    let check = |label: &str, command: &str| {
+        json!({
+            "label": label, "command": command, "working_dir": null,
+            "depends_on": [], "timeout_secs": null, "authoritative": true
+        })
+    };
+    let declarations = json!({
+        "stop": [check("root-check", "make check")],
+        "task_completed": [check("child-check", "make test")]
+    });
     let mut ctx = Map::new();
     ctx.insert("tool".into(), json!("calc"));
     let req = ChatRequest {
+        completion_checks: Some(serde_json::from_value(declarations.clone()).unwrap()),
         message: "hello".into(),
         conversation_authority: None,
         user_intent: Some("pure hello".into()),
@@ -1571,9 +1506,16 @@ fn chat_request_into_data_maps_all_fields() {
         model_selection: Some(astra_turn_types::ModelSelection {
             offering_id: "offer-gpt-4".into(),
         }),
+        requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: "offer-gpt-4".into(),
+            },
+        }),
+        expected_model_name: Some("gpt-4".into()),
         resolved_model_selection: Some(astra_services::runs::ResolvedModelSelection {
             offering_id: "offer-gpt-4".into(),
             model_name: "gpt-4".into(),
+            source_identity: None,
         }),
         capability_descriptors: None,
         agent_bindings: Vec::new(),
@@ -1608,6 +1550,7 @@ fn chat_request_into_data_maps_all_fields() {
             remaining_seconds: 37,
         }),
         execution_policy: ExecutionPolicyRequest {
+            model_routing: Default::default(),
             turn_intent: TurnIntentExecutionPolicy::FixedDefault,
             skill_auto_route: SkillAutoRouteExecutionPolicy::Disabled,
         },
@@ -1618,6 +1561,10 @@ fn chat_request_into_data_maps_all_fields() {
         is_plan_subtask: None,
     };
     let data = chat_request_into_data(req);
+    assert_eq!(
+        serde_json::to_value(data.completion_checks.as_ref().unwrap()).unwrap(),
+        declarations
+    );
     assert_eq!(data.message, "hello");
     assert_eq!(data.user_intent.as_deref(), Some("pure hello"));
     assert_eq!(data.parts, vec![json!({"type": "text", "text": "hello"})]);
@@ -1645,11 +1592,20 @@ fn chat_request_into_data_maps_all_fields() {
         data.model.is_none(),
         "wire conversion must not resolve routes"
     );
+    assert_eq!(data.expected_model_name.as_deref(), Some("gpt-4"));
     assert_eq!(
         data.model_selection
             .as_ref()
             .map(|selection| selection.offering_id.as_str()),
         Some("offer-gpt-4")
+    );
+    assert_eq!(
+        data.requested_model_policy,
+        Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: "offer-gpt-4".into(),
+            },
+        })
     );
     assert_eq!(
         data.resolved_model_selection.as_ref().map(|selection| (
@@ -1746,6 +1702,7 @@ fn chat_request_rejects_removed_mcp_binding_ids_field() {
 #[test]
 fn chat_request_into_data_merges_plan_subtask_into_context() {
     let req = ChatRequest {
+        completion_checks: None,
         message: "do step".into(),
         conversation_authority: None,
         user_intent: None,
@@ -1757,6 +1714,8 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         work_binding: None,
         agent_id: None,
         model_selection: None,
+        requested_model_policy: None,
+        expected_model_name: None,
         resolved_model_selection: None,
         capability_descriptors: None,
         agent_bindings: Vec::new(),

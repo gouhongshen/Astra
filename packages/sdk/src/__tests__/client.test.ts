@@ -1,5 +1,6 @@
 import { AstraClient, AstraApiError, chatRequestToWire } from "../client";
 import { PATH_SESSIONS } from "../paths";
+import type { SessionAuditSummary } from "../index";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -253,7 +254,7 @@ describe("AstraClient — Sessions", () => {
   });
 
   test.each([null, 0, 900])("getSessionAudit preserves cache evidence %s", async (cacheRead) => {
-    const summary = {
+    const summary: SessionAuditSummary = {
       session_id: "s4",
       status: "closed",
       turn_count: 2,
@@ -262,12 +263,15 @@ describe("AstraClient — Sessions", () => {
       request_usage: {
         scope: "session_all_runs",
         request_count: 2,
-        fresh_input_tokens: 10,
-        cache_read_tokens: cacheRead,
-        cache_creation_tokens: 0,
-        output_tokens: 20,
+        nonterminal_attempt_count: 0,
+        fresh_input_tokens: { known_tokens: 10, observed_attempts: 2 },
+        cache_read_tokens: { known_tokens: cacheRead, observed_attempts: cacheRead === null ? 0 : 2 },
+        cache_creation_tokens: { known_tokens: 0, observed_attempts: 2 },
+        output_tokens: { known_tokens: 20, observed_attempts: 2 },
       },
-      cost: { priced_turn_count: 0, unpriced_turn_count: 2 },
+      cost: cacheRead === null
+        ? { unavailable_reason: "historical_attempt_coverage_incomplete" }
+        : { estimated_cost_usd: cacheRead === 0 ? 0 : 0.003 },
       tool_calls_total: 3,
       tool_calls_failed: 0,
       error_count: 0,
@@ -289,10 +293,8 @@ describe("AstraClient — Sessions", () => {
     const result = await createClient().getSessionAudit("s4");
     expect(result.session_id).toBe("s4");
     expect(result.turn_count).toBe(2);
-    expect(result.request_usage.cache_read_tokens).toBe(cacheRead);
-    expect(result.request_usage.cache_creation_tokens).toBe(0);
-    expect(result.cost.unpriced_turn_count).toBe(2);
-    expect(result.cost.estimated_cost_usd).toBeUndefined();
+    expect(result.request_usage).toEqual(summary.request_usage);
+    expect(result.cost).toEqual(summary.cost);
   });
 });
 
@@ -785,12 +787,12 @@ describe("AstraClient — Session lifecycle and reflect", () => {
   test("cancelSession preserves pending execution and run evidence", async () => {
     globalThis.fetch = mockFetch(202, {
       ...sessWire, status: "cancellation_requested", execution_settled: false,
-      workspace_blocker: "unresolved_tool",
+      execution_blocker: "unresolved_tool",
       runs: [{ run_id: "r1", status: "cancelled", execution_settled: false }],
     });
     const result = await createClient().cancelSession("sx");
     expect(result.executionSettled).toBe(false);
-    expect(result.workspaceBlocker).toBe("unresolved_tool");
+    expect(result.executionBlocker).toBe("unresolved_tool");
     expect(result.runs).toEqual([{ runId: "r1", status: "cancelled", executionSettled: false }]);
   });
 
@@ -1275,25 +1277,6 @@ describe("AstraClient — thin protocol", () => {
       "edge-1",
     );
   });
-
-  test("postTaskLeaseClaim sends edge header", async () => {
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      text: () => Promise.resolve("{}"),
-      headers: new Headers(),
-    } as unknown as Response);
-    await createClient().postTaskLeaseClaim(
-      "task-1",
-      { edge_agent_id: "e1" },
-      { edgeTransportId: "transport-1" },
-    );
-    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(call[0]).toContain("/tasks/task-1/lease/claim");
-    expect((call[1].headers as Record<string, string>)["X-Astra-Edge-Id"]).toBe(
-      "transport-1",
-    );
-  });
 });
 
 // ─── Error handling ────────────────────────────────────────────────
@@ -1440,6 +1423,16 @@ describe("AstraClient — Errors", () => {
 // ─── chatRequestToWire ─────────────────────────────────────────────
 
 describe("chatRequestToWire", () => {
+  test("Auto opts into Server routing without an explicit Offering", () => {
+    expect(chatRequestToWire({ message: "explain this", modelSelection: "auto" })).toEqual({
+      message: "explain this",
+      execution_policy: { model_routing: "auto" },
+    });
+    expect(chatRequestToWire({ message: "explain this", modelSelection: { offeringId: "chosen" } })).toEqual({
+      message: "explain this",
+      model_selection: { offering_id: "chosen" },
+    });
+  });
   test("maps hard allowlists separately from optional tool enablement", () => {
     const body = chatRequestToWire({
       message: "hi",
@@ -1499,8 +1492,15 @@ describe("chatRequestToWire", () => {
   });
 
   test("full snake_case mapping: session, agent, selected model, binding, context, plan, edge, capabilities, budget, bindings", () => {
+    const completionChecks = {
+      stop: [{ label: "verify", command: "make check", working_dir: null,
+        depends_on: [], timeout_secs: null, authoritative: true }],
+      task_completed: [{ label: "child", command: "make test", working_dir: null,
+        depends_on: [], timeout_secs: null, authoritative: true }],
+    };
     const body = chatRequestToWire({
       message: "q",
+      completionChecks,
       parts: [{ type: "text", text: "q" }],
       attachments: [{ id: "att-1", kind: "file" }],
       executionBudget: {
@@ -1545,6 +1545,7 @@ describe("chatRequestToWire", () => {
     });
     expect(body).toMatchObject({
       message: "q",
+      completion_checks: completionChecks,
       parts: [{ type: "text", text: "q" }],
       attachments: [{ id: "att-1", kind: "file" }],
       execution_budget: {

@@ -1,8 +1,7 @@
 //! Apply one `/chat/turn` stream outcome to agentic loop state (usage and response guards).
 //!
-//! Hosts (CLI `stream_chat_sse`, future headless clients) build [`AgenticTurnStreamSnapshot`] and pass
-//! edge-tool names via `edge_round_len` + an index closure (`usize` → owned `String`) so closure
-//! signatures stay lifetime-simple.
+//! Provider requests and authoritative Server summaries own tool usage.
+//! Executed callback receipts are settled separately at the admitted tool boundary.
 
 use std::collections::HashSet;
 
@@ -98,6 +97,8 @@ pub fn agentic_turn_stream_snapshot_with_kind<'a>(
 
 /// Mutable agentic-loop fields updated by [`ingest_agentic_turn_stream`].
 pub struct AgenticTurnIngestMut<'a> {
+    pub model_item_id: Option<&'a str>,
+    pub final_text_model_item_id: &'a mut Option<String>,
     pub first_ttft_ms: &'a mut Option<u64>,
     pub current_session_id: &'a mut Option<String>,
     pub current_run_id: &'a mut Option<String>,
@@ -150,14 +151,47 @@ pub fn map_ingest_outcome_to_iteration_control(
     }
 }
 
+/// Ingest a Server admission as observations, never client work.
+/// Completed Edge callbacks are journal facts handled by their existing owner;
+/// their count must not be added to the Server's authoritative aggregate.
+pub fn ingest_remote_server_turn<'a>(
+    accum: &'a ChatTurnSseAccum,
+    ttft_ms: Option<u64>,
+    error_kind: Option<astra_core::ErrorKind>,
+    message: &str,
+    mut st: AgenticTurnIngestMut<'a>,
+) -> AgenticTurnIngestOutcome {
+    st.model_item_id = accum.model_item_id.as_deref();
+    let failure = accum.remote_admission_error(error_kind);
+    let failure_message = failure.as_ref().map(|error| error.message.clone());
+    let mut observed = agentic_turn_stream_snapshot_with_kind(accum, ttft_ms, error_kind);
+    if let Some(error) = failure {
+        observed.error_message = &failure_message;
+        observed.error_kind = Some(error.kind);
+    }
+    observed.tool_calls = &[];
+    // Error responses still own their partial bytes and model identity.
+    // Ordinary ingest intentionally avoids committing them as an assistant
+    // message, but they must survive in the returned failure projection.
+    if observed.error_message.is_some() && !observed.full_text.trim().is_empty() {
+        *st.final_text = observed.full_text.to_owned();
+        *st.final_text_model_item_id = st.model_item_id.map(str::to_owned);
+    }
+    match ingest_agentic_turn_stream(&observed, message, st) {
+        outcome @ (AgenticTurnIngestOutcome::Break | AgenticTurnIngestOutcome::Fatal(_)) => outcome,
+        AgenticTurnIngestOutcome::Continue | AgenticTurnIngestOutcome::HasToolCalls => {
+            AgenticTurnIngestOutcome::Fatal(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "remote Server declared terminal continuation ownership while returning pending client continuation work",
+            ))
+        }
+    }
+}
+
 /// Merge streaming turn metadata into running totals and decide whether to finish or run tools.
 pub fn ingest_agentic_turn_stream(
     snap: &AgenticTurnStreamSnapshot<'_>,
-    edge_round_len: usize,
-    mut edge_tool_name: impl FnMut(usize) -> String,
     message: &str,
-    _recent_tools: &[String],
-    _quiet: bool,
     st: AgenticTurnIngestMut<'_>,
 ) -> AgenticTurnIngestOutcome {
     // Measurement is evidence even when response guards or provider errors
@@ -176,9 +210,9 @@ pub fn ingest_agentic_turn_stream(
     } else if let Some(sid) = snap.session_id.as_ref() {
         *st.current_session_id = Some(sid.clone());
     }
-    let round_has_edge_work = !snap.tool_calls.is_empty() || edge_round_len > 0;
+    let round_has_tool_requests = !snap.tool_calls.is_empty();
     let preserve_prior_final_after_runtime_scaffolding_retry = !snap.full_text.is_empty()
-        && !round_has_edge_work
+        && !round_has_tool_requests
         && should_preserve_prior_final_after_runtime_scaffolding_retry(
             st.messages,
             st.final_text.as_str(),
@@ -188,22 +222,26 @@ pub fn ingest_agentic_turn_stream(
     // calls is an intermediate preamble; surfacing it as `final_text` makes
     // interrupted/budget-exhausted turns look successfully completed.
     if !snap.full_text.is_empty()
-        && !round_has_edge_work
+        && !round_has_tool_requests
         && !preserve_prior_final_after_runtime_scaffolding_retry
+        && snap.error_message.is_none()
     {
         *st.final_text = snap.full_text.to_string();
+        *st.final_text_model_item_id = st.model_item_id.map(str::to_string);
     }
 
     if !snap.full_text.is_empty()
-        && !round_has_edge_work
+        && !round_has_tool_requests
         && !preserve_prior_final_after_runtime_scaffolding_retry
+        && snap.error_message.is_none()
     {
-        let guard = apply_response_guards(st.final_text.as_str(), snap.tool_calls, &[], message);
+        let guard = apply_response_guards(st.final_text.as_str(), message);
         if let Some(replacement) = guard.replacement {
             agent_warn!("response_guard", "Guard triggered, replacing LLM output");
             *st.final_text = replacement;
+            *st.final_text_model_item_id = None;
             *st.last_finish_reason = Some(RESPONSE_GUARD_REDACTED_FINISH_REASON.to_string());
-            persist_final_assistant_message(st.messages, st.final_text.as_str());
+            persist_final_assistant_message(st.messages, st.final_text.as_str(), None);
             return AgenticTurnIngestOutcome::Break;
         }
         if guard.quality.has_fabrication_markers {
@@ -231,20 +269,13 @@ pub fn ingest_agentic_turn_stream(
     *st.total_cache_read += snap.cache_read_tokens;
     *st.total_cache_creation += snap.cache_creation_tokens;
     let tool_calls_this_round = snap.server_execution_summary.map_or_else(
-        || {
-            u32::try_from(if !snap.tool_calls.is_empty() {
-                snap.tool_calls.len()
-            } else {
-                edge_round_len
-            })
-            .unwrap_or(u32::MAX)
-        },
+        || u32::try_from(snap.tool_calls.len()).unwrap_or(u32::MAX),
         |summary| summary.tool_calls_count,
     );
     *st.total_tool_calls = st.total_tool_calls.saturating_add(tool_calls_this_round);
     let observation_tool_calls_this_round = if let Some(summary) = snap.server_execution_summary {
         summary.observation_tool_calls_count
-    } else if !snap.tool_calls.is_empty() {
+    } else {
         u32::try_from(
             snap.tool_calls
                 .iter()
@@ -253,14 +284,6 @@ pub fn ingest_agentic_turn_stream(
                 .count(),
         )
         .unwrap_or(u32::MAX)
-    } else {
-        let mut count = 0u32;
-        for i in 0..edge_round_len {
-            if tool_counts_as_external_observation(&edge_tool_name(i)) {
-                count = count.saturating_add(1);
-            }
-        }
-        count
     };
     *st.total_observation_tool_calls = st
         .total_observation_tool_calls
@@ -278,9 +301,6 @@ pub fn ingest_agentic_turn_stream(
             if let Some(name) = tool_call_name(tc) {
                 insert_tool_used(st.all_tools_used, name.to_string());
             }
-        }
-        for i in 0..edge_round_len {
-            insert_tool_used(st.all_tools_used, edge_tool_name(i));
         }
     }
     *st.has_any_usage = *st.has_any_usage || snap.has_usage;
@@ -318,9 +338,13 @@ pub fn ingest_agentic_turn_stream(
         ));
     }
 
-    if !round_has_edge_work {
+    if !round_has_tool_requests {
         if !snap.full_text.is_empty() && !preserve_prior_final_after_runtime_scaffolding_retry {
-            persist_final_assistant_message(st.messages, st.final_text.as_str());
+            persist_final_assistant_message(
+                st.messages,
+                st.final_text.as_str(),
+                st.final_text_model_item_id.as_deref(),
+            );
         }
         return AgenticTurnIngestOutcome::Break;
     }
@@ -334,14 +358,55 @@ fn insert_tool_used(target: &mut HashSet<String>, name: String) {
     }
 }
 
-fn persist_final_assistant_message(messages: &mut Vec<Value>, final_text: &str) {
-    if final_text.is_empty() {
-        return;
+/// Return terminal assistant content only when its current-turn identity is new.
+/// Callers append through their existing transcript owner.
+pub fn terminal_assistant_message_to_append(
+    messages: &[Value],
+    final_text: &str,
+    model_item_id: Option<&str>,
+) -> Option<Value> {
+    let trimmed = final_text.trim();
+    if trimmed.is_empty() {
+        return None;
     }
-    messages.push(serde_json::json!({
-        "role": "assistant",
-        "content": final_text,
-    }));
+    let current_turn_start = messages
+        .iter()
+        .rposition(astra_turn_types::is_human_user_message)
+        .unwrap_or(0);
+    let already_materialized = messages[current_turn_start..]
+        .iter()
+        .rev()
+        .find(|message| {
+            message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+        })
+        .is_some_and(|message| match model_item_id {
+            Some(id) => astra_turn_types::model_item_id(message) == Some(id),
+            None => {
+                astra_turn_types::model_item_id(message).is_none()
+                    && crate::prompt_facing::extract_text_content(message)
+                        .is_some_and(|content| content.trim() == trimmed)
+            }
+        });
+    if !already_materialized {
+        let mut message = serde_json::json!({
+            "role": "assistant",
+            "content": final_text,
+        });
+        astra_turn_types::mark_model_message(&mut message, model_item_id);
+        return Some(message);
+    }
+    None
+}
+
+fn persist_final_assistant_message(
+    messages: &mut Vec<Value>,
+    final_text: &str,
+    model_item_id: Option<&str>,
+) {
+    if let Some(message) = terminal_assistant_message_to_append(messages, final_text, model_item_id)
+    {
+        messages.push(message);
+    }
 }
 
 fn should_preserve_prior_final_after_runtime_scaffolding_retry(
@@ -376,6 +441,8 @@ mod tests {
     use serde_json::json;
 
     struct Pack {
+        model_item_id: Option<String>,
+        final_text_model_item_id: Option<String>,
         first_ttft_ms: Option<u64>,
         current_session_id: Option<String>,
         current_run_id: Option<String>,
@@ -398,6 +465,8 @@ mod tests {
     impl Pack {
         fn new() -> Self {
             Self {
+                model_item_id: None,
+                final_text_model_item_id: None,
                 first_ttft_ms: None,
                 current_session_id: None,
                 current_run_id: None,
@@ -425,6 +494,8 @@ mod tests {
 
         fn ingest_mut(&mut self) -> AgenticTurnIngestMut<'_> {
             AgenticTurnIngestMut {
+                model_item_id: self.model_item_id.as_deref(),
+                final_text_model_item_id: &mut self.final_text_model_item_id,
                 first_ttft_ms: &mut self.first_ttft_ms,
                 current_session_id: &mut self.current_session_id,
                 current_run_id: &mut self.current_run_id,
@@ -447,6 +518,140 @@ mod tests {
     }
 
     #[test]
+    fn remote_admission_rejects_missing_terminal_and_pending_work_without_losing_partial_facts() {
+        for (terminal, pending, error, kind, override_kind) in [
+            (false, false, None, None, None),
+            (true, true, None, None, None),
+            (
+                false,
+                false,
+                None,
+                Some(astra_core::ErrorKind::ServerError),
+                None,
+            ),
+            (
+                true,
+                false,
+                Some("provider failed after output"),
+                None,
+                None,
+            ),
+            (
+                true,
+                false,
+                Some("original provider error"),
+                Some(astra_core::ErrorKind::ServerError),
+                Some(astra_core::ErrorKind::RateLimit),
+            ),
+        ] {
+            let accum = ChatTurnSseAccum {
+                session_id: Some("session".into()),
+                run_id: Some("physical-run".into()),
+                model_item_id: Some("current-model-item".into()),
+                full_text: "current partial response".into(),
+                prompt_tokens: 12,
+                completion_tokens: 3,
+                has_usage: true,
+                server_loop_terminal: terminal,
+                has_tool_calls: pending,
+                error_message: error.map(str::to_owned),
+                error_kind: kind,
+                ..Default::default()
+            };
+            let mut pack = Pack::new();
+            pack.final_text = "stale candidate".into();
+            pack.model_item_id = Some("stale-model-item".into());
+            let outcome = ingest_remote_server_turn(
+                &accum,
+                Some(8),
+                override_kind,
+                "request",
+                pack.ingest_mut(),
+            );
+            let AgenticTurnIngestOutcome::Fatal(failure) = outcome else {
+                panic!("remote boundary must return a failure, never client continuation");
+            };
+            if let Some(kind) = override_kind.or(kind) {
+                assert_eq!(failure.kind, kind);
+            } else if error.is_none() {
+                assert_eq!(failure.kind, astra_core::ErrorKind::ContractViolation);
+            }
+            if let Some(error) = error {
+                assert_eq!(failure.message, error);
+            }
+            assert_eq!(pack.current_run_id.as_deref(), Some("physical-run"));
+            assert_eq!(pack.current_session_id.as_deref(), Some("session"));
+            assert_eq!((pack.total_prompt, pack.total_completion), (12, 3));
+            assert_eq!(pack.total_tool_calls, 0);
+            assert_eq!(pack.final_text, "current partial response");
+            assert_eq!(
+                pack.final_text_model_item_id.as_deref(),
+                Some("current-model-item")
+            );
+            assert!(
+                pack.messages.is_empty(),
+                "partial output is not a successful commit"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_history_uses_current_turn_and_model_identity() {
+        for (messages, identity, should_append) in [
+            (
+                vec![
+                    json!({"role":"user","content":"answer"}),
+                    json!({"role":"assistant","content":"same","model_item_id":"A"}),
+                ],
+                Some("B"),
+                true,
+            ),
+            (
+                vec![
+                    json!({"role":"user","content":"answer"}),
+                    json!({"role":"assistant","content":"same","model_item_id":"A"}),
+                ],
+                Some("A"),
+                false,
+            ),
+            (
+                vec![
+                    json!({"role":"user","content":"answer"}),
+                    json!({"role":"assistant","content":"same"}),
+                ],
+                None,
+                false,
+            ),
+            (
+                vec![
+                    json!({"role":"user","content":"answer"}),
+                    json!({"role":"assistant","content":"same"}),
+                    json!({"role":"assistant","content":"later update"}),
+                ],
+                None,
+                true,
+            ),
+            (
+                vec![
+                    json!({"role":"assistant","content":"same"}),
+                    json!({"role":"user","content":"new turn"}),
+                ],
+                None,
+                true,
+            ),
+        ] {
+            let mut messages = messages;
+            let appended = terminal_assistant_message_to_append(&messages, "same", identity);
+            assert_eq!(appended.is_some(), should_append);
+            if let Some(message) = appended {
+                assert_eq!(astra_turn_types::model_item_id(&message), identity);
+                messages.push(message);
+            }
+            assert!(terminal_assistant_message_to_append(&messages, "same", identity).is_none());
+        }
+    }
+
+    #[test]
     fn conflicting_physical_input_evidence_stays_invalid_through_snapshot_and_ingest() {
         let accum = ChatTurnSseAccum {
             current_request_usage: astra_turn_types::RequestTokenUsage::try_new(50, 50, 0, 10).ok(),
@@ -459,15 +664,7 @@ mod tests {
         assert_eq!(snap.measured_request_input_tokens(), None);
         let mut pack = Pack::new();
         pack.last_measured_prompt_tokens = Some(123);
-        let _ = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "continue this session",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let _ = ingest_agentic_turn_stream(&snap, "continue this session", pack.ingest_mut());
         assert_eq!(pack.last_measured_prompt_tokens, None);
     }
 
@@ -507,26 +704,28 @@ mod tests {
             error_kind: None,
         };
 
-        let outcome = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "continue this session",
-            &[],
-            true,
-            p.ingest_mut(),
-        );
+        let outcome = ingest_agentic_turn_stream(&snap, "continue this session", p.ingest_mut());
 
         assert_eq!(outcome, AgenticTurnIngestOutcome::Break);
         assert_eq!(
             p.current_session_id.as_deref(),
             Some("authoritative-session")
         );
-        let summary = p.step_recorder.summary();
-        assert_eq!(summary.user_id, TEST_USER_ID);
-        assert_eq!(
-            summary.session_id, "ephemeral",
-            "a session-only frame may update in-memory identity, but it cannot persist recorder events"
+        assert!(
+            p.step_recorder
+                .current_step()
+                .unwrap()
+                .step_id()
+                .starts_with("ephemeral-run-")
+        );
+        assert!(
+            astra_pipeline::step_checkpoint::FileBackedEventStore::new(
+                TEST_USER_ID,
+                "authoritative-session"
+            )
+            .all_events()
+            .is_empty(),
+            "a session-only frame must not persist recorder events"
         );
 
         // A later frame carrying both identities establishes the durable run
@@ -551,18 +750,27 @@ mod tests {
             error_message: &error_message,
             error_kind: None,
         };
-        let outcome = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "continue this session",
-            &[],
-            true,
-            p.ingest_mut(),
-        );
+        let outcome = ingest_agentic_turn_stream(&snap, "continue this session", p.ingest_mut());
         assert_eq!(outcome, AgenticTurnIngestOutcome::Break);
-        let summary = p.step_recorder.summary();
-        assert_eq!(summary.session_id, "authoritative-session");
+        assert!(
+            p.step_recorder
+                .current_step()
+                .unwrap()
+                .step_id()
+                .starts_with("authoritative-session-run-")
+        );
+        let persisted = astra_pipeline::step_checkpoint::FileBackedEventStore::new(
+            TEST_USER_ID,
+            "authoritative-session",
+        );
+        assert!(!persisted.all_events().is_empty());
+        assert!(
+            persisted
+                .all_events()
+                .iter()
+                .all(|event| event.run_id == "authoritative-run"
+                    && event.step_id.starts_with("authoritative-session-run-"))
+        );
         assert!(!p.step_recorder.events().is_empty());
         assert!(
             p.step_recorder
@@ -604,15 +812,7 @@ mod tests {
         let snap = agentic_turn_stream_snapshot_from_sse_accum(&accum, Some(7));
         let mut p = Pack::new();
 
-        let outcome = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| panic!("Server-owned execution must not request an Edge tool"),
-            "delegate the work",
-            &[],
-            true,
-            p.ingest_mut(),
-        );
+        let outcome = ingest_agentic_turn_stream(&snap, "delegate the work", p.ingest_mut());
 
         assert_eq!(outcome, AgenticTurnIngestOutcome::Break);
         assert_eq!(p.total_tool_calls, 3);
@@ -676,15 +876,8 @@ mod tests {
         let mut p = Pack::new();
         p.last_measured_prompt_tokens = Some(99_000);
 
-        let outcome = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| panic!("server-owned execution must not request edge tools"),
-            "finish the delegated work",
-            &[],
-            true,
-            p.ingest_mut(),
-        );
+        let outcome =
+            ingest_agentic_turn_stream(&snap, "finish the delegated work", p.ingest_mut());
 
         assert_eq!(outcome, AgenticTurnIngestOutcome::Break);
         assert_eq!(
@@ -810,15 +1003,7 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
-        let out = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "hi",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
         assert!(matches!(out, AgenticTurnIngestOutcome::Fatal(ref e) if e.message == "boom"));
         assert_eq!(pack.consecutive_context_window_errors, 0);
     }
@@ -846,15 +1031,7 @@ mod tests {
         };
         let mut pack = Pack::new();
         pack.consecutive_context_window_errors = 1;
-        let out = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "hi",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
         assert!(matches!(out, AgenticTurnIngestOutcome::Fatal(ref e)
             if e.kind == astra_core::ErrorKind::ContextWindow
             && e.message == "prompt is too long"
@@ -885,15 +1062,7 @@ mod tests {
         };
         let mut pack = Pack::new();
         pack.consecutive_context_window_errors = 4;
-        let out = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "hi",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
         assert!(
             matches!(out, AgenticTurnIngestOutcome::Fatal(ref e) if e.message == "rate limited")
         );
@@ -939,15 +1108,7 @@ mod tests {
             };
             let mut pack = Pack::new();
             pack.consecutive_context_window_errors = 3;
-            let out = ingest_agentic_turn_stream(
-                &snap,
-                0,
-                |_| String::new(),
-                "hi",
-                &[],
-                true,
-                pack.ingest_mut(),
-            );
+            let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
 
             assert!(
                 matches!(out, AgenticTurnIngestOutcome::Fatal(ref e)
@@ -979,15 +1140,7 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
-        let out = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "hi",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
         assert_eq!(out, AgenticTurnIngestOutcome::Break);
         assert_eq!(pack.first_ttft_ms, Some(12u64));
         assert_eq!(pack.total_prompt, 1);
@@ -1020,15 +1173,7 @@ mod tests {
                 ..Default::default()
             };
             let snapshot = agentic_turn_stream_snapshot_from_sse_accum(&accum, None);
-            ingest_agentic_turn_stream(
-                &snapshot,
-                0,
-                |_| String::new(),
-                "hi",
-                &[],
-                true,
-                pack.ingest_mut(),
-            );
+            ingest_agentic_turn_stream(&snapshot, "hi", pack.ingest_mut());
             assert_eq!(
                 pack.last_measured_prompt_tokens,
                 physical.map(|usage| {
@@ -1059,15 +1204,7 @@ mod tests {
                     ..Default::default()
                 };
                 let snapshot = agentic_turn_stream_snapshot_from_sse_accum(&accum, None);
-                let outcome = ingest_agentic_turn_stream(
-                    &snapshot,
-                    0,
-                    |_| String::new(),
-                    "hi",
-                    &[],
-                    true,
-                    pack.ingest_mut(),
-                );
+                let outcome = ingest_agentic_turn_stream(&snapshot, "hi", pack.ingest_mut());
                 assert_eq!(pack.last_measured_prompt_tokens, physical.map(|_| 0));
                 assert_eq!(
                     pack.consecutive_context_window_errors,
@@ -1080,41 +1217,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn has_tool_calls_when_edge_round_nonzero() {
-        let snap = AgenticTurnStreamSnapshot {
-            ttft_ms: None,
-            session_id: &None,
-            run_id: &None,
-            full_text: "",
-            tool_calls: &[],
-            server_execution_summary: None,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            qualified_usage: None,
-            current_request_input_tokens: None,
-            current_request_usage: None,
-            has_usage: false,
-            error_message: &None,
-            error_kind: None,
-        };
-        let mut pack = Pack::new();
-        let out = ingest_agentic_turn_stream(
-            &snap,
-            1,
-            |_| "bash".to_string(),
-            "hi",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
-        assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
-        assert!(pack.all_tools_used.contains("bash"));
-        assert_eq!(pack.total_tool_calls, 1);
     }
 
     #[test]
@@ -1143,15 +1245,7 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
-        let out = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "hi",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
         assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
         assert!(pack.all_tools_used.contains("read_file"));
     }
@@ -1181,15 +1275,7 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
-        let out = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "hi",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
 
         assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
         assert_eq!(pack.total_tool_calls, 2);
@@ -1200,13 +1286,22 @@ mod tests {
     }
 
     #[test]
-    fn edge_tool_names_are_canonicalized_before_recording() {
+    fn provider_tool_names_are_canonicalized_before_recording() {
+        let calls = [" bash ", "bash", " "]
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| {
+                json!({"id": format!("call-{i}"), "type": "function", "function": {
+                    "name": name, "arguments": "{}"
+                }})
+            })
+            .collect::<Vec<_>>();
         let snap = AgenticTurnStreamSnapshot {
             ttft_ms: None,
             session_id: &None,
             run_id: &None,
             full_text: "",
-            tool_calls: &[],
+            tool_calls: &calls,
             server_execution_summary: None,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -1220,16 +1315,7 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
-        let tool_names = [" bash ", "bash", " "];
-        let out = ingest_agentic_turn_stream(
-            &snap,
-            tool_names.len(),
-            |i| tool_names[i].to_string(),
-            "hi",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
 
         assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
         assert_eq!(pack.total_tool_calls, 3);
@@ -1265,56 +1351,88 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
-        let out = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "hi",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let out = ingest_agentic_turn_stream(&snap, "hi", pack.ingest_mut());
         assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
         assert!(pack.all_tools_used.contains("read_file"));
     }
 
     #[test]
     fn tool_turn_draft_text_does_not_become_final_output() {
-        let tcs = vec![json!({"name": "bash", "arguments": {}})];
-        let snap = AgenticTurnStreamSnapshot {
-            ttft_ms: None,
-            session_id: &None,
-            run_id: &None,
-            full_text: "intermediate analysis before tool calls",
-            tool_calls: &tcs,
-            server_execution_summary: None,
-            prompt_tokens: 1,
-            completion_tokens: 2,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            qualified_usage: None,
-            current_request_input_tokens: None,
-            current_request_usage: None,
-            has_usage: true,
-            error_message: &None,
-            error_kind: None,
-        };
+        for draft in [
+            "intermediate analysis before tool calls",
+            "How does authentication work?",
+        ] {
+            let tcs = vec![
+                json!({"id": "preamble-tool", "type": "function", "function": {"name": "bash", "arguments": "{}"}}),
+            ];
+            let snap = AgenticTurnStreamSnapshot {
+                ttft_ms: None,
+                session_id: &None,
+                run_id: &None,
+                full_text: draft,
+                tool_calls: &tcs,
+                server_execution_summary: None,
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                qualified_usage: None,
+                current_request_input_tokens: None,
+                current_request_usage: None,
+                has_usage: true,
+                error_message: &None,
+                error_kind: None,
+            };
+            let mut pack = Pack::new();
+            pack.final_text = "previous stable answer".to_string();
+            let out = ingest_agentic_turn_stream(
+                &snap,
+                "How does authentication work?",
+                pack.ingest_mut(),
+            );
+            assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
+            assert_eq!(
+                pack.final_text, "previous stable answer",
+                "tool-call preambles are intermediate and must not overwrite the user-visible final answer"
+            );
+        }
+    }
+
+    #[test]
+    fn model_item_identity_survives_partial_failure_and_distinguishes_equal_responses() {
         let mut pack = Pack::new();
-        pack.final_text = "previous stable answer".to_string();
-        let out = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "hi",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
-        assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
+        for (id, text, failed) in [
+            ("accepted-A", "same answer", false),
+            ("partial-P", "unfinished", true),
+            ("resume-B", "same answer", false),
+        ] {
+            pack.model_item_id = Some(id.into());
+            let accum = ChatTurnSseAccum {
+                full_text: text.into(),
+                error_message: failed.then(|| "transport interrupted".into()),
+                error_kind: failed.then_some(astra_core::ErrorKind::Network),
+                ..Default::default()
+            };
+            let snap = agentic_turn_stream_snapshot_from_sse_accum(&accum, None);
+            let outcome = ingest_agentic_turn_stream(&snap, "answer", pack.ingest_mut());
+            if failed {
+                assert!(matches!(outcome, AgenticTurnIngestOutcome::Fatal(_)));
+                assert_eq!(pack.final_text, "same answer");
+                assert_eq!(pack.final_text_model_item_id.as_deref(), Some("accepted-A"));
+                assert_eq!(pack.messages.len(), 1);
+            }
+        }
+        assert_eq!(pack.final_text_model_item_id.as_deref(), Some("resume-B"));
+        assert_eq!(pack.messages.len(), 2);
         assert_eq!(
-            pack.final_text, "previous stable answer",
-            "tool-call preambles are intermediate and must not overwrite the user-visible final answer"
+            astra_turn_types::model_item_id(&pack.messages[0]),
+            Some("accepted-A")
         );
+        assert_eq!(
+            astra_turn_types::model_item_id(&pack.messages[1]),
+            Some("resume-B")
+        );
+        assert_eq!(pack.messages[0]["content"], pack.messages[1]["content"]);
     }
 
     #[test]
@@ -1339,6 +1457,8 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
+        pack.model_item_id = Some("retry-B".into());
+        pack.final_text_model_item_id = Some("accepted-A".into());
         pack.final_text = prior_answer.to_string();
         pack.messages.push(json!({
             "role": "assistant",
@@ -1355,18 +1475,11 @@ mod tests {
             astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
         ));
 
-        let out = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "give advice only",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let out = ingest_agentic_turn_stream(&snap, "give advice only", pack.ingest_mut());
 
         assert_eq!(out, AgenticTurnIngestOutcome::Break);
         assert_eq!(pack.final_text, prior_answer);
+        assert_eq!(pack.final_text_model_item_id.as_deref(), Some("accepted-A"));
         assert_eq!(
             pack.messages.len(),
             3,
@@ -1407,11 +1520,7 @@ mod tests {
 
         let out = ingest_agentic_turn_stream(
             &snap,
-            0,
-            |_| String::new(),
             "Please adjust the recommendation.",
-            &[],
-            true,
             pack.ingest_mut(),
         );
 
@@ -1441,15 +1550,7 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
-        let out = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "show me the latest PR",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let out = ingest_agentic_turn_stream(&snap, "show me the latest PR", pack.ingest_mut());
         assert_eq!(out, AgenticTurnIngestOutcome::Break);
         assert_eq!(pack.final_text, "Here are your recent PRs: ...");
         assert_eq!(pack.last_measured_prompt_tokens, None);
@@ -1480,15 +1581,7 @@ mod tests {
             error_kind: None,
         };
 
-        let out = ingest_agentic_turn_stream(
-            &snapshot,
-            0,
-            |_| String::new(),
-            "hi",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let out = ingest_agentic_turn_stream(&snapshot, "hi", pack.ingest_mut());
 
         assert_eq!(out, AgenticTurnIngestOutcome::Break);
         assert_eq!(
@@ -1541,15 +1634,7 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
-        let out = ingest_agentic_turn_stream(
-            &snap1,
-            0,
-            |_| String::new(),
-            "q1",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let out = ingest_agentic_turn_stream(&snap1, "q1", pack.ingest_mut());
         assert_eq!(out, AgenticTurnIngestOutcome::Break);
         assert_eq!(pack.total_cache_read, 80);
         assert_eq!(pack.total_cache_creation, 20);
@@ -1565,15 +1650,7 @@ mod tests {
             cache_creation_tokens: 30,
             ..snap1
         };
-        let out2 = ingest_agentic_turn_stream(
-            &snap2,
-            0,
-            |_| String::new(),
-            "q2",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let out2 = ingest_agentic_turn_stream(&snap2, "q2", pack.ingest_mut());
         assert_eq!(out2, AgenticTurnIngestOutcome::Break);
         assert_eq!(pack.total_cache_read, 230); // 80 + 150
         assert_eq!(pack.total_cache_creation, 50); // 20 + 30
@@ -1602,15 +1679,7 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
-        ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "q",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        ingest_agentic_turn_stream(&snap, "q", pack.ingest_mut());
         assert_eq!(pack.total_cache_read, 0);
         assert_eq!(pack.total_cache_creation, 0);
         assert_eq!(pack.total_prompt, 500);
@@ -1639,15 +1708,7 @@ mod tests {
         };
         let mut pack = Pack::new();
         assert!(!pack.has_any_usage);
-        ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "q",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        ingest_agentic_turn_stream(&snap, "q", pack.ingest_mut());
         assert!(pack.has_any_usage);
         assert_eq!(pack.total_cache_read, 400);
         assert_eq!(pack.total_cache_creation, 50);
@@ -1675,15 +1736,7 @@ mod tests {
             error_kind: None,
         };
         let mut pack = Pack::new();
-        ingest_agentic_turn_stream(
-            &snap1,
-            0,
-            |_| String::new(),
-            "q",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        ingest_agentic_turn_stream(&snap1, "q", pack.ingest_mut());
         // Second turn: cache_creation but no cache_read
         let snap2 = AgenticTurnStreamSnapshot {
             full_text: "t2",
@@ -1691,15 +1744,7 @@ mod tests {
             cache_creation_tokens: 75,
             ..snap1
         };
-        ingest_agentic_turn_stream(
-            &snap2,
-            0,
-            |_| String::new(),
-            "q",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        ingest_agentic_turn_stream(&snap2, "q", pack.ingest_mut());
         assert_eq!(pack.total_cache_read, 90); // only from turn 1
         assert_eq!(pack.total_cache_creation, 75); // only from turn 2
     }
@@ -1733,15 +1778,7 @@ mod tests {
             error_message: &err_msg,
             error_kind: None,
         };
-        let outcome = ingest_agentic_turn_stream(
-            &snap,
-            0,
-            |_| String::new(),
-            "",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let outcome = ingest_agentic_turn_stream(&snap, "", pack.ingest_mut());
         assert!(matches!(outcome, AgenticTurnIngestOutcome::Fatal(_)));
         assert_eq!(
             pack.consecutive_context_window_errors, 1,
@@ -1768,15 +1805,7 @@ mod tests {
             error_message: &no_err,
             error_kind: None,
         };
-        let outcome = ingest_agentic_turn_stream(
-            &snap_ok,
-            0,
-            |_| String::new(),
-            "done",
-            &[],
-            true,
-            pack.ingest_mut(),
-        );
+        let outcome = ingest_agentic_turn_stream(&snap_ok, "done", pack.ingest_mut());
         assert!(matches!(outcome, AgenticTurnIngestOutcome::Break));
         assert_eq!(
             pack.consecutive_context_window_errors, 0,

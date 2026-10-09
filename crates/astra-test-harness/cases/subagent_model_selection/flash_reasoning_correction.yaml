@@ -1,0 +1,44 @@
+name: flash_reasoning_correction
+description: |
+  A later user correction must supersede the earlier reasoning setting for
+  the same child, without an extra judge or a lexical correction table.
+prompt: |
+  请让一个子代理用 high 思考完成一个只返回标记的任务。
+  等等，改成 medium 思考，再让它开始。子代理只能回答
+  REASONING-CORRECTION-OK，不要调用任何工具；完成后告诉我结果。
+  本用例不指定模型，子代理应继承当前模型；父代理调用 agent 时不要填写
+  requested_model_policy。
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: execution_child_results_adopted
+    children:
+      - expected_result: {text: REASONING-CORRECTION-OK}
+        model: deepseek-v4-flash
+        initial_thinking: {kind: exact, config: {mode: adaptive, effort: medium}}
+  - type: execution_tool_count
+    name: bash
+    min: 0
+    max: 0
+  - type: execution_tool_count
+    name: grep
+    min: 0
+    max: 0
+  - type: execution_tool_count
+    name: read_file
+    min: 0
+    max: 0
+  - type: execution_tool_count
+    name: reflect
+    min: 0
+    max: 0
+  - type: execution_tool_count
+    name: agent
+    ok: false
+    min: 0
+    max: 0
+  - type: text_contains
+    needle: REASONING-CORRECTION-OK

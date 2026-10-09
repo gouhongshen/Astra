@@ -1,7 +1,7 @@
 //! Session-end lesson extractor.
 //!
 //! When a session ends, the signals we already track — repeated tool
-//! failures, stall events, and user corrections — need to be distilled
+//! failures and user corrections — need to be distilled
 //! into lessons for Memoria L3 storage.
 //!
 //! This module is the pure mapping step: `SessionSummary` → `Vec<NewLesson>`.
@@ -19,10 +19,8 @@ use astra_services::{LessonKind, NewLesson};
 
 use crate::observability::ObservabilitySession;
 
-/// Minimal session-end signal bundle. The runtime already tracks every
-/// field in `TurnState` / `ImprovementTracker`; this struct is just the
-/// view the extractor needs, so the extractor stays independent of those
-/// concrete types.
+/// Session-end view of observed runtime signals used by lesson extraction.
+/// This bundle keeps the extractor independent of the execution state types.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionSummary {
     /// `tool_name → failure_count` across the session.
@@ -39,8 +37,6 @@ pub struct SessionSummary {
     /// extractor skips them — better to miss a lesson than to falsely
     /// block a tool for a week.
     pub undetermined_failure_tools: std::collections::HashSet<String>,
-    /// Number of stall events the pipeline detected.
-    pub stall_events: u32,
     /// User-correction snippets recorded during the session.
     pub user_corrections: Vec<String>,
     /// Tools that were successfully used ≥ SUCCESS_REHABILITATE_THRESHOLD
@@ -52,22 +48,12 @@ pub struct SessionSummary {
 
 // ── Thresholds (test-pinned; bump deliberately) ─────────────────────────────
 //
-// These are **post-session** thresholds for persisting durable lessons.
-// They are deliberately lower than the **in-session** auto-invoke
-// thresholds in `astra_skills::auto_invoke` (STALL_TRIGGER_COUNT=5,
-// CORRECTION_TRIGGER_COUNT=5). Rationale: auto-invoke fires a
-// diagnostic mid-session (high cost, interrupts flow), so it needs a
-// higher bar. Lesson extraction runs once at session end (zero runtime
-// cost), so it can be more sensitive.
-
 /// A tool must fail at least this many times to warrant a
 /// ToolAvoidance lesson.
 pub const TOOL_FAILURE_LESSON_THRESHOLD: u32 = 3;
 /// A tool must succeed at least this many times in one session to
 /// rehabilitate (weaken) an existing ToolAvoidance lesson.
 pub const SUCCESS_REHABILITATE_THRESHOLD: usize = 3;
-/// Stall events that warrant a PromptShape lesson.
-pub const STALL_LESSON_THRESHOLD: u32 = 3;
 /// User corrections that warrant a PromptShape lesson.
 pub const CORRECTION_LESSON_THRESHOLD: usize = 2;
 
@@ -77,7 +63,7 @@ pub const CORRECTION_LESSON_THRESHOLD: usize = 2;
 /// `(user_id, persona, workload_tag)`.
 ///
 /// Output ordering is deterministic: tool-avoidance lessons first,
-/// then stall / correction prompt-shape lessons. Deterministic output
+/// then correction prompt-shape lessons. Deterministic output
 /// keeps upstream tests stable.
 #[must_use]
 pub fn extract_lessons(
@@ -118,21 +104,6 @@ pub fn extract_lessons(
         });
     }
 
-    // Stalls → PromptShape (agent looped, prompt likely too open-ended).
-    if summary.stall_events >= STALL_LESSON_THRESHOLD {
-        out.push(NewLesson {
-            user_id: user_id.to_string(),
-            persona: persona.to_string(),
-            workload_tag: workload_tag.map(str::to_string),
-            kind: LessonKind::PromptShape,
-            trigger_signal: "stall_events".to_string(),
-            action: "tighten the plan: restate scope before each tool call and break tasks into \
-                 explicit steps"
-                .into(),
-            confidence: None,
-        });
-    }
-
     // Repeated corrections → PromptShape. Dedup snippets first so two
     // identical corrections count once (user hitting the same nit twice).
     let mut seen = std::collections::HashSet::new();
@@ -165,7 +136,7 @@ pub fn extract_lessons(
 ///
 /// Zero-failure tools are omitted so the extractor's thresholds don't
 /// see noise. Missing `ObservabilitySession` degrades gracefully: the
-/// secondary signals (stalls / corrections) stay at zero rather than
+/// correction signals stay empty rather than
 /// pretending we have data we don't.
 #[must_use]
 pub fn summarise_from_runtime(
@@ -213,13 +184,9 @@ pub fn summarise_from_runtime(
         }
     }
 
-    let (user_corrections, stall_events) = match obs {
-        None => (Vec::new(), 0),
-        Some(session) => (
-            session.recent_correction_excerpts.clone(),
-            session.stall_event_count,
-        ),
-    };
+    let user_corrections = obs
+        .map(|session| session.recent_correction_excerpts.clone())
+        .unwrap_or_default();
 
     // Tools that were successfully used enough times this session to
     // rehabilitate stale ToolAvoidance lessons.
@@ -235,7 +202,7 @@ pub fn summarise_from_runtime(
         tool_failures,
         transient_failure_tools,
         undetermined_failure_tools,
-        stall_events,
+
         user_corrections,
         rehabilitated_tools,
     }
@@ -282,7 +249,7 @@ mod tests {
     fn subthreshold_signals_yield_no_lessons() {
         let mut s = base_summary();
         s.tool_failures.insert("grep".into(), 2); // threshold is 3
-        s.stall_events = 2;
+
         s.user_corrections = vec!["nit 1".into()]; // threshold is 2
         assert!(extract_lessons(&s, "u", "p", None).is_empty());
     }
@@ -328,16 +295,6 @@ mod tests {
     }
 
     #[test]
-    fn stall_at_threshold_yields_prompt_shape() {
-        let mut s = base_summary();
-        s.stall_events = 3;
-        let out = extract_lessons(&s, "u", "p", None);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].kind, LessonKind::PromptShape);
-        assert_eq!(out[0].trigger_signal, "stall_events");
-    }
-
-    #[test]
     fn corrections_at_threshold_yield_prompt_shape() {
         let mut s = base_summary();
         s.user_corrections = vec!["use rg not grep".into(), "limit to src/ only".into()];
@@ -378,13 +335,13 @@ mod tests {
     // ── Composition — multiple signals at once ──────────────────────────────
 
     #[test]
-    fn tool_stall_and_correction_signals_yield_expected_lesson_kinds() {
+    fn tool_and_correction_signals_yield_expected_lesson_kinds() {
         let mut s = base_summary();
         s.tool_failures.insert("grep".into(), 3);
-        s.stall_events = 3;
+
         s.user_corrections = vec!["a".into(), "b".into()];
         let out = extract_lessons(&s, "u", "p", None);
-        assert_eq!(out.len(), 3);
+        assert_eq!(out.len(), 2);
         let kinds: std::collections::HashSet<LessonKind> = out.iter().map(|l| l.kind).collect();
         assert!(kinds.contains(&LessonKind::ToolAvoidance));
         assert!(kinds.contains(&LessonKind::PromptShape));
@@ -396,7 +353,7 @@ mod tests {
     fn workload_tag_is_attached_to_every_lesson() {
         let mut s = base_summary();
         s.tool_failures.insert("grep".into(), 3);
-        s.stall_events = 3;
+
         let out = extract_lessons(&s, "u", "p", Some("code-review"));
         assert!(!out.is_empty());
         for l in &out {
@@ -411,7 +368,7 @@ mod tests {
         let mut s = base_summary();
         s.tool_failures.insert("grep".into(), 10);
         s.tool_failures.insert("rg".into(), 3);
-        s.stall_events = 7;
+
         s.user_corrections = (0..6).map(|i| format!("correction {i}")).collect();
         let out = extract_lessons(&s, "u", "p", Some("x"));
         for l in &out {
@@ -428,7 +385,7 @@ mod tests {
         // by-content dedup works across sessions with different counts.
         let mut s = base_summary();
         s.tool_failures.insert("grep".into(), 3);
-        s.stall_events = 5;
+
         s.user_corrections = vec!["a".into(), "b".into()];
         let lessons = extract_lessons(&s, "u", "p", None);
 
@@ -445,7 +402,7 @@ mod tests {
         // (different action text is fine — action is not part of the key).
         let mut s2 = base_summary();
         s2.tool_failures.insert("grep".into(), 10); // different count
-        s2.stall_events = 20;
+
         s2.user_corrections = vec!["x".into(), "y".into()]; // different snippets
         let lessons2 = extract_lessons(&s2, "u", "p", None);
 
@@ -534,7 +491,7 @@ mod tests {
     fn summarise_without_observability_leaves_extra_signals_zero() {
         let entries = vec![health("grep", 5, 8)];
         let s = summarise_from_runtime(&entries, None);
-        assert_eq!(s.stall_events, 0);
+
         assert!(s.user_corrections.is_empty());
     }
 
@@ -550,27 +507,13 @@ mod tests {
     }
 
     #[test]
-    fn summarise_propagates_stall_counts_from_observability() {
-        use crate::observability::ObservabilitySession;
-        let mut obs = ObservabilitySession::new_simple("s-p7a");
-        obs.record_stall_event();
-        obs.record_stall_event();
-        obs.record_stall_event();
-
-        let s = summarise_from_runtime(&[], Some(&obs));
-        assert_eq!(s.stall_events, 3);
-    }
-
-    #[test]
-    fn summarise_with_stalls_yields_expected_lesson_kinds_end_to_end() {
+    fn summarise_health_and_corrections_yields_expected_lesson_kinds() {
         // Full stack: observability counters → summary → extractor must
-        // produce ToolAvoidance + PromptShape (stalls).
+        // produce ToolAvoidance + PromptShape (corrections).
         use crate::observability::ObservabilitySession;
         let entries = vec![health_inherent("grep", 3, 5)];
         let mut obs = ObservabilitySession::new_simple("s-p7a-e2e");
-        obs.record_stall_event();
-        obs.record_stall_event();
-        obs.record_stall_event();
+        obs.recent_correction_excerpts = vec!["use rg".into(), "narrow the search".into()];
 
         let summary = summarise_from_runtime(&entries, Some(&obs));
         let lessons = extract_lessons(&summary, "u1", "generic", None);

@@ -11,7 +11,7 @@ use crate::tool::registry::meta::{IntentType, tool_meta};
 /// Canonical name of the ask-user tool.
 pub const ASK_USER_TOOL_NAME: &str = "ask_user";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum TurnInteractionMode {
     #[default]
     NonInteractive,
@@ -55,7 +55,8 @@ impl TurnInteractionMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TurnInteractionPolicy {
     pub mode: TurnInteractionMode,
     pub visible_tool_names: Vec<String>,

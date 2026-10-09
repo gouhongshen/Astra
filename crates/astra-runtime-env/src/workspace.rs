@@ -29,6 +29,7 @@ pub enum WorkspaceSource {
     },
     ServerSandbox {
         session_id: String,
+        executor_id: String,
     },
     GitCheckout {
         repository: String,
@@ -56,6 +57,24 @@ pub enum WorkspaceSource {
     },
 }
 
+impl WorkspaceSource {
+    pub fn validate(&self) -> Result<(), WorkspaceProvisionError> {
+        if let Self::ServerSandbox { executor_id, .. } = self
+            && (executor_id.is_empty()
+                || executor_id.trim() != executor_id
+                || executor_id.len() > 256
+                || executor_id.contains('\0'))
+        {
+            return Err(WorkspaceProvisionError {
+                kind: WorkspaceProvisionErrorKind::SourceKindMismatch,
+                message: "server sandbox requires an exact executor identity".into(),
+                workspace_id: None,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspacePersistence {
@@ -79,14 +98,17 @@ pub struct WorkspaceProvisionRequest {
 }
 
 impl WorkspaceProvisionRequest {
-    pub fn server_sandbox(session_id: impl Into<String>) -> Self {
+    pub fn server_sandbox(session_id: impl Into<String>, executor_id: impl Into<String>) -> Self {
         let session_id = session_id.into();
         Self {
             workspace_id: session_id.clone(),
             owner_scope: WorkspaceOwnerScope::ServerSession,
             kind: WorkspaceBindingKind::ServerSandbox,
             authority: WorkspaceAuthority::ReadWrite,
-            source: WorkspaceSource::ServerSandbox { session_id },
+            source: WorkspaceSource::ServerSandbox {
+                session_id,
+                executor_id: executor_id.into(),
+            },
             persistence: WorkspacePersistence::Session,
             requested_root: None,
             display_name: Some("Server sandbox".to_string()),
@@ -95,6 +117,7 @@ impl WorkspaceProvisionRequest {
 
     pub fn validate(&self) -> Result<(), WorkspaceProvisionError> {
         validate_workspace_id(&self.workspace_id)?;
+        self.source.validate()?;
         if self.authority == WorkspaceAuthority::None && self.kind != WorkspaceBindingKind::None {
             return Err(WorkspaceProvisionError {
                 kind: WorkspaceProvisionErrorKind::AuthorityDenied,
@@ -403,11 +426,11 @@ mod tests {
 
     #[test]
     fn server_sandbox_request_validates_safe_workspace_id() {
-        WorkspaceProvisionRequest::server_sandbox("session-1")
+        WorkspaceProvisionRequest::server_sandbox("session-1", "test-executor")
             .validate()
             .expect("safe id");
 
-        let error = WorkspaceProvisionRequest::server_sandbox("../session")
+        let error = WorkspaceProvisionRequest::server_sandbox("../session", "test-executor")
             .validate()
             .expect_err("unsafe id should fail");
 
@@ -423,6 +446,7 @@ mod tests {
             authority: WorkspaceAuthority::ReadWrite,
             root_or_volume_ref: "/tmp/astra-workspaces/session-1".to_string(),
             source: WorkspaceSource::ServerSandbox {
+                executor_id: "test-executor".into(),
                 session_id: "session-1".to_string(),
             },
             persistence: WorkspacePersistence::Session,
@@ -466,7 +490,7 @@ mod tests {
 
     #[test]
     fn workspace_request_rejects_source_kind_mismatch() {
-        let mut request = WorkspaceProvisionRequest::server_sandbox("session-1");
+        let mut request = WorkspaceProvisionRequest::server_sandbox("session-1", "test-executor");
         request.source = WorkspaceSource::GitCheckout {
             repository: "https://example.test/repo.git".to_string(),
             reference: None,

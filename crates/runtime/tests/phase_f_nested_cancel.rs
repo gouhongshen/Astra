@@ -1,10 +1,7 @@
 //! Phase F — Track #3: nested sub-run cancellation propagation (2+ levels deep).
 //!
-//! The audit flagged that while single-level cancel was covered by
-//! `team_execution_respects_cancellation` (via `JoinHandle::abort`), the
-//! `cancel_token` propagation path — which is how real sub-runs inside
-//! `DelegationEngine` are asked to wind down gracefully — had no test at
-//! nesting depth > 1.
+//! Exercise cooperative cancellation beyond a single delegated level.
+//! The root token must reach nested tasks through `SubRunConfig::cancel_token`.
 //!
 //! These tests use `DelegationEngine` plus a mock `SubRunExecutor` that
 //! spawns two additional task levels internally, both holding a clone of the
@@ -22,7 +19,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use astra_runtime::server::delegation::engine::{
-    DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutor,
+    DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutionResult, SubRunExecutor,
 };
 use astra_runtime::server::run::engine::RunEngine;
 use astra_services::coordination::{
@@ -41,6 +38,7 @@ fn setup() -> (
     Arc<RwLock<AgentProfileRegistry>>,
     Arc<RunEngine>,
     Arc<DelegationTracker>,
+    Arc<astra_runtime::orchestration::DynamicAgentSpawner>,
 ) {
     let mut reg = AgentProfileRegistry::new();
     reg.register(AgentProfile::new("orch", "Orch", AgentTier::Orchestrator))
@@ -52,7 +50,14 @@ fn setup() -> (
     let run_store = Arc::new(InMemoryRunStateStore::new());
     let run_engine = Arc::new(RunEngine::new(run_store));
     let tracker = Arc::new(DelegationTracker::new());
-    (Arc::new(RwLock::new(reg)), run_engine, tracker)
+    let router = Arc::new(astra_messaging::AgentMailboxRouter::new(
+        Arc::new(astra_messaging::InProcessTransport::new()),
+        tracker.clone(),
+    ));
+    let supervisor = Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
+        router,
+    ));
+    (Arc::new(RwLock::new(reg)), run_engine, tracker, supervisor)
 }
 
 fn fan_out(delegation_id: &str, agents: Vec<&str>) -> DelegationRequest {
@@ -85,6 +90,51 @@ async fn persist_request_parent(run_engine: &RunEngine, request: &DelegationRequ
         )
         .await
         .expect("nested cancellation fixture should persist its durable parent");
+    let binding = astra_runtime::server::tool_transport::ExecutionBindingSnapshot::inferred(
+        astra_runtime::server::tool_transport::WorkspaceBinding::none(),
+        astra_runtime::server::tool_transport::ExecutorBinding::server_control_plane(),
+    );
+    let events: Vec<_> = ["workspace_bound", "executor_bound"]
+        .into_iter()
+        .map(|kind| {
+            let mut fields = astra_runtime::server::tool_transport::binding_event_fields(
+                &binding.workspace,
+                &binding.executor,
+            );
+            fields.insert("type".into(), serde_json::json!(kind));
+            fields.insert("run_id".into(), serde_json::json!(request.parent_run_id));
+            fields.insert("session_id".into(), serde_json::json!(request.session_id));
+            fields.insert(
+                "idempotency_key".into(),
+                serde_json::json!(format!(
+                    "run-start:{}:{}-bound",
+                    request.parent_run_id,
+                    if kind == "workspace_bound" {
+                        "workspace"
+                    } else {
+                        "executor"
+                    }
+                )),
+            );
+            fields.insert("runtime".into(), serde_json::Value::Null);
+            if kind == "workspace_bound" {
+                fields.insert(
+                    "completion_checks".into(),
+                    serde_json::json!(astra_turn_types::StopHookObligations::default()),
+                );
+            }
+            serde_json::Value::Object(fields)
+        })
+        .collect();
+    run_engine
+        .append_events_batch(
+            &request.user_id,
+            &request.session_id,
+            &request.parent_run_id,
+            &events,
+        )
+        .await
+        .unwrap();
 }
 
 /// Mock executor whose `execute()` itself opens two additional nesting levels
@@ -116,7 +166,7 @@ impl NestedMockExecutor {
 
 #[async_trait]
 impl SubRunExecutor for NestedMockExecutor {
-    async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+    async fn execute(&self, config: SubRunConfig) -> Result<SubRunExecutionResult, String> {
         self.started_at_root.fetch_add(1, Ordering::SeqCst);
         let token = config.cancel_token.clone().expect("cancel_token required");
 
@@ -167,15 +217,19 @@ impl SubRunExecutor for NestedMockExecutor {
                 .map_err(|error| format!("depth-1 cancellation task failed: {error}"))?;
         }
 
-        Ok(AgentResult {
-            agent_id: config.agent_profile.agent_id,
-            run_id: config.run_id,
-            status: "cancelled".to_string(),
-            output: None,
-            error: None,
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            tool_calls: 0,
+        Ok(SubRunExecutionResult {
+            result: AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: "cancelled".to_string(),
+                output: None,
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            },
+            committed_frontier: None,
+            applied_user_intents: Vec::new(),
         })
     }
 }
@@ -187,9 +241,10 @@ impl SubRunExecutor for NestedMockExecutor {
 // natural task timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nested_cancel_propagates_through_three_levels() {
-    let (reg, engine, tracker) = setup();
+    let (reg, engine, tracker, supervisor) = setup();
     let exec = Arc::new(NestedMockExecutor::new(3));
-    let de = DelegationEngine::with_executor(reg, engine.clone(), tracker, exec.clone());
+    let de = DelegationEngine::with_executor(reg, engine.clone(), tracker, exec.clone())
+        .for_execution(supervisor);
 
     let token = Arc::new(CancellationToken::new());
     let req = fan_out("del-nested-1", vec!["w1", "w2"]);
@@ -269,9 +324,10 @@ async fn nested_cancel_propagates_through_three_levels() {
 // should not burn seconds on sub-runs that can never make progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_cancelled_token_short_circuits_nested_execute() {
-    let (reg, engine, tracker) = setup();
+    let (reg, engine, tracker, supervisor) = setup();
     let exec = Arc::new(NestedMockExecutor::new(2));
-    let de = DelegationEngine::with_executor(reg, engine.clone(), tracker, exec.clone());
+    let de = DelegationEngine::with_executor(reg, engine.clone(), tracker, exec.clone())
+        .for_execution(supervisor);
 
     let token = Arc::new(CancellationToken::new());
     token.cancel(); // pre-cancel
@@ -295,14 +351,12 @@ async fn pre_cancelled_token_short_circuits_nested_execute() {
 // unifies tokens into a shared global.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sibling_delegations_have_isolated_cancel_tokens() {
-    let (reg, engine, tracker) = setup();
+    let (reg, engine, tracker, supervisor) = setup();
     let exec = Arc::new(NestedMockExecutor::new(2));
-    let de = Arc::new(DelegationEngine::with_executor(
-        reg,
-        engine.clone(),
-        tracker,
-        exec.clone(),
-    ));
+    let de = Arc::new(
+        DelegationEngine::with_executor(reg, engine.clone(), tracker, exec.clone())
+            .for_execution(supervisor),
+    );
 
     let token_a = Arc::new(CancellationToken::new());
     let token_b = Arc::new(CancellationToken::new());

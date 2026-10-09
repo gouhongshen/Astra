@@ -106,9 +106,9 @@ mod tests {
         cp.maybe_checkpoint(&summary1, 10, "u1", "generic", None);
 
         let mut summary2 = summary_with_tool_failures(&[("grep", 5), ("rg", 3)]);
-        summary2.stall_events = 3; // also triggers a PromptShape lesson
+        summary2.user_corrections = vec!["narrow the search".into(), "use rg".into()];
         let delta = cp.maybe_checkpoint(&summary2, 15, "u1", "generic", None);
-        assert_eq!(delta.len(), 2, "rg + stall should be new");
+        assert_eq!(delta.len(), 2, "rg + corrections should be new");
         assert!(delta.iter().any(|l| l.trigger_signal.contains("rg")));
         assert!(delta.iter().any(|l| l.kind == LessonKind::PromptShape));
     }
@@ -137,10 +137,9 @@ mod tests {
         let mut cp = LessonCheckpointer::new();
         let mut summary = SessionSummary::default();
         summary.tool_failures.insert("grep".into(), 5);
-        summary.stall_events = 3;
         summary.user_corrections = vec!["fix a".into(), "fix b".into()];
 
         cp.maybe_checkpoint(&summary, 10, "u1", "generic", None);
-        assert_eq!(cp.recorded_count(), 3); // tool + stall + corrections
+        assert_eq!(cp.recorded_count(), 2); // tool + corrections
     }
 }

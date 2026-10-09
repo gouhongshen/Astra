@@ -1,18 +1,11 @@
 mod completions;
 #[cfg(feature = "server")]
-pub mod conflict_resolver;
-#[cfg(feature = "server")]
 pub mod edge_capacity_rpc;
 #[cfg(feature = "server")]
 pub mod edge_connection_pool;
 pub mod edge_ws_protocol;
+mod model_admission;
 pub mod session_run_tree;
-#[cfg(feature = "server")]
-pub mod team_orchestrator_traits;
-#[cfg(feature = "server")]
-pub mod team_orchestrator_types;
-#[cfg(feature = "server")]
-pub mod worktree_isolation;
 #[cfg(feature = "server")]
 pub mod ws_progress_callback;
 
@@ -26,11 +19,11 @@ use astra_services::auth::{
 use astra_services::auth::{SessionActivityCursor, SessionActivityRecord, SessionListCursor};
 #[cfg(feature = "server")]
 use astra_services::{
-    AdminAuditRecord, AdminFeedbackStatsRecord, AdminInitRecord, AdminTokenRecord,
-    AdminUserRoleRecord, AuthTokenRecord, AuthUserRecord, CancelRunRecord, ChatRequestData,
-    ChatRunRecord, RunContinuationRecord, RunListCursor, RunListRecord, RunMutationDisposition,
-    RunMutationRecord, RunStatusRecord, SessionArtifactListCursor, SessionListRecord,
-    SessionRecord, run_list_cursor_db_updated_at, run_list_cursor_run_id,
+    AdminAuditRecord, AdminInitRecord, AdminTokenRecord, AdminUserRoleRecord, AuthTokenRecord,
+    AuthUserRecord, CancelRunRecord, ChatRequestData, ChatRunRecord, RunContinuationRecord,
+    RunListCursor, RunListRecord, RunMutationDisposition, RunMutationRecord, RunStatusRecord,
+    SessionArtifactListCursor, SessionListRecord, SessionRecord, run_list_cursor_db_updated_at,
+    run_list_cursor_run_id,
 };
 #[cfg(feature = "server")]
 use astra_tools::AskUserPrompt;
@@ -45,6 +38,10 @@ pub use completions::{
 pub use edge_ws_protocol::{
     EDGE_AUTH_TIMEOUT_SECS, EDGE_HEARTBEAT_INTERVAL_SECS, EDGE_TOOL_RESULT_GRACE_SECS,
     EDGE_TOOL_TIMEOUT_SECS, EdgeClientMessage, EdgeServerMessage, MAX_EDGE_TOOL_TIMEOUT_SECS,
+};
+pub use model_admission::{
+    ModelAdmissionReasoningInheritanceV1, ModelAdmissionRequestV1, ModelAdmissionResponseV1,
+    ModelAdmissionResultV1, ModelAdmissionSlotV1,
 };
 pub use session_run_tree::{
     SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunLifecycleStatus, SessionRunNode,
@@ -1339,6 +1336,9 @@ pub struct AuthReauthenticateRequest {
 #[serde(deny_unknown_fields)]
 pub struct ChatRequest {
     pub message: String,
+    /// Verification obligations supplied by the selected remote workspace.
+    #[serde(default)]
+    pub completion_checks: Option<astra_turn_types::CompletionCheckDeclarations>,
     #[serde(default)]
     pub user_intent: Option<String>,
     #[serde(default)]
@@ -1355,6 +1355,14 @@ pub struct ChatRequest {
     pub agent_id: Option<String>,
     #[serde(default)]
     pub model_selection: Option<astra_turn_types::ModelSelection>,
+    /// Original model behavior requested by the caller, kept separate from
+    /// the exact Offering identity used for Server admission.
+    #[serde(default)]
+    pub requested_model_policy: Option<astra_turn_types::RequestedModelPolicy>,
+    /// Expected resolved name from preflighted CLI sub-runs. Used only to
+    /// reject identity drift after fresh server-side admission.
+    #[serde(default)]
+    pub expected_model_name: Option<String>,
     #[serde(default)]
     pub resolved_model_selection: Option<astra_services::runs::ResolvedModelSelection>,
     #[serde(default)]
@@ -1735,8 +1743,8 @@ pub struct CancelSessionResponse {
     pub execution_settled: bool,
     pub runs: Vec<CancelRunResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_blocker:
-        Option<astra_services::session_context_coordinator::WorkspaceReuseBlocker>,
+    pub execution_blocker:
+        Option<astra_services::session_context_coordinator::SessionExecutionBlocker>,
 }
 
 #[cfg(feature = "server")]
@@ -1807,82 +1815,6 @@ pub struct HealthResponse {
 }
 
 #[cfg(feature = "server")]
-#[derive(Serialize, PartialEq, Eq)]
-pub struct LearningHealthResponse {
-    pub status: String,
-    pub service: String,
-    pub version: String,
-    pub timestamp: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub lesson_count: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retired_count: Option<u64>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Serialize, PartialEq, Eq)]
-pub struct LearningSignalsResponse {
-    pub signal_types: Vec<&'static str>,
-    pub descriptions: LearningSignalDescriptions,
-}
-
-#[cfg(feature = "server")]
-#[derive(Serialize, PartialEq, Eq)]
-pub struct LearningSignalDescriptions {
-    pub wrong_skill: &'static str,
-    pub slow_execution: &'static str,
-    pub high_cost: &'static str,
-    pub low_satisfaction: &'static str,
-}
-
-#[cfg(feature = "server")]
-#[derive(Serialize, PartialEq)]
-pub struct LearningStatsResponse {
-    pub total_learnings: i32,
-    pub high_confidence: i32,
-    pub low_confidence: i32,
-    pub avg_confidence: f64,
-    pub by_signal_type: serde_json::Map<String, serde_json::Value>,
-    pub weights: serde_json::Map<String, serde_json::Value>,
-    pub weights_per_signal: serde_json::Map<String, serde_json::Value>,
-    pub decay: serde_json::Map<String, serde_json::Value>,
-    pub total_gates: i32,
-    pub passed_gates: i32,
-    pub failed_gates: i32,
-    pub pass_rate: f64,
-    pub avg_improvement_pct: f64,
-    pub per_skill: serde_json::Map<String, serde_json::Value>,
-    pub last_learning_time: Option<String>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
-pub struct LearningTriggerRequest {
-    #[serde(default = "default_days")]
-    pub days: i32,
-    #[serde(default)]
-    pub force: bool,
-    #[serde(default = "default_signal_types")]
-    pub signal_types: Vec<String>,
-    #[serde(default)]
-    pub weights: Option<serde_json::Map<String, serde_json::Value>>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Serialize, PartialEq)]
-pub struct LearningTriggerResponse {
-    pub status: &'static str,
-    pub learned: i32,
-    pub signals_by_type: Option<serde_json::Value>,
-    pub gate_verdict: Option<String>,
-    pub improvement_pct: Option<serde_json::Value>,
-    pub test_count: Option<i32>,
-    pub error: Option<&'static str>,
-    pub message: Option<serde_json::Value>,
-    pub model_version: &'static str,
-}
-
-#[cfg(feature = "server")]
 #[derive(Deserialize, Default)]
 pub struct AdminTokenListQuery {
     pub token_type: Option<String>,
@@ -1934,13 +1866,6 @@ pub struct FeedbackExportResponse {
 
 #[cfg(feature = "server")]
 #[derive(Deserialize)]
-pub struct AdminFeedbackStatsQuery {
-    pub agent_id: Option<String>,
-    pub since: Option<String>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Deserialize)]
 pub struct AdminAuditListQuery {
     pub user_id: Option<String>,
     pub since: Option<String>,
@@ -1969,16 +1894,6 @@ pub struct AdminAuditResponse {
     pub resource_id: Option<String>,
     pub timestamp: String,
     pub details: Option<serde_json::Value>,
-}
-
-#[cfg(feature = "server")]
-#[derive(Serialize, PartialEq)]
-pub struct AdminFeedbackStatsResponse {
-    pub total_feedback: i64,
-    pub positive_feedback: i64,
-    pub negative_feedback: i64,
-    pub avg_rating: Option<f64>,
-    pub feedback_by_type: serde_json::Map<String, serde_json::Value>,
 }
 
 #[cfg(feature = "server")]
@@ -2018,6 +1933,8 @@ pub enum WsClientMessage {
     /// Send a chat message to the agent.
     #[serde(rename = "message")]
     ChatMessage {
+        #[serde(default)]
+        completion_checks: Option<astra_turn_types::CompletionCheckDeclarations>,
         content: String,
         #[serde(default)]
         session_id: Option<String>,
@@ -2219,12 +2136,6 @@ pub fn merge_plan_subtask_context(
 
 #[cfg(feature = "server")]
 #[doc(hidden)]
-pub fn default_days() -> i32 {
-    7
-}
-
-#[cfg(feature = "server")]
-#[doc(hidden)]
 pub fn default_admin_scope() -> String {
     "global".to_string()
 }
@@ -2269,12 +2180,6 @@ pub fn default_feedback_export_format() -> String {
 #[doc(hidden)]
 pub fn default_admin_audit_limit() -> u32 {
     100
-}
-
-#[cfg(feature = "server")]
-#[doc(hidden)]
-pub fn default_signal_types() -> Vec<String> {
-    vec!["wrong_skill".to_string()]
 }
 
 #[cfg(feature = "server")]
@@ -2327,19 +2232,6 @@ impl From<AdminAuditRecord> for AdminAuditResponse {
             resource_id: value.resource_id,
             timestamp: value.timestamp,
             details: value.details,
-        }
-    }
-}
-
-#[cfg(feature = "server")]
-impl From<AdminFeedbackStatsRecord> for AdminFeedbackStatsResponse {
-    fn from(value: AdminFeedbackStatsRecord) -> Self {
-        Self {
-            total_feedback: value.total_feedback,
-            positive_feedback: value.positive_feedback,
-            negative_feedback: value.negative_feedback,
-            avg_rating: value.avg_rating,
-            feedback_by_type: value.feedback_by_type,
         }
     }
 }
@@ -2545,6 +2437,17 @@ impl From<ReauthenticationProofRecord> for AuthReauthenticateResponse {
 #[cfg(feature = "server")]
 #[doc(hidden)]
 pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
+    // An Offering supplied by the HTTP caller is explicit intent even when
+    // the optional policy is omitted. Profile defaults must not replace it.
+    let requested_model_policy = request.requested_model_policy.take().or_else(|| {
+        request.model_selection.as_ref().map(|selection| {
+            astra_turn_types::RequestedModelPolicy::Fixed {
+                selector: astra_turn_types::ModelSelector::OfferingId {
+                    offering_id: selection.offering_id.clone(),
+                },
+            }
+        })
+    });
     let context = merge_plan_subtask_context(
         request.context.take(),
         request.plan_subtask_id.take(),
@@ -2561,6 +2464,8 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
             .map(|ea| ea.id.clone())
     });
     ChatRequestData {
+        completion_checks: request.completion_checks,
+        model_catalog_reader: None,
         message: request.message,
         user_intent: request.user_intent,
         parts: request.parts,
@@ -2568,14 +2473,17 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         stable_runtime_system_prompt: request.stable_runtime_system_prompt,
         runtime_system_prompt: request.runtime_system_prompt,
         session_id: request.session_id,
+        execution_authentication: None,
         session_admission_facts: None,
         work_binding: request.work_binding,
         run_start_idempotency: None,
         full_llm_capture: false,
         agent_id: request.agent_id,
         model: None,
+        expected_model_name: request.expected_model_name,
         model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: request.model_selection,
+        requested_model_policy,
         resolved_model_selection: request.resolved_model_selection,
         admitted_model_execution: None,
         capability_descriptors: request.capability_descriptors,

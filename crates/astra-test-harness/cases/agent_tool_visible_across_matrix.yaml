@@ -7,7 +7,7 @@ description: |
   result, and surfaces the marker; child punctuation remains provider data.
   **Fail means**: Tool surface regression — `agent` is hidden from one or more model families.
 prompt: |
-  Use the `agent` tool with action `spawn` to start one foreground child:
+  Use the `agent` tool with action `spawn` to start exactly one child:
     description: "G3 matrix child"
     prompt: "Say the exact text: G3-matrix-ok. Do not use any tools, just reply with that text."
     agent_type: "general-purpose"
@@ -33,12 +33,28 @@ criteria:
     name: agent
     document: result
     path: /status
-    equals: completed
-  - type: journal_tool_json_contains
+    equals: launched
+  - type: journal_tool_json
     name: agent
     document: result
-    path: /result
-    contains: G3-matrix-ok
+    path: /result_family
+    equals: control_receipt
+  - type: session_event_count
+    event_type: agent_spawned
+    min: 1
+    max: 1
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 1
+    max: 1
+    json_match:
+      path: /metadata/status
+      equals: completed
+      same_run_as:
+        event_type: agent_spawned
+        run_id_path: /metadata/run_id
+  - type: session_child_result_adopted
+    expected_result: "G3-matrix-ok"
   - type: tools_count_between
     min: 1
     max: 4

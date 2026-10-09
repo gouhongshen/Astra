@@ -2,7 +2,7 @@
 //! Web agent mode E2E tests — incremental SSE streaming, edge tool delivery via ledger.
 //!
 //! These tests exercise the `/chat/stream` → `ServerAgenticLoopHost` path (NOT the bridge),
-//! using `test_llm_rounds` injected into the host to mock LLM responses.
+//! using native loopback provider responses through the real Server execution path.
 //!
 //! ```text
 //! cargo test -p astra-runtime --test web_agent_e2e --features e2e-hooks
@@ -10,6 +10,9 @@
 
 mod test_support;
 
+use astra_runtime::server::provider_test_support::{
+    InferenceLedgerFixture, ProviderGateway, ProviderRequest, ProviderResponse, ProviderScript,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -40,8 +43,6 @@ use axum::{
     Json, Router,
     body::{self, Body},
     http::{HeaderMap, Request, StatusCode},
-    middleware::{self, Next},
-    response::Response,
     routing::post,
 };
 use futures_util::StreamExt;
@@ -66,20 +67,11 @@ const DEFAULT_TOOL_RESULT_RUN_ID: &str = "web-agent-e2e-run";
 const DEFAULT_TOOL_RESULT_TURN_CHAIN_ID: &str = "web-agent-e2e-turn-chain";
 
 static SECRET_INIT: OnceLock<()> = OnceLock::new();
-type TimestampedToolResultIdentity = (u128, ToolResultIdentity);
-type ToolRequestIdentityCache =
-    tokio::sync::Mutex<HashMap<String, Vec<TimestampedToolResultIdentity>>>;
-static TOOL_REQUEST_IDENTITY_CACHE: OnceLock<ToolRequestIdentityCache> = OnceLock::new();
-
 #[derive(Clone, Debug)]
 struct ToolResultIdentity {
     session_id: String,
     run_id: String,
     turn_chain_id: String,
-}
-
-fn tool_request_identity_cache() -> &'static ToolRequestIdentityCache {
-    TOOL_REQUEST_IDENTITY_CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
 fn tool_request_identity_from_event(event: &Value) -> Option<(String, ToolResultIdentity)> {
@@ -102,46 +94,6 @@ fn tool_request_identity_from_event(event: &Value) -> Option<(String, ToolResult
             turn_chain_id,
         },
     ))
-}
-
-async fn record_tool_request_identity(event: &Value) {
-    let Some((request_id, identity)) = tool_request_identity_from_event(event) else {
-        return;
-    };
-    let mut cache = tool_request_identity_cache().lock().await;
-    let entry = cache.entry(request_id).or_default();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    entry.push((now, identity));
-}
-
-async fn take_tool_request_identity(request_id: &str) -> Option<ToolResultIdentity> {
-    let mut cache = tool_request_identity_cache().lock().await;
-    if let Some(entries) = cache.get_mut(request_id)
-        && let Some((_, identity)) = entries.pop()
-    {
-        if entries.is_empty() {
-            cache.remove(request_id);
-        }
-        return Some(identity);
-    }
-    None
-}
-
-async fn wait_for_tool_request_identity(request_id: &str) -> ToolResultIdentity {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if let Some(identity) = take_tool_request_identity(request_id).await {
-            return identity;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "missing tool_request identity for request_id {request_id}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
 }
 
 fn unmatched_tool_result_identity() -> ToolResultIdentity {
@@ -212,6 +164,7 @@ impl AuthService for StubAuth {
                     display_name: None,
                 },
                 session_id: None,
+                execution_continuation: None,
                 origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
                     AuthProviderAuthorizedRequestContext {
                         provider_id: PROVIDER_ID.to_string(),
@@ -479,7 +432,21 @@ impl SkillService for TestSkillService {
     }
 }
 
-struct TestModelService;
+#[derive(Default)]
+struct TestModelService {
+    judgment_base_url: Option<String>,
+}
+
+impl TestModelService {
+    fn model_record(&self, name: String) -> ModelRecord {
+        let mut model = test_model_record(name);
+        if let Some(url) = &self.judgment_base_url {
+            model.provider = "openai".to_string();
+            model.base_url = Some(url.clone());
+        }
+        model
+    }
+}
 
 fn test_model_record(name: String) -> ModelRecord {
     ModelRecord {
@@ -519,14 +486,31 @@ impl ModelService for TestModelService {
         _: String,
         _: bool,
     ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
-        unimplemented!()
+        let model = self.model_record("test-model".to_string());
+        Ok(vec![ModelListItem {
+            thinking_protocol: None,
+            offering_id: DEFAULT_MODEL_OFFERING_ID.to_string(),
+            access_id: "web-e2e-model-access".to_string(),
+            access_kind: astra_services::models::ModelAccessKind::CloudByok,
+            access_label: "test".to_string(),
+            execution_placement: astra_services::models::ModelExecutionPlacement::Server,
+            name: model.name,
+            provider: model.provider,
+            description: model.description,
+            is_active: model.is_active,
+            context_window: model.context_window,
+            max_completion_tokens: model.max_completion_tokens,
+            architecture: model.architecture,
+            thinking_capability: model.thinking_capability,
+            pricing: None,
+        }])
     }
 
     async fn get_model(
         &self,
         model_name: String,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-        Ok(test_model_record(model_name))
+        Ok(self.model_record(model_name))
     }
 
     async fn resolve_model_offering(
@@ -548,9 +532,16 @@ impl ModelService for TestModelService {
                 model_name,
                 wire_model_name: None,
                 api_key: "test-provider-secret".to_string(),
-                base_url: "http://127.0.0.1:1".to_string(),
-                provider: "mock".to_string(),
-                fallback_chain: Vec::new(),
+                base_url: self
+                    .judgment_base_url
+                    .clone()
+                    .unwrap_or_else(|| "http://127.0.0.1:1".to_string()),
+                provider: if self.judgment_base_url.is_some() {
+                    "openai"
+                } else {
+                    "mock"
+                }
+                .to_string(),
                 tags: Vec::new(),
                 request_body_overrides: None,
                 fixed_temperature: None,
@@ -560,6 +551,7 @@ impl ModelService for TestModelService {
                 context_window: Some(128_000),
                 max_completion_tokens: Some(16_384),
                 request_headers: None,
+                price_snapshot: None,
             },
         })
     }
@@ -580,15 +572,23 @@ impl ModelService for TestModelService {
         &self,
         model_name: String,
     ) -> Result<ModelRecord, (StatusCode, Json<ErrorResponse>)> {
-        Ok(test_model_record(model_name))
+        Ok(self.model_record(model_name))
     }
 }
 
 // ── App builder ──────────────────────────────────────────────────────────────
 
 fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
+    build_test_app_with_models(Arc::new(TestModelService::default()), None)
+}
+
+fn build_test_app_with_models(
+    models: Arc<TestModelService>,
+    inference: Option<&InferenceLedgerFixture>,
+) -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>) {
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
+        .with_model_service(models.clone())
         .with_session_service(Arc::new(StubSession));
 
     let ledger = base.edge_callback_ledger();
@@ -597,18 +597,52 @@ fn build_test_app() -> (Router, Arc<tokio::sync::Mutex<HashMap<String, Value>>>)
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger.clone(),
     )
-    .with_model_service(Arc::new(TestModelService))
+    .with_model_service(models)
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
+    let lifecycle = if let Some(inference) = inference {
+        lifecycle.with_e2e_inference_ledger(inference)
+    } else {
+        lifecycle
+    };
 
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
     (build_app(state), ledger)
 }
 
+async fn build_native_test_app(
+    scripts: Vec<ProviderScript>,
+) -> (Router, ProviderGateway, InferenceLedgerFixture) {
+    let gateway = ProviderGateway::start(scripts).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, _) = build_test_app_with_models(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
+    (app, gateway, inference)
+}
+
+fn primary_request_for(request: &ProviderRequest, message: &str) -> bool {
+    request.path == "/v1/chat/completions"
+        && request.body["model"] == "test-model"
+        && request.body["stream"] == true
+        && request.body["messages"].as_array().is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|value| value["role"] == "user" && value["content"] == message)
+        })
+}
+
 /// Build a test app with recording hook DB + observer writers for verification.
-fn build_test_app_with_hooks() -> (
+fn build_test_app_with_hooks(
+    models: Arc<TestModelService>,
+    inference: Option<&InferenceLedgerFixture>,
+) -> (
     Router,
     Arc<RecordingHookDbWriter>,
     Arc<RecordingObserverWorker>,
+    test_support::EdgeCallbackLedger,
 ) {
     init_env();
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
@@ -620,18 +654,26 @@ fn build_test_app_with_hooks() -> (
     let observer_worker = Arc::new(RecordingObserverWorker::default());
     let lifecycle = test_run_lifecycle(
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
-        ledger,
+        ledger.clone(),
     )
-    .with_model_service(Arc::new(TestModelService))
+    .with_model_service(models)
     .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
+    let lifecycle = if let Some(inference) = inference {
+        lifecycle.with_e2e_inference_ledger(inference)
+    } else {
+        lifecycle
+    };
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
-    (build_app(state), hook_writer, observer_worker)
+    (build_app(state), hook_writer, observer_worker, ledger)
 }
 
-fn build_test_app_with_hooks_and_skills() -> (
+fn build_test_app_with_hooks_and_skills(
+    models: Arc<TestModelService>,
+    inference: Option<&InferenceLedgerFixture>,
+) -> (
     Router,
     Arc<RecordingHookDbWriter>,
     Arc<RecordingObserverWorker>,
@@ -648,18 +690,25 @@ fn build_test_app_with_hooks_and_skills() -> (
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger,
     )
-    .with_model_service(Arc::new(TestModelService))
+    .with_model_service(models)
     .with_skill_service(Arc::new(TestSkillService))
     .with_hook_db_writer(hook_writer.clone())
     .with_observer_worker(observer_worker.clone())
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
+    let lifecycle = if let Some(inference) = inference {
+        lifecycle.with_e2e_inference_ledger(inference)
+    } else {
+        lifecycle
+    };
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
     (build_app(state), hook_writer, observer_worker)
 }
 
 fn build_test_app_with_agent_bindings(
     binding_service: Arc<InMemoryAgentBindingService>,
+    models: Arc<TestModelService>,
+    inference: Option<&InferenceLedgerFixture>,
 ) -> (Router, Arc<RecordingObserverWorker>) {
     init_env();
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
@@ -672,16 +721,178 @@ fn build_test_app_with_agent_bindings(
         test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
         ledger,
     )
-    .with_model_service(Arc::new(TestModelService))
+    .with_model_service(models)
     .with_agent_binding_service(binding_service)
     .with_observer_worker(observer_worker.clone())
     .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
 
+    let lifecycle = if let Some(inference) = inference {
+        lifecycle.with_e2e_inference_ledger(inference)
+    } else {
+        lifecycle
+    };
     let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
     (build_app(state), observer_worker)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+fn delegation_assessment(body: &Value) -> Option<Value> {
+    body["messages"].as_array()?.iter().find_map(|message| {
+        let input: Value = serde_json::from_str(message["content"].as_str()?).ok()?;
+        (input["user_text"].is_string()
+            && input["candidates"].is_array()
+            && input["slots"].is_array())
+        .then_some(input)
+    })
+}
+
+async fn assert_native_delegation_without_auxiliary_selector(
+    gateway: &ProviderGateway,
+    user_text: &str,
+    slots: &[(&str, &str)],
+) {
+    let requests = gateway.requests.lock().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| delegation_assessment(&request.body).is_some())
+            .count(),
+        0,
+        "ordinary delegation must not make an auxiliary selector request"
+    );
+    let request = requests
+        .iter()
+        .rfind(|request| primary_request_for(request, user_text))
+        .expect("parent must reach the provider");
+    assert_eq!(request.body["model"], "test-model");
+    assert_eq!(request.body["stream"], true);
+    let first = requests
+        .iter()
+        .find(|request| primary_request_for(request, user_text))
+        .unwrap();
+    let agent = first.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "agent")
+        .expect("resident agent contract");
+    let schemas = astra_tools::schemas::all_tool_schemas();
+    let canonical = schemas
+        .iter()
+        .find(|tool| tool["function"]["name"] == "agent")
+        .unwrap();
+    assert_eq!(
+        agent["function"]["parameters"]["properties"]["requested_model_policy"]["description"]
+            .as_str()
+            .expect("provider must receive model-control semantics"),
+        canonical["function"]["parameters"]["properties"]["requested_model_policy"]
+            ["x-astra-discovery-summary"]
+            .as_str()
+            .expect("canonical model-control semantics"),
+        "model-control semantics must reach the provider, not only the full catalog"
+    );
+    let candidates: Vec<_> = first.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| {
+            let text = message["content"].as_str()?;
+            let text = text
+                .strip_prefix("<astra-runtime-context>\n")
+                .and_then(|text| text.strip_suffix("\n</astra-runtime-context>"))
+                .unwrap_or(text);
+            let payload: Value = serde_json::from_str(text).ok()?;
+            payload
+                .get("catalog")
+                .is_some()
+                .then_some((message, payload))
+        })
+        .collect();
+    assert_eq!(
+        candidates.len(),
+        1,
+        "cold parent request must carry one candidate context"
+    );
+    assert_eq!(candidates[0].0["role"], "user");
+    assert_eq!(
+        candidates[0]
+            .1
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["catalog", "child_model_selection_allowed"],
+        "candidate context carries observations, not another selection policy"
+    );
+    let items = candidates[0].1["catalog"]["items"].as_array().unwrap();
+    let selected = items
+        .iter()
+        .find(|item| item["offering_id"] == DEFAULT_MODEL_OFFERING_ID)
+        .expect("authorized parent Offering must be visible on the wire");
+    assert_eq!(selected["name"], "test-model");
+    assert_eq!(selected["provider"], "openai");
+    let mut actual = Vec::new();
+    for call in request.body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .filter_map(|message| message["tool_calls"].as_array())
+        .flatten()
+    {
+        let name = call["function"]["name"].as_str().unwrap();
+        let args: Value =
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        let (name, args) = if name == "invoke_tool" {
+            (args["name"].as_str().unwrap(), &args["arguments"])
+        } else {
+            (name, &args)
+        };
+        match (name, args["action"].as_str()) {
+            ("agent", Some("spawn")) => actual.push(args.clone()),
+            ("agent_fanout", Some("start")) => {
+                actual.extend(args["slots"].as_array().unwrap().iter().cloned())
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(actual.len(), slots.len());
+    for (index, (description, prompt)) in slots.iter().enumerate() {
+        assert_eq!(actual[index]["description"], *description);
+        assert_eq!(actual[index]["prompt"], *prompt);
+        let child = requests
+            .iter()
+            .find(|request| primary_request_for(request, prompt))
+            .expect("each declared child must reach the provider with its complete task");
+        assert_eq!(child.body["model"], "test-model");
+        assert_eq!(child.body["stream"], true);
+    }
+}
+
+fn assert_child_joined_before_parent(
+    events: &[Value],
+    agent_id: &Value,
+    result: &str,
+    parent_text: &str,
+) {
+    let child_terminal = events
+        .iter()
+        .position(|event| {
+            event["agent_id"] == *agent_id
+                && (event["type"] == "agent_completed" || event["event_type"] == "agent_completed")
+                && event["result_summary"] == result
+        })
+        .expect("exact child completed result");
+    let parent_final = events
+        .iter()
+        .position(|event| event["type"] == "text_delta" && event["content"] == parent_text)
+        .expect("parent synthesis");
+    assert!(
+        child_terminal < parent_final,
+        "child must join before parent synthesis"
+    );
+}
 
 fn normalize_chat_stream_payload(mut payload: Value) -> Value {
     let Some(object) = payload.as_object_mut() else {
@@ -751,16 +962,6 @@ fn ensure_test_edge_profile_for_edge_tools(payload: &mut Map<String, Value>) {
         executor_binding["kind"].as_str(),
         Some("edge_agent"),
         "test payload with edge runtime tools must use an edge executor binding"
-    );
-    assert_eq!(
-        executor_binding["transport"].as_str(),
-        Some("edge_ledger"),
-        "web_agent_e2e edge runtime tools are executed through the client ledger"
-    );
-    assert_eq!(
-        executor_binding["status"].as_str(),
-        Some("online"),
-        "web_agent_e2e edge runtime tool fixtures require an online executor"
     );
 }
 
@@ -837,6 +1038,7 @@ async fn create_e2e_agent_binding(
                 display_name: None,
             },
             session_id: None,
+            execution_continuation: None,
             origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
                 AuthProviderAuthorizedRequestContext {
                     provider_id: PROVIDER_ID.to_string(),
@@ -980,7 +1182,7 @@ fn agent_binding_chat_payload(
     foundation_binding_id: &str,
     extension_binding_id: &str,
     capability_endpoint: &str,
-    test_llm_rounds: Value,
+    model_endpoint: &str,
 ) -> Value {
     json!({
         "message": "Analyze the attached financial statement.",
@@ -1000,7 +1202,7 @@ fn agent_binding_chat_payload(
                 "id": "moi-model-gateway",
                 "type": "model_gateway",
                 "transport": "http",
-                "endpoint_url": capability_endpoint,
+                "endpoint_url": model_endpoint,
                 "protocol": "openai_chat_completions",
                 "model_context_window": 128000
             },
@@ -1019,8 +1221,7 @@ fn agent_binding_chat_payload(
                 "protocol": "astra_skills"
             }
         },
-        "execution_policy": {"turn_intent": "fixed_default"},
-        "context": {"test_llm_rounds": test_llm_rounds}
+        "execution_policy": {"turn_intent": "fixed_default", "skill_auto_route":"disabled"}
     })
 }
 
@@ -1045,7 +1246,12 @@ async fn multi_agent_binding_http_e2e_discovers_and_reads_skill_from_owning_bind
             extension_binding_id.clone(),
         )
         .await;
-        let (app, observer_worker) = build_test_app_with_agent_bindings(binding_service);
+        let gateway=ProviderGateway::start(vec![ProviderScript::new("binding skill and actual continuation", |request| primary_request_for(request,"Analyze the attached financial statement."), vec![
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[tool_call("tc-financial-analysis","skill",json!({"skill_name":"financial-analysis"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Financial analysis completed with the user workflow."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+let inference=InferenceLedgerFixture::default();
+let model_endpoint=format!("{}/v1",gateway.base_url);
+let (app,observer_worker)=build_test_app_with_agent_bindings(binding_service, Arc::new(TestModelService{judgment_base_url:Some(model_endpoint.clone())}),Some(&inference));
 
         let events = provider_chat_stream_collect(
             &app,
@@ -1053,25 +1259,17 @@ async fn multi_agent_binding_http_e2e_discovers_and_reads_skill_from_owning_bind
                 &foundation_binding_id,
                 &extension_binding_id,
                 &capability_endpoint,
-                json!([
-                    {
-                        "tool_calls": [tool_call(
-                            "tc-financial-analysis",
-                            "skill",
-                            json!({"skill_name": "financial-analysis"})
-                        )]
-                    },
-                    {"full_text": "Financial analysis completed with the user workflow."}
-                ]),
+                &format!("{model_endpoint}/chat/completions"),
             ),
         )
         .await;
 
+        gateway.assert_complete();
         assert!(
             find_events(&events, "error").is_empty(),
             "unexpected SSE error events: {events:?}"
         );
-        assert_eq!(find_events(&events, "turn_complete").len(), 1);
+        assert_eq!(find_events(&events, "turn_complete").len(), 1, "native binding events: {events:?}");
         assert!(find_events(&events, "text_delta").iter().any(|event| {
             event["content"]
                 .as_str()
@@ -1142,6 +1340,14 @@ async fn multi_agent_binding_http_e2e_discovers_and_reads_skill_from_owning_bind
         );
         drop(calls);
         gateway_server.abort();
+        gateway.assert_complete();
+        inference.assert_quiescent();
+        assert_eq!(inference.attempt_count(),2);
+        let wire=gateway.requests.lock().await;
+        assert_eq!(wire.len(),2);
+        let instructions=wire[1].body["messages"].as_array().unwrap().iter().find(|message| message["tool_call_id"]=="tc-financial-analysis").unwrap()["content"].as_str().unwrap();
+        assert!(instructions.contains("Use the user-provided financial analysis workflow."));
+        assert!(instructions.contains("<skill-loaded name=\"financial-analysis\"/>"));
     })
     .await
     .expect("multi-Agent-Binding HTTP E2E timed out");
@@ -1157,7 +1363,11 @@ async fn multi_agent_binding_http_e2e_reports_exact_missing_binding_id() {
     )
     .await;
     let missing_binding_id = "ab_missing_financial_extension";
-    let (app, _observer_worker) = build_test_app_with_agent_bindings(binding_service);
+    let (app, _observer_worker) = build_test_app_with_agent_bindings(
+        binding_service,
+        Arc::new(TestModelService::default()),
+        None,
+    );
 
     let events = provider_chat_stream_collect(
         &app,
@@ -1165,7 +1375,7 @@ async fn multi_agent_binding_http_e2e_reports_exact_missing_binding_id() {
             &foundation_binding_id,
             missing_binding_id,
             "http://127.0.0.1:9/capabilities",
-            json!([{"full_text": "must not run"}]),
+            "http://127.0.0.1:9/v1",
         ),
     )
     .await;
@@ -1196,25 +1406,6 @@ async fn chat_stream_start(app: &Router, payload: Value) -> axum::response::Resp
         .body(Body::from(payload.to_string()))
         .unwrap();
     app.clone().oneshot(req).await.unwrap()
-}
-
-async fn inject_test_llm_authority(mut request: Request<Body>, next: Next) -> Response {
-    request.headers_mut().insert(
-        "x-astra-e2e-test-secret",
-        SECRET.parse().expect("static test secret header"),
-    );
-    next.run(request).await
-}
-
-/// POST /tools/result
-async fn post_tool_result(
-    app: &Router,
-    request_id: &str,
-    output: &str,
-    status: &str,
-) -> StatusCode {
-    let identity = wait_for_tool_request_identity(request_id).await;
-    post_tool_result_with_identity(app, request_id, output, status, identity).await
 }
 
 async fn post_unmatched_tool_result(
@@ -1389,54 +1580,344 @@ fn find_event_type<'a>(events: &'a [Value], event_type: &str) -> Vec<&'a Value> 
 
 #[tokio::test]
 async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthesis() {
-    init_env();
-    let (app, _ledger) = build_test_app();
+    structured_spawn_journey(None).await;
+}
 
-    let events = chat_stream_collect(
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires disposable MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_web_agent_propagates_execution_owner_to_real_child() {
+    let settings = test_support::require_db_it_env();
+    let catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    astra_services::ensure_core_schema(&settings, &catalog)
+        .await
+        .unwrap();
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    structured_spawn_journey(Some(pool)).await;
+}
+
+#[tokio::test]
+async fn manual_pause_discards_losing_evaluation_from_live_and_replay() {
+    paused_evaluation_journey(None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires disposable MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn db_manual_pause_discards_losing_evaluation_from_live_and_replay() {
+    let settings = test_support::require_db_it_env();
+    let catalog =
+        std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".into());
+    astra_services::ensure_core_schema(&settings, &catalog)
+        .await
+        .unwrap();
+    paused_evaluation_journey(Some(astra_core::SharedPool::new(&settings).await.unwrap())).await;
+}
+
+async fn paused_evaluation_journey(pool: Option<astra_core::SharedPool>) {
+    use futures_util::FutureExt;
+    init_env();
+    const MESSAGE: &str = "Explain the completed result after this request.";
+    let session = format!("paused-evaluation-{}", uuid::Uuid::new_v4());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let gateway = ProviderGateway::start(vec![ProviderScript::new(
+            "pause before final provider response", |request| primary_request_for(request, MESSAGE),
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks: vec![
+                    format!("data: {}\n\n", json!({"id":"pause-native","model":"test-model","choices":[{"index":0,"delta":{"content":"The result is ready."},"finish_reason":null}]})).into_bytes(),
+                    format!("data: {}\n\n", json!({"id":"pause-native","model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})).into_bytes(),
+                    b"data: [DONE]\n\n".to_vec(),
+                ],
+                release_before_chunk: Some((1, release.clone())),
+            }],
+        )]).await;
+        let models = Arc::new(TestModelService { judgment_base_url: Some(format!("{}/v1", gateway.base_url)) });
+        let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+            .with_auth_service(Arc::new(StubAuth)).with_session_service(Arc::new(StubSession));
+        let store: Arc<dyn astra_services::RunStateStore> = if let Some(pool) = &pool {
+            sqlx::query("INSERT INTO agent_sessions (session_id,user_id,agent_id,title,status,metadata,created_at,updated_at) VALUES (?,?,'run-test-agent','pause evaluation','active','{}',NOW(6),NOW(6))")
+                .bind(&session).bind(USER_ID).execute(pool.get()).await.unwrap();
+            Arc::new(astra_services::DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("pause-evaluation-owner"))
+        } else { Arc::new(astra_services::InMemoryRunStateStore::new()) };
+        let engine = astra_runtime::RunEngine::new(store);
+        let inference = InferenceLedgerFixture::default();
+        let lifecycle = astra_runtime::AgenticRunLifecycleService::new(
+            astra_runtime::MatrixOneSettings::mock(), test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
+            base.edge_callback_ledger(), engine.clone());
+        let lifecycle = astra_runtime::server::provider_test_support::configure_workspace_provider(
+            lifecycle, Arc::new(tempfile::tempdir().unwrap()), "pause-evaluation-executor")
+            .with_model_service(models).with_e2e_inference_ledger(&inference)
+            .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
+        let lifecycle = if let Some(pool) = &pool { lifecycle.with_pool(pool.clone()) } else { lifecycle };
+        let app = build_app(base.with_run_lifecycle_service(Arc::new(lifecycle)));
+        let response = chat_stream_start(&app, json!({"message":MESSAGE,"session_id":session,
+            "model_selection":{"offering_id":DEFAULT_MODEL_OFFERING_ID},
+            "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}})).await;
+        let (mut rx, reader) = spawn_sse_reader(response.into_body()).await;
+        let identity = wait_for_sse(&mut rx, "session_info", E2E_WAIT_TIMEOUT_SECS).await;
+        let run_id = identity["run_id"].as_str().unwrap();
+        wait_for_sse(&mut rx, "text_delta", E2E_WAIT_TIMEOUT_SECS).await;
+        let request = Request::builder().method("POST").uri(format!("/chat/runs/{run_id}/pause"))
+            .header("authorization", TOKEN).body(Body::empty()).unwrap();
+        assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
+        release.notify_one();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader).await.unwrap().unwrap();
+        assert!(events.iter().all(|event| event.get("turn_evaluation").is_none()), "losing live candidate: {events:?}");
+        let durable = engine.load_run(USER_ID, run_id).await.unwrap().unwrap();
+        assert_eq!(durable.status, "paused");
+        assert!(durable.events.iter().all(|event| event.pointer("/data/turn_evaluation").is_none()), "losing durable candidate: {:?}", durable.events);
+        let (status, replay) = get_run_stream(&app, run_id, 0).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(replay.iter().all(|event| event.get("turn_evaluation").is_none()), "losing process-local replay: {replay:?}");
+        let replay_lifecycle = astra_runtime::AgenticRunLifecycleService::new(
+            astra_runtime::MatrixOneSettings::mock(), test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
+            Arc::new(tokio::sync::Mutex::new(HashMap::new())), engine);
+        let replay_app = build_app(AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+            .with_auth_service(Arc::new(StubAuth)).with_session_service(Arc::new(StubSession))
+            .with_run_lifecycle_service(Arc::new(replay_lifecycle)));
+        let (status, replay) = get_run_stream(&replay_app, run_id, 0).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(replay.iter().all(|event| event.get("turn_evaluation").is_none()), "losing durable replay: {replay:?}");
+        gateway.assert_complete();
+        inference.assert_quiescent();
+    }).catch_unwind().await;
+    release.notify_one();
+    if let Some(pool) = &pool {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id=? AND session_id=? AND owner_pod_id IS NOT NULL")
+                    .bind(USER_ID).bind(&session).fetch_one(pool.get()).await.unwrap();
+                if active == 0 { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }).await.expect("paused fixture owners must drain before cleanup");
+        for table in [
+            "tool_invocation_ledger",
+            "agent_session_execution_slots",
+            "run_display_projections",
+            "run_checkpoints",
+            "agent_run_events",
+            "agent_runs",
+            "agent_sessions",
+        ] {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sqlx::query(&format!(
+                    "DELETE FROM {table} WHERE user_id=? AND session_id=?"
+                ))
+                .bind(USER_ID)
+                .bind(&session)
+                .execute(pool.get()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+    }
+    if let Err(error) = outcome {
+        std::panic::resume_unwind(error);
+    }
+}
+
+async fn structured_spawn_journey(pool: Option<astra_core::SharedPool>) {
+    use futures_util::FutureExt;
+    let session = format!("native-child-owner-{}", uuid::Uuid::new_v4());
+    let release_child = Arc::new(tokio::sync::Notify::new());
+    let result = std::panic::AssertUnwindSafe(async {
+    init_env();
+    use astra_runtime::server::provider_test_support::{
+        InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+    };
+    const ROOT: &str = "Use a child agent to review the code.";
+    const TASK: &str = "Review src/lib.rs and summarize one issue.";
+    fn assessment(body: &Value) -> Option<Value> {
+        body["messages"].as_array()?.iter().find_map(|message| {
+            let input: Value = serde_json::from_str(message["content"].as_str()?).ok()?;
+            (input["user_text"].is_string()
+                && input["candidates"].is_array()
+                && input["slots"].is_array())
+            .then_some(input)
+        })
+    }
+    fn primary(text: &str, tools: Vec<Value>) -> ProviderResponse {
+        let finish = if tools.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        };
+        ProviderResponse::OpenAi(json!({
+            "id":format!("native-web-{}",uuid::Uuid::new_v4()),"model":"test-model",
+            "choices":[{"index":0,"message":{"role":"assistant","content":text,"tool_calls":tools},"finish_reason":finish}],
+            "usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}
+        }))
+    }
+    fn root_request(body: &Value) -> bool {
+        assessment(body).is_none()
+            && body["messages"].as_array().is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message["role"] == "user" && message["content"] == ROOT)
+            })
+    }
+    let child_entered = Arc::new(tokio::sync::Notify::new());
+    let child_response = primary("child review result: no critical issues", Vec::new());
+    let child_response = {
+        let ProviderResponse::OpenAi(response) = child_response else {
+            unreachable!()
+        };
+        let chunk = json!({"id":response["id"],"model":response["model"],
+            "choices":[{"index":0,"delta":{"content":"child review result: no critical issues"},"finish_reason":null}]});
+        let finish = json!({"id":response["id"],"model":response["model"],
+            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":response["usage"]});
+        ProviderResponse::Stream {
+            content_type: "text/event-stream",
+            chunks: vec![
+                format!("data: {chunk}\n\n").into_bytes(),
+                format!("data: {finish}\n\n").into_bytes(),
+                b"data: [DONE]\n\n".to_vec(),
+            ],
+            release_before_chunk: Some((0, release_child.clone())),
+        }
+    };
+    let entered = child_entered.clone();
+    let gateway = ProviderGateway::start(vec![
+        ProviderScript::new("root discovery, spawn, wait, synthesis", |request|
+            request.path == "/v1/chat/completions" && request.body["model"] == "test-model" && root_request(&request.body), vec![
+            primary("", vec![tool_call("call-select-agent", "tool_search", json!({"query":"select:agent"}))]),
+            primary("", vec![tool_call("call-spawn-reviewer", "invoke_tool", json!({"name":"agent","arguments":{
+                "action":"spawn","description":"structured child review","prompt":TASK,"agent_type":"code-review"
+            }}))]),
+            primary("", vec![tool_call("call-join-reviewer", "invoke_tool", json!({"name":"agent","arguments":{"action":"wait","timeout_ms":10000}}))]),
+            primary("parent synthesis grounded in child review", Vec::new()),
+        ]),
+        ProviderScript::new("actual delegated child", move |request| {
+            let matches = request.path == "/v1/chat/completions" && request.body["model"] == "test-model" && assessment(&request.body).is_none()
+                && !root_request(&request.body) && request.body["messages"].as_array().is_some_and(|messages|
+                    messages.iter().any(|message| message["content"].as_str().is_some_and(|text| text.contains(TASK))));
+            if matches { entered.notify_one(); }
+            matches
+        }, vec![child_response]),
+    ]).await;
+    let models = Arc::new(TestModelService {
+        judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+    });
+    let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+        .with_auth_service(Arc::new(StubAuth))
+        .with_model_service(models.clone())
+        .with_session_service(Arc::new(StubSession));
+    let store: Arc<dyn astra_services::RunStateStore> = if let Some(pool) = &pool {
+        sqlx::query("INSERT INTO agent_sessions (session_id,user_id,agent_id,title,status,metadata,created_at,updated_at) VALUES (?,?,'run-test-agent','native child owner','active','{}',NOW(6),NOW(6))")
+            .bind(&session).bind(USER_ID).execute(pool.get()).await.unwrap();
+        Arc::new(
+            astra_services::DatabaseRunStateStore::new(pool.clone())
+                .with_owner_pod_id("web-parent-owner"),
+        )
+    } else {
+        Arc::new(astra_services::InMemoryRunStateStore::new())
+    };
+    let engine = astra_runtime::RunEngine::new(store);
+    let inference = InferenceLedgerFixture::default();
+    let lifecycle = astra_runtime::AgenticRunLifecycleService::new(
+        astra_runtime::MatrixOneSettings::mock(),
+        test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
+        base.edge_callback_ledger(),
+        engine.clone(),
+    )
+    ;
+    let workspace_directory = Arc::new(tempfile::tempdir().unwrap());
+    let directory_lifetime = Arc::downgrade(&workspace_directory);
+    let workspace_base = workspace_directory.path().to_owned();
+    let lifecycle = astra_runtime::server::provider_test_support::configure_workspace_provider(
+        lifecycle, workspace_directory.clone(), "structured-spawn-fixture-executor")
+    .with_model_service(models)
+    .with_e2e_inference_ledger(&inference)
+    .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
+    let lifecycle = if let Some(pool) = &pool {
+        lifecycle.with_pool(pool.clone())
+    } else {
+        lifecycle
+    };
+    let managed_record = astra_runtime::server::provider_test_support::provision_workspace_fixture(&lifecycle, &session).unwrap();
+    let marker = std::path::Path::new(&managed_record.root_or_volume_ref).join("lifetime.txt");
+    std::fs::write(&marker, "retained while child executes").unwrap();
+    let app = build_app(base.with_run_lifecycle_service(Arc::new(lifecycle)));
+    let response = chat_stream_start(
         &app,
         json!({
-            "message": "Use a child agent to review the code.",
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [
-                            tool_call(
-                                "call-select-agent",
-                                "tool_search",
-                                json!({"query": "select:agent"})
-                            )
-                        ]
-                    },
-                    {
-                        "tool_calls": [
-                            // `agent` is a deferred capability.  Discovery binds
-                            // its exact contract, while execution stays on the
-                            // resident carrier so the provider tool prefix does
-                            // not change between rounds.
-                            tool_call("call-spawn-reviewer", "invoke_tool", json!({
-                                "name": "agent",
-                                "arguments": {
-                                    "action": "spawn",
-                                    "description": "structured child review",
-                                    "prompt": "Review src/lib.rs and summarize one issue.",
-                                    "agent_type": "code-review"
-                                }
-                            }))
-                        ]
-                    },
-                    {
-                        "full_text": "parent synthesis grounded in child review"
-                    }
-                ],
-                "test_spawn_child_llm_rounds": [
-                    {
-                        "full_text": "child review result: no critical issues"
-                    }
-                ]
-            }
+            "message":ROOT,"session_id":session,"model_selection":{"offering_id":DEFAULT_MODEL_OFFERING_ID},
+            "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         }),
-    )
-    .await;
+    ).await;
+    let (_rx, stream) = spawn_sse_reader(response.into_body()).await;
+    drop(app);
+    drop(workspace_directory);
+    tokio::pin!(stream);
+    {
+        tokio::select! {
+            entered = tokio::time::timeout(std::time::Duration::from_secs(30), child_entered.notified()) => { entered.expect("child must reach provider within the admission budget"); }
+            events = &mut stream => panic!("child must reach the actual provider before parent finishes: {events:?}"),
+        }
+        assert!(directory_lifetime.upgrade().is_some(), "actual root/child executor owns the directory after App and caller drop");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "retained while child executes");
+    }
+    if let Some(pool) = &pool {
+        let owners = async {
+            let runs: Vec<String> = sqlx::query_scalar(
+                "SELECT run_id FROM agent_runs WHERE user_id=? AND session_id=?",
+            )
+            .bind(USER_ID)
+            .bind(&session)
+            .fetch_all(pool.get())
+            .await
+            .map_err(|error| error.to_string())?;
+            let mut records = Vec::new();
+            for run in runs {
+                records.push(
+                    engine
+                        .load_run(USER_ID, &run)
+                        .await?
+                        .ok_or_else(|| "durable run missing".to_string())?,
+                );
+            }
+            Ok::<_, String>(records)
+        }
+        .await;
+        release_child.notify_one();
+        let owners = owners.unwrap();
+        assert_eq!(owners.len(), 2, "root and child must both own durable runs");
+        for record in owners {
+            assert_eq!(record.owner_pod_id.as_deref(), Some("web-parent-owner"));
+        }
+    } else {
+        release_child.notify_one();
+    }
+    let events = tokio::time::timeout(std::time::Duration::from_secs(30), stream)
+        .await.unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // The last Arc becomes un-upgradeable before TempDir::drop finishes.
+        while directory_lifetime.upgrade().is_some() || workspace_base.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("workspace fixture must be released after real execution drain");
+    assert!(!workspace_base.exists());
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 5);
+    assert_native_delegation_without_auxiliary_selector(
+        &gateway, ROOT, &[("structured child review", TASK)],
+    ).await;
+    let requests = gateway.requests.lock().await;
+    assert_eq!(requests.len(), 5);
+    let child_wire = requests
+        .iter()
+        .find(|request| assessment(&request.body).is_none() && !root_request(&request.body))
+        .unwrap();
+    assert!(
+        !child_wire.body["messages"].to_string().contains(ROOT),
+        "parent human remains isolated"
+    );
+    drop(requests);
 
     assert!(
         find_events(&events, "text_delta")
@@ -1456,13 +1937,57 @@ async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthes
         .find(|event| event["call_id"].as_str() == Some("call-spawn-reviewer"))
         .and_then(|event| event["result"].as_str())
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
-        .unwrap_or_else(|| {
-            panic!("spawn should return a structured terminal result: {serialized}")
-        });
-    assert_eq!(launch_receipt["status"], "completed", "{serialized}");
-    assert_eq!(
-        launch_receipt["result"], "child review result: no critical issues",
-        "{serialized}"
+        .unwrap_or_else(|| panic!("spawn should return a canonical launch receipt: {serialized}"));
+    assert_eq!(launch_receipt["status"], "launched", "{serialized}");
+    assert_eq!(launch_receipt["result_family"], "control_receipt");
+    assert_eq!(launch_receipt["success"], true);
+    let child_run = launch_receipt["run_id"].as_str().unwrap();
+    let root_record = engine.load_run(USER_ID, &run_id).await.unwrap().unwrap();
+    let child_record = engine.load_run(USER_ID, child_run).await.unwrap().unwrap();
+    assert_ne!(root_record.run_id, child_record.run_id);
+    assert_eq!(child_record.parent_run_id.as_deref(), Some(run_id.as_str()));
+    let admissions = inference.admissions();
+    let root_admissions: Vec<_> = admissions
+        .iter()
+        .filter(|(scope, _)| {
+            scope.run_id() == Some(run_id.as_str()) && scope.operation_id() == "agent_turn"
+        })
+        .collect();
+    let child_admissions: Vec<_> = admissions
+        .iter()
+        .filter(|(scope, _)| scope.run_id() == Some(child_run))
+        .collect();
+    assert_eq!(root_admissions.len(), 4);
+    assert_eq!(child_admissions.len(), 1);
+    for (scope, authority) in root_admissions.into_iter().chain(child_admissions) {
+        assert_eq!(scope.session_id(), Some(root_record.session_id.as_str()));
+        let record = if scope.run_id() == Some(child_run) {
+            &child_record
+        } else {
+            &root_record
+        };
+        let authority = authority.as_ref().unwrap();
+        assert_eq!(authority.expected_owner_generation, record.run_generation);
+        assert_eq!(
+            authority.expected_owner_pod_id,
+            if pool.is_some() {
+                "web-parent-owner"
+            } else {
+                "test-inference-owner"
+            },
+            "inference must preserve the selected execution owner's pod"
+        );
+        assert!(
+            authority.expected_control_epoch >= 0
+                && authority.expected_control_epoch <= record.last_event_idx
+        );
+    }
+
+    assert_child_joined_before_parent(
+        &events,
+        &launch_receipt["agent_id"],
+        "child review result: no critical issues",
+        "parent synthesis grounded in child review",
     );
     assert!(
         launch_receipt["agent_id"].as_str().is_some(),
@@ -1540,9 +2065,33 @@ async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthes
         "server-control-plane"
     );
 
-    let (replay_status, replay_events) = get_run_stream(&app, &run_id, 0).await;
+    // Replay uses the same authoritative Run store with a fresh read-only
+    // lifecycle, so it cannot keep the original directory capability alive.
+    let replay_lifecycle = astra_runtime::AgenticRunLifecycleService::new(
+        test_support::test_matrixone_settings(), test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
+        Arc::new(tokio::sync::Mutex::new(HashMap::new())), engine.clone());
+    let replay_lifecycle = if let Some(pool) = &pool { replay_lifecycle.with_pool(pool.clone()) } else { replay_lifecycle };
+    let replay_app = build_app(AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+        .with_auth_service(Arc::new(StubAuth)).with_session_service(Arc::new(StubSession))
+        .with_run_lifecycle_service(Arc::new(replay_lifecycle)));
+    let (replay_status, replay_events) = get_run_stream(&replay_app, &run_id, 0).await;
     assert_eq!(replay_status, StatusCode::OK);
     let replay_serialized = serde_json::to_string(&replay_events).unwrap();
+    let live_terminal = events.iter().find(|event| event["type"] == "run_finished" && event["run_id"] == run_id).expect("root terminal");
+    let replay_terminal = replay_events.iter().find(|event| event["type"] == "run_finished" && event["run_id"] == run_id).expect("replayed root terminal");
+    assert_eq!(live_terminal["turn_evaluation"], replay_terminal["turn_evaluation"]);
+    let evaluation = astra_turn_core::evaluation::turn_evaluation_from_terminal(
+        &live_terminal["turn_evaluation"], Some(&session), &run_id,
+        live_terminal["owner_generation"].as_u64(), live_terminal["status"].as_str().unwrap(),
+    ).expect("real root evaluation must carry exact authority");
+    assert_eq!(evaluation.producer_scope.unwrap().run_id, run_id);
+    let child_evaluation = child_record.events.iter().find_map(|event| event.pointer("/data/turn_evaluation")).expect("real child terminal evaluation");
+    assert_eq!(child_evaluation["producer_scope"]["run_id"], child_run);
+    assert_eq!(child_evaluation["metadata"]["execution_owner_generation"], child_record.run_generation);
+    astra_turn_core::evaluation::turn_evaluation_from_terminal(
+        child_evaluation, Some(&session), child_run, Some(child_record.run_generation), &child_record.status,
+    ).expect("real child evaluation must carry exact authority");
+
     assert!(
         !find_event_type(&replay_events, "agent_spawned").is_empty(),
         "completed run replay should include durable agent_spawned: {replay_serialized}"
@@ -1551,30 +2100,57 @@ async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthes
         !find_event_type(&replay_events, "agent_completed").is_empty(),
         "completed run replay should include durable agent_completed: {replay_serialized}"
     );
+    }).catch_unwind().await;
+    release_child.notify_one();
+    if let Some(pool) = &pool {
+        // Drain execution owners before deleting this disposable fixture, even
+        // when an assertion failed while the child response was gated.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id=? AND session_id=? AND owner_pod_id IS NOT NULL")
+                    .bind(USER_ID).bind(&session).fetch_one(pool.get()).await.unwrap();
+                if active == 0 { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }).await.expect("test execution owners must drain before fixture cleanup");
+        for table in [
+            "tool_invocation_ledger",
+            "agent_session_execution_slots",
+            "run_display_projections",
+            "run_checkpoints",
+            "agent_run_events",
+            "agent_runs",
+            "agent_sessions",
+        ] {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sqlx::query(&format!(
+                    "DELETE FROM {table} WHERE user_id=? AND session_id=?"
+                ))
+                .bind(USER_ID)
+                .bind(&session)
+                .execute(pool.get()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+    }
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }
 
 #[tokio::test]
 async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrier() {
     init_env();
-    let (app, _ledger) = build_test_app();
-
-    let events = chat_stream_collect(
-        &app,
-        json!({
-            "message": "Use two independent child agents and combine their findings.",
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [
+    let (app,gateway,inference)=build_native_test_app(vec![ProviderScript::new("parent actual execution", |request| primary_request_for(request,"Use two independent child agents and combine their findings.") && delegation_assessment(&request.body).is_none(),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                             tool_call(
                                 "call-select-agent-parallel",
                                 "tool_search",
                                 json!({"query": "select:agent_fanout"})
                             )
-                        ]
-                    },
-                    {
-                        "tool_calls": [
+                        ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                             tool_call("call-fanout", "invoke_tool", json!({
                                 "name": "agent_fanout",
                                 "arguments": {
@@ -1596,15 +2172,26 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
                                     ]
                                 }
                             }))
-                        ]
-                    },
-                    {"full_text": "combined findings from both children"}
-                ],
-                "test_spawn_child_llm_rounds": [
-                    {"full_text": "child review completed"}
-                ]
+                        ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("call-join-fanout","invoke_tool",json!({"name":"agent","arguments":{"action":"wait","timeout_ms":10000}}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"combined findings from both children","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))]),ProviderScript::new("delegated child actual execution", |request| request.path=="/v1/chat/completions" && request.body["model"]=="test-model" && delegation_assessment(&request.body).is_none() && !primary_request_for(request,"Use two independent child agents and combine their findings."),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"child review completed","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"child review completed","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+
+    let events = chat_stream_collect(
+        &app,
+        json!({
+            "message": "Use two independent child agents and combine their findings.",
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
+            "context": {
+
             }
         }),
+    )
+    .await;
+    assert_native_delegation_without_auxiliary_selector(
+        &gateway,
+        "Use two independent child agents and combine their findings.",
+        &[
+            ("parallel child A", "Review one independent concern."),
+            ("parallel child B", "Review another independent concern."),
+        ],
     )
     .await;
 
@@ -1613,10 +2200,18 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
         .find(|event| event["call_id"].as_str() == Some("call-fanout"))
         .and_then(|event| event["result"].as_str())
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
-        .expect("fanout must return a terminal structured result");
-    // Auxiliary absence is not a negative topology decision. The fixed typed
-    // carrier still passes through canonical runtime delegation admission.
-    assert_eq!(result["status"], "completed");
+        .expect("fanout must return structured launch receipts");
+    // Primary-model proposals use canonical admission without an auxiliary selector.
+    assert_eq!(result["status"], "started");
+    let agents = result["agents"]
+        .as_array()
+        .expect("per-child launch receipts");
+    assert_eq!(agents.len(), 2);
+    for agent in agents {
+        assert_eq!(agent["status"], "launched");
+        assert!(agent["agent_id"].as_str().is_some());
+        assert!(agent["run_id"].as_str().is_some());
+    }
     assert!(
         find_events(&events, "text_delta")
             .iter()
@@ -1627,15 +2222,26 @@ async fn web_agent_parallel_fanout_without_auxiliary_admission_uses_typed_carrie
     assert_eq!(spawned.len(), 2);
     assert_eq!(find_event_type(&events, "agent_completed").len(), 2);
     for child in spawned {
+        assert_child_joined_before_parent(
+            &events,
+            &child["agent_id"],
+            "child review completed",
+            "combined findings from both children",
+        );
         assert_eq!(child["workspace"]["kind"], "none");
         assert_eq!(child["executor"]["kind"], "server_local");
     }
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(gateway.requests.lock().await.len(), 6);
+    assert_eq!(inference.attempt_count(), 6);
 }
 
 #[tokio::test]
-async fn web_agent_parallel_direct_spawns_without_auxiliary_admission_fail_closed() {
+async fn web_agent_parallel_direct_spawns_with_unavailable_model_policy_fail_closed() {
     init_env();
-    let (app, _ledger) = build_test_app();
+
     let calls: Vec<Value> = ["direct-a", "direct-b"]
         .into_iter()
         .map(|id| {
@@ -1646,22 +2252,20 @@ async fn web_agent_parallel_direct_spawns_without_auxiliary_admission_fail_close
                     "name": "agent",
                     "arguments": {
                         "action": "spawn",
+                        "description": format!("Independent review {id}"),
                         "agent_type": "code-review",
+                        "requested_model_policy": {"mode": "auto", "strategy": "balanced"},
                         "prompt": "Review one independent concern."
                     }
                 }),
             )
         })
         .collect();
+    let (app,gateway,inference)=build_native_test_app(vec![ProviderScript::new("parent actual execution", |request| primary_request_for(request,"Use two independent child agents and combine their findings.") && delegation_assessment(&request.body).is_none(),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("select-agent", "tool_search", json!({"query": "select:agent"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":calls},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Continuing without unauthorized parallel children.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let events = chat_stream_collect(&app, json!({
-        "message": "Use two independent child agents and combine their findings.",
+        "message": "Use two independent child agents and combine their findings.","execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "context": {
-            "test_llm_rounds": [
-                {"tool_calls": [tool_call("select-agent", "tool_search", json!({"query": "select:agent"}))]},
-                {"tool_calls": calls},
-                {"full_text": "Continuing without unauthorized parallel children."}
-            ],
-            "test_spawn_child_llm_rounds": [{"full_text": "must not execute"}]
+
         }
     })).await;
     for id in ["direct-a", "direct-b"] {
@@ -1671,55 +2275,45 @@ async fn web_agent_parallel_direct_spawns_without_auxiliary_admission_fail_close
             .and_then(|event| event["result"].as_str())
             .and_then(|result| serde_json::from_str::<Value>(result).ok())
             .expect("direct spawn must return a structured rejection");
-        assert_eq!(result["status"], "rejected");
-        assert_eq!(
-            result["error_kind"],
-            "parallel_topology_admission_unavailable"
-        );
+        assert_eq!(result["status"], "failed");
+        assert_eq!(result["error_kind"], "delegation_model_unavailable");
+        assert_eq!(result["advisory"]["executed"], false);
     }
     assert!(find_event_type(&events, "agent_spawned").is_empty());
     assert!(find_event_type(&events, "agent_completed").is_empty());
+    assert!(find_events(&events, "agent_live_event").is_empty());
+    assert!(find_events(&events, "text_delta").iter().all(|event| {
+        !event["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("must not execute")
+    }));
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    let requests = gateway.requests.lock().await;
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| delegation_assessment(&request.body).is_some())
+            .count(),
+        0,
+        "unsupported typed model policy must fail before any auxiliary or child request"
+    );
+    assert_eq!(inference.attempt_count(), 3);
 }
 
 #[tokio::test]
 async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     init_env();
-    let (app, _ledger) = build_test_app();
-
-    let response = chat_stream_start(
-        &app,
-        json!({
-            "message": "Use a child agent to review the edge workspace.",
-            "workspace_binding": {
-                "kind": "edge_workspace",
-                "display_name": "MacBook Pro",
-                "root": "/workspace/astra",
-                "source": {
-                    "kind": "edge_path",
-                    "path": "/workspace/astra"
-                },
-                "authority": "read_write",
-            },
-            "executor_binding": {
-                "kind": "edge_agent",
-                "executor_id": DEFAULT_TEST_EDGE_AGENT_ID,
-                "display_name": "MacBook Pro",
-                "transport": "edge_ledger",
-                "status": "online"
-            },
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [
+    let (app,gateway,inference)=build_native_test_app(vec![ProviderScript::new("parent actual execution", |request| primary_request_for(request,"Use a child agent to review the edge workspace.") && delegation_assessment(&request.body).is_none(),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                             tool_call(
                                 "call-select-edge-agent",
                                 "tool_search",
                                 json!({"query": "select:agent"})
                             )
-                        ]
-                    },
-                    {
-                        "tool_calls": [
+                        ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                             tool_call("call-spawn-edge-reviewer", "invoke_tool", json!({
                                 "name": "agent",
                                 "arguments": {
@@ -1729,26 +2323,37 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
                                     "agent_type": "code-review"
                                 }
                             }))
-                        ]
-                    },
-                    {
-                        "full_text": "parent synthesis after edge child review"
-                    }
-                ],
-                "test_spawn_child_llm_rounds": [
-                    {
-                        "tool_calls": [
+                        ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("call-join-edge-reviewer","invoke_tool",json!({"name":"agent","arguments":{"action":"wait","timeout_ms":10000}}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"parent synthesis after edge child review","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))]),ProviderScript::new("delegated child actual execution", |request| request.path=="/v1/chat/completions" && request.body["model"]=="test-model" && delegation_assessment(&request.body).is_none() && !primary_request_for(request,"Use a child agent to review the edge workspace."),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                             tool_call(
                                 "call-child-read-file",
                                 "read_file",
                                 json!({"path": "/workspace/astra/src/lib.rs"})
                             )
-                        ]
-                    },
-                    {
-                        "full_text": "edge child reviewed concrete file evidence: pub fn run()"
-                    }
-                ]
+                        ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"edge child reviewed concrete file evidence: pub fn run()","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+
+    let response = chat_stream_start(
+        &app,
+        json!({
+            "message": "Use a child agent to review the edge workspace.",
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
+            "workspace_binding": {
+                "kind": "edge_workspace",
+                "display_name": "MacBook Pro",
+                "root": "/workspace/astra",
+                "source": {
+                    "kind": "edge_path",
+                    "path": "/workspace/astra"
+                },
+                "authority": "read_write"},
+            "executor_binding": {
+                "kind": "edge_agent",
+                "executor_id": DEFAULT_TEST_EDGE_AGENT_ID,
+                "display_name": "MacBook Pro",
+                "transport": "edge_ledger",
+                "status": "online"
+            },
+            "context": {
+
             }
         }),
     )
@@ -1775,6 +2380,15 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
         .await
         .expect("edge child stream timed out")
         .expect("edge child stream reader failed");
+    assert_native_delegation_without_auxiliary_selector(
+        &gateway,
+        "Use a child agent to review the edge workspace.",
+        &[(
+            "edge child review",
+            "Review src/lib.rs in the inherited edge workspace.",
+        )],
+    )
+    .await;
 
     let serialized = serde_json::to_string(&events).unwrap();
     assert!(
@@ -1793,10 +2407,14 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
         .and_then(|event| event["result"].as_str())
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
         .unwrap_or_else(|| panic!("edge spawn must return a canonical result: {serialized}"));
-    assert_eq!(spawn_result["status"], "completed", "{serialized}");
-    assert_eq!(
-        spawn_result["result"], "edge child reviewed concrete file evidence: pub fn run()",
-        "{serialized}"
+    assert_eq!(spawn_result["status"], "launched", "{serialized}");
+    assert_eq!(spawn_result["result_family"], "control_receipt");
+    assert_eq!(spawn_result["success"], true);
+    assert_child_joined_before_parent(
+        &events,
+        &spawn_result["agent_id"],
+        "edge child reviewed concrete file evidence: pub fn run()",
+        "parent synthesis after edge child review",
     );
 
     let workspace = find_event(&events, "workspace_bound")
@@ -1896,6 +2514,148 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     assert_eq!(completed[0]["workspace"]["kind"], "edge_workspace");
     assert_eq!(completed[0]["executor"]["kind"], "edge_agent");
     assert_eq!(completed[0]["transport"], "edge_ledger");
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(gateway.requests.lock().await.len(), 6);
+    assert_eq!(inference.attempt_count(), 6);
+}
+
+#[tokio::test]
+async fn discovery_only_child_keeps_native_tool_and_first_request_budget() {
+    const ROOT: &str = "Delegate one discovery-only GitHub availability check.";
+    const CHILD: &str =
+        "Select github once and return CHILD_GITHUB_UNAVAILABLE when it is missing.";
+    const MARKER: &str = "CHILD_GITHUB_UNAVAILABLE";
+    let response = |calls: Vec<Value>, text: &str| {
+        ProviderResponse::OpenAi(json!({
+            "choices":[{"index":0,"message":{"role":"assistant","content":text,"tool_calls":calls},
+                "finish_reason":if calls.is_empty(){"stop"}else{"tool_calls"}}],
+            "usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}
+        }))
+    };
+    let (app, gateway, inference) = build_native_test_app(vec![
+        ProviderScript::new("discovery parent", |request| primary_request_for(request, ROOT) && delegation_assessment(&request.body).is_none(), vec![
+            response(vec![tool_call("select-child-agent", "tool_search", json!({"query":"select:agent"}))], ""),
+            response(vec![tool_call("spawn-discovery-child", "invoke_tool", json!({"name":"agent","arguments":{
+                "action":"spawn","description":"discover GitHub availability","prompt":CHILD,
+                "agent_type":"explore","allowed_tools":["tool_search"],"max_output_tokens":256
+            }}))], ""),
+            response(vec![tool_call("join-discovery-child", "agent", json!({"action":"wait","timeout_ms":10000}))], ""),
+            response(vec![], MARKER),
+        ]),
+        ProviderScript::new("discovery child", |request| primary_request_for(request, CHILD) && delegation_assessment(&request.body).is_none(), vec![
+            response(vec![tool_call("child-select-github", "tool_search", json!({"query":"select:github"}))], ""),
+            response(vec![], MARKER),
+        ]),
+    ]).await;
+    let response = chat_stream_start(&app, json!({
+        "message":ROOT,
+        "allow_skills":[],
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+        "workspace_binding":{"kind":"edge_workspace","display_name":"test workspace","root":"/workspace/astra",
+            "source":{"kind":"edge_path","path":"/workspace/astra"},"authority":"read_write"},
+        "executor_binding":{"kind":"edge_agent","executor_id":DEFAULT_TEST_EDGE_AGENT_ID,
+            "display_name":"test executor","transport":"edge_ledger","status":"online"}
+    })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let events = read_sse_events_from_body(response.into_body()).await;
+    assert!(
+        find_events(&events, "tool_request").is_empty(),
+        "discovery must execute on Server without a client callback"
+    );
+    let spawn = find_events(&events, "tool_call_end")
+        .into_iter()
+        .find(|event| event["call_id"] == "spawn-discovery-child")
+        .and_then(|event| event["result"].as_str())
+        .map(|text| serde_json::from_str::<Value>(text).unwrap())
+        .expect("launch receipt");
+    assert_eq!(spawn["status"], "launched");
+    assert_child_joined_before_parent(&events, &spawn["agent_id"], MARKER, MARKER);
+    let (status, replay) = get_run_stream(&app, spawn["run_id"].as_str().unwrap(), 0).await;
+    assert_eq!(status, StatusCode::OK);
+    let finished = find_event(&replay, "run_finished").expect("durable child terminal");
+    assert_eq!(finished["status"], "completed");
+    assert_eq!(
+        finished["turn_evaluation"]["metadata"]["tool_execution_count"],
+        1
+    );
+    assert_eq!(
+        finished["turn_evaluation"]["metadata"]["tool_rejected_count"],
+        0
+    );
+    assert_eq!(
+        find_event(&replay, "text_done").unwrap()["full_text"],
+        MARKER
+    );
+    let requests = gateway.requests.lock().await;
+    let root_first = requests
+        .iter()
+        .find(|request| primary_request_for(request, ROOT))
+        .unwrap();
+    let agent = root_first.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "agent")
+        .unwrap();
+    assert_eq!(
+        agent["function"]["parameters"]["properties"]["max_output_tokens"]["minimum"],
+        1
+    );
+    let child: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            primary_request_for(request, CHILD) && delegation_assessment(&request.body).is_none()
+        })
+        .collect();
+    assert_eq!(child.len(), 2);
+    for request in &child {
+        let mut names: Vec<_> = request.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["invoke_tool", "tool_search"]);
+    }
+    assert_eq!(child[0].body["max_completion_tokens"], 256);
+    assert!(
+        child[1].body["max_completion_tokens"].as_u64().unwrap() > 256,
+        "only the first child request is capped"
+    );
+    let results: Vec<Value> = child[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| {
+            message["role"] == "tool" && message["tool_call_id"] == "child-select-github"
+        })
+        .map(|message| serde_json::from_str(message["content"].as_str().unwrap()).unwrap())
+        .collect();
+    let paired_calls = child[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .filter_map(|message| message["tool_calls"].as_array())
+        .flatten()
+        .filter(|call| call["id"] == "child-select-github")
+        .count();
+    assert_eq!(paired_calls, 1);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["missing"], json!(["github"]));
+    assert_eq!(requests.len(), 6);
+    assert!(
+        requests
+            .iter()
+            .all(|request| delegation_assessment(&request.body).is_none())
+    );
+    drop(requests);
+    assert_eq!(inference.attempt_count(), 6);
+    inference.assert_quiescent();
+    gateway.assert_complete();
 }
 
 // ── Event-driven synchronization helpers ─────────────────────────────────────
@@ -1925,7 +2685,6 @@ async fn spawn_sse_reader(body: Body) -> (mpsc::UnboundedReceiver<Value>, JoinHa
                 if let Some(data) = event_str.strip_prefix("data: ")
                     && let Ok(v) = serde_json::from_str::<Value>(data)
                 {
-                    record_tool_request_identity(&v).await;
                     let _ = tx.send(v.clone());
                     events.push(v);
                 }
@@ -1984,7 +2743,7 @@ async fn wait_for_sse(
 }
 
 #[derive(Clone)]
-struct MockToolScenarioStep {
+struct EdgeCallbackStep {
     request_id: &'static str,
     tool_name: &'static str,
     args: Value,
@@ -1993,20 +2752,19 @@ struct MockToolScenarioStep {
 }
 
 #[derive(Clone)]
-struct MockToolScenario {
+struct EdgeCallbackScenario {
     name: &'static str,
     message: String,
     edge_tools: Vec<&'static str>,
-    steps: Vec<MockToolScenarioStep>,
+    steps: Vec<EdgeCallbackStep>,
     final_text: &'static str,
-    expected_query_fragments: Vec<&'static str>,
 }
 
-async fn execute_mock_tool_turn(
+async fn execute_edge_callback_turn(
     app: &Router,
     payload: Value,
     case_name: &str,
-    steps: &[MockToolScenarioStep],
+    steps: &[EdgeCallbackStep],
     final_text: &str,
 ) -> Vec<Value> {
     let resp = chat_stream_start(app, payload).await;
@@ -2039,7 +2797,8 @@ async fn execute_mock_tool_turn(
             case_name,
             step.request_id
         );
-        let status = post_tool_result(app, step.request_id, step.result_output, "completed").await;
+        let status =
+            post_tool_result_from_event(app, &request, step.result_output, "completed").await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -2062,99 +2821,64 @@ async fn execute_mock_tool_turn(
     events
 }
 
-async fn run_mock_tool_scenario(case: MockToolScenario) {
-    let (app, hook_writer, observer) = build_test_app_with_hooks();
-    let edge_tools: Vec<Value> = case
-        .edge_tools
-        .iter()
-        .map(|tool| tool_schema(tool))
-        .collect();
-
-    if case.steps.is_empty() {
-        let events = chat_stream_collect(
-            &app,
-            json!({
-                "message": &case.message,
-                "context": {
-                    "test_llm_rounds": [{ "full_text": case.final_text }]
-                }
-            }),
-        )
-        .await;
-        assert!(
-            find_events(&events, "text_delta")
-                .iter()
-                .any(|event| event["content"].as_str() == Some(case.final_text)),
-            "{}: expected final text",
-            case.name
-        );
-
-        poll_until(
-            || {
-                let observer = observer.clone();
-                async move { !observer.requests.lock().await.is_empty() }
-            },
-            5,
-        )
-        .await;
-        assert!(hook_writer.plans.lock().await.is_empty());
-        return;
-    }
-
+async fn run_tool_scenario(case: EdgeCallbackScenario) {
+    assert!(!case.steps.is_empty());
+    assert!(
+        case.steps
+            .iter()
+            .all(|step| test_tool_uses_client_ledger(step.tool_name))
+    );
+    let message = case.message.clone();
     let tool_calls: Vec<Value> = case
         .steps
         .iter()
         .map(|step| tool_call(step.request_id, step.tool_name, step.args.clone()))
         .collect();
-
-    let _events = execute_mock_tool_turn(
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new(case.name, move |request| primary_request_for(request, &message), vec![
+        ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":tool_calls},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+        ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":case.final_text},"finish_reason":"stop"}],"usage":{"prompt_tokens":52,"completion_tokens":8,"total_tokens":60}})),
+    ])]).await;
+    let edge_tools: Vec<Value> = case
+        .edge_tools
+        .iter()
+        .map(|tool| tool_schema(tool))
+        .collect();
+    let events = execute_edge_callback_turn(
         &app,
         json!({
             "message": &case.message,
             "interactive_client": case.steps.iter().any(|step| step.requires_approval),
-            "context": {
-                "test_llm_rounds": [
-                    { "tool_calls": tool_calls },
-                    { "full_text": case.final_text }
-                ],
-                "edge_tools": edge_tools
-            }
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
+            "context": {"edge_tools": edge_tools}
         }),
         case.name,
         &case.steps,
         case.final_text,
     )
     .await;
-
-    let hw = hook_writer.clone();
-    poll_until(
-        move || {
-            let hw = hw.clone();
-            async move { !hw.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let plans = hook_writer.plans.lock().await;
-    let plan = plans.last().expect("tool hook plan");
-    let skill = plan.skill_selection.as_ref().expect("tool skill selection");
-    let selected_skills: std::collections::HashSet<&str> =
-        skill.selected_skills.iter().map(String::as_str).collect();
+    assert_eq!(find_events(&events, "turn_complete").len(), 1);
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 2);
+    let requests = gateway.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    let followup = requests[1].body["messages"].as_array().unwrap();
     for step in &case.steps {
         assert!(
-            selected_skills.contains(step.tool_name),
-            "{}: missing selected skill {}",
-            case.name,
-            step.tool_name
+            followup.iter().any(|message| message["role"] == "tool"
+                && message["tool_call_id"] == step.request_id
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains(step.result_output))),
+            "{}: actual callback must reach the next provider request",
+            case.name
         );
-    }
-    for fragment in &case.expected_query_fragments {
-        assert!(
-            skill.user_query.contains(fragment),
-            "{}: user_query should contain {:?}",
-            case.name,
-            fragment
+        assert_eq!(
+            find_events(&events, "tool_request")
+                .iter()
+                .filter(|event| event["request_id"] == step.request_id)
+                .count(),
+            1
         );
     }
 }
@@ -2201,15 +2925,11 @@ where
 #[tokio::test]
 async fn text_only_response_streams_session_info_and_text() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("text_only_response_streams_session_info_and_text", |request| primary_request_for(request, "Hello"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Hi there!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     let payload = json!({
         "message": "Hello",
-        "context": {
-            "test_llm_rounds": [
-                { "full_text": "Hi there!" }
-            ]
-        }
+        "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
     });
 
     let events = chat_stream_collect(&app, payload).await;
@@ -2222,8 +2942,11 @@ async fn text_only_response_streams_session_info_and_text() {
     );
     let session_info = &events[0];
     assert_eq!(session_info["type"], "session_info");
-    assert!(session_info.get("session_id").is_some());
-    assert!(session_info.get("run_id").is_some());
+    let session_id = session_info["session_id"].as_str().unwrap();
+    assert!(!session_id.is_empty());
+    assert!(session_id.starts_with("web-e2e-"));
+    uuid::Uuid::parse_str(session_id.strip_prefix("web-e2e-").unwrap()).unwrap();
+    uuid::Uuid::parse_str(session_info["run_id"].as_str().unwrap()).unwrap();
 
     // Should have text_delta event.
     let text_events = find_events(&events, "text_delta");
@@ -2231,13 +2954,18 @@ async fn text_only_response_streams_session_info_and_text() {
         !text_events.is_empty(),
         "expected at least one text_delta event"
     );
+    assert_eq!(text_events.len(), 1, "one plain answer is projected once");
     assert_eq!(text_events[0]["content"], "Hi there!");
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 #[tokio::test]
 async fn web_agent_stream_emits_workspace_and_executor_binding_snapshots() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("web_agent_stream_emits_workspace_and_executor_binding_snapshots", |request| primary_request_for(request, "Hello"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Hi there!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     let events = chat_stream_collect(
         &app,
@@ -2255,11 +2983,7 @@ async fn web_agent_stream_emits_workspace_and_executor_binding_snapshots() {
                 "transport": "server_local",
                 "status": "online"
             },
-            "context": {
-                "test_llm_rounds": [
-                    { "full_text": "Hi there!" }
-                ]
-            }
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
         }),
     )
     .await;
@@ -2284,22 +3008,29 @@ async fn web_agent_stream_emits_workspace_and_executor_binding_snapshots() {
         .unwrap_or_else(|| panic!("expected executor_bound event: {events:?}"));
     assert_eq!(executor["run_id"], run_id);
     assert_eq!(executor["executor"]["status"], "online");
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 #[tokio::test]
 async fn web_agent_tool_call_events_include_execution_binding_metadata() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("web_agent_tool_call_events_include_execution_binding_metadata", |request| primary_request_for(request,"Run a command in the workspace"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
+                            tool_call("call-bash-binding", "bash", json!({"command": "printf ok"}))
+                        ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Command finished.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     let response = chat_stream_start(
         &app,
         json!({
             "message": "Run a command in the workspace",
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
             "workspace_binding": {
                 "kind": "server_sandbox",
                 "display_name": "Server sandbox",
-                "authority": "read_write",
-            },
+                "authority": "read_write"},
             "executor_binding": {
                 "kind": "server_local",
                 "executor_id": "server-local",
@@ -2308,14 +3039,7 @@ async fn web_agent_tool_call_events_include_execution_binding_metadata() {
                 "status": "online"
             },
             "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [
-                            tool_call("call-bash-binding", "bash", json!({"command": "printf ok"}))
-                        ]
-                    },
-                    { "full_text": "Command finished." }
-                ]
+
             }
         }),
     )
@@ -2363,86 +3087,29 @@ async fn web_agent_tool_call_events_include_execution_binding_metadata() {
         }),
         "tool_call_end should carry the actual provisioned workspace: {tool_end:?}"
     );
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 #[tokio::test]
-async fn edge_executor_offline_blocks_run_before_next_llm_round() {
+async fn offline_edge_capabilities_are_not_exposed_or_dispatched() {
     init_env();
-    let (app, _) = build_test_app();
-
-    let events = chat_stream_collect(
-        &app,
-        json!({
-            "message": "Run a command in my edge workspace",
-            "workspace_binding": {
-                "kind": "edge_workspace",
-                "display_name": "MacBook Pro",
-                "root": "/workspace/astra",
-                "source": {
-                    "kind": "edge_path",
-                    "path": "/workspace/astra"
-                },
-                "authority": "read_write",
-            },
-            "executor_binding": {
-                "kind": "edge_agent",
-                "executor_id": "edge-macbook-1",
-                "display_name": "MacBook Pro",
-                "transport": "edge_ws",
-                "status": "offline"
-            },
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("offline_edge_capabilities_are_not_exposed_or_dispatched", |request| primary_request_for(request,"Run a command in my edge workspace"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                             tool_call(
                                 "call-edge-offline-bash",
                                 "bash",
                                 json!({"command": "printf should-not-run"})
                             )
-                        ]
-                    },
-                    { "full_text": "Should never run." }
-                ]
-            }
-        }),
-    )
-    .await;
-
-    let serialized = serde_json::to_string(&events).unwrap();
-    assert!(
-        find_events(&events, "run_blocked").iter().any(|event| {
-            event["call_id"].as_str() == Some("call-edge-offline-bash")
-                && event["reason"].as_str() == Some("executor_offline")
-                && event["executor"]["status"].as_str() == Some("offline")
-        }),
-        "edge offline tool should emit actionable blocked event: {serialized}"
-    );
-    assert!(
-        find_events(&events, "run_waiting")
-            .iter()
-            .any(|event| event["reason"]
-                .as_str()
-                .is_some_and(|r| r.contains("executor_offline"))),
-        "edge offline tool should put the run into waiting state: {serialized}"
-    );
-    assert!(
-        !find_events(&events, "text_delta")
-            .iter()
-            .any(|event| event["content"].as_str() == Some("Should never run.")),
-        "run must not continue to the next LLM round after executor-offline blocking: {serialized}"
-    );
-}
-
-#[tokio::test]
-async fn edge_executor_offline_child_returns_actionable_wait_to_structured_parent() {
-    init_env();
-    let (app, _) = build_test_app();
+                        ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"The selected edge executor is offline; reconnect it before running the command."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     let events = chat_stream_collect(
         &app,
         json!({
-            "message": "Use a child agent in my edge workspace",
+            "message": "Run a command in my edge workspace",
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
@@ -2451,8 +3118,7 @@ async fn edge_executor_offline_child_returns_actionable_wait_to_structured_paren
                     "kind": "edge_path",
                     "path": "/workspace/astra"
                 },
-                "authority": "read_write",
-            },
+                "authority": "read_write"},
             "executor_binding": {
                 "kind": "edge_agent",
                 "executor_id": "edge-macbook-1",
@@ -2460,137 +3126,43 @@ async fn edge_executor_offline_child_returns_actionable_wait_to_structured_paren
                 "transport": "edge_ws",
                 "status": "offline"
             },
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [
-                            tool_call(
-                                "call-select-offline-child-agent",
-                                "tool_search",
-                                json!({"query": "select:agent"})
-                            )
-                        ]
-                    },
-                    {
-                        "tool_calls": [
-                            tool_call("call-spawn-offline-child", "invoke_tool", json!({
-                                "name": "agent",
-                                "arguments": {
-                                    "action": "spawn",
-                                    "description": "edge child command",
-                                    "prompt": "Run a command in the inherited edge workspace.",
-                                    "agent_type": "code-review"
-                                }
-                            }))
-                        ]
-                    },
-                    { "full_text": "The child is waiting for edge-macbook-1 to reconnect." }
-                ],
-                "test_spawn_child_llm_rounds": [
-                    {
-                        "tool_calls": [
-                            tool_call(
-                                "call-child-edge-offline-bash",
-                                "bash",
-                                json!({"command": "printf child-should-not-run"})
-                            )
-                        ]
-                    },
-                    { "full_text": "Child should never synthesize." }
-                ]
-            }
+            "context": {"edge_tools":[tool_schema("bash")]}
         }),
     )
     .await;
 
-    let serialized = serde_json::to_string(&events).unwrap();
-    assert!(
-        find_event_type(&events, "agent_spawned")
-            .iter()
-            .any(|event| {
-                event["workspace"]["kind"].as_str() == Some("edge_workspace")
-                    && event["executor"]["kind"].as_str() == Some("edge_agent")
-                    && event["executor"]["status"].as_str() == Some("offline")
-            }),
-        "child spawn should inherit edge binding metadata: {serialized}"
+    let context = find_event(&events, "context_meta").unwrap();
+    let visible = context["visible_tools"].as_array().unwrap();
+    assert!(!visible.iter().any(|tool| tool == "bash"));
+    let coverage = find_event(&events, "executor_bound").unwrap();
+    assert_eq!(coverage["executor"]["status"], "offline");
+    assert_eq!(coverage["workspace"]["kind"], "edge_workspace");
+    assert!(find_events(&events, "tool_request").is_empty());
+    assert!(find_events(&events, "tool_call_end").is_empty());
+    let text = find_events(&events, "text_delta")
+        .iter()
+        .map(|event| event["content"].as_str().unwrap())
+        .collect::<String>();
+    assert_eq!(
+        text,
+        "The selected edge executor is offline; reconnect it before running the command."
     );
-    assert!(
-        find_events(&events, "tool_call_end").iter().any(|event| {
-            event["call_id"].as_str() == Some("call-spawn-offline-child")
-                && event["success"].as_bool() == Some(false)
-                && event["blocked"].as_bool() == Some(true)
-                && event["agent_status"].as_str() == Some("waiting")
-                && event["error_kind"].as_str() == Some("executor_offline")
-                && event["result"]
-                    .as_str()
-                    .and_then(|result| serde_json::from_str::<Value>(result).ok())
-                    .is_some_and(|receipt| {
-                        receipt["status"].as_str() == Some("waiting")
-                            && receipt["reason"].as_str() == Some("executor_offline")
-                            && receipt["agent_id"].as_str().is_some()
-                            && receipt["run_id"].as_str().is_some()
-                    })
-        }),
-        "foreground spawn should return the child's exact actionable wait: {serialized}"
-    );
-    assert!(
-        find_events(&events, "agent_live_event")
-            .iter()
-            .any(|event| {
-                event["event_kind"].as_str() == Some("signal")
-                    && event["signal"]["signal"].as_str() == Some("execution_waiting")
-                    && event["signal"]["reason"].as_str() == Some("executor_offline")
-            }),
-        "the waiting child should remain visible as a live signal: {serialized}"
-    );
-    assert!(
-        find_event_type(&events, "agent_waiting")
-            .iter()
-            .any(|event| {
-                event["reason"].as_str() == Some("executor_offline")
-                    && event["workspace"]["kind"].as_str() == Some("edge_workspace")
-                    && event["executor"]["kind"].as_str() == Some("edge_agent")
-            }),
-        "the child waiting projection should preserve its execution binding: {serialized}"
-    );
-    assert!(
-        find_events(&events, "run_waiting").iter().any(|event| {
-            event["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("executor_offline"))
-                && event["resumable"].as_bool() == Some(true)
-        }) && find_events(&events, "run_finished").iter().any(|event| {
-            event["status"].as_str() == Some("paused") && event["resumable"].as_bool() == Some(true)
-        }),
-        "the root run must preserve an honest resumable wait instead of claiming completion: {serialized}"
-    );
-    assert!(
-        find_events(&events, "text_delta").is_empty(),
-        "an execution-boundary wait must not spend another parent model round: {serialized}"
-    );
-    assert!(
-        !find_events(&events, "text_delta")
-            .iter()
-            .any(|event| event["content"].as_str() == Some("Child should never synthesize.")),
-        "the child must not continue past its executor-offline boundary: {serialized}"
-    );
+    assert_eq!(find_events(&events, "turn_complete").len(), 1);
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 #[tokio::test]
 async fn text_with_reasoning_streams_both() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("text_with_reasoning_streams_both", |request| primary_request_for(request, "Think step by step"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"The answer is 42.", "reasoning_content": "Let me think about this..."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     let payload = json!({
         "message": "Think step by step",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "full_text": "The answer is 42.",
-                    "reasoning": "Let me think about this...",
-                }
-            ]
-        }
+        "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
     });
 
     let events = chat_stream_collect(&app, payload).await;
@@ -2602,23 +3174,20 @@ async fn text_with_reasoning_streams_both() {
     let text = find_events(&events, "text_delta");
     assert!(!text.is_empty());
     assert_eq!(text[0]["content"], "The answer is 42.");
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 #[tokio::test]
 async fn usage_event_emitted() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("usage_event_emitted", |request| primary_request_for(request, "hello"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150}}))])]).await;
 
     let payload = json!({
         "message": "hello",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "full_text": "hi",
-                    "usage": { "prompt_tokens": 100, "completion_tokens": 50 }
-                }
-            ]
-        }
+        "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
     });
 
     let events = chat_stream_collect(&app, payload).await;
@@ -2626,183 +3195,202 @@ async fn usage_event_emitted() {
     assert!(!usage.is_empty(), "expected usage event");
     assert_eq!(usage[0]["input_tokens"], 100);
     assert_eq!(usage[0]["output_tokens"], 50);
-}
-
-// ── Edge tool delivery via ledger ────────────────────────────────────────────
-
-#[tokio::test]
-async fn edge_tool_delivery_emits_tool_request_and_waits_for_result() {
-    init_env();
-    let (app, _ledger) = build_test_app();
-
-    let payload = json!({
-        "message": "Read the file",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
-                        {
-                            "id": "tc-read-1",
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": "{\"path\": \"/tmp/test.txt\"}"
-                            }
-                        }
-                    ]
-                },
-                {
-                    "full_text": "The file contains: hello world"
-                }
-            ],
-            "edge_tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "description": "Read a file",
-                        "parameters": {
-                            "type": "object",
-                            "properties": { "path": { "type": "string" } }
-                        }
-                    }
-                }
-            ]
-        }
-    });
-
-    // Start the stream and use event-driven synchronization.
-    let resp = chat_stream_start(&app, payload).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    // Wait for tool_request event before posting tool result.
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-
-    // Post tool result to the ledger.
-    let status = post_tool_result(&app, "tc-read-1", "hello world", "completed").await;
-    assert_eq!(status, StatusCode::OK);
-
-    // Wait for the stream to complete.
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-
-    // Verify session_info is present.
-    assert_eq!(events[0]["type"], "session_info");
-
-    // Verify we got tool_call events.
-    let tool_calls = find_events(&events, "tool_call");
-    assert!(!tool_calls.is_empty(), "expected tool_call events");
-
-    // Verify we got text at the end.
-    let text = find_events(&events, "text_delta");
-    assert!(!text.is_empty(), "expected text_delta after tool round");
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 #[tokio::test]
-async fn multiple_tool_calls_in_single_round() {
-    init_env();
-    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks();
-
-    let payload = json!({
-        "message": "Read two files",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
-                        {
-                            "id": "tc-1",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": "{ \"path\": \"/tmp/a.txt\" }"
-                            }
-                        },
-                        {
-                            "id": "tc-2",
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": "{\n \"path\": \"/tmp/b.txt\"\n}"
-                            }
-                        }
-                    ]
+async fn edge_batch_and_sequential_callbacks_preserve_usage_history_and_cleanup() {
+    const MESSAGE: &str = "Read and list the batch, search it, then find source files.";
+    fn response(
+        text: &str,
+        reasoning: &str,
+        calls: Vec<Value>,
+        input: u64,
+        output: u64,
+    ) -> ProviderResponse {
+        let finish = if calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        };
+        ProviderResponse::OpenAi(
+            json!({"choices":[{"index":0,"message":{"role":"assistant","content":text,"reasoning_content":reasoning,"tool_calls":calls},"finish_reason":finish}],"usage":{"prompt_tokens":input,"completion_tokens":output,"total_tokens":input+output}}),
+        )
+    }
+    let complex_args = json!({"path":"/file0", "options":{"encoding":"utf-8","line_numbers":true,"range":[1,100]},"metadata":{"tags":["rust","source"],"nested":{"deep":{"value":42}}}});
+    let batch: Vec<Value> = (0..5)
+        .map(|i| {
+            tool_call(
+                &format!("batch-{i}"),
+                if i == 4 { "list_dir" } else { "read_file" },
+                if i == 4 {
+                    json!({})
+                } else if i == 0 {
+                    complex_args.clone()
+                } else {
+                    json!({"path":format!("/file{i}")})
                 },
-                {
-                    "full_text": "Both files read successfully"
-                }
-            ],
-            "edge_tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "description": "Read a file",
-                        "parameters": {
-                            "type": "object",
-                            "properties": { "path": { "type": "string" } }
-                        }
-                    }
-                }
-            ]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    // Wait for tool_request before posting results for both tool calls.
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-
-    let s1 = post_tool_result(&app, "tc-1", "content of a.txt", "completed").await;
-    assert_eq!(s1, StatusCode::OK);
-    let s2 = post_tool_result(&app, "tc-2", "content of b.txt", "completed").await;
-    assert_eq!(s2, StatusCode::OK);
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-
-    // Verify tool_call events for both.
-    let tool_calls = find_events(&events, "tool_call");
-    assert!(
-        tool_calls.len() >= 2,
-        "expected 2 tool_call events, got {}",
-        tool_calls.len()
+            )
+        })
+        .collect();
+    let gateway = ProviderGateway::start(vec![ProviderScript::new(
+        "actual batch and three tool rounds",
+        |request| primary_request_for(request, MESSAGE),
+        vec![
+            response(
+                "Checking the batch.",
+                "I need the file evidence.",
+                batch,
+                42,
+                7,
+            ),
+            response(
+                "",
+                "",
+                vec![tool_call(
+                    "search-next",
+                    "grep",
+                    json!({"pattern":"TODO","path":"."}),
+                )],
+                52,
+                8,
+            ),
+            response(
+                "",
+                "",
+                vec![tool_call("glob-last", "glob", json!({"pattern":"*.rs"}))],
+                62,
+                9,
+            ),
+            response("Completed the file analysis.", "", Vec::new(), 72, 10),
+        ],
+    )])
+    .await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, hook, observer, ledger) = build_test_app_with_hooks(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
     );
-
-    // Verify final text.
-    let text = find_events(&events, "text_delta");
-    assert!(!text.is_empty());
-
+    let mut read_schema = tool_schema("read_file");
+    read_schema["function"]["parameters"]["properties"]["options"] = json!({"type":"object"});
+    read_schema["function"]["parameters"]["properties"]["metadata"] = json!({"type":"object"});
+    let response = chat_stream_start(&app,json!({"message":MESSAGE,"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},"context":{"edge_tools":[read_schema,tool_schema("grep"),tool_schema("list_dir"),tool_schema("glob")]}})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (mut rx, reader) = spawn_sse_reader(response.into_body()).await;
+    let large = "y".repeat(50_000);
+    let outputs: Vec<(String, String)> = (0..5)
+        .map(|i| {
+            (
+                format!("batch-{i}"),
+                if i == 3 {
+                    large.clone()
+                } else {
+                    format!("content of file{i}")
+                },
+            )
+        })
+        .chain([
+            ("search-next".into(), "TODO matches: 3".into()),
+            ("glob-last".into(), "main.rs\nlib.rs\nmod.rs".into()),
+        ])
+        .collect();
+    for (index, (id, output)) in outputs.iter().enumerate() {
+        let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
+        assert_eq!(request["request_id"], *id);
+        if index == 0 {
+            assert_eq!(request["args"], complex_args);
+            assert_eq!(
+                gateway.requests.lock().await.len(),
+                1,
+                "Server must wait for callbacks in this execution"
+            );
+            let run_id = request["run_id"].as_str().unwrap();
+            let (status, body) = get_run_status(&app, run_id).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_ne!(body["status"], "completed");
+        }
+        assert_eq!(
+            post_tool_result_from_event(&app, &request, output, "completed").await,
+            StatusCode::OK
+        );
+    }
+    let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
+        .await
+        .expect("stream deadline")
+        .unwrap();
+    let session = find_event(&events, "session_info").unwrap();
+    let body = poll_run_status(
+        &app,
+        session["run_id"].as_str().unwrap(),
+        "completed",
+        E2E_WAIT_TIMEOUT_SECS,
+    )
+    .await;
+    assert_eq!(body["run_id"], session["run_id"]);
+    assert_eq!(body["session_id"], session["session_id"]);
+    assert!(body["waiting_for"].is_null());
+    assert!(body["events_count"].as_u64().unwrap() > 0);
+    assert_eq!(find_events(&events, "tool_call").len(), 7);
+    assert_eq!(find_events(&events, "tool_request").len(), 7);
+    assert_eq!(find_events(&events, "turn_complete").len(), 1);
+    let text = find_events(&events, "text_delta")
+        .into_iter()
+        .map(|event| event["content"].as_str().unwrap())
+        .collect::<String>();
+    assert!(text.contains("Checking the batch."));
+    assert!(text.contains("Completed the file analysis."));
+    assert!(!find_events(&events, "reasoning_delta").is_empty());
+    let usage = find_events(&events, "usage");
+    assert!(usage.len() >= 4);
+    assert_eq!(usage.last().unwrap()["input_tokens"], 228);
+    assert_eq!(usage.last().unwrap()["output_tokens"], 34);
     poll_until(
         || {
-            let observer_worker = observer_worker.clone();
-            async move { !observer_worker.requests.lock().await.is_empty() }
+            let observer = observer.clone();
+            async move { !observer.requests.lock().await.is_empty() }
         },
         5,
     )
     .await;
-    let requests = observer_worker.requests.lock().await;
-    let messages = &requests
-        .first()
-        .expect("the completed turn must be observable")
-        .messages;
-    let assistant_batch = messages
+    let observer_requests = observer.requests.lock().await;
+    assert_eq!(observer_requests.len(), 1);
+    let messages = &observer_requests[0].messages;
+    let first_batch = messages
         .iter()
         .find_map(|message| message.get("tool_calls").and_then(Value::as_array))
-        .expect("second provider request must retain the assistant tool batch");
-    assert_eq!(assistant_batch.len(), 2);
-    assert_eq!(assistant_batch[0]["id"], "tc-1");
-    assert_eq!(assistant_batch[1]["id"], "tc-2");
+        .unwrap();
+    assert_eq!(
+        first_batch
+            .iter()
+            .map(|call| call["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        outputs[..5]
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(first_batch[0]["function"]["arguments"].as_str().unwrap())
+            .unwrap(),
+        complex_args
+    );
     let result_ids = messages
         .iter()
         .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
         .filter_map(|message| message.get("tool_call_id").and_then(Value::as_str))
         .collect::<Vec<_>>();
-    assert_eq!(result_ids, vec!["tc-1", "tc-2"]);
+    assert_eq!(
+        result_ids,
+        outputs
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>()
+    );
     assert!(messages.iter().all(|message| {
         message.get("role").and_then(Value::as_str) != Some("assistant")
             || message.get("content") != Some(&Value::Null)
@@ -2811,271 +3399,61 @@ async fn multiple_tool_calls_in_single_round() {
                 .and_then(Value::as_array)
                 .is_some_and(|calls| !calls.is_empty())
     }));
-}
-
-// ── Multi-round: tools → results → more LLM → final text ────────────────────
-
-#[tokio::test]
-async fn multi_round_tool_execution() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    // Round 1: LLM calls read_file (no approval required)
-    // Round 2: LLM calls list_dir (no approval required)
-    // Round 3: LLM returns final text
-    let payload = json!({
-        "message": "List source files",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
-                        {
-                            "id": "tc-read",
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": "{\"path\": \"/src/main.rs\"}"
-                            }
-                        }
-                    ]
-                },
-                {
-                    "tool_calls": [
-                        {
-                            "id": "tc-list",
-                            "type": "function",
-                            "function": {
-                                "name": "list_dir",
-                                "arguments": "{\"path\": \"/src\"}"
-                            }
-                        }
-                    ]
-                },
-                {
-                    "full_text": "Found 3 source files."
-                }
-            ],
-            "edge_tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "description": "Read file contents",
-                        "parameters": { "type": "object", "properties": {} }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "list_dir",
-                        "description": "List directory",
-                        "parameters": { "type": "object", "properties": {} }
-                    }
-                }
-            ]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    // Post results as tool_request events are emitted.
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    let st = post_tool_result(&app, "tc-read", "fn main() {}", "completed").await;
-    assert_eq!(st, 200, "tc-read POST failed");
-
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    let st = post_tool_result(&app, "tc-list", "main.rs\nlib.rs\nmod.rs", "completed").await;
-    assert_eq!(st, 200, "tc-list POST failed");
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-
-    // Should have 2 tool_call events (one per round).
-    let tool_calls = find_events(&events, "tool_call");
-    assert!(
-        tool_calls.len() >= 2,
-        "expected >= 2 tool_call events, got {}",
-        tool_calls.len()
-    );
-
-    // Should have final text.
-    let text = find_events(&events, "text_delta");
-    assert!(!text.is_empty());
-    assert!(
-        text.iter()
-            .any(|t| t["content"].as_str().unwrap_or("").contains("Found"))
-    );
-}
-
-// ── Server-side tools (no edge tools → auto-populated) ──────────────────────
-
-#[tokio::test]
-async fn server_side_tools_no_edge_tools_auto_populated() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    // No edge_tools in context → server_side_tools = true.
-    // The mock LLM returns tool calls, but runtime_tool_executor would handle them.
-    // With mock LLM, tool calls with no edge tools won't go through the ledger.
-    let payload = json!({
-        "message": "Hello server mode",
-        "context": {
-            "test_llm_rounds": [
-                { "full_text": "I'm running in server mode." }
-            ]
-        }
-    });
-
-    let events = chat_stream_collect(&app, payload).await;
-    assert_eq!(events[0]["type"], "session_info");
-    let text = find_events(&events, "text_delta");
-    assert!(!text.is_empty());
-    assert_eq!(text[0]["content"], "I'm running in server mode.");
-}
-
-// ── Session ID preservation ──────────────────────────────────────────────────
-
-#[tokio::test]
-async fn custom_session_id_preserved() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "Hello",
-        "session_id": "custom-web-session-123",
-        "context": {
-            "test_llm_rounds": [
-                { "full_text": "Hello!" }
-            ]
-        }
-    });
-
-    let events = chat_stream_collect(&app, payload).await;
-    let session_info = &events[0];
-    assert_eq!(session_info["session_id"], "custom-web-session-123");
-}
-
-// ── Error scenario: empty test_llm_rounds ────────────────────────────────────
-
-#[tokio::test]
-async fn budget_interruption_streams_one_authoritative_paused_terminal() {
-    init_env();
-    let (app, _) = build_test_app();
-    let payload = json!({
-        "message": "Produce a deterministic partial result",
-        "context": {
-            "test_llm_rounds": [{
-                "error": {
-                    "kind": "budget_exhausted",
-                    "message": "provider budget",
-                    "details": {"partial_full_text": "partial"}
-                }
-            }]
-        }
-    });
-
-    let response = chat_stream_start(&app, payload).await;
-    let body = body::to_bytes(response.into_body(), 16 * 1024 * 1024)
-        .await
-        .expect("SSE body");
-    let wire = String::from_utf8(body.to_vec()).expect("utf8 SSE");
-    let events = parse_sse_events(&wire);
-    let run_id = find_event(&events, "session_info")
-        .and_then(|event| event["run_id"].as_str())
-        .expect("root run id");
-
-    let interrupted = events
-        .iter()
-        .position(|event| event["type"] == "run_interrupted")
-        .expect("typed interruption");
-    let finished = events
-        .iter()
-        .position(|event| event["type"] == "run_finished")
-        .expect("durable terminal");
-    let complete = events
-        .iter()
-        .position(|event| event["type"] == "turn_complete")
-        .expect("authoritative completion");
-    assert!(interrupted < finished && finished < complete, "{events:#?}");
-    assert_eq!(events[interrupted]["kind"], "budget_exhausted");
-    assert_eq!(events[finished]["status"], "paused");
-    assert_eq!(events[complete]["continuation_owner"], "server");
-    assert_eq!(
-        events[complete]["execution_state"]["interruption_kind"],
-        "budget_exhausted"
-    );
-    assert_eq!(events[complete]["interruption"]["kind"], "budget_exhausted");
-    assert_eq!(wire.matches("data: [DONE]\n\n").count(), 1);
-
-    let mut accum = ChatTurnSseAccum::default();
-    let mut edge_pending = Vec::new();
-    for block in wire.split("\n\n").filter(|block| !block.is_empty()) {
-        dispatch_chat_turn_sse_event_block(block, &mut accum, &mut edge_pending);
-    }
-    assert!(accum.server_loop_terminal);
-    assert_eq!(accum.error_kind, None);
-    let summary = accum
-        .server_execution_summary
-        .expect("CLI accepts authoritative interrupted summary");
-    assert_eq!(summary.llm_rounds, 1);
-    assert_eq!(summary.runtime_feedback, None);
-
-    let (status, durable) = get_run_status(&app, run_id).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(durable["status"], "paused");
-}
-
-#[tokio::test]
-async fn empty_test_llm_rounds_completes_gracefully() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    // No rounds → loop should complete immediately (no LLM to call).
-    // This may result in an error event since model resolution will fail
-    // (no real DB), but the stream should still complete.
-    let payload = json!({
-        "message": "Hello",
-        "context": {
-            "test_llm_rounds": []
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    // The response should complete (not hang forever).
-    let events = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        read_sse_events_from_body(resp.into_body()),
+    assert!(hook.plans.lock().await.is_empty());
+    poll_until(
+        || {
+            let ledger = ledger.clone();
+            async move { ledger.lock().await.is_empty() }
+        },
+        5,
     )
-    .await
-    .expect("stream should not hang on empty rounds");
-
-    // Should at least have session_info.
-    assert!(!events.is_empty(), "expected at least session_info event");
-    assert_eq!(events[0]["type"], "session_info");
+    .await;
+    assert!(ledger.lock().await.is_empty());
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 4);
+    let requests = gateway.requests.lock().await;
+    assert_eq!(requests.len(), 4);
+    for (id, output) in &outputs {
+        let content = requests.last().unwrap().body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool" && message["tool_call_id"] == *id)
+            .and_then(|message| message["content"].as_str())
+            .expect("every actual callback retains its exact tool identity");
+        if id == "batch-3" {
+            assert!(content.starts_with("<persisted-output>"));
+            assert!(content.contains("50000 chars"));
+            assert!(content.contains("Tool result id: batch-3"));
+            assert!(content.contains(&"y".repeat(128)));
+            assert!(content.len() < output.len());
+        } else {
+            assert!(content.contains(output));
+        }
+    }
 }
 
 #[tokio::test]
 async fn skill_tool_call_is_intercepted_without_edge_tool_request() {
     init_env();
-    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills();
+    let gateway=ProviderGateway::start(vec![ProviderScript::new("skill_tool_call_is_intercepted_without_edge_tool_request", |request| request.path == "/v1/chat/completions" && request.body["model"] == "MiniMax-M2.7" && request.body["stream"] == true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message| message["role"] == "user" && message["content"] == "Use the test skill")), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
+                        tool_call("tc-skill-1", "skill", json!({"skill_name": "test-skill"}))
+                    ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"I used the skill instructions.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, hook_writer, observer_worker) = build_test_app_with_hooks_and_skills(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
 
     let payload = json!({
         "message": "Use the test skill",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
-                        tool_call("tc-skill-1", "skill", json!({"skill_name": "test-skill"}))
-                    ]
-                },
-                {
-                    "full_text": "I used the skill instructions."
-                }
-            ]
-        }
+    "model_selection":{"offering_id":"model-MiniMax-M2.7"},
+    "context":{"edge_profile":{"active_skills":["concise","markdown"],"cwd":"/workspace/astra","git_branch":"main"}},
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}
     });
 
     let events = chat_stream_collect(&app, payload).await;
@@ -3108,6 +3486,23 @@ async fn skill_tool_call_is_intercepted_without_edge_tool_request() {
         "skill result should be injected into the turn: {result}"
     );
 
+    assert!(result.contains("You are the test skill. Return the prepared instructions."));
+    assert!(result.find("You are the test skill").unwrap() < result.find("<skill-loaded").unwrap());
+    assert!(!find_events(&events, "context_meta").is_empty());
+    assert_eq!(find_events(&events, "tool_call").len(), 1);
+    let terminals = find_events(&events, "turn_complete");
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0]["llm_rounds"], 2);
+    assert_eq!(terminals[0]["tool_calls_count"], 1);
+    let wire = gateway.requests.lock().await;
+    let delivered = wire[1].body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "tc-skill-1")
+        .unwrap();
+    assert_eq!(delivered["content"], result);
+    drop(wire);
     let text_events = find_events(&events, "text_delta");
     assert!(
         text_events
@@ -3115,13 +3510,53 @@ async fn skill_tool_call_is_intercepted_without_edge_tool_request() {
             .any(|event| event["content"].as_str() == Some("I used the skill instructions.")),
         "final LLM round should continue after skill interception"
     );
+
+    poll_until(
+        || {
+            let hook_writer = hook_writer.clone();
+            async move { !hook_writer.plans.lock().await.is_empty() }
+        },
+        5,
+    )
+    .await;
+    let plans = hook_writer.plans.lock().await;
+    assert_eq!(
+        plans.len(),
+        1,
+        "an intercepted skill must persist exactly one selection"
+    );
+    let skill = plans
+        .first()
+        .and_then(|plan| plan.skill_selection.as_ref())
+        .expect("an intercepted skill must persist its explicit selection");
+    assert_eq!(skill.skill_name, "test-skill");
+    assert_eq!(skill.selected_skills, vec!["test-skill".to_string()]);
+    assert_eq!(skill.selection_method, "llm_skill_choice");
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 #[tokio::test]
 async fn cli_thin_client_single_admission_completes_server_owned_multi_round_loop() {
     init_env();
-    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills();
-    let app = app.layer(middleware::from_fn(inject_test_llm_authority));
+    let gateway=ProviderGateway::start(vec![ProviderScript::new("cli_thin_client_single_admission_completes_server_owned_multi_round_loop", |request| primary_request_for(request,"Use the test skill and report the result"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
+                        tool_call(
+                            "tc-cli-server-skill",
+                            "skill",
+                            json!({"skill_name": "test-skill"})
+                        )
+                    ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"The server completed the skill round.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind CLI + Server journey listener");
@@ -3138,19 +3573,9 @@ async fn cli_thin_client_single_admission_completes_server_owned_multi_round_loo
 
     let payload = normalize_chat_stream_payload(json!({
         "message": "Use the test skill and report the result",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
-                        tool_call(
-                            "tc-cli-server-skill",
-                            "skill",
-                            json!({"skill_name": "test-skill"})
-                        )
-                    ]
-                },
-                { "full_text": "The server completed the skill round." }
-            ]
+
         }
     }));
     let client = astra_thin_client::ThinClient::new(&format!("http://{address}"), None)
@@ -3218,240 +3643,33 @@ async fn cli_thin_client_single_admission_completes_server_owned_multi_round_loo
         .await
         .expect("CLI + Server test server shutdown timed out")
         .expect("CLI + Server test server join failed");
-}
 
-/// Full resolve round-trip: verify the resolved skill *instructions body*
-/// (not just the `<skill-loaded/>` marker) reaches the next LLM round as a
-/// tool_result. The existing `skill_tool_call_is_intercepted_*` test only
-/// asserts the tag — this guards the actual content contract that makes
-/// skills functionally useful.
-#[tokio::test]
-async fn skill_resolve_round_trip_carries_instructions_to_next_turn() {
-    // Guard against hangs from deadlocked channels or unresponsive mock paths:
-    // mock tests should complete in milliseconds; 30s is a generous ceiling
-    // that still prevents CI from hanging indefinitely on a regression.
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        init_env();
-        let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills();
-
-        // TestSkillService at line ~290 serves `test-skill` with instructions:
-        //   "You are the test skill. Return the prepared instructions."
-        let payload = json!({
-            "message": "use the test skill",
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [
-                            tool_call("tc-skill-roundtrip", "skill", json!({"skill_name": "test-skill"}))
-                        ]
-                    },
-                    { "full_text": "done" }
-                ]
-            }
-        });
-
-        let events = chat_stream_collect(&app, payload).await;
-
-        // No edge passthrough (same contract as the existing interception test).
-        assert!(
-            find_events(&events, "tool_request").is_empty(),
-            "skill resolution must not fall through to edge tool"
-        );
-
-        let ow = observer_worker.clone();
-        poll_until(
-            || {
-                let ow = ow.clone();
-                async move { !ow.requests.lock().await.is_empty() }
-            },
-            5,
-        )
-        .await;
-
-        let requests = observer_worker.requests.lock().await;
-        let observer_req = requests
-            .first()
-            .expect("observer should have received the second-round request");
-
-        let tool_result_msg = observer_req
-            .messages
-            .iter()
-            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("tc-skill-roundtrip"))
-            .expect("tool_result for the skill call must be in the next-round messages");
-        let content = tool_result_msg
-            .get("content")
-            .and_then(Value::as_str)
-            .expect("tool_result content must be a string");
-
-        // Load-marker present (existing contract).
-        assert!(
-            content.contains("<skill-loaded name=\"test-skill\"/>"),
-            "skill-loaded marker missing: {content}"
-        );
-
-        // Actual instructions body reaches the LLM (the new guarantee).
-        assert!(
-            content.contains("You are the test skill")
-                && content.contains("Return the prepared instructions"),
-            "resolved instructions body missing from tool_result: {content}"
-        );
-
-        // Marker must sit AFTER the instructions (producer contract in skill_tool.rs:1078).
-        let body_idx = content.find("You are the test skill").unwrap();
-        let marker_idx = content.find("<skill-loaded").unwrap();
-        assert!(
-            body_idx < marker_idx,
-            "instructions body must precede the skill-loaded marker"
-        );
-    })
-    .await
-    .expect("skill_resolve_round_trip_carries_instructions_to_next_turn exceeded 30s timeout — likely a hang regression");
-}
-
-/// Cost guardrail for skill invocation round-trips.
-///
-/// Every `skill` tool call today costs TWO LLM rounds: (1) the model emits
-/// the call, (2) the model reads resolved instructions and produces the
-/// answer. This measurable cost is the motivation for a future selector
-/// fast-path (pre-resolve when selector top-1 confidence is overwhelming).
-///
-/// This test pins the current cost so any accidental regression (e.g. a
-/// refactor that spawns THREE rounds per skill) is caught immediately, and
-/// any intentional optimization that drops it to ONE round must update the
-/// expected value — making the design change visible in code review.
-#[tokio::test]
-async fn skill_invocation_costs_exactly_two_llm_rounds_today() {
-    // Guard against hangs from deadlocked channels or unresponsive mock paths:
-    // mock tests should complete in milliseconds; 30s is a generous ceiling
-    // that still prevents CI from hanging indefinitely on a regression.
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        init_env();
-        let (app, _hook_writer, _observer) = build_test_app_with_hooks_and_skills();
-
-        let payload = json!({
-            "message": "use skill",
-            "context": {
-                "test_llm_rounds": [
-                    // Round 1: model calls the skill.
-                    {
-                        "tool_calls": [
-                            tool_call("tc-cost", "skill", json!({"skill_name": "test-skill"}))
-                        ]
-                    },
-                    // Round 2: model consumes resolved instructions.
-                    { "full_text": "answered" },
-                ]
-            }
-        });
-
-        let events = chat_stream_collect(&app, payload).await;
-
-        // The harness serves one round per entry in `test_llm_rounds`. If the
-        // agentic loop consumed more or fewer rounds than configured, the mock
-        // queue would emit different totals. Use the presence of the final
-        // text_delta as the completion marker.
-        let deltas = find_events(&events, "text_delta");
-        let final_answer = deltas
-            .iter()
-            .any(|e| e["content"].as_str() == Some("answered"));
-        assert!(
-            final_answer,
-            "expected round 2 (post-skill) to emit the final answer"
-        );
-
-        // Pin the "skill invocation costs exactly 2 LLM rounds" invariant by
-        // counting observable side-effects:
-        //   round 1 emits `tool_call` events (server_loop_host.rs:1061)
-        //   round 2 emits the final `text_delta` containing "answered"
-        //
-        // NOTE: the server currently emits each tool_call event *twice* per
-        // round (once from the streaming aggregator path, once from the
-        // post-stream finalize path in server_loop_host.rs around L1061). That
-        // duplication is a known observability smell — tracked separately — but
-        // is orthogonal to the LLM-round-count invariant this test pins. Here
-        // we require `2 duplicates × 1 round = 2` so we lock current behavior;
-        // a fast-path to 1 round would drop to 0 tool_call events, and a
-        // regression to 3+ rounds would leave the 2nd mock entry unconsumed
-        // (separate harness guard).
-        let tool_calls = find_events(&events, "tool_call");
-        // Expected: exactly 1 tool_call event per logical skill invocation.
-        // Current (known bug): 2 events are emitted because `build_host` is
-        // called *twice* within the same chat turn — once for the main agentic
-        // loop (run_lifecycle.rs:2345/2757) and once for the skill subrun
-        // (run_lifecycle.rs:3465). Each call creates a fresh `ServerAgenticLoopHost`
-        // instance with its own empty `emitted_tool_call_ids` HashSet, so the
-        // cross-instance dedup fails and the Round-1 tool_call is re-emitted
-        // when the skill subrun's host runs.
-        //
-        // Proper fix (deferred to a separate PR): promote `emitted_tool_call_ids`
-        // to `Arc<Mutex<HashSet<String>>>` and share it between the parent host
-        // and skill-subrun host via `ServerAgenticLoopHostBuilder::with_dedup_state()`.
-        // That is an architecture-level change touching 3 files and multiple
-        // construction sites; keeping it out of this bugfix PR.
-        //
-        // Accept 1 (post-fix) or 2 (current known bug) so CI stays green across
-        // the fix landing. Regression to 0 (suppressed) or 3+ (new duplicate
-        // path) is still caught. A follow-up issue tracks the 2→1 fix.
-        let n = tool_calls.len();
-        assert!(
-            (1..=2).contains(&n),
-            "round 1 must emit 1 (post-fix) or 2 (current known cross-host-instance \
-             dedup bug — see comment above and run_lifecycle.rs:3465) tool_call events. \
-             Observed {n}: {tool_calls:?}"
-        );
-        if n == 2 {
-            eprintln!(
-                "known-issue: skill_invocation emitted 2 tool_call events \
-                 (expected 1 once emitted_tool_call_ids is shared across host \
-                 instances via Arc<Mutex<HashSet>>)"
-            );
-        }
-        let answered_deltas: Vec<_> = find_events(&events, "text_delta")
-            .into_iter()
-            .filter(|e| e["content"].as_str() == Some("answered"))
-            .collect();
-        assert!(
-            !answered_deltas.is_empty(),
-            "round 2 must emit the final text_delta(s) carrying the mocked \
-             answer; update this assertion together with any fast-path change. \
-             Observed 'answered' deltas: {answered_deltas:?}"
-        );
-
-        let turn_completes = find_events(&events, "turn_complete");
-        assert_eq!(
-            turn_completes.len(),
-            1,
-            "one user turn should emit exactly one turn_complete regardless of internal rounds"
-        );
-
-        // If/when a fast-path optimization collapses skill round-trips to a
-        // single call, the supplied `test_llm_rounds` above will have an unused
-        // entry — meaning the expected answer won't be the final `full_text`
-        // served (because round 2 never fires). Update this assertion together
-        // with the fast-path implementation so the design shift is explicit.
-    })
-    .await
-    .expect("skill_invocation_costs_exactly_two_llm_rounds_today exceeded 30s timeout — likely a hang regression");
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 #[tokio::test]
 async fn unknown_skill_returns_error_without_edge_tool_request() {
     init_env();
-    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills();
+    let gateway=ProviderGateway::start(vec![ProviderScript::new("unknown_skill_returns_error_without_edge_tool_request", |request| primary_request_for(request,"Use a missing skill"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
+                        tool_call("tc-skill-unknown", "skill", json!({"skill_name": "missing-skill"}))
+                    ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"The skill was unavailable.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
 
     let payload = json!({
         "message": "Use a missing skill",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
-                        tool_call("tc-skill-unknown", "skill", json!({"skill_name": "missing-skill"}))
-                    ]
-                },
-                {
-                    "full_text": "The skill was unavailable."
-                }
-            ]
+
         }
     });
 
@@ -3486,6 +3704,11 @@ async fn unknown_skill_returns_error_without_edge_tool_request() {
         result.contains("Unknown skill") || result.contains("unknown skill"),
         "unknown skill should surface a clear error: {result}"
     );
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 // ── Event ordering ───────────────────────────────────────────────────────────
@@ -3493,19 +3716,11 @@ async fn unknown_skill_returns_error_without_edge_tool_request() {
 #[tokio::test]
 async fn events_arrive_in_correct_order() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("events_arrive_in_correct_order", |request| primary_request_for(request, "Ordered test"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"The answer.", "reasoning_content": "Thinking..."},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":10,"total_tokens":30}}))])]).await;
 
     let payload = json!({
         "message": "Ordered test",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "full_text": "The answer.",
-                    "reasoning": "Thinking...",
-                    "usage": { "prompt_tokens": 20, "completion_tokens": 10 }
-                }
-            ]
-        }
+        "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
     });
 
     let events = chat_stream_collect(&app, payload).await;
@@ -3519,14 +3734,22 @@ async fn events_arrive_in_correct_order() {
     assert_eq!(types[0], "session_info");
 
     // Reasoning should come before text.
-    let reasoning_idx = types.iter().position(|&t| t == "reasoning_delta");
-    let text_idx = types.iter().position(|&t| t == "text_delta");
-    if let (Some(r), Some(t)) = (reasoning_idx, text_idx) {
-        assert!(r < t, "reasoning_delta should come before text_delta");
-    }
+    let reasoning_idx = types
+        .iter()
+        .position(|&t| t == "reasoning_delta")
+        .expect("actual reasoning");
+    let text_idx = types
+        .iter()
+        .position(|&t| t == "text_delta")
+        .expect("actual text");
+    assert!(reasoning_idx < text_idx, "reasoning must precede text");
 
     // Usage should be present.
     assert!(types.contains(&"usage"));
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 // ── Concurrent streams don't interfere ───────────────────────────────────────
@@ -3534,24 +3757,19 @@ async fn events_arrive_in_correct_order() {
 #[tokio::test]
 async fn concurrent_streams_isolated() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, gateway, inference) = build_native_test_app(vec![
+        ProviderScript::new("stream 1", |request| primary_request_for(request, "Stream 1"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Response for stream 1"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))]),
+        ProviderScript::new("stream 2", |request| primary_request_for(request, "Stream 2"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Response for stream 2"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))]),
+    ]).await;
 
     let payload1 = json!({
         "message": "Stream 1",
-        "context": {
-            "test_llm_rounds": [
-                { "full_text": "Response for stream 1" }
-            ]
-        }
+        "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
     });
 
     let payload2 = json!({
         "message": "Stream 2",
-        "context": {
-            "test_llm_rounds": [
-                { "full_text": "Response for stream 2" }
-            ]
-        }
+        "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
     });
 
     let app1 = app.clone();
@@ -3575,6 +3793,11 @@ async fn concurrent_streams_isolated() {
     let text2 = find_events(&events2, "text_delta");
     assert_eq!(text1[0]["content"], "Response for stream 1");
     assert_eq!(text2[0]["content"], "Response for stream 2");
+    assert_ne!(events1[0]["run_id"], events2[0]["run_id"]);
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 // ── Tool call with error result ──────────────────────────────────────────────
@@ -3582,14 +3805,7 @@ async fn concurrent_streams_isolated() {
 #[tokio::test]
 async fn tool_call_with_error_result_continues() {
     init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "Try reading",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("tool_call_with_error_result_continues", |request| primary_request_for(request,"Try reading"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                         {
                             "id": "tc-err-1",
                             "type": "function",
@@ -3598,12 +3814,13 @@ async fn tool_call_with_error_result_continues() {
                                 "arguments": "{\"path\": \"/nonexistent\"}"
                             }
                         }
-                    ]
-                },
-                {
-                    "full_text": "Sorry, the file was not found."
-                }
-            ],
+                    ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Sorry, the file was not found.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+
+    let payload = json!({
+        "message": "Try reading",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+        "context": {
             "edge_tools": [
                 {
                     "type": "function",
@@ -3620,8 +3837,12 @@ async fn tool_call_with_error_result_continues() {
     let resp = chat_stream_start(&app, payload).await;
     let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
 
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    post_tool_result(&app, "tc-err-1", "status=error: file not found", "failed").await;
+    let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
+    assert_eq!(request["request_id"].as_str(), Some("tc-err-1"));
+    assert_eq!(
+        post_tool_result_from_event(&app, &request, "status=error: file not found", "failed").await,
+        StatusCode::OK
+    );
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
@@ -3631,6 +3852,11 @@ async fn tool_call_with_error_result_continues() {
     // Should still get final text.
     let text = find_events(&events, "text_delta");
     assert!(!text.is_empty(), "LLM should continue after tool error");
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 // ── Approval flow test ──────────────────────────────────────────────────────
@@ -3638,16 +3864,7 @@ async fn tool_call_with_error_result_continues() {
 #[tokio::test]
 async fn tool_requiring_approval_emits_approval_event_and_waits() {
     init_env();
-    let (app, _) = build_test_app();
-
-    // write_file requires approval before tool_request is emitted.
-    let payload = json!({
-        "message": "Write a file",
-        "interactive_client": true,
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("tool_requiring_approval_emits_approval_event_and_waits", |request| primary_request_for(request,"Write a file"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                         {
                             "id": "tc-approve-1",
                             "type": "function",
@@ -3656,12 +3873,15 @@ async fn tool_requiring_approval_emits_approval_event_and_waits() {
                                 "arguments": "{\"path\": \"/tmp/out.txt\", \"content\": \"hello\"}"
                             }
                         }
-                    ]
-                },
-                {
-                    "full_text": "File written."
-                }
-            ],
+                    ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"File written.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+
+    // write_file requires approval before tool_request is emitted.
+    let payload = json!({
+        "message": "Write a file",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+        "interactive_client": true,
+        "context": {
             "edge_tools": [
                 {
                     "type": "function",
@@ -3684,8 +3904,9 @@ async fn tool_requiring_approval_emits_approval_event_and_waits() {
     let st = post_approval_respond(&app, &approval_identity, "tc-approve-1", "allow").await;
     assert_eq!(st, 200, "approval POST failed");
 
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    let st = post_tool_result(&app, "tc-approve-1", "written", "completed").await;
+    let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
+    assert_eq!(request["request_id"].as_str(), Some("tc-approve-1"));
+    let st = post_tool_result_from_event(&app, &request, "written", "completed").await;
     assert_eq!(st, 200, "tool result POST failed");
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -3710,20 +3931,17 @@ async fn tool_requiring_approval_emits_approval_event_and_waits() {
     // Should have final text.
     let text = find_events(&events, "text_delta");
     assert!(!text.is_empty(), "expected final text");
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 #[tokio::test]
 async fn approval_batch_does_not_block_earlier_read_only_request() {
     init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "Read first, then write both files",
-        "interactive_client": true,
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("approval_batch_does_not_block_earlier_read_only_request", |request| primary_request_for(request,"Read first, then write both files"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                         {
                             "id": "tc-read-first",
                             "type": "function",
@@ -3748,12 +3966,14 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
                                 "arguments": "{\"path\": \"/tmp/b.txt\", \"content\": \"B\"}"
                             }
                         }
-                    ]
-                },
-                {
-                    "full_text": "Done."
-                }
-            ],
+                    ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Done.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+
+    let payload = json!({
+        "message": "Read first, then write both files",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+        "interactive_client": true,
+        "context": {
             "edge_tools": [
                 {
                     "type": "function",
@@ -3794,7 +4014,7 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
         Some("tc-read-first"),
         "earlier read-only call should execute before later approval-gated block"
     );
-    let st = post_tool_result(&app, "tc-read-first", "read-ok", "completed").await;
+    let st = post_tool_result_from_event(&app, &read_request, "read-ok", "completed").await;
     assert_eq!(st, 200, "read-only tool result POST failed");
 
     let st = post_approval_respond(&app, &approval_identity, "tc-write-a", "allow").await;
@@ -3804,12 +4024,12 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
 
     let write_request_a = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(write_request_a["request_id"].as_str(), Some("tc-write-a"));
-    let st = post_tool_result(&app, "tc-write-a", "write-a-ok", "completed").await;
+    let st = post_tool_result_from_event(&app, &write_request_a, "write-a-ok", "completed").await;
     assert_eq!(st, 200, "first write result POST failed");
 
     let write_request_b = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(write_request_b["request_id"].as_str(), Some("tc-write-b"));
-    let st = post_tool_result(&app, "tc-write-b", "write-b-ok", "completed").await;
+    let st = post_tool_result_from_event(&app, &write_request_b, "write-b-ok", "completed").await;
     assert_eq!(st, 200, "second write result POST failed");
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -3839,6 +4059,11 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
         !find_events(&events, "text_delta").is_empty(),
         "expected final text after approval batch completes"
     );
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 // ── Approval denied → error result ──────────────────────────────────────────
@@ -3846,15 +4071,7 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
 #[tokio::test]
 async fn approval_denied_skips_tool_and_continues() {
     init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "Write a file",
-        "interactive_client": true,
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("approval_denied_skips_tool_and_continues", |request| primary_request_for(request,"Write a file"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                         {
                             "id": "tc-deny-1",
                             "type": "function",
@@ -3863,12 +4080,14 @@ async fn approval_denied_skips_tool_and_continues() {
                                 "arguments": "{\"command\": \"rm -rf /\"}"
                             }
                         }
-                    ]
-                },
-                {
-                    "full_text": "Operation was denied."
-                }
-            ],
+                    ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Operation was denied.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+
+    let payload = json!({
+        "message": "Write a file",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+        "interactive_client": true,
+        "context": {
             "edge_tools": [
                 {
                     "type": "function",
@@ -3913,152 +4132,82 @@ async fn approval_denied_skips_tool_and_continues() {
     // LLM should still continue with final text.
     let text = find_events(&events, "text_delta");
     assert!(!text.is_empty(), "expected final text after denial");
-}
 
-// ── Cancellation test ───────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn cancel_mid_stream_stops_further_rounds() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    // Round 1: edge tool (read_file) — will wait on ledger
-    // Round 2: text — should NOT execute if cancelled between rounds
-    let payload = json!({
-        "message": "Read and summarize",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
-                        {
-                            "id": "tc-cancel-1",
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": "{\"path\": \"/src/main.rs\"}"
-                            }
-                        }
-                    ]
-                },
-                {
-                    "full_text": "This text should NOT appear because we cancelled."
-                }
-            ],
-            "edge_tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "description": "Read",
-                        "parameters": { "type": "object", "properties": {} }
-                    }
-                }
-            ]
-        }
-    });
-
-    // Start the stream.
-    let app_clone = app.clone();
-    let resp = chat_stream_start(&app_clone, payload).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Read SSE frames incrementally to get the run_id, then cancel.
-    let body = resp.into_body();
-    let mut collected_events: Vec<Value> = Vec::new();
-    let mut buf = String::new();
-    let mut stream = body.into_data_stream();
-    let mut run_id: Option<String> = None;
-    let mut cancelled = false;
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-
-    loop {
-        let frame = tokio::time::timeout_at(deadline, stream.next()).await;
-        let frame = match frame {
-            Ok(Some(Ok(bytes))) => bytes,
-            Ok(Some(Err(_))) | Err(_) => break, // error or timeout
-            Ok(None) => break,                  // stream ended
-        };
-        buf.push_str(&String::from_utf8_lossy(&frame));
-
-        // Parse complete SSE events from the buffer.
-        while let Some(idx) = buf.find("\n\n") {
-            let event_str = buf[..idx].to_string();
-            buf = buf[idx + 2..].to_string();
-            if let Some(data) = event_str.strip_prefix("data: ")
-                && let Ok(v) = serde_json::from_str::<Value>(data)
-            {
-                let event_type = v
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-
-                // Capture run_id from session_info.
-                if event_type == "session_info" {
-                    run_id = v.get("run_id").and_then(Value::as_str).map(String::from);
-                }
-
-                collected_events.push(v.clone());
-
-                // After seeing tool_request, cancel the run, then post result to unblock.
-                if event_type == "tool_request"
-                    && !cancelled
-                    && let Some(rid) = &run_id
-                {
-                    let st = cancel_run(&app, rid).await;
-                    assert_eq!(st, 200, "cancel_run failed");
-                    cancelled = true;
-
-                    // Post tool result to unblock the ledger wait.
-                    post_tool_result_from_event(&app, &v, "file contents", "completed").await;
-                }
-            }
-        }
-    }
-
-    assert!(cancelled, "should have cancelled the run");
-    assert!(
-        run_id.is_some(),
-        "should have received session_info with run_id"
-    );
-
-    // Round 2's text ("This text should NOT appear") should be absent
-    // because cancellation was detected before round 2 started.
-    let text_events = find_events(&collected_events, "text_delta");
-    let has_round2_text = text_events.iter().any(|t| {
-        t.get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .contains("should NOT appear")
-    });
-    assert!(
-        !has_round2_text,
-        "round 2 text should not appear after cancellation"
-    );
-
-    // Verify run cleaned up — status should reach cancelled/completed.
-    let rid = run_id.unwrap();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let (st, body) = get_run_status(&app, &rid).await;
-        if st == StatusCode::OK {
-            let status = body["status"].as_str().unwrap_or("");
-            if status == "cancelled" || status == "completed" {
-                break;
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "run should finalize after cancel"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // EDGE CASES: Malformed payloads, missing fields, auth failures
 // ══════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn cancelled_edge_run_stops_inference_and_clears_its_callback_ledger() {
+    const MESSAGE: &str = "Read the file before cancellation.";
+    let gateway=ProviderGateway::start(vec![ProviderScript::new("cancel while waiting for actual Edge callback",|request|primary_request_for(request,MESSAGE),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[tool_call("native-cancel","read_file",json!({"path":"/src/main.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, ledger) = build_test_app_with_models(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
+    let response=chat_stream_start(&app,json!({"message":MESSAGE,"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},"context":{"edge_tools":[tool_schema("read_file")]}})).await;
+    let (mut rx, reader) = spawn_sse_reader(response.into_body()).await;
+    let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
+    assert_eq!(request["request_id"], "native-cancel");
+    let run_id = request["run_id"].as_str().unwrap();
+    let (status, list) = list_runs(&app, 10).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        list["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|run| run["run_id"] == run_id && run["status"] == "running")
+    );
+    assert_eq!(cancel_run(&app, run_id).await, StatusCode::OK);
+    assert_eq!(
+        post_tool_result_from_event(&app, &request, "cancelled", "completed").await,
+        StatusCode::OK
+    );
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .expect("cancel must finish the original stream")
+        .unwrap();
+    let body = poll_run_status(&app, run_id, "cancelled", E2E_WAIT_TIMEOUT_SECS).await;
+    assert_eq!(body["status"], "cancelled");
+    assert_eq!(body["run_id"], run_id);
+    assert!(body["waiting_for"].is_null());
+    let finished = find_events(&events, "run_finished");
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["status"], "cancelled");
+    // Cancellation is committed by the Run owner; its run_finished is the terminal.
+    assert!(find_events(&events, "turn_complete").is_empty());
+    assert!(
+        find_events(&events, "text_delta").is_empty(),
+        "no post-cancel answer may be synthesized"
+    );
+    poll_until(
+        || {
+            let ledger = ledger.clone();
+            async move { ledger.lock().await.is_empty() }
+        },
+        5,
+    )
+    .await;
+    assert!(ledger.lock().await.is_empty());
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(
+        gateway.requests.lock().await.len(),
+        1,
+        "cancellation forbids another provider round"
+    );
+}
 
 #[tokio::test]
 async fn missing_auth_header_returns_unauthorized() {
@@ -4113,24 +4262,36 @@ async fn invalid_auth_token_returns_unauthorized() {
 #[tokio::test]
 async fn empty_message_with_user_intent_still_completes() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("empty_message_with_user_intent_still_completes", |request| primary_request_for(request, "respond to the explicit empty-message test intent"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"You sent an empty message."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     let payload = json!({
         "message": "",
         "user_intent": "respond to the explicit empty-message test intent",
-        "context": {
-            "test_llm_rounds": [
-                { "full_text": "You sent an empty message." }
-            ]
-        }
+        "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
     });
 
     let events = chat_stream_collect(&app, payload).await;
     let text = find_events(&events, "text_delta");
-    assert!(
-        !text.is_empty(),
-        "should get text back even for empty message"
+    assert_eq!(
+        text.iter()
+            .map(|event| event["content"].as_str().unwrap())
+            .collect::<String>(),
+        "You sent an empty message.",
+        "stream diagnostics: {:?}",
+        events
+            .iter()
+            .map(|event| (
+                &event["type"],
+                &event["code"],
+                &event["message"],
+                &event["detail"]
+            ))
+            .collect::<Vec<_>>()
     );
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 #[tokio::test]
@@ -4167,17 +4328,7 @@ async fn missing_message_field_returns_sse_error() {
 #[tokio::test]
 async fn tool_call_without_provider_identity_is_rejected_before_edge_delivery() {
     init_env();
-    let (app, _) = build_test_app();
-
-    // Execution identity belongs to the provider. The runtime must not mint
-    // one because doing so makes replay, callback, and durable pairing
-    // ambiguous.
-    let payload = json!({
-        "message": "auto-id test",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("tool_call_without_provider_identity_is_rejected_before_edge_delivery", |request| primary_request_for(request,"auto-id test"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
                         {
                             "type": "function",
                             "function": {
@@ -4185,10 +4336,15 @@ async fn tool_call_without_provider_identity_is_rejected_before_edge_delivery() 
                                 "arguments": "{\"path\": \"/test\"}"
                             }
                         }
-                    ]
-                },
-                { "full_text": "Done." }
-            ],
+                    ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+
+    // Execution identity belongs to the provider. The runtime must not mint
+    // one because doing so makes replay, callback, and durable pairing
+    // ambiguous.
+    let payload = json!({
+        "message": "auto-id test",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+        "context": {
             "edge_tools": [
                 {
                     "type": "function",
@@ -4221,6 +4377,11 @@ async fn tool_call_without_provider_identity_is_rejected_before_edge_delivery() 
                 .is_some_and(|message| message.contains("provider tool-call protocol violation"))),
         "the identity contract failure must remain observable: {events:?}"
     );
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 #[tokio::test]
@@ -4257,501 +4418,45 @@ async fn approval_for_unknown_request_id_is_rejected_without_side_effects() {
 #[tokio::test]
 async fn large_text_response_streams_completely() {
     init_env();
-    let (app, _) = build_test_app();
+    let large_text = "x".repeat(10_000);
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("large_text_response_streams_completely", |request| primary_request_for(request, "Generate a long response"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":large_text.clone()},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     // Generate a large text response (~10KB).
-    let large_text = "x".repeat(10_000);
     let payload = json!({
         "message": "Generate a long response",
-        "context": {
-            "test_llm_rounds": [
-                { "full_text": large_text }
-            ]
-        }
+        "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
     });
 
     let events = chat_stream_collect(&app, payload).await;
     let text = find_events(&events, "text_delta");
     assert!(!text.is_empty());
-    let content = text[0]["content"].as_str().unwrap_or("");
-    assert_eq!(content.len(), 10_000, "full 10KB text should be preserved");
-}
-
-#[tokio::test]
-async fn many_tool_calls_in_single_round() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    // 5 tool calls in one round — all need results.
-    let tool_calls: Vec<Value> = (0..5)
-        .map(|i| {
-            json!({
-                "id": format!("tc-many-{i}"),
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "arguments": format!("{{\"path\": \"/file{i}\"}}")
-                }
-            })
-        })
-        .collect();
-
-    let payload = json!({
-        "message": "Read 5 files",
-        "context": {
-            "test_llm_rounds": [
-                { "tool_calls": tool_calls },
-                { "full_text": "Read all 5 files." }
-            ],
-            "edge_tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "description": "Read",
-                        "parameters": { "type": "object", "properties": {} }
-                    }
-                }
-            ]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    // Wait for tool_request then post all 5 results.
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    for i in 0..5 {
-        let id = format!("tc-many-{i}");
-        post_tool_result(&app, &id, &format!("content of file{i}"), "completed").await;
-    }
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-
-    let tool_calls_events = find_events(&events, "tool_call");
-    assert!(
-        tool_calls_events.len() >= 5,
-        "expected >= 5 tool_call events, got {}",
-        tool_calls_events.len()
-    );
-
-    let text = find_events(&events, "text_delta");
-    assert!(!text.is_empty(), "should have final text");
-}
-
-#[tokio::test]
-async fn three_sequential_rounds_all_with_tools() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    // 3 rounds of tools, then final text.
-    let payload = json!({
-        "message": "Three round tool test",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [{
-                        "id": "tc-r1",
-                        "type": "function",
-                        "function": { "name": "grep", "arguments": "{\"pattern\": \"test\"}" }
-                    }]
-                },
-                {
-                    "tool_calls": [{
-                        "id": "tc-r2",
-                        "type": "function",
-                        "function": { "name": "glob", "arguments": "{\"pattern\": \"*.rs\"}" }
-                    }]
-                },
-                {
-                    "tool_calls": [{
-                        "id": "tc-r3",
-                        "type": "function",
-                        "function": { "name": "read_file", "arguments": "{\"path\": \"/found\"}" }
-                    }]
-                },
-                { "full_text": "Completed 3-round tool chain." }
-            ],
-            "edge_tools": [
-                { "type": "function", "function": { "name": "grep", "description": "Search", "parameters": { "type": "object", "properties": {} } } },
-                { "type": "function", "function": { "name": "glob", "description": "Find files", "parameters": { "type": "object", "properties": {} } } },
-                { "type": "function", "function": { "name": "read_file", "description": "Read", "parameters": { "type": "object", "properties": {} } } }
-            ]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    for (id, output) in [
-        ("tc-r1", "grep matches: 3"),
-        ("tc-r2", "found: main.rs, lib.rs"),
-        ("tc-r3", "file content here"),
-    ] {
-        wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-        post_tool_result(&app, id, output, "completed").await;
-    }
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-
-    let tool_calls_events = find_events(&events, "tool_call");
-    assert!(
-        tool_calls_events.len() >= 3,
-        "expected >= 3 tool_call events for 3 rounds, got {}",
-        tool_calls_events.len()
-    );
-
-    let text = find_events(&events, "text_delta");
-    assert!(
-        text.iter()
-            .any(|t| t["content"].as_str().unwrap_or("").contains("3-round")),
-        "expected final text"
-    );
-}
-
-#[tokio::test]
-async fn tool_call_with_complex_json_arguments() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let complex_args = serde_json::to_string(&json!({
-        "path": "/src/main.rs",
-        "options": {
-            "encoding": "utf-8",
-            "line_numbers": true,
-            "range": [1, 100]
-        },
-        "metadata": {
-            "tags": ["rust", "source"],
-            "nested": { "deep": { "value": 42 } }
-        }
-    }))
-    .unwrap();
-
-    let payload = json!({
-        "message": "Complex args test",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [{
-                        "id": "tc-complex",
-                        "type": "function",
-                        "function": { "name": "read_file", "arguments": complex_args }
-                    }]
-                },
-                { "full_text": "Done." }
-            ],
-            "edge_tools": [
-                { "type": "function", "function": { "name": "read_file", "description": "Read", "parameters": { "type": "object", "properties": {} } } }
-            ]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    let st = post_tool_result(&app, "tc-complex", "file content", "completed").await;
-    assert_eq!(st, 200);
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-
-    // Should complete normally even with complex args.
-    let text = find_events(&events, "text_delta");
-    assert!(!text.is_empty());
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// INTEGRATION: Mixed scenarios, session/state verification
-// ══════════════════════════════════════════════════════════════════════════════
-
-#[tokio::test]
-async fn text_then_tool_then_text_interleaved() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    // Round 1: text + tool call → text_delta emitted, then tool_request, wait on ledger
-    // Round 2: text only → second text_delta, loop completes
-    // (Round 1 must have tool calls so the agentic loop continues to round 2.)
-    let payload = json!({
-        "message": "Mixed flow",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "full_text": "Let me check that.",
-                    "tool_calls": [{
-                        "id": "tc-mixed",
-                        "type": "function",
-                        "function": { "name": "read_file", "arguments": "{\"path\": \"/info\"}" }
-                    }]
-                },
-                { "full_text": "Here is the result." }
-            ],
-            "edge_tools": [
-                { "type": "function", "function": { "name": "read_file", "description": "Read", "parameters": { "type": "object", "properties": {} } } }
-            ]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    post_tool_result(&app, "tc-mixed", "info content", "completed").await;
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-
-    let text = find_events(&events, "text_delta");
-    // Should have text from round 1 and round 2.
-    assert!(
-        text.len() >= 2,
-        "expected at least 2 text_delta events, got {}",
-        text.len()
-    );
-    let all_text: String = text
+    let content: String = text
         .iter()
-        .filter_map(|t| t["content"].as_str())
-        .collect::<Vec<_>>()
-        .join("");
-    assert!(all_text.contains("check"), "should have round 1 text");
-    assert!(all_text.contains("result"), "should have round 2 text");
-}
-
-#[tokio::test]
-async fn reasoning_tokens_with_tool_calls() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    // LLM returns reasoning + tool calls in same round.
-    let payload = json!({
-        "message": "Think and act",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "reasoning": "I should read the file first to understand the context.",
-                    "tool_calls": [{
-                        "id": "tc-think",
-                        "type": "function",
-                        "function": { "name": "read_file", "arguments": "{\"path\": \"/src\"}" }
-                    }]
-                },
-                { "full_text": "Got it." }
-            ],
-            "edge_tools": [
-                { "type": "function", "function": { "name": "read_file", "description": "Read", "parameters": { "type": "object", "properties": {} } } }
-            ]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    post_tool_result(&app, "tc-think", "file data", "completed").await;
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-
-    // Should have reasoning events.
-    let reasoning = find_events(&events, "reasoning_delta");
-    assert!(!reasoning.is_empty(), "expected reasoning_delta events");
-
-    // Should also have tool_call and text.
-    let tool_calls_events = find_events(&events, "tool_call");
-    assert!(!tool_calls_events.is_empty(), "expected tool_call events");
-    let text = find_events(&events, "text_delta");
-    assert!(!text.is_empty(), "expected final text");
-}
-
-#[tokio::test]
-async fn multiple_usage_events_accumulate() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    // Round 1: tool call with usage → loop continues to round 2
-    // Round 2: text only with usage → loop stops
-    // Both rounds emit usage events through execute_mock_turn.
-    let payload = json!({
-        "message": "Multi-round usage",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "full_text": "Checking...",
-                    "tool_calls": [{
-                        "id": "tc-usage",
-                        "type": "function",
-                        "function": { "name": "list_dir", "arguments": "{\"path\": \"/\"}" }
-                    }],
-                    "usage": { "prompt_tokens": 100, "completion_tokens": 50 }
-                },
-                {
-                    "full_text": "Done.",
-                    "usage": { "prompt_tokens": 200, "completion_tokens": 100 }
-                }
-            ],
-            "edge_tools": [
-                { "type": "function", "function": { "name": "list_dir", "description": "List", "parameters": { "type": "object", "properties": {} } } }
-            ]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    post_tool_result(&app, "tc-usage", "file1\nfile2", "completed").await;
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-
-    let usage = find_events(&events, "usage");
-    assert!(
-        usage.len() >= 2,
-        "expected at least 2 usage events, got {}",
-        usage.len()
-    );
-}
-
-#[tokio::test]
-async fn session_info_has_required_fields() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "Check session info",
-        "context": {
-            "test_llm_rounds": [
-                { "full_text": "ok" }
-            ]
-        }
-    });
-
-    let events = chat_stream_collect(&app, payload).await;
-    let session_info = find_events(&events, "session_info");
-    assert!(!session_info.is_empty(), "expected session_info event");
-
-    let si = session_info[0];
-    assert!(
-        si.get("session_id").and_then(Value::as_str).is_some(),
-        "session_info must have session_id"
-    );
-    assert!(
-        si.get("run_id").and_then(Value::as_str).is_some(),
-        "session_info must have run_id"
-    );
-}
-
-#[tokio::test]
-async fn run_status_queryable_after_stream_completes() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "Check run status",
-        "context": {
-            "test_llm_rounds": [
-                { "full_text": "Done." }
-            ]
-        }
-    });
-
-    let events = chat_stream_collect(&app, payload).await;
-    let session_info = find_events(&events, "session_info");
-    let run_id = session_info[0]
-        .get("run_id")
-        .and_then(Value::as_str)
-        .expect("run_id in session_info");
-
-    // Poll run status until finalized.
-    let body = poll_run_status(&app, run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
-    let status = body["status"].as_str().unwrap_or("");
-    assert!(
-        status == "completed" || status == "running",
-        "expected completed or running, got: {status}"
-    );
-}
-
-#[tokio::test]
-async fn tool_result_with_large_output() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "Large tool output",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [{
-                        "id": "tc-large",
-                        "type": "function",
-                        "function": { "name": "read_file", "arguments": "{\"path\": \"/big\"}" }
-                    }]
-                },
-                { "full_text": "Processed large output." }
-            ],
-            "edge_tools": [
-                { "type": "function", "function": { "name": "read_file", "description": "Read", "parameters": { "type": "object", "properties": {} } } }
-            ]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    // Post a large tool result (~50KB).
-    let large_output = "y".repeat(50_000);
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    let st = post_tool_result(&app, "tc-large", &large_output, "completed").await;
-    assert_eq!(st, 200);
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-
-    let text = find_events(&events, "text_delta");
-    assert!(
-        !text.is_empty(),
-        "should complete even with large tool output"
-    );
+        .map(|event| event["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(content, large_text, "every provider chunk must be retained");
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 #[tokio::test]
 async fn approval_allow_session_approves_tool() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("approval_allow_session_approves_tool", |request| primary_request_for(request,"Session-wide approval"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[{
+                        "id": "tc-session-approve",
+                        "type": "function",
+                        "function": { "name": "write_file", "arguments": "{\"path\": \"/out\"}" }
+                    }]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Written.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     // Test "allow_session" decision (alternative to "allow").
     let payload = json!({
         "message": "Session-wide approval",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "interactive_client": true,
         "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [{
-                        "id": "tc-session-approve",
-                        "type": "function",
-                        "function": { "name": "write_file", "arguments": "{\"path\": \"/out\"}" }
-                    }]
-                },
-                { "full_text": "Written." }
-            ],
             "edge_tools": [
                 { "type": "function", "function": { "name": "write_file", "description": "Write", "parameters": { "type": "object", "properties": {} } } }
             ]
@@ -4772,8 +4477,9 @@ async fn approval_allow_session_approves_tool() {
     .await;
     assert_eq!(st, 200);
 
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    let st = post_tool_result(&app, "tc-session-approve", "ok", "completed").await;
+    let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
+    assert_eq!(request["request_id"].as_str(), Some("tc-session-approve"));
+    let st = post_tool_result_from_event(&app, &request, "ok", "completed").await;
     assert_eq!(st, 200);
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
@@ -4786,6 +4492,11 @@ async fn approval_allow_session_approves_tool() {
         !text.is_empty(),
         "should complete after allow_session approval"
     );
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 2);
+    assert_eq!(gateway.requests.lock().await.len(), 2);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -4883,13 +4594,11 @@ async fn stream_and_get_run_id(app: &Router, payload: Value) -> (Vec<Value>, Str
 #[tokio::test]
 async fn a1_run_status_all_fields_text_only() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("a1_run_status_all_fields_text_only", |request| primary_request_for(request, "text only run"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Done."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     let payload = json!({
         "message": "text only run",
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Done." }]
-        }
+        "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
     });
 
     let (_events, run_id, session_id) = stream_and_get_run_id(&app, payload).await;
@@ -4912,490 +4621,134 @@ async fn a1_run_status_all_fields_text_only() {
     assert!(body["workspace"].is_null());
     assert!(body["executor"].is_null());
     assert!(body["transport"].is_null());
-}
-
-#[tokio::test]
-async fn a1_run_status_all_fields_after_tool_round() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "tool round run",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [{
-                        "id": "tc-a1",
-                        "type": "function",
-                        "function": { "name": "read_file", "arguments": "{\"path\": \"/x\"}" }
-                    }]
-                },
-                { "full_text": "All done." }
-            ],
-            "edge_tools": [tool_schema("read_file")]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    let st = post_tool_result(&app, "tc-a1", "file contents", "completed").await;
-    assert_eq!(st, 200);
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("timed out")
-        .expect("task panicked");
-
-    let si = find_events(&events, "session_info");
-    let run_id = si[0]["run_id"].as_str().unwrap();
-    let session_id = si[0]["session_id"].as_str().unwrap();
-
-    let body = poll_run_status(&app, run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(body["run_id"].as_str().unwrap(), run_id);
-    assert_eq!(body["session_id"].as_str().unwrap(), session_id);
-    assert_eq!(body["status"].as_str().unwrap(), "completed");
-    assert!(body["waiting_for"].is_null());
-    assert!(body["events_count"].as_i64().unwrap() > 0);
-}
-
-// ── A2: Run Status Transitions ───────────────────────────────────────────────
-
-#[tokio::test]
-async fn a2_transition_running_to_completed_text_only() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "transition text",
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Response." }]
-        }
-    });
-
-    let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    let body = poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(body["status"].as_str().unwrap(), "completed");
-}
-
-#[tokio::test]
-async fn a2_transition_running_to_completed_after_tool_rounds() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "tool then complete",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [{
-                        "id": "tc-a2-tool",
-                        "type": "function",
-                        "function": { "name": "glob", "arguments": "{\"pattern\": \"*.rs\"}" }
-                    }]
-                },
-                { "full_text": "Tool done." }
-            ],
-            "edge_tools": [tool_schema("glob")]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    post_tool_result(&app, "tc-a2-tool", "file.rs", "completed").await;
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("timed out")
-        .expect("task panicked");
-
-    let si = find_events(&events, "session_info");
-    let run_id = si[0]["run_id"].as_str().unwrap();
-
-    let body = poll_run_status(&app, run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
-    assert_eq!(body["status"].as_str().unwrap(), "completed");
-}
-
-#[tokio::test]
-async fn a2_transition_running_to_cancelled() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    // Use a tool round so the loop doesn't terminate immediately.
-    let payload = json!({
-        "message": "cancel me",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [{
-                        "id": "tc-a2-cancel",
-                        "type": "function",
-                        "function": { "name": "read_file", "arguments": "{\"path\": \"/c\"}" }
-                    }]
-                },
-                { "full_text": "never reached" }
-            ],
-            "edge_tools": [tool_schema("read_file")]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    // Wait for tool_request to know the stream is running, then get run_id and cancel.
-    let _tool_req = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-
-    // We need to cancel — but first we need the run_id. We'll list runs to find it.
-    let (_, list_body) = list_runs(&app, 10).await;
-    let runs = list_body["runs"].as_array().expect("runs array");
-    assert!(!runs.is_empty(), "should have at least one run");
-    let running = runs
-        .iter()
-        .find(|r| r["status"].as_str() == Some("running"));
-    assert!(running.is_some(), "should have a running run");
-    let run_id = running.unwrap()["run_id"].as_str().unwrap().to_string();
-
-    let cancel_status = cancel_run(&app, &run_id).await;
-    assert_eq!(cancel_status, StatusCode::OK);
-
-    // Also post the tool result so the stream can terminate.
-    post_tool_result(&app, "tc-a2-cancel", "cancelled", "completed").await;
-
-    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("timed out")
-        .expect("task panicked");
-
-    let body = poll_run_status(&app, &run_id, "cancelled", E2E_WAIT_TIMEOUT_SECS).await;
-    let status = body["status"].as_str().unwrap();
-    assert!(
-        status == "cancelled" || status == "completed",
-        "expected cancelled or completed after cancel, got: {status}"
-    );
-}
-
-// ── A3: Event Replay via stream_run ──────────────────────────────────────────
-
-#[tokio::test]
-async fn a3_event_replay_all_events_from_index_zero() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "replay test",
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Replay me." }]
-        }
-    });
-
-    let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
-
-    // Replay from index 0 — should get all stored events.
-    let (status, replay_events) = get_run_stream(&app, &run_id, 0).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        !replay_events.is_empty(),
-        "replay from index 0 should return events"
-    );
-
-    // Replayed events should have index fields.
-    assert_eq!(replay_events[0]["index"], 0);
-
-    // Should contain a run_started or run_finished event type.
-    let has_terminal = replay_events.iter().any(|e| {
-        let t = e["type"].as_str().unwrap_or("");
-        t == "run_started" || t == "run_finished"
-    });
-    assert!(has_terminal, "replay should include run lifecycle events");
-}
-
-#[tokio::test]
-async fn a3_event_replay_partial_from_middle() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "partial replay",
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Partial replay content." }]
-        }
-    });
-
-    let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
-
-    // Get all externally visible events first. The cursor is over the
-    // durable event log, so the public projection may legitimately skip
-    // internal-only rows and return a first visible index greater than the
-    // requested cursor.
-    let (_, all_events) = get_run_stream(&app, &run_id, 0).await;
-    assert!(
-        all_events.len() >= 2,
-        "need at least 2 events for partial replay"
-    );
-
-    // Replay from durable index 1 — this deliberately exercises a cursor
-    // that may land on an internal-only row. The public projection must still
-    // contain exactly the visible events whose durable index is at least 1.
-    let (_, partial_events) = get_run_stream(&app, &run_id, 1).await;
-    let expected_partial: Vec<_> = all_events
-        .iter()
-        .filter(|event| event["index"].as_u64().is_some_and(|index| index >= 1))
-        .cloned()
-        .collect();
-    assert_eq!(
-        partial_events, expected_partial,
-        "replay from a durable cursor must preserve the visible event projection and ordering"
-    );
-    assert!(
-        partial_events
-            .iter()
-            .all(|event| event["index"].as_u64().is_some_and(|index| index >= 1)),
-        "replay must not return an event below the requested durable cursor"
-    );
-
-    // A cursor taken from a known visible event distinguishes durable-cursor
-    // semantics from the incorrect "skip one already-projected event"
-    // implementation. The event at the cursor must remain the first result.
-    let visible_cursor = all_events[1]["index"]
-        .as_u64()
-        .expect("second visible replay event should carry a durable index");
-    assert!(
-        visible_cursor > 0,
-        "visible cursor must advance past index zero"
-    );
-    let (_, from_visible_cursor) = get_run_stream(&app, &run_id, visible_cursor as u32).await;
-    let expected_from_visible_cursor: Vec<_> = all_events
-        .iter()
-        .filter(|event| {
-            event["index"]
-                .as_u64()
-                .is_some_and(|index| index >= visible_cursor)
-        })
-        .cloned()
-        .collect();
-    assert_eq!(from_visible_cursor, expected_from_visible_cursor);
-    assert_eq!(
-        from_visible_cursor
-            .first()
-            .and_then(|event| event["index"].as_u64()),
-        Some(visible_cursor),
-        "inclusive durable cursor must retain the visible event at the cursor"
-    );
-}
-
-#[tokio::test]
-async fn a3_event_replay_beyond_end_returns_empty() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "beyond end",
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Short." }]
-        }
-    });
-
-    let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
-
-    // Replay from a very high index.
-    let (status, events) = get_run_stream(&app, &run_id, 9999).await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        events.is_empty(),
-        "replay beyond end should return empty, got {} events",
-        events.len()
-    );
-}
-
-#[tokio::test]
-async fn a3_event_replay_matches_sse_stream_content() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "match test",
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Match this text." }]
-        }
-    });
-
-    let (sse_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
-
-    let (status, replay_events) = get_run_stream(&app, &run_id, 0).await;
-    assert_eq!(status, StatusCode::OK);
-
-    // Live transport exposes incremental text_delta events; durable replay
-    // intentionally stores the terminal text_done event instead of every delta.
-    let sse_text = sse_events
-        .iter()
-        .filter(|e| e["type"].as_str() == Some("text_delta"))
-        .filter_map(|e| {
-            e.get("content")
-                .and_then(Value::as_str)
-                .or_else(|| e.get("text").and_then(Value::as_str))
-        })
-        .fold(String::new(), |mut acc, chunk| {
-            acc.push_str(chunk);
-            acc
-        });
-
-    let replay_text: Vec<String> = replay_events
-        .iter()
-        .filter(|e| {
-            e.get("type").and_then(Value::as_str) == Some("text_done")
-                || e.get("event_type").and_then(Value::as_str) == Some("text_done")
-        })
-        .filter_map(|e| {
-            e.get("full_text")
-                .and_then(Value::as_str)
-                .or_else(|| e.pointer("/data/full_text").and_then(Value::as_str))
-        })
-        .map(ToOwned::to_owned)
-        .collect();
-
-    assert!(!sse_text.is_empty(), "SSE should have text_delta content");
-    assert_eq!(
-        replay_text,
-        vec![sse_text.clone()],
-        "durable replay text_done should match the live SSE text content"
-    );
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 // ── A4: Ledger Cleanup Verification ──────────────────────────────────────────
 
 #[tokio::test]
-async fn a4_ledger_empty_after_tool_run_completes() {
+async fn completed_run_can_be_queried_and_replayed_by_its_owner() {
     init_env();
-    let (app, ledger) = build_test_app();
-
-    let payload = json!({
-        "message": "ledger cleanup test",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [{
-                        "id": "tc-a4-ledger",
-                        "type": "function",
-                        "function": { "name": "read_file", "arguments": "{\"path\": \"/l\"}" }
-                    }]
-                },
-                { "full_text": "Ledger clean." }
-            ],
-            "edge_tools": [tool_schema("read_file")]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    post_tool_result(&app, "tc-a4-ledger", "content", "completed").await;
-
-    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("timed out")
-        .expect("task panicked");
-
-    let ledger_cl = ledger.clone();
-    poll_until(
-        || {
-            let l = ledger_cl.clone();
-            async move { l.lock().await.is_empty() }
-        },
-        5,
+    let answer = "The completed run can be queried and replayed.";
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("complete then replay", |request| primary_request_for(request, "Complete this explanation."), vec![ProviderResponse::OpenAi(json!({
+        "choices":[{"index":0,"message":{"role":"assistant","content":answer},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}
+    }))])]).await;
+    let (live, run_id, session_id) = stream_and_get_run_id(
+        &app,
+        json!({
+            "message":"Complete this explanation.",
+            "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}
+        }),
     )
     .await;
-
-    // Ledger should be empty — all tool entries consumed.
-    let ledger_map = ledger.lock().await;
+    assert_eq!(find_events(&live, "session_info").len(), 1);
+    assert!(!session_id.is_empty());
+    assert!(session_id.contains('-'));
+    let status = poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
+    let (code, queried) = get_run_status(&app, &run_id).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(queried["run_id"], run_id);
+    assert_eq!(queried["session_id"], session_id);
+    assert_eq!(queried["status"], "completed");
+    let (code, listing) = list_runs(&app, 50).await;
+    assert_eq!(code, StatusCode::OK);
     assert!(
-        ledger_map.is_empty(),
-        "ledger should be empty after run completes, has {} entries: {:?}",
-        ledger_map.len(),
-        ledger_map.keys().collect::<Vec<_>>()
+        listing["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|run| run["run_id"] == run_id && run["status"] == "completed")
     );
-}
+    let (code, _) = get_run_status_with_auth(&app, &run_id, "Bearer wrong-token").await;
+    assert_eq!(code, StatusCode::UNAUTHORIZED);
 
-#[tokio::test]
-async fn a4_ledger_empty_after_cancelled_run() {
-    init_env();
-    let (app, ledger) = build_test_app();
-
-    let payload = json!({
-        "message": "cancel ledger test",
-        "context": {
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [{
-                        "id": "tc-a4-cancel-ledger",
-                        "type": "function",
-                        "function": { "name": "read_file", "arguments": "{\"path\": \"/cl\"}" }
-                    }]
-                },
-                { "full_text": "never reached" }
-            ],
-            "edge_tools": [tool_schema("read_file")]
-        }
-    });
-
-    let resp = chat_stream_start(&app, payload).await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    // Wait for tool_request so we know the stream is running, then cancel.
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-
-    // Find running run and cancel it.
-    let (_, list_body) = list_runs(&app, 10).await;
-    let runs = list_body["runs"].as_array().expect("runs array");
-    let running = runs
+    let (code, all) = get_run_stream(&app, &run_id, 0).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(
+        all.len() >= 2,
+        "completed run must have durable visible events"
+    );
+    let indices: Vec<_> = all
         .iter()
-        .find(|r| r["status"].as_str() == Some("running"));
-    let running = running.expect("tool_request must have a corresponding running run");
-    let run_id = running["run_id"]
-        .as_str()
-        .expect("running run should expose run_id");
+        .map(|event| event["index"].as_u64().expect("durable event index"))
+        .collect();
+    assert_eq!(indices[0], 0);
+    // One durable terminal row projects usage and run_finished at the same index.
+    assert!(indices.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(all.iter().any(|event| matches!(
+        event["type"].as_str().or(event["event_type"].as_str()),
+        Some("run_started" | "run_finished")
+    )));
+
+    let (code, from_one) = get_run_stream(&app, &run_id, 1).await;
+    assert_eq!(code, StatusCode::OK);
     assert_eq!(
-        cancel_run(&app, run_id).await,
-        StatusCode::OK,
-        "cancelling the tool-waiting run should succeed"
+        from_one,
+        all.iter()
+            .filter(|event| event["index"].as_u64().unwrap() >= 1)
+            .cloned()
+            .collect::<Vec<_>>(),
+        "cursor refers to durable rows, including hidden rows"
     );
-
-    // Post tool result so the stream can finish even if cancel didn't interrupt.
+    let visible_cursor = *indices.iter().find(|index| **index > 0).unwrap();
+    assert!(visible_cursor > 0);
+    let (code, from_visible) =
+        get_run_stream(&app, &run_id, u32::try_from(visible_cursor).unwrap()).await;
+    assert_eq!(code, StatusCode::OK);
     assert_eq!(
-        post_tool_result(&app, "tc-a4-cancel-ledger", "cancelled", "completed").await,
-        StatusCode::OK,
-        "the cancellation cleanup callback should be accepted"
+        from_visible,
+        all.iter()
+            .filter(|event| event["index"].as_u64().unwrap() >= visible_cursor)
+            .cloned()
+            .collect::<Vec<_>>()
     );
-
-    let _events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("timed out")
-        .expect("task panicked");
-
-    let ledger_cl = ledger.clone();
-    poll_until(
-        || {
-            let l = ledger_cl.clone();
-            async move { l.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let ledger_map = ledger.lock().await;
+    assert_eq!(
+        from_visible.first().unwrap()["index"],
+        visible_cursor,
+        "cursor is inclusive"
+    );
+    let beyond = status["events_count"]
+        .as_u64()
+        .expect("durable last index plus one");
+    assert!(beyond > *indices.last().unwrap());
+    let (code, empty) = get_run_stream(&app, &run_id, u32::try_from(beyond).unwrap()).await;
+    assert_eq!(code, StatusCode::OK);
     assert!(
-        ledger_map.is_empty(),
-        "ledger should be empty after cancelled run, has {} entries: {:?}",
-        ledger_map.len(),
-        ledger_map.keys().collect::<Vec<_>>()
+        empty.is_empty(),
+        "replay beyond the durable end returns no events"
     );
+
+    let text: String = find_events(&live, "text_delta")
+        .iter()
+        .map(|event| event["content"].as_str().unwrap())
+        .collect();
+    assert_eq!(text, answer);
+    let completed: Vec<_> = all
+        .iter()
+        .filter(|event| event["type"] == "text_done" || event["event_type"] == "text_done")
+        .collect();
+    assert_eq!(completed.len(), 1);
+    let full_text = completed[0]["full_text"]
+        .as_str()
+        .or_else(|| {
+            completed[0]
+                .pointer("/data/full_text")
+                .and_then(Value::as_str)
+        })
+        .unwrap();
+    assert_eq!(full_text, text);
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(
+        inference.attempt_count(),
+        1,
+        "queries and replay cannot start inference"
+    );
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 // ── A5: Run Not Found / Access Denied ────────────────────────────────────────
@@ -5410,30 +4763,6 @@ async fn a5_run_status_not_found() {
     assert!(
         body["detail"].as_str().is_some(),
         "error response should have detail"
-    );
-}
-
-#[tokio::test]
-async fn a5_run_status_unauthorized() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    // Create a run first.
-    let payload = json!({
-        "message": "auth test",
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Auth." }]
-        }
-    });
-    let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
-
-    // Try with wrong token.
-    let (status, _) = get_run_status_with_auth(&app, &run_id, "Bearer wrong-token").await;
-    assert_eq!(
-        status,
-        StatusCode::UNAUTHORIZED,
-        "wrong token should get 401"
     );
 }
 
@@ -5455,55 +4784,16 @@ async fn a5_stream_run_not_found() {
     assert_eq!(code, "NOT_FOUND", "error code should be NOT_FOUND");
 }
 
-// ── A6: Session Info Consistency ─────────────────────────────────────────────
-
-#[tokio::test]
-async fn a6_session_id_consistent_across_events_and_run() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "session consistency",
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Consistent." }]
-        }
-    });
-
-    let (events, run_id, session_id) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
-
-    // Verify run status session_id matches.
-    let (_, body) = get_run_status(&app, &run_id).await;
-    assert_eq!(
-        body["session_id"].as_str().unwrap(),
-        session_id,
-        "run status session_id should match session_info"
-    );
-
-    // Verify session_id is non-empty and looks like a UUID.
-    assert!(!session_id.is_empty(), "session_id should not be empty");
-    assert!(
-        session_id.contains('-'),
-        "session_id should be UUID-like: {session_id}"
-    );
-
-    // All events in the stream should be associated with this session.
-    let si_events = find_events(&events, "session_info");
-    assert_eq!(si_events.len(), 1, "should have exactly one session_info");
-}
-
 #[tokio::test]
 async fn a6_custom_session_id_preserved() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("a6_custom_session_id_preserved", |request| primary_request_for(request, "custom session"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Custom."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     let custom_sid = format!("custom-{}", uuid::Uuid::new_v4());
     let payload = json!({
         "message": "custom session",
         "session_id": &custom_sid,
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Custom." }]
-        }
+        "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
     });
 
     let (_events, run_id, session_id) = stream_and_get_run_id(&app, payload).await;
@@ -5518,12 +4808,16 @@ async fn a6_custom_session_id_preserved() {
     // Run status should also reflect the custom session_id.
     let (_, body) = get_run_status(&app, &run_id).await;
     assert_eq!(body["session_id"].as_str().unwrap(), custom_sid);
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 #[tokio::test]
 async fn a6_multiple_runs_same_session() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("two serial runs", |request| primary_request_for(request, "run 1") || primary_request_for(request, "run 2"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Run one."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})), ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Run two."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     let shared_sid = format!("shared-{}", uuid::Uuid::new_v4());
 
@@ -5531,24 +4825,26 @@ async fn a6_multiple_runs_same_session() {
     let payload1 = json!({
         "message": "run 1",
         "session_id": &shared_sid,
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Run one." }]
-        }
+    "context":{"edge_profile":{"active_skills":["concise"]}},
+        "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
     });
-    let (_, run_id_1, sid_1) = stream_and_get_run_id(&app, payload1).await;
+    let (events_1, run_id_1, sid_1) = stream_and_get_run_id(&app, payload1).await;
     poll_run_status(&app, &run_id_1, "completed", E2E_WAIT_TIMEOUT_SECS).await;
 
     // Second run with same session.
     let payload2 = json!({
         "message": "run 2",
         "session_id": &shared_sid,
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Run two." }]
-        }
+    "context":{"edge_profile":{"active_skills":["concise"]}},
+        "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
     });
-    let (_, run_id_2, sid_2) = stream_and_get_run_id(&app, payload2).await;
+    let (events_2, run_id_2, sid_2) = stream_and_get_run_id(&app, payload2).await;
     poll_run_status(&app, &run_id_2, "completed", E2E_WAIT_TIMEOUT_SECS).await;
 
+    for events in [&events_1, &events_2] {
+        assert!(!find_events(events, "context_meta").is_empty());
+        assert_eq!(find_events(events, "turn_complete").len(), 1);
+    }
     // Both should share the same session_id.
     assert_eq!(sid_1, shared_sid);
     assert_eq!(sid_2, shared_sid);
@@ -5564,29 +4860,15 @@ async fn a6_multiple_runs_same_session() {
     assert_eq!(s2, StatusCode::OK);
     assert_eq!(b1["session_id"].as_str().unwrap(), shared_sid);
     assert_eq!(b2["session_id"].as_str().unwrap(), shared_sid);
-}
-
-#[tokio::test]
-async fn a6_list_runs_shows_completed_runs() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "list me",
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Listed." }]
-        }
-    });
-
-    let (_events, run_id, _) = stream_and_get_run_id(&app, payload).await;
-    poll_run_status(&app, &run_id, "completed", E2E_WAIT_TIMEOUT_SECS).await;
-
-    let (status, body) = list_runs(&app, 50).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let runs = body["runs"].as_array().expect("runs array");
-    let found = runs.iter().any(|r| r["run_id"].as_str() == Some(&run_id));
-    assert!(found, "list_runs should include the completed run {run_id}");
+    assert_eq!(b1["status"], "completed");
+    assert_eq!(b2["status"], "completed");
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 2);
+    let requests = gateway.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(primary_request_for(&requests[0], "run 1"));
+    assert!(primary_request_for(&requests[1], "run 2"));
 }
 
 // ─── Turn Complete Event Tests ──────────────────────────────────────────────
@@ -5594,13 +4876,11 @@ async fn a6_list_runs_shows_completed_runs() {
 #[tokio::test]
 async fn turn_complete_is_last_typed_event() {
     init_env();
-    let (app, _) = build_test_app();
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("turn_complete_is_last_typed_event", |request| primary_request_for(request, "order check"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Done."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
     let payload = json!({
         "message": "order check",
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Done." }]
-        }
+        "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"}
     });
 
     let (events, _, _) = stream_and_get_run_id(&app, payload).await;
@@ -5617,74 +4897,83 @@ async fn turn_complete_is_last_typed_event() {
         types.len() - 1,
         "turn_complete should be the last typed SSE event, order: {types:?}"
     );
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
-// ─── Client Disconnect Cancellation Tests ───────────────────────────────────
+// ─── Subscriber Disconnect Tests ───────────────────────────────────
 
 #[tokio::test]
 async fn client_disconnect_run_still_finalizes() {
-    init_env();
-    let (app, _) = build_test_app();
-
-    let payload = json!({
-        "message": "disconnect test",
-        "context": {
-            "test_llm_rounds": [{ "full_text": "Quick response." }]
-        }
-    });
-    let payload = normalize_chat_stream_payload(payload);
-
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/chat/stream")
-                .header("authorization", TOKEN)
-                .header("content-type", "application/json")
-                .body(Body::from(payload.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    // Read just session_info, then drop the body (simulating client disconnect).
-    let mut stream = resp.into_body().into_data_stream();
-    let mut run_id = String::new();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let text = json!({"id":"disconnect-native","model":"test-model","choices":[{"index":0,"delta":{"content":"Completed after subscriber disconnect."},"finish_reason":null}]});
+    let finish = json!({"id":"disconnect-native","model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}});
+    let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new(
+        "finish real inference after subscriber disconnect",
+        |request| primary_request_for(request, "disconnect test"),
+        vec![ProviderResponse::Stream {
+            content_type: "text/event-stream",
+            chunks: vec![
+                format!("data: {text}\n\n").into_bytes(),
+                format!("data: {finish}\n\n").into_bytes(),
+                b"data: [DONE]\n\n".to_vec(),
+            ],
+            release_before_chunk: Some((0, release.clone())),
+        }],
+    )])
+    .await;
+    let response=chat_stream_start(&app,json!({"message":"disconnect test","execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}})).await;
+    let mut stream = response.into_body().into_data_stream();
+    let mut buffer = String::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, stream.next()).await {
-        let bytes = chunk.unwrap();
-        let text = String::from_utf8_lossy(&bytes);
-        if let Some(data) = text.lines().find_map(|line| line.strip_prefix("data: "))
-            && let Ok(v) = serde_json::from_str::<Value>(data)
-            && v["type"].as_str() == Some("session_info")
+    let run_id = loop {
+        let chunk = tokio::time::timeout_at(deadline, stream.next())
+            .await
+            .expect("session_info deadline")
+            .expect("session_info before EOF")
+            .unwrap();
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        if let Some(event) = parse_sse_events(&buffer)
+            .into_iter()
+            .find(|event| event["type"] == "session_info")
         {
-            run_id = v["run_id"].as_str().unwrap_or("").to_string();
-            break;
+            break event["run_id"].as_str().unwrap().to_string();
         }
-    }
-    assert!(!run_id.is_empty(), "should get session_info with run_id");
-
-    // Drop the stream — simulating client disconnect.
+    };
+    let calls = gateway.requests.clone();
+    poll_until(
+        || {
+            let calls = calls.clone();
+            async move { calls.lock().await.len() == 1 }
+        },
+        5,
+    )
+    .await;
+    let (status, running) = get_run_status(&app, &run_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(running["status"], "running");
     drop(stream);
-
-    // Wait for the background task to finalize.
-    let mut final_status = String::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline {
-        let (st, body) = get_run_status(&app, &run_id).await;
-        if st == StatusCode::OK {
-            final_status = body["status"].as_str().unwrap_or("").to_string();
-            if final_status == "completed" || final_status == "cancelled" {
-                break;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert!(
-        final_status == "completed" || final_status == "cancelled",
-        "run should finalize after client disconnect, got: {final_status}"
+    release.notify_one();
+    let completed = poll_run_status(&app, &run_id, "completed", 5).await;
+    assert_eq!(
+        completed["status"], "completed",
+        "disconnect is not explicit cancellation"
     );
+    let (status, replay) = get_run_stream(&app, &run_id, 0).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(replay.iter().any(|event| event["type"] == "text_done"
+        && event["full_text"] == "Completed after subscriber disconnect."));
+    assert!(
+        replay
+            .iter()
+            .any(|event| event["type"] == "run_finished" && event["status"] == "completed")
+    );
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 // ── Hook DB + Observer Persistence Tests ─────────────────────────────────────
@@ -5692,15 +4981,20 @@ async fn client_disconnect_run_still_finalizes() {
 /// Ordinary answers reach the observer without writing a hook projection.
 #[tokio::test]
 async fn hook_db_text_only_skips_writer() {
-    let (app, hook_writer, observer_worker) = build_test_app_with_hooks();
+    let gateway = ProviderGateway::start(vec![ProviderScript::new("hook_db_text_only_skips_writer", |request| primary_request_for(request, "hello"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Hi there!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, hook_writer, observer_worker, _ledger) = build_test_app_with_hooks(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
 
     let events = chat_stream_collect(
         &app,
         json!({
             "message": "hello",
-            "context": {
-                "test_llm_rounds": [{ "full_text": "Hi there!" }]
-            }
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
         }),
     )
     .await;
@@ -5720,79 +5014,54 @@ async fn hook_db_text_only_skips_writer() {
     let requests = observer_worker.requests.lock().await;
     assert_eq!(requests.len(), 1, "observer fired once");
     assert_eq!(requests[0].user_id, USER_ID);
-    assert!(!requests[0].messages.is_empty());
-}
-
-/// Tool selection retains the existing skill-selection record.
-#[tokio::test]
-async fn hook_db_skill_selection_with_tools() {
-    let (app, hook_writer, _observer) = build_test_app_with_hooks();
-
-    let resp = chat_stream_start(
-        &app,
-        json!({
-            "message": "list files",
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [tool_call("tc1", "list_dir", json!({"path": "."}))]
-                    },
-                    { "full_text": "Here are the files." }
-                ],
-                "edge_tools": [tool_schema("list_dir"), tool_schema("read_file")]
-            }
-        }),
-    )
-    .await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    // Deliver tool results for tc1.
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    post_tool_result(&app, "tc1", "file1.txt\nfile2.txt", "completed").await;
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-    assert!(!events.is_empty());
-    let hw = hook_writer.clone();
-    poll_until(
-        || {
-            let hw = hw.clone();
-            async move { !hw.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let plans = hook_writer.plans.lock().await;
-    assert_eq!(plans.len(), 1);
-    let plan = &plans[0];
-
-    let skill = plan
-        .skill_selection
-        .as_ref()
-        .expect("skill_selection present");
-    assert_eq!(skill.skill_name, "list_dir");
-    assert_eq!(skill.selection_method, "llm_tool_choice");
-    assert!(skill.selected_skills.contains(&"list_dir".to_string()));
-    assert_eq!(skill.user_query, "list files");
-    assert_eq!(skill.execution_success, Some(1));
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(
+                |message| message.get("role").and_then(Value::as_str) == Some("user")
+                    && message.get("content").and_then(Value::as_str) == Some("hello")
+            )
+    );
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(
+                |message| message.get("role").and_then(Value::as_str) == Some("assistant")
+                    && message.get("content").and_then(Value::as_str) == Some("Hi there!")
+            )
+    );
+    let text = find_events(&events, "text_delta")
+        .into_iter()
+        .map(|event| event["content"].as_str().unwrap())
+        .collect::<String>();
+    assert_eq!(text, "Hi there!");
+    assert_eq!(find_events(&events, "turn_complete").len(), 1);
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 /// Observer receives correct session_id and turn_count.
 #[tokio::test]
 async fn observer_fired_with_correct_metadata() {
-    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks();
+    let gateway = ProviderGateway::start(vec![ProviderScript::new("observer_fired_with_correct_metadata", |request| primary_request_for(request, "hello"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Hi!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, _hook_writer, observer_worker, _ledger) = build_test_app_with_hooks(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
 
     let events = chat_stream_collect(
         &app,
         json!({
             "message": "hello",
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
             "session_id": "obs-session-123",
-            "context": {
-                "test_llm_rounds": [{ "full_text": "Hi!" }]
-            }
         }),
     )
     .await;
@@ -5814,92 +5083,26 @@ async fn observer_fired_with_correct_metadata() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].session_id, "obs-session-123");
     assert!(requests[0].turn_count >= 1, "at least one turn completed");
-}
-
-/// Multiple tool calls across rounds produce a skill selection with all tool names.
-#[tokio::test]
-async fn hook_db_multiple_tools_selected() {
-    let (app, hook_writer, _observer) = build_test_app_with_hooks();
-
-    // Two rounds of approval-free tools (read_file, list_dir) + final text.
-    let resp = chat_stream_start(
-        &app,
-        json!({
-            "message": "do stuff",
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [
-                            tool_call("tc1", "read_file", json!({"path": "a.txt"}))
-                        ]
-                    },
-                    {
-                        "tool_calls": [
-                            tool_call("tc2", "list_dir", json!({"path": "/src"}))
-                        ]
-                    },
-                    { "full_text": "Done!" }
-                ],
-                "edge_tools": [
-                    tool_schema("read_file"),
-                    tool_schema("list_dir")
-                ]
-            }
-        }),
-    )
-    .await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
-
-    // Deliver tool results for round 1 (tc1).
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    post_tool_result(&app, "tc1", "contents of a.txt", "completed").await;
-
-    // Deliver tool results for round 2 (tc2).
-    wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
-    post_tool_result(&app, "tc2", "main.rs\nlib.rs", "completed").await;
-
-    let events = tokio::time::timeout(std::time::Duration::from_secs(15), reader)
-        .await
-        .expect("stream timed out")
-        .expect("reader task failed");
-    assert!(!events.is_empty());
-
-    // Wait for async persistence.
-    let hw = hook_writer.clone();
-    poll_until(
-        || {
-            let hw = hw.clone();
-            async move { !hw.plans.lock().await.is_empty() }
-        },
-        5,
-    )
-    .await;
-
-    let plans = hook_writer.plans.lock().await;
-    assert_eq!(plans.len(), 1);
-
-    let skill = plans[0].skill_selection.as_ref().expect("skill_selection");
-    // All unique tool names should be captured.
-    assert!(skill.selected_skills.contains(&"read_file".to_string()));
-    assert!(skill.selected_skills.contains(&"list_dir".to_string()));
+    let text = find_events(&events, "text_delta")
+        .into_iter()
+        .map(|event| event["content"].as_str().unwrap())
+        .collect::<String>();
+    assert_eq!(text, "Hi!");
+    assert_eq!(find_events(&events, "turn_complete").len(), 1);
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 #[tokio::test]
-async fn mock_llm_tool_flow_scenario_matrix() {
+async fn edge_callbacks_and_approval_reach_the_same_provider_execution() {
     let cases = [
-        MockToolScenario {
-            name: "text_only",
-            message: "hello".to_string(),
-            edge_tools: vec![],
-            steps: vec![],
-            final_text: "Hi there!",
-            expected_query_fragments: vec![],
-        },
-        MockToolScenario {
+        EdgeCallbackScenario {
             name: "read_file",
             message: "read the README".to_string(),
             edge_tools: vec!["read_file"],
-            steps: vec![MockToolScenarioStep {
+            steps: vec![EdgeCallbackStep {
                 request_id: "tc-matrix-read",
                 tool_name: "read_file",
                 args: json!({"path": "README.md"}),
@@ -5907,13 +5110,12 @@ async fn mock_llm_tool_flow_scenario_matrix() {
                 requires_approval: false,
             }],
             final_text: "Read the README.",
-            expected_query_fragments: vec!["read the README"],
         },
-        MockToolScenario {
+        EdgeCallbackScenario {
             name: "write_file_with_approval",
             message: "create a new file named notes.txt".to_string(),
             edge_tools: vec!["write_file"],
-            steps: vec![MockToolScenarioStep {
+            steps: vec![EdgeCallbackStep {
                 request_id: "tc-matrix-write",
                 tool_name: "write_file",
                 args: json!({"path": "notes.txt", "content": "hello"}),
@@ -5921,13 +5123,12 @@ async fn mock_llm_tool_flow_scenario_matrix() {
                 requires_approval: true,
             }],
             final_text: "Created the file.",
-            expected_query_fragments: vec!["create a new file named notes.txt"],
         },
-        MockToolScenario {
+        EdgeCallbackScenario {
             name: "search_with_grep",
             message: "search the repo for TODO".to_string(),
             edge_tools: vec!["grep"],
-            steps: vec![MockToolScenarioStep {
+            steps: vec![EdgeCallbackStep {
                 request_id: "tc-matrix-grep",
                 tool_name: "grep",
                 args: json!({"pattern": "TODO", "path": "."}),
@@ -5935,49 +5136,20 @@ async fn mock_llm_tool_flow_scenario_matrix() {
                 requires_approval: false,
             }],
             final_text: "Found TODO matches.",
-            expected_query_fragments: vec!["search the repo for TODO"],
         },
-        MockToolScenario {
-            name: "memory_store",
-            message: "记住我喜欢 Rust".to_string(),
-            edge_tools: vec!["memory"],
-            steps: vec![MockToolScenarioStep {
-                request_id: "tc-matrix-mstore",
-                tool_name: "memory",
-                args: json!({"action": "remember", "content": "User likes Rust"}),
-                result_output: "memory stored",
-                requires_approval: false,
-            }],
-            final_text: "I stored that preference.",
-            expected_query_fragments: vec!["记住我喜欢 Rust"],
-        },
-        MockToolScenario {
-            name: "memory_search",
-            message: "我之前说过我喜欢什么语言?".to_string(),
-            edge_tools: vec!["memory"],
-            steps: vec![MockToolScenarioStep {
-                request_id: "tc-matrix-msearch",
-                tool_name: "memory",
-                args: json!({"action": "recall", "query": "preferred language"}),
-                result_output: "User likes Rust",
-                requires_approval: false,
-            }],
-            final_text: "You said you like Rust.",
-            expected_query_fragments: vec!["我之前说过我喜欢什么语言?"],
-        },
-        MockToolScenario {
+        EdgeCallbackScenario {
             name: "multi_tool_batch",
             message: "inspect the project files".to_string(),
             edge_tools: vec!["read_file", "list_dir"],
             steps: vec![
-                MockToolScenarioStep {
+                EdgeCallbackStep {
                     request_id: "tc-matrix-list",
                     tool_name: "list_dir",
                     args: json!({"path": "."}),
                     result_output: "Cargo.toml\nREADME.md",
                     requires_approval: false,
                 },
-                MockToolScenarioStep {
+                EdgeCallbackStep {
                     request_id: "tc-matrix-read-batch",
                     tool_name: "read_file",
                     args: json!({"path": "README.md"}),
@@ -5986,7 +5158,6 @@ async fn mock_llm_tool_flow_scenario_matrix() {
                 },
             ],
             final_text: "Inspected the project files.",
-            expected_query_fragments: vec!["inspect the project files"],
         },
     ];
 
@@ -5995,172 +5166,43 @@ async fn mock_llm_tool_flow_scenario_matrix() {
     // one serial deadline or flooding the shared test executor all at once.
     // Each scenario retains its own event, stream, and persistence deadlines.
     for pair in cases.chunks(2) {
-        futures_util::future::join_all(pair.iter().cloned().map(run_mock_tool_scenario)).await;
+        futures_util::future::join_all(pair.iter().cloned().map(run_tool_scenario)).await;
     }
 }
 
 #[tokio::test]
-async fn mock_llm_memory_followup_preserves_session_binding_without_observer_relearning() {
-    let (app, hook_writer, observer_worker) = build_test_app_with_hooks();
-    let sid = format!("memory-state-{}", uuid::Uuid::new_v4());
-
-    let store_events = execute_mock_tool_turn(
-        &app,
-        json!({
-            "session_id": &sid,
-            "message": "记住我喜欢 Rust",
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [tool_call(
-                            "tc-memory-store",
-                            "memory",
-                            json!({"action": "remember", "content": "User likes Rust"})
-                        )]
-                    },
-                    { "full_text": "我记住了你的偏好。" }
-                ],
-                "edge_tools": [tool_schema("memory")]
-            }
-        }),
-        "memory_store_turn",
-        &[MockToolScenarioStep {
-            request_id: "tc-memory-store",
-            tool_name: "memory",
-            args: json!({"action": "remember", "content": "User likes Rust"}),
-            result_output: "memory stored",
-            requires_approval: false,
-        }],
-        "我记住了你的偏好。",
-    )
-    .await;
-    assert_eq!(
-        find_event(&store_events, "session_info").and_then(|event| event["session_id"].as_str()),
-        Some(sid.as_str())
-    );
-
-    let search_events = execute_mock_tool_turn(
-        &app,
-        json!({
-            "session_id": &sid,
-            "message": "我刚才让你记住了什么?",
-            "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [tool_call(
-                            "tc-memory-search",
-                            "memory",
-                            json!({"action": "recall", "query": "latest remembered preference"})
-                        )]
-                    },
-                    { "full_text": "你刚才让我记住你喜欢 Rust。" }
-                ],
-                "edge_tools": [tool_schema("memory")]
-            }
-        }),
-        "memory_search_turn",
-        &[MockToolScenarioStep {
-            request_id: "tc-memory-search",
-            tool_name: "memory",
-            args: json!({"action": "recall", "query": "latest remembered preference"}),
-            result_output: "User likes Rust",
-            requires_approval: false,
-        }],
-        "你刚才让我记住你喜欢 Rust。",
-    )
-    .await;
-    assert_eq!(
-        find_event(&search_events, "session_info").and_then(|event| event["session_id"].as_str()),
-        Some(sid.as_str())
-    );
-
-    let hw = hook_writer.clone();
-    poll_until(
-        move || {
-            let hw = hw.clone();
-            async move { hw.plans.lock().await.len() >= 2 }
-        },
-        5,
-    )
-    .await;
-
-    let requests = observer_worker.requests.lock().await;
-    // Memory operations are already handled by the dedicated memory tool.
-    // Sending their user-turn segments to the cross-session observer would
-    // re-learn the request, tool result, and confirmation as new knowledge.
-    // Keep this at zero so the test protects the shared anti-feedback-loop
-    // boundary while the hook assertions below prove both turns stayed
-    // durable and attributable to this session.
-    assert!(
-        requests.is_empty(),
-        "structural memory operation turns must not reach the observer"
-    );
-    drop(requests);
-
-    let hook_plans = hook_writer.plans.lock().await;
-    assert_eq!(hook_plans.len(), 2, "expected one hook persist per turn");
-    let store_skill = hook_plans[0]
-        .skill_selection
-        .as_ref()
-        .expect("store turn skill selection");
-    assert_eq!(store_skill.session_id, sid);
-    assert!(store_skill.selected_skills.contains(&"memory".to_string()));
-    assert!(store_skill.user_query.contains("记住我喜欢 Rust"));
-    let search_skill = hook_plans[1]
-        .skill_selection
-        .as_ref()
-        .expect("search turn skill selection");
-    assert_eq!(search_skill.session_id, sid);
-    assert!(search_skill.selected_skills.contains(&"memory".to_string()));
-    assert!(search_skill.user_query.contains("我刚才让你记住了什么?"));
-}
-
-#[tokio::test]
 async fn context_meta_exposes_late_round_guidance_signals() {
-    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
+    let gateway=ProviderGateway::start(vec![ProviderScript::new("context_meta_exposes_late_round_guidance_signals", |request| primary_request_for(request,"inspect the project files"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-guidance-r1", "read_file", json!({"path": "README.md"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-guidance-r2", "list_dir", json!({"path": "."}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-guidance-r3", "grep", json!({"pattern": "TODO", "path": "."}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-guidance-r4", "grep", json!({"pattern": "FIXME", "path": "."}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-guidance-r5", "glob", json!({"pattern": "**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-guidance-r6", "read_file", json!({"path": "src/main.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-guidance-r7", "list_dir", json!({"path": "src"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
+                            tool_call("tc-guidance-r8a", "grep", json!({"pattern": "fn main", "path": "."})),
+                            tool_call("tc-guidance-r8b", "glob", json!({"pattern": "**/*.toml"}))
+                        ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-guidance-r9", "read_file", json!({"path": "Cargo.toml"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Done.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
 
     let resp = chat_stream_start(
         &app,
         json!({
             "message": "inspect the project files",
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
             "execution_budget": {
                 "initial_turns": 10,
                 "hard_turn_limit": 10
             },
             "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [tool_call("tc-guidance-r1", "read_file", json!({"path": "README.md"}))]
-                    },
-                    {
-                        "tool_calls": [tool_call("tc-guidance-r2", "list_dir", json!({"path": "."}))]
-                    },
-                    {
-                        "tool_calls": [tool_call("tc-guidance-r3", "grep", json!({"pattern": "TODO", "path": "."}))]
-                    },
-                    {
-                        "tool_calls": [tool_call("tc-guidance-r4", "grep", json!({"pattern": "FIXME", "path": "."}))]
-                    },
-                    {
-                        "tool_calls": [tool_call("tc-guidance-r5", "glob", json!({"pattern": "**/*.rs"}))]
-                    },
-                    {
-                        "tool_calls": [tool_call("tc-guidance-r6", "read_file", json!({"path": "src/main.rs"}))]
-                    },
-                    {
-                        "tool_calls": [tool_call("tc-guidance-r7", "list_dir", json!({"path": "src"}))]
-                    },
-                    {
-                        "tool_calls": [
-                            tool_call("tc-guidance-r8a", "grep", json!({"pattern": "fn main", "path": "."})),
-                            tool_call("tc-guidance-r8b", "glob", json!({"pattern": "**/*.toml"}))
-                        ]
-                    },
-                    {
-                        "tool_calls": [tool_call("tc-guidance-r9", "read_file", json!({"path": "Cargo.toml"}))]
-                    },
-                    { "full_text": "Done." }
-                ],
                 "edge_tools": [
                     tool_schema("read_file"),
                     tool_schema("list_dir"),
@@ -6187,7 +5229,7 @@ async fn context_meta_exposes_late_round_guidance_signals() {
     ] {
         let request = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
         assert_eq!(request["request_id"].as_str(), Some(id));
-        let status = post_tool_result(&app, id, result, "completed").await;
+        let status = post_tool_result_from_event(&app, &request, result, "completed").await;
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -6216,43 +5258,38 @@ async fn context_meta_exposes_late_round_guidance_signals() {
         guidance_signals["parallel_batching_nudge"].is_boolean(),
         "context_meta should expose the parallel_batching_nudge flag"
     );
-    assert!(
-        guidance_signals["parallel_feedback"].is_boolean(),
-        "context_meta should expose the parallel_feedback flag"
-    );
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 10);
+    assert_eq!(gateway.requests.lock().await.len(), 10);
 }
 
 #[tokio::test]
 async fn analysis_turn_records_circuit_breaker_advisory_without_aborting_repetition() {
-    let (app, _hook_writer, observer_worker) = build_test_app_with_hooks();
+    let gateway=ProviderGateway::start(vec![ProviderScript::new("analysis_turn_records_circuit_breaker_advisory_without_aborting_repetition", |request| primary_request_for(request,"review 最新的commit"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-analysis-r1", "grep", json!({"pattern": "TODO", "path": "src/"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-analysis-r2", "grep", json!({"pattern": "TODO", "path": "src/"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-analysis-r3", "grep", json!({"pattern": "TODO", "path": "src/"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-analysis-r4", "grep", json!({"pattern": "TODO", "path": "src/"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Done reviewing.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, _hook_writer, observer_worker, _ledger) = build_test_app_with_hooks(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
 
     let resp = chat_stream_start(
         &app,
         json!({
             "message": "review 最新的commit",
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
             "execution_budget": {
                 "initial_turns": 20,
                 "hard_turn_limit": 20
             },
             "context": {
-                // Circuit breaker fires after repetition_threshold (3) identical rounds.
-                // Round 4 is served but the post-LLM check aborts when the model
-                // still emits tool calls after the correction was injected.
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [tool_call("tc-analysis-r1", "grep", json!({"pattern": "TODO", "path": "src/"}))]
-                    },
-                    {
-                        "tool_calls": [tool_call("tc-analysis-r2", "grep", json!({"pattern": "TODO", "path": "src/"}))]
-                    },
-                    {
-                        "tool_calls": [tool_call("tc-analysis-r3", "grep", json!({"pattern": "TODO", "path": "src/"}))]
-                    },
-                    {
-                        "tool_calls": [tool_call("tc-analysis-r4", "grep", json!({"pattern": "TODO", "path": "src/"}))]
-                    },
-                    { "full_text": "Done reviewing." }
-                ],
                 "edge_tools": [
                     tool_schema("grep"),
                     tool_schema("list_dir"),
@@ -6282,7 +5319,7 @@ async fn analysis_turn_records_circuit_breaker_advisory_without_aborting_repetit
             .expect("tool_request.request_id")
             .to_string();
         let status =
-            post_tool_result(&app, &request_id, "src/lib.rs:12:// TODO", "completed").await;
+            post_tool_result_from_event(&app, &event, "src/lib.rs:12:// TODO", "completed").await;
         assert_eq!(status, StatusCode::OK);
         callback_request_ids.push(request_id);
     }
@@ -6331,30 +5368,36 @@ async fn analysis_turn_records_circuit_breaker_advisory_without_aborting_repetit
         tool_result_count, 4,
         "circuit-breaker advice must not abort a repeated but otherwise valid tool phase; got {tool_result_count}"
     );
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 5);
+    assert_eq!(gateway.requests.lock().await.len(), 5);
 }
 
 #[tokio::test]
 async fn execution_budget_extends_web_agent_run_when_progress_is_real() {
-    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
+    let gateway=ProviderGateway::start(vec![ProviderScript::new("execution_budget_extends_web_agent_run_when_progress_is_real", |request| primary_request_for(request,"explore the codebase and investigate the root cause"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-r1", "read_file", json!({"path": "src/lib.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Completed after exploratory extension.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
 
     let resp = chat_stream_start(
         &app,
         json!({
             "message": "explore the codebase and investigate the root cause",
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
             "execution_budget": {
                 "initial_turns": 2,
                 "hard_turn_limit": 4
             },
             "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [tool_call("tc-budget-r1", "read_file", json!({"path": "src/lib.rs"}))]
-                    },
-                    {
-                        "tool_calls": [tool_call("tc-budget-r2", "glob", json!({"pattern": "src/**/*.rs"}))]
-                    },
-                    { "full_text": "Completed after exploratory extension." }
-                ],
                 "edge_tools": [
                     tool_schema("read_file"),
                     tool_schema("glob")
@@ -6368,14 +5411,14 @@ async fn execution_budget_extends_web_agent_run_when_progress_is_real() {
     let first = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(first["request_id"].as_str(), Some("tc-budget-r1"));
     assert_eq!(
-        post_tool_result(&app, "tc-budget-r1", "module contents", "completed").await,
+        post_tool_result_from_event(&app, &first, "module contents", "completed").await,
         StatusCode::OK
     );
 
     let second = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(second["request_id"].as_str(), Some("tc-budget-r2"));
     assert_eq!(
-        post_tool_result(&app, "tc-budget-r2", "src/lib.rs\nsrc/main.rs", "completed").await,
+        post_tool_result_from_event(&app, &second, "src/lib.rs\nsrc/main.rs", "completed").await,
         StatusCode::OK
     );
 
@@ -6395,30 +5438,36 @@ async fn execution_budget_extends_web_agent_run_when_progress_is_real() {
         !text.contains("Turn budget exhausted"),
         "extension path should not terminate with exhaustion text: {text}"
     );
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 3);
+    assert_eq!(gateway.requests.lock().await.len(), 3);
 }
 
 #[tokio::test]
 async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
-    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
+    let gateway=ProviderGateway::start(vec![ProviderScript::new("execution_budget_hard_limit_stops_web_agent_run_even_with_progress", |request| primary_request_for(request,"explore the codebase and investigate the root cause"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r1", "read_file", json!({"path": "src/lib.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-hard-limit-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Final answer after the hard limit.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
 
     let resp = chat_stream_start(
         &app,
         json!({
             "message": "explore the codebase and investigate the root cause",
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
             "execution_budget": {
                 "initial_turns": 2,
                 "hard_turn_limit": 2
             },
             "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [tool_call("tc-hard-limit-r1", "read_file", json!({"path": "src/lib.rs"}))]
-                    },
-                    {
-                        "tool_calls": [tool_call("tc-hard-limit-r2", "glob", json!({"pattern": "src/**/*.rs"}))]
-                    },
-                    { "full_text": "Final answer after the hard limit." }
-                ],
                 "edge_tools": [
                     tool_schema("read_file"),
                     tool_schema("glob")
@@ -6427,12 +5476,19 @@ async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
         }),
     )
     .await;
-    let (mut rx, reader) = spawn_sse_reader(resp.into_body()).await;
+    let raw_wire = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let capture = raw_wire.clone();
+    let body = Body::from_stream(resp.into_body().into_data_stream().inspect(move |chunk| {
+        if let Ok(bytes) = chunk {
+            capture.lock().unwrap().extend_from_slice(bytes);
+        }
+    }));
+    let (mut rx, reader) = spawn_sse_reader(body).await;
 
     let first = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(first["request_id"].as_str(), Some("tc-hard-limit-r1"));
     assert_eq!(
-        post_tool_result(&app, "tc-hard-limit-r1", "module contents", "completed").await,
+        post_tool_result_from_event(&app, &first, "module contents", "completed").await,
         StatusCode::OK
     );
 
@@ -6440,6 +5496,58 @@ async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
         .await
         .expect("stream timed out")
         .expect("reader task failed");
+    let wire = String::from_utf8(raw_wire.lock().unwrap().clone()).unwrap();
+    let interrupted = events
+        .iter()
+        .position(|event| event["type"] == "run_interrupted")
+        .expect("typed interruption");
+    let finished = events
+        .iter()
+        .position(|event| event["type"] == "run_finished")
+        .expect("durable terminal");
+    let complete = events
+        .iter()
+        .position(|event| event["type"] == "turn_complete")
+        .expect("authoritative completion");
+    assert!(interrupted < finished && finished < complete);
+    assert_eq!(events[interrupted]["kind"], "budget_exhausted");
+    assert_eq!(events[complete]["continuation_owner"], "server");
+    assert_eq!(events[complete]["interruption"]["kind"], "budget_exhausted");
+    assert_eq!(wire.matches("data: [DONE]\n\n").count(), 1);
+    let mut accum = ChatTurnSseAccum::default();
+    let mut edge_pending = Vec::new();
+    for block in wire.split("\n\n").filter(|block| !block.is_empty()) {
+        dispatch_chat_turn_sse_event_block(block, &mut accum, &mut edge_pending);
+    }
+    assert!(accum.server_loop_terminal);
+    assert_eq!(accum.error_kind, None);
+    let summary = accum
+        .server_execution_summary
+        .expect("CLI accepts the actual paused summary");
+    assert_eq!(summary.llm_rounds, 3);
+    let feedback = summary
+        .runtime_feedback
+        .expect("actual provider execution supplies runtime feedback");
+    assert_eq!(
+        feedback.identity.run_id,
+        find_event(&events, "session_info").unwrap()["run_id"]
+            .as_str()
+            .unwrap()
+    );
+    assert_eq!(feedback.progress.llm_rounds_completed, 3);
+    assert_eq!(feedback.progress.slice_rounds_remaining, 0);
+    assert_eq!(feedback.progress.absolute_round_ceiling, Some(2));
+    let accounted = feedback
+        .run_usage
+        .expect("settled provider attempts retain their usage");
+    assert_eq!(accounted.prompt, 126);
+    assert_eq!(accounted.completion, 21);
+    let root = find_event(&events, "session_info").unwrap()["run_id"]
+        .as_str()
+        .unwrap();
+    let (status, durable) = get_run_status(&app, root).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(durable["status"], "paused");
     let text: String = find_events(&events, "text_delta")
         .into_iter()
         .filter_map(|event| event["content"].as_str().map(str::to_string))
@@ -6490,56 +5598,36 @@ async fn execution_budget_hard_limit_stops_web_agent_run_even_with_progress() {
     assert_eq!(run_finished["status"], "paused");
     assert_eq!(run_finished["interruption_kind"], "budget_exhausted");
     assert_eq!(run_finished["resumable"], true);
-}
 
-#[tokio::test]
-async fn web_agent_stream_emits_plain_final_text_once() {
-    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
-
-    let events = chat_stream_collect(
-        &app,
-        json!({
-            "message": "answer directly",
-            "context": {
-                "test_llm_rounds": [{ "full_text": "Single final answer." }]
-            }
-        }),
-    )
-    .await;
-
-    let text_events = find_events(&events, "text_delta");
-    let exact_matches = text_events
-        .iter()
-        .filter(|event| event["content"].as_str() == Some("Single final answer."))
-        .count();
-    assert_eq!(
-        exact_matches, 1,
-        "plain final answer should stream exactly once, got events: {text_events:?}"
-    );
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 3);
+    assert_eq!(gateway.requests.lock().await.len(), 3);
 }
 
 #[tokio::test]
 async fn web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end() {
-    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
+    let gateway=ProviderGateway::start(vec![ProviderScript::new("web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end", |request| primary_request_for(request,"explore the codebase and investigate the root cause"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-fail-r1", "read_file", json!({"path": "src/lib.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[tool_call("tc-budget-fail-r2", "glob", json!({"pattern": "src/**/*.rs"}))]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),
+ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Edge operations returned partial failure and denial.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
 
     let resp = chat_stream_start(
         &app,
         json!({
             "message": "explore the codebase and investigate the root cause",
+        "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
             "execution_budget": {
                 "initial_turns": 2,
                 "hard_turn_limit": 4
             },
             "context": {
-                "test_llm_rounds": [
-                    {
-                        "tool_calls": [tool_call("tc-budget-fail-r1", "read_file", json!({"path": "src/lib.rs"}))]
-                    },
-                    {
-                        "tool_calls": [tool_call("tc-budget-fail-r2", "glob", json!({"pattern": "src/**/*.rs"}))]
-                    },
-                    { "full_text": "Should never run." }
-                ],
                 "edge_tools": [
                     tool_schema("read_file"),
                     tool_schema("glob")
@@ -6553,20 +5641,15 @@ async fn web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end() {
     let first = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(first["request_id"].as_str(), Some("tc-budget-fail-r1"));
     assert_eq!(
-        post_tool_result(
-            &app,
-            "tc-budget-fail-r1",
-            "transient read failure",
-            "partial_failure"
-        )
-        .await,
+        post_tool_result_from_event(&app, &first, "transient read failure", "partial_failure")
+            .await,
         StatusCode::OK
     );
 
     let second = wait_for_sse(&mut rx, "tool_request", E2E_WAIT_TIMEOUT_SECS).await;
     assert_eq!(second["request_id"].as_str(), Some("tc-budget-fail-r2"));
     assert_eq!(
-        post_tool_result(&app, "tc-budget-fail-r2", "permission denied", "denied").await,
+        post_tool_result_from_event(&app, &second, "permission denied", "denied").await,
         StatusCode::OK
     );
 
@@ -6590,19 +5673,29 @@ async fn web_agent_stream_preserves_failed_edge_statuses_in_tool_call_end() {
             .any(|result| result.contains("status=denied")),
         "expected denied tool result in SSE stream, got: {tool_end_results:?}"
     );
+
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 3);
+    assert_eq!(gateway.requests.lock().await.len(), 3);
 }
 
 #[tokio::test]
 async fn context_meta_exposes_memory_signal_context_flag() {
-    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
+    let gateway = ProviderGateway::start(vec![ProviderScript::new("context_meta_exposes_memory_signal_context_flag", |request| primary_request_for(request, "remember that I prefer dark mode"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Stored."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
 
     let events = chat_stream_collect(
         &app,
         json!({
             "message": "remember that I prefer dark mode",
-            "context": {
-                "test_llm_rounds": [{ "full_text": "Stored." }]
-            }
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
         }),
     )
     .await;
@@ -6628,22 +5721,39 @@ async fn context_meta_exposes_memory_signal_context_flag() {
             .is_boolean(),
         "context_meta should expose the other context flags as structured booleans"
     );
+    let text = find_events(&events, "text_delta")
+        .into_iter()
+        .map(|event| event["content"].as_str().unwrap())
+        .collect::<String>();
+    assert_eq!(text, "Stored.");
+    assert_eq!(find_events(&events, "turn_complete").len(), 1);
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 #[tokio::test]
 async fn context_meta_exposes_builder_supplied_context_signals() {
-    let (app, _hook_writer, _observer) = build_test_app_with_hooks();
+    let gateway = ProviderGateway::start(vec![ProviderScript::new("context_meta_exposes_builder_supplied_context_signals", |request| primary_request_for(request, "remember that I prefer dark mode"), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Stored."},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
+    let inference = InferenceLedgerFixture::default();
+    let (app, _hook_writer, _observer, _ledger) = build_test_app_with_hooks(
+        Arc::new(TestModelService {
+            judgment_base_url: Some(format!("{}/v1", gateway.base_url)),
+        }),
+        Some(&inference),
+    );
 
     let events = chat_stream_collect(
         &app,
         json!({
             "message": "remember that I prefer dark mode",
+            "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
             "context": {
                 "edge_profile": {
                     "active_skills": ["concise"],
                     "system_prompt_override": "You are operating under a delegated reviewer contract."
-                },
-                "test_llm_rounds": [{ "full_text": "Stored." }]
+                }
             }
         }),
     )
@@ -6660,6 +5770,16 @@ async fn context_meta_exposes_builder_supplied_context_signals() {
         Some(true),
         "server loop context_meta must report edge_profile.system_prompt_override"
     );
+    let text = find_events(&events, "text_delta")
+        .into_iter()
+        .map(|event| event["content"].as_str().unwrap())
+        .collect::<String>();
+    assert_eq!(text, "Stored.");
+    assert_eq!(find_events(&events, "turn_complete").len(), 1);
+    gateway.assert_complete();
+    inference.assert_quiescent();
+    assert_eq!(inference.attempt_count(), 1);
+    assert_eq!(gateway.requests.lock().await.len(), 1);
 }
 
 /// Regression: `model` override must not break requests carrying `active_skills`.
@@ -6671,23 +5791,21 @@ async fn context_meta_exposes_builder_supplied_context_signals() {
 /// invocation. This test guards the request/event flow from model-override drift.
 #[tokio::test]
 async fn context_meta_active_skills_survive_model_override() {
-    // Guard against hangs from deadlocked channels or unresponsive mock paths:
-    // mock tests should complete in milliseconds; 30s is a generous ceiling
-    // that still prevents CI from hanging indefinitely on a regression.
+    // Bound the real provider request and complete Server execution.
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         init_env();
-        let (app, _hook_writer, _observer) = build_test_app_with_hooks();
+        let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("context_meta_active_skills_survive_model_override", |request| request.path == "/v1/chat/completions" && request.body["model"] == "MiniMax-M2.7" && request.body["stream"] == true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|value| value["role"] == "user" && value["content"] == "help me review")), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
         let events = chat_stream_collect(
             &app,
             json!({
                 "message": "help me review",
+                "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
                 "model_selection": { "offering_id": "model-MiniMax-M2.7" },
                 "context": {
                     "edge_profile": {
                         "active_skills": ["concise", "markdown"]
-                    },
-                    "test_llm_rounds": [{ "full_text": "ok" }]
+                    }
                 }
             }),
         )
@@ -6709,6 +5827,15 @@ async fn context_meta_active_skills_survive_model_override() {
             !turn_complete.is_empty(),
             "turn must complete with model_override + active_skills"
         );
+        let text = find_events(&events, "text_delta").into_iter().map(|event| event["content"].as_str().unwrap()).collect::<String>();
+        assert_eq!(text, "ok");
+        assert_eq!(turn_complete.len(), 1);
+        gateway.assert_complete();
+        inference.assert_quiescent();
+        assert_eq!(inference.attempt_count(), 1);
+        let requests = gateway.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+
     })
     .await
     .expect("context_meta_active_skills_survive_model_override exceeded 30s timeout — likely a hang regression");
@@ -6720,22 +5847,20 @@ async fn context_meta_active_skills_survive_model_override() {
 /// tokens; actual skill resolution remains owned by the skill invocation path.
 #[tokio::test]
 async fn context_meta_surfaces_unknown_active_skills_for_debugging() {
-    // Guard against hangs from deadlocked channels or unresponsive mock paths:
-    // mock tests should complete in milliseconds; 30s is a generous ceiling
-    // that still prevents CI from hanging indefinitely on a regression.
+    // Bound the real provider request and complete Server execution.
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         init_env();
-        let (app, _hook_writer, _observer) = build_test_app_with_hooks();
+        let (app, gateway, inference) = build_native_test_app(vec![ProviderScript::new("context_meta_surfaces_unknown_active_skills_for_debugging", |request| request.path == "/v1/chat/completions" && request.body["model"] == "test-model" && request.body["stream"] == true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|value| value["role"] == "user" && value["content"] == "test")), vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
 
         let events = chat_stream_collect(
             &app,
             json!({
                 "message": "test",
+                "execution_policy": {"turn_intent":"fixed_default", "skill_auto_route":"disabled"},
                 "context": {
                     "edge_profile": {
                         "active_skills": ["totally-nonexistent-skill-xyz"]
-                    },
-                    "test_llm_rounds": [{ "full_text": "ok" }]
+                    }
                 }
             }),
         )
@@ -6756,224 +5881,17 @@ async fn context_meta_surfaces_unknown_active_skills_for_debugging() {
             !turn_complete.is_empty(),
             "turn must complete even with unknown active_skills"
         );
+        let text = find_events(&events, "text_delta").into_iter().map(|event| event["content"].as_str().unwrap()).collect::<String>();
+        assert_eq!(text, "ok");
+        assert_eq!(turn_complete.len(), 1);
+        gateway.assert_complete();
+        inference.assert_quiescent();
+        assert_eq!(inference.attempt_count(), 1);
+        let requests = gateway.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        let system = requests[0].body["messages"].as_array().unwrap().iter().filter(|value| value["role"] == "system").map(|value| value["content"].to_string()).collect::<String>();
+        assert!(!system.contains("totally-nonexistent-skill-xyz"));
     })
     .await
     .expect("context_meta_surfaces_unknown_active_skills_for_debugging exceeded 30s timeout — likely a hang regression");
-}
-
-/// Realistic production-like scenario mirroring the reported "session 9474cce1"
-/// case: a MiniMax-M2.7 request with `model_override` set, multiple
-/// `active_skills` pinned in `edge_profile`, AND the model actively invoking
-/// the `skill` tool mid-conversation. The original report conflated two
-/// distinct things ("skill lost" vs "model manually re-loads skill each turn")
-/// — this test pins the *actual* invariants so future regressions are caught
-/// without needing to reproduce the full session.
-///
-/// What this scenario exercises in one turn:
-///   1. `model` override is set (routing metadata will be marked "skipped")
-///   2. Two `active_skills` names are carried as runtime metadata only
-///   3. Model calls the `skill` tool to load a different skill mid-turn
-///   4. Resolved skill instructions flow back as a tool_result
-///   5. Model continues and produces final answer
-///
-/// Asserts:
-///   * `context_meta` remains available with model override and runtime metadata.
-///   * Skill tool call does NOT escape as an edge `tool_request`.
-///   * The intercepted skill instructions appear in the observer's
-///     follow-up round so the model can actually act on them.
-///   * Exactly one `turn_complete` — skill interception must not double-count.
-///   * Final text_delta present — the turn actually completes end-to-end.
-#[tokio::test]
-async fn complex_scenario_model_override_plus_active_skills_plus_skill_invocation() {
-    // Guard against hangs from deadlocked channels or unresponsive mock paths:
-    // mock tests should complete in milliseconds; 30s is a generous ceiling
-    // that still prevents CI from hanging indefinitely on a regression.
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        init_env();
-        let (app, _hook_writer, observer_worker) = build_test_app_with_hooks_and_skills();
-
-        let payload = json!({
-            "message": "Review this commit under the pinned output skills.",
-            "model_selection": { "offering_id": "model-MiniMax-M2.7" },
-            "context": {
-                "edge_profile": {
-                    "active_skills": ["concise", "markdown"],
-                    "cwd": "/workspace/astra",
-                    "git_branch": "main"
-                },
-                "test_llm_rounds": [
-                    // Round 1: model invokes the skill tool, loading test-skill
-                    // (which exists in TestSkillService, served via get_skill).
-                    {
-                        "tool_calls": [
-                            tool_call("tc-complex-1", "skill", json!({"skill_name": "test-skill"}))
-                        ]
-                    },
-                    // Round 2: model consumes resolved instructions and produces answer
-                    { "full_text": "Reviewed per test-skill instructions; concise markdown output." }
-                ]
-            }
-        });
-
-        let events = chat_stream_collect(&app, payload).await;
-
-        // ── Invariant 1: context_meta is emitted even with model_override ──
-        // With pipeline-based assembly, context_signals and skills_injected
-        // are not individually populated in the breakdown. Verify that
-        // context_meta is emitted and the turn proceeds.
-        let context_metas = find_events(&events, "context_meta");
-        assert!(
-            !context_metas.is_empty(),
-            "context_meta with active_output_skills must fire"
-        );
-
-        // ── Invariant 2: skill tool call is intercepted, not leaked to edge ──
-        let tool_reqs = find_events(&events, "tool_request");
-        assert!(
-            tool_reqs
-                .iter()
-                .all(|r| r["tool"].as_str() != Some("skill")),
-            "skill tool call must be intercepted, never emitted as edge tool_request"
-        );
-
-        // ── Invariant 3: resolved instructions reach the next LLM round ──
-        let ow = observer_worker.clone();
-        poll_until(
-            || {
-                let ow = ow.clone();
-                async move { !ow.requests.lock().await.is_empty() }
-            },
-            5,
-        )
-        .await;
-
-        let requests = observer_worker.requests.lock().await;
-        let follow_up = requests
-            .first()
-            .expect("observer must receive the follow-up round");
-        let tool_result_content = follow_up
-            .messages
-            .iter()
-            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("tc-complex-1"))
-            .and_then(|m| m.get("content").and_then(Value::as_str))
-            .expect("tool_result for the skill call must be in the next-round messages");
-        assert!(
-            tool_result_content.contains("You are the test skill"),
-            "resolved instructions body missing from follow-up round: {tool_result_content}"
-        );
-        assert!(
-            tool_result_content.contains("<skill-loaded name=\"test-skill\"/>"),
-            "skill-loaded marker missing from follow-up round"
-        );
-
-        // ── Invariant 4: exactly one turn_complete for this user message ──
-        let turn_completes = find_events(&events, "turn_complete");
-        assert_eq!(
-            turn_completes.len(),
-            1,
-            "one user message -> exactly one turn_complete, got {}",
-            turn_completes.len()
-        );
-
-        // ── Invariant 5: final answer reaches the client ──
-        let text_deltas = find_events(&events, "text_delta");
-        let final_text = text_deltas.iter().any(|e| {
-            e["content"]
-                .as_str()
-                .map(|c| c.contains("Reviewed per test-skill"))
-                .unwrap_or(false)
-        });
-        assert!(
-            final_text,
-            "final answer from round 2 must appear in text_delta stream"
-        );
-    })
-    .await
-    .expect("complex_scenario_model_override_plus_active_skills_plus_skill_invocation exceeded 30s timeout — likely a hang regression");
-}
-
-/// Multi-turn variant of the complex scenario: same `session_id` across two
-/// user messages, both under `model_override` with `active_skills` pinned.
-/// Catches drift in cross-turn invariants that the single-turn test can't:
-///   * Does runtime skill metadata remain accepted in BOTH turns?
-///   * Does `state.skills.invoked` persist across the turn boundary so the
-///     model doesn't need to re-load the same skill?
-///
-/// If this ever starts failing with "skill disappeared in turn 2", that
-/// directly reproduces one class of the original session 9474cce1 report.
-#[tokio::test]
-async fn complex_scenario_multi_turn_preserves_active_skills_and_invoked_state() {
-    // Guard against hangs from deadlocked channels or unresponsive mock paths:
-    // mock tests should complete in milliseconds; 30s is a generous ceiling
-    // that still prevents CI from hanging indefinitely on a regression.
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        init_env();
-        let (app, _hook_writer, _observer) = build_test_app_with_hooks_and_skills();
-        let sid = format!("complex-multi-{}", uuid::Uuid::new_v4());
-
-        // ── Turn 1: model loads the skill ──
-        let events_t1 = chat_stream_collect(
-            &app,
-            json!({
-                "session_id": &sid,
-                "message": "first request: use test-skill",
-                "model_selection": { "offering_id": "model-MiniMax-M2.7" },
-                "context": {
-                    "edge_profile": {
-                        "active_skills": ["concise"]
-                    },
-                    "test_llm_rounds": [
-                        {
-                            "tool_calls": [
-                                tool_call("tc-mt-1", "skill", json!({"skill_name": "test-skill"}))
-                            ]
-                        },
-                        { "full_text": "Turn 1 done." }
-                    ]
-                }
-            }),
-        )
-        .await;
-
-        // Turn 1: context_meta must be emitted
-        // With pipeline-based assembly, context_signals are not individually
-        // populated. Verify context_meta is present and turn completes.
-        let cm_t1 = find_events(&events_t1, "context_meta");
-        assert!(
-            !cm_t1.is_empty(),
-            "turn 1: context_meta must be emitted"
-        );
-
-        // ── Turn 2: same session, different question ──
-        let events_t2 = chat_stream_collect(
-            &app,
-            json!({
-                "session_id": &sid,
-                "message": "second request: keep the pinned skill",
-                "model_selection": { "offering_id": "model-MiniMax-M2.7" },
-                "context": {
-                    "edge_profile": {
-                        "active_skills": ["concise"]
-                    },
-                    "test_llm_rounds": [
-                        { "full_text": "Turn 2 done." }
-                    ]
-                }
-            }),
-        )
-        .await;
-
-        // Turn 2 must also emit context_meta — verifying cross-turn persistence.
-        let cm_t2 = find_events(&events_t2, "context_meta");
-        assert!(
-            !cm_t2.is_empty(),
-            "turn 2: context_meta must still be emitted (cross-turn persistence)"
-        );
-
-        // Both turns completed cleanly
-        assert_eq!(find_events(&events_t1, "turn_complete").len(), 1);
-        assert_eq!(find_events(&events_t2, "turn_complete").len(), 1);
-    })
-    .await
-    .expect("complex_scenario_multi_turn_preserves_active_skills_and_invoked_state exceeded 30s timeout — likely a hang regression");
 }

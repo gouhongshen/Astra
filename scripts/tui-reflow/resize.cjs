@@ -12,7 +12,7 @@ const { Terminal } = require('@xterm/headless');
 const binary = path.resolve(process.env.ASTRA_TEST_BINARY || '../../target/debug/astra');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function journey(sizes, draft = false, rapid = false) {
+async function journey(sizes, draft = false, rapid = false, displacedCursor = false, expiredReply = false) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'astra-reflow-'));
   const terminal = new Terminal({ cols: 100, rows: 30, scrollback: 2000, allowProposedApi: true });
   const child = spawn('python3', ['-u', path.join(__dirname, 'pty_bridge.py'), binary, root], {
@@ -20,11 +20,15 @@ async function journey(sizes, draft = false, rapid = false) {
   });
   const exited = once(child, 'exit');
   const trace = [];
+  const started = Date.now();
   let tracingResize = false;
   let cursorReports = 0;
   let holdCursorReply = false;
   let heldCursorReply;
-  const send = message => child.stdin.write(JSON.stringify(message) + '\n');
+  const send = message => {
+    if (tracingResize) snapshot('send ' + JSON.stringify(message));
+    child.stdin.write(JSON.stringify(message) + '\n');
+  };
   terminal.onData(input => {
     if (/\x1b\[\d+;\d+R/.test(input)) cursorReports++;
     if (tracingResize) snapshot('reply ' + JSON.stringify(input));
@@ -40,10 +44,21 @@ async function journey(sizes, draft = false, rapid = false) {
     }
   });
   let writes = Promise.resolve();
+  let pendingResize = null;
   let lastOutput = Date.now();
   const output = [];
   readline.createInterface({ input: child.stdout }).on('line', line => {
-    const data = Buffer.from(JSON.parse(line).data, 'base64');
+    const message = JSON.parse(line);
+    if (message.resize) {
+      const applyResize = pendingResize;
+      writes = writes.then(() => {
+        // A timed-out request has already failed; its late ACK must not
+        // replace that failure or interfere with cleanup/a later request.
+        if (applyResize && pendingResize === applyResize) return applyResize(message.resize);
+      });
+      return;
+    }
+    const data = Buffer.from(message.data, 'base64');
     output.push(data);
     lastOutput = Date.now();
     writes = writes.then(() => new Promise(resolve => terminal.write(data, resolve))).then(() => {
@@ -56,9 +71,35 @@ async function journey(sizes, draft = false, rapid = false) {
   };
   function snapshot(label) {
     const b = terminal.buffer.active;
-    trace.push({label, size: [terminal.cols, terminal.rows], base: b.baseY,
+    trace.push({label, elapsedMs: Date.now() - started, size: [terminal.cols, terminal.rows], base: b.baseY,
       cursor: [b.cursorX, b.cursorY],
-      ui: lines().map((v, row) => ({row, v})).filter(x => /Message Astra|resize-model.*Ask/.test(x.v))});
+      ui: lines().map((v, row) => ({row, v})).filter(x => /DRAFT_SENTINEL|Message Astra|resize-model.*Ask/.test(x.v))});
+  }
+  async function resize(cols, rows, displaceCursor = false) {
+    assert.equal(pendingResize, null, 'only one PTY resize may be outstanding');
+    let timer;
+    try {
+      await new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('PTY resize was not acknowledged')), 15000);
+        pendingResize = async size => {
+          try {
+            assert.deepEqual(size, [cols, rows]);
+            // Apply geometry in the same ordered stream as output. A DSR
+            // must not observe the new emulator size before TIOCSWINSZ, or
+            // an old output chunk after geometry from a later command.
+            terminal.resize(cols, rows);
+            if (displaceCursor) {
+              await new Promise(done => terminal.write('\x1b[2B', done));
+            }
+            resolve();
+          } catch (error) { reject(error); }
+        };
+        send({ resize: [cols, rows] });
+      });
+    } finally {
+      clearTimeout(timer);
+      pendingResize = null;
+    }
   }
   async function waitFor(predicate) {
     const deadline = Date.now() + 15000;
@@ -103,12 +144,46 @@ async function journey(sizes, draft = false, rapid = false) {
       await settle();
     }
     check('initial 100x30');
+    if (expiredReply) {
+      tracingResize = true;
+      holdCursorReply = true;
+      const before = cursorReports;
+      await resize(expiredReply === 'width' ? 40 : 100, 15);
+      await waitFor(() => cursorReports > before);
+      const expired = heldCursorReply;
+      if (expiredReply === 'width') await settle();
+      await resize(100, 30);
+      // Outlast the query deadline. A terminal with no response must remain
+      // usable, but another indistinguishable DSR must not overlap this one.
+      await settle();
+      send({ input: '\x1b[200~ PENDING_INPUT\x1b[201~' });
+      if (expiredReply !== 'width') await waitFor(() => lines().join('').includes('PENDING_INPUT'));
+      await settle();
+      assert.equal(cursorReports, before + 1, 'issued another cursor query before the expired reply was consumed');
+      if (expiredReply === 'width') {
+        assert.equal(lines().filter(line => line.includes('Workspace trusted')).length, 1,
+          'width query timeout erased committed history:\n' + lines().join('\n'));
+      } else {
+        check('cursor reply deadline; paste remains responsive');
+      }
+      holdCursorReply = false;
+      send({ input: expired });
+      send({ input: '\x1b[200~ RECOVERED_INPUT\x1b[201~' });
+      await waitFor(() => lines().join('').includes('RECOVERED_INPUT'));
+      await resize(160, 30);
+      await waitFor(() => cursorReports > before + 1);
+      await settle();
+      assert(lines().join('').includes('PENDING_INPUT'), 'input was lost during cursor reply quarantine');
+      check('late cursor reply quarantined; fresh resize recovered');
+      return;
+    }
     tracingResize = rapid;
     for (const [index, [cols, rows]] of sizes.entries()) {
       const reportsBeforeResize = cursorReports;
       if (rapid && index === 0) holdCursorReply = true;
-      terminal.resize(cols, rows);
-      send({ resize: [cols, rows] });
+      // Apply the final cursor displacement before ACK-following output can
+      // issue a query, rather than depending on the JavaScript continuation.
+      await resize(cols, rows, displacedCursor && index === sizes.length - 1);
       if (rapid) snapshot('resize');
       if (rapid && index === 1) {
         holdCursorReply = false;
@@ -128,7 +203,7 @@ async function journey(sizes, draft = false, rapid = false) {
     }
     if (rapid) {
       await settle();
-      check('rapid resize round trips');
+      check(displacedCursor ? 'rapid resize with cursor displacement' : 'rapid resize round trips');
     }
   } catch (error) {
     if (rapid) console.error(JSON.stringify(trace, null, 2));
@@ -149,4 +224,7 @@ async function journey(sizes, draft = false, rapid = false) {
   const rapidSizes = Array.from({ length: 3 }, () => [[40, 30], [160, 30], [100, 15], [100, 30]]).flat();
   await journey(rapidSizes, false, true);
   await journey(rapidSizes, true, true);
+  await journey(rapidSizes, true, true, true);
+  await journey([], true, true, false, true);
+  await journey([], true, true, false, 'width');
 })().catch(error => { console.error(error); process.exitCode = 1; });

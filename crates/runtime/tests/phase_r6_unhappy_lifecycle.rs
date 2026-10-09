@@ -1,286 +1,144 @@
-//! Item 3 of the consolidated sweep — LLM-misbehavior tripwires on the
-//! unhappy path. Each scenario pins the current resolution behavior so
-//! that a future regression (panic, stall, or silent data loss) becomes
-//! a test failure rather than a production outage.
-//!
-//! Adversarial posture: assertions walk tool_call and history shape
-//! explicitly. We do NOT use substring `.contains()` on rendered text;
-//! we parse and count fields.
-
+//! Misbehaving provider responses through real parsing, admission and recovery.
 #![cfg(feature = "e2e-hooks")]
 
-use std::sync::Arc;
-
-use astra_runtime::server::server_loop_host::ServerAgenticLoopHostBuilder;
-use astra_runtime::turn::agentic_loop::host::make_test_loop_state;
-use astra_runtime::{FernetTokenEncryptor, MatrixOneSettings};
+use astra_runtime::server::provider_test_support::{
+    InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+    bind_server_workspace, loop_state, server_host_builder,
+};
+use astra_runtime::server::tool_transport::{
+    ExecutionBindingSnapshot, ExecutorBinding, WorkspaceBinding,
+};
+use astra_runtime::turn::agentic_loop::finalization::run_agentic_loop_with_host;
 use serde_json::{Value, json};
 
-const VALID_FERNET_KEY: &str = "cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=";
-
-fn mock_matrixone() -> MatrixOneSettings {
-    MatrixOneSettings::mock()
-}
-
-fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
-    Arc::new(FernetTokenEncryptor::new(VALID_FERNET_KEY).unwrap())
-}
-
-fn sample_tools() -> Vec<Value> {
-    vec![json!({
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "read a file",
-            "parameters": {
-                "type": "object",
-                "properties": { "path": { "type": "string" } },
-                "required": ["path"],
-            },
-        }
-    })]
-}
-
-fn usage() -> Value {
-    json!({
-        "prompt_tokens": 10,
-        "completion_tokens": 5,
-        "cache_read_tokens": 0,
-        "cache_creation_tokens": 0,
-    })
-}
-
-fn build_host(
-    rounds: Vec<Value>,
-) -> astra_runtime::server::server_loop_host::ServerAgenticLoopHost {
-    ServerAgenticLoopHostBuilder::new(
-        mock_matrixone(),
-        mock_encryptor(),
-        "u".to_string(),
-        "s".to_string(),
+async fn recover_from_call(
+    name: &str,
+    arguments: &str,
+    preliminary_text: &str,
+) -> (Vec<Value>, Vec<Value>) {
+    let workspace = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        workspace.path().join("evidence.txt"),
+        "unchanged evidence\n",
     )
-    .with_edge_tools(sample_tools())
-    .with_test_llm_rounds(rounds)
-    .with_mock_provider("openai", "gpt-4o")
-    .build()
+    .unwrap();
+    let gateway = ProviderGateway::start(vec![ProviderScript::new("primary recovery", |r| r.path == "/v1/chat/completions" && r.body["model"] == "provider-fixture-model", vec![
+        ProviderResponse::OpenAi(json!({"id":"misbehaving-response","model":"provider-fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":preliminary_text,"tool_calls":[{"id":"call-unhappy","type":"function","function":{"name":name,"arguments":arguments}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}})),
+        ProviderResponse::OpenAi(json!({"id":"recovery-response","model":"provider-fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"The request could not be executed; no changes were made."},"finish_reason":"stop"}],"usage":{"prompt_tokens":15,"completion_tokens":6,"total_tokens":21}})),
+    ])]).await;
+    let ledger = InferenceLedgerFixture::default();
+    let session = format!("unhappy-fixture-{}", uuid::Uuid::new_v4());
+    let mut host = server_host_builder(
+        &gateway,
+        &ledger,
+        &session,
+        "openai",
+        "provider-fixture-model",
+        None,
+    )
+    .with_static_tool_catalog_admissible(true)
+    .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(workspace.path()),
+        ExecutorBinding::server_local(),
+    ))
+    .build();
+    let mut state = loop_state(
+        &session,
+        Vec::new(),
+        "Explain the evidence without making any changes.",
+    );
+    bind_server_workspace(&mut state, workspace.path()).await;
+    state.skills.request_constraints.allowed_tools =
+        Some(["read_file".to_owned()].into_iter().collect());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_agentic_loop_with_host(&mut host, &mut state),
+    )
+    .await
+    .expect("bounded recovery")
+    .unwrap();
+    assert_eq!(
+        state.final_text,
+        "The request could not be executed; no changes were made."
+    );
+    assert_eq!(state.llm_rounds_completed, 2);
+    assert_eq!((state.total_prompt, state.total_completion), (25, 11));
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("evidence.txt")).unwrap(),
+        "unchanged evidence\n"
+    );
+    assert_eq!(ledger.attempt_count(), 2);
+    ledger.assert_quiescent();
+    gateway.assert_complete();
+    let requests = gateway.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    let messages = requests[1].body["messages"].as_array().unwrap().clone();
+    let records = state
+        .stall
+        .tool_call_records
+        .iter()
+        .map(|record| serde_json::to_value(record).unwrap())
+        .collect();
+    (messages, records)
 }
 
-// ── (A) Malformed tool_call arguments ───────────────────────────────────────
-//
-// Pins current behavior: the mock pipeline preserves the raw broken
-// `arguments` string verbatim on the accum (no silent coercion to `{}`
-// that would mask the strict canonical admission check on the execution path.
-// This test guarantees the TURN DOES NOT PANIC and that
-// `llm_rounds_completed` increments exactly once, catching any future
-// regression where malformed args stall the loop at round 0 forever.
+fn paired_failure(messages: &[Value]) -> &str {
+    let assistant = messages
+        .iter()
+        .find(|m| m.pointer("/tool_calls/0/id").and_then(Value::as_str) == Some("call-unhappy"))
+        .expect("real assistant tool request");
+    assert_eq!(assistant["tool_calls"].as_array().unwrap().len(), 1);
+    let results: Vec<_> = messages
+        .iter()
+        .filter(|m| m["role"] == "tool" && m["tool_call_id"] == "call-unhappy")
+        .collect();
+    assert_eq!(results.len(), 1, "exactly one actual admission result");
+    results[0]["content"].as_str().unwrap()
+}
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(prompt_cache_env)]
+#[tokio::test]
 async fn unhappy_tool_call_with_invalid_json_args() {
-    let round = json!({
-        "full_text": "",
-        "tool_calls": [{
-            "id": "call_bad",
-            "type": "function",
-            "function": { "name": "read_file", "arguments": "{broken" }
-        }],
-        "usage": usage(),
-    });
-    let mut host = build_host(vec![round]);
-    let mut state = make_test_loop_state();
-    state
-        .messages
-        .push(json!({ "role": "user", "content": "do a thing" }));
-
-    // No panic: this is the primary safety invariant.
-    let result = host.run_one_mock_turn_for_test(&mut state).await;
-    let turn = result.expect("turn must not error out on malformed args");
-
-    assert_eq!(
-        state.llm_rounds_completed, 1,
-        "round counter must advance exactly once (no silent stall at 0)"
-    );
-    assert_eq!(
-        turn.accum.tool_calls.len(),
-        1,
-        "the malformed tool_call must still be recorded for downstream guards",
-    );
-    let tc = &turn.accum.tool_calls[0];
-    // Raw broken args must be preserved verbatim so response_guard can
-    // detect malformation. If this ever flips to Some("{}"), the detector
-    // becomes blind.
-    let args = tc
-        .pointer("/function/arguments")
-        .and_then(Value::as_str)
-        .expect("tool_call.function.arguments must be a string, not silently replaced");
-    assert_eq!(
-        args, "{broken",
-        "raw malformed args must be preserved for downstream malformed_args detection"
-    );
-    assert_eq!(
-        tc.get("id").and_then(Value::as_str),
-        Some("call_bad"),
-        "tool_call id must survive the mock pipeline"
-    );
+    let (messages, records) = recover_from_call("read_file", "{broken", "").await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["disposition"], "rejected");
+    assert_eq!(records[0]["ok"], false);
+    let rejection: Value =
+        serde_json::from_str(records[0]["result_full"].as_str().unwrap()).unwrap();
+    assert_eq!(rejection["status"], "rejected");
+    assert_eq!(rejection["error_kind"], "tool_call_arguments_invalid");
+    let wire_rejection: Value = serde_json::from_str(paired_failure(&messages)).unwrap();
+    assert_eq!(wire_rejection["error_kind"], "tool_call_arguments_invalid");
 }
 
-// ── (B) Unknown tool name ──────────────────────────────────────────────────
-//
-// Pins current behavior: when the LLM hallucinates a tool that isn't
-// registered, the mock pipeline propagates the canonical tool call faithfully
-// so the execution admission boundary can return its structured unknown-tool
-// result and the next turn can recover. The test also
-// verifies that after the loop would inject a placeholder tool result
-// (what `merge_tool_results_into_history` does when edge disconnected),
-// the history ends well-formed — no dangling tool_calls without
-// matching tool messages.
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(prompt_cache_env)]
+#[tokio::test]
 async fn unhappy_tool_call_to_unknown_tool_name() {
-    let round = json!({
-        "full_text": "",
-        "tool_calls": [{
-            "id": "call_ghost",
-            "type": "function",
-            "function": {
-                "name": "nonexistent_synth_tool",
-                "arguments": "{}"
-            }
-        }],
-        "usage": usage(),
-    });
-    let mut host = build_host(vec![round]);
-    let mut state = make_test_loop_state();
-    state
-        .messages
-        .push(json!({ "role": "user", "content": "summon a ghost" }));
-
-    let turn = host
-        .run_one_mock_turn_for_test(&mut state)
-        .await
-        .expect("unknown-tool-name must not panic");
-
-    assert_eq!(state.llm_rounds_completed, 1);
-    assert_eq!(turn.accum.tool_calls.len(), 1);
-    let name = turn.accum.tool_calls[0]
-        .pointer("/function/name")
-        .and_then(Value::as_str)
-        .expect("tool_call.function.name must exist");
-    assert_eq!(
-        name, "nonexistent_synth_tool",
-        "unknown tool name must be preserved verbatim for execution admission"
-    );
-
-    // Simulate the loop appending assistant+tool_calls and the resulting
-    // placeholder tool-result that `merge_tool_results_into_history`
-    // inserts when the edge can't execute. The history MUST be
-    // well-formed: every tool_call id has a matching tool message.
-    state.messages.push(json!({
-        "role": "assistant",
-        "content": "",
-        "tool_calls": [&turn.accum.tool_calls[0]],
-    }));
-    let mut synth_history = state.messages.clone();
-    astra_turn_core::history::merge_tool_results_into_history(&mut synth_history, None);
-
-    // Find the assistant block, verify every tool_calls[].id has a paired
-    // subsequent tool message.
-    let asst_idx = synth_history
-        .iter()
-        .position(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
-        .expect("assistant exists");
-    let tc_ids: Vec<String> = synth_history[asst_idx]
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .expect("assistant.tool_calls array")
-        .iter()
-        .filter_map(|tc| tc.get("id").and_then(Value::as_str).map(String::from))
-        .collect();
-    assert!(!tc_ids.is_empty());
-    // Every id must have a following tool message with matching id.
-    let follow_tool_ids: Vec<String> = synth_history[asst_idx + 1..]
-        .iter()
-        .take_while(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
-        .filter_map(|m| {
-            m.get("tool_call_id")
-                .and_then(Value::as_str)
-                .map(String::from)
-        })
-        .collect();
-    assert_eq!(
-        tc_ids, follow_tool_ids,
-        "every assistant.tool_calls id must have a matched tool message (no dangling ids)",
-    );
-    // The placeholder content must be present and non-empty (so the next
-    // LLM turn sees a signal that the tool didn't execute).
-    let placeholder = synth_history[asst_idx + 1]
-        .get("content")
-        .and_then(Value::as_str)
-        .expect("placeholder tool result must have content");
+    let (messages, records) = recover_from_call("nonexistent_synth_tool", "{}", "").await;
+    // The native response parser rejects calls absent from the exact wire surface.
+    assert!(records.is_empty(), "no tool invocation was admitted");
     assert!(
-        !placeholder.is_empty(),
-        "placeholder must not be empty — otherwise the LLM can't recover"
+        messages
+            .iter()
+            .all(|message| message.get("tool_calls").is_none() && message["role"] != "tool")
+    );
+    assert!(
+        messages.iter().any(|message| message["content"]
+            .as_str()
+            .is_some_and(|text| text
+                .contains("provider_attempt_ended_without_executable_or_visible_delivery")))
     );
 }
 
-// ── (C) Ambiguous: final text AND tool_call in the same round ──────────────
-//
-// Pin current behavior: the mock pipeline faithfully records BOTH the
-// `full_text` and the `tool_calls`. The `has_tool_calls` flag becomes
-// true (because `!tool_calls.is_empty()`), which causes the surrounding
-// agentic loop to treat this as a tool-executing round — the final text
-// is NOT discarded, but tool execution takes precedence (i.e. the loop
-// will continue to the next turn rather than stop on the text).
-//
-// This is the documented resolution. Any future change that silently
-// drops the full_text or stops on text would flip this assertion.
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(prompt_cache_env)]
+#[tokio::test]
 async fn unhappy_assistant_final_then_extra_tool_calls() {
-    let round = json!({
-        "full_text": "Here is my final answer.",
-        "tool_calls": [{
-            "id": "call_mixed",
-            "type": "function",
-            "function": { "name": "read_file", "arguments": "{\"path\":\"x\"}" }
-        }],
-        "usage": usage(),
-    });
-    let mut host = build_host(vec![round]);
-    let mut state = make_test_loop_state();
-    state
-        .messages
-        .push(json!({ "role": "user", "content": "ambiguous request" }));
-
-    let turn = host
-        .run_one_mock_turn_for_test(&mut state)
-        .await
-        .expect("ambiguous round must not panic");
-
-    // Both signals are preserved — neither is silently dropped.
-    assert_eq!(
-        turn.accum.full_text, "Here is my final answer.",
-        "full_text must be preserved verbatim alongside tool_calls"
-    );
-    assert_eq!(
-        turn.accum.tool_calls.len(),
-        1,
-        "tool_calls must be preserved alongside full_text"
-    );
-    // Resolution: has_tool_calls wins — the loop will continue.
-    assert!(
-        turn.accum.has_tool_calls,
-        "has_tool_calls must latch true when tool_calls is non-empty, \
-         regardless of full_text presence (this is the documented precedence: \
-         tools-win, loop continues)"
-    );
-    // state.final_text is also populated by execute_mock_turn so the text
-    // isn't lost — a subsequent final round or finalization can render it.
-    assert_eq!(
-        state.final_text, "Here is my final answer.",
-        "state.final_text must carry the ambiguous text forward"
-    );
-    assert_eq!(state.llm_rounds_completed, 1);
+    let (messages, records) = recover_from_call(
+        "read_file",
+        "{\"path\":\"missing-file\"}",
+        "Premature final answer.",
+    )
+    .await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["disposition"], "executed");
+    assert_eq!(records[0]["ok"], false);
+    assert!(paired_failure(&messages).contains("PATH_RESOLUTION_FAILED"));
+    // The public loop delivers only the later answer after real tool completion.
 }

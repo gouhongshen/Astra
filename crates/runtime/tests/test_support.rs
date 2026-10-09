@@ -7,12 +7,14 @@ use std::{
 };
 
 use astra_core::ErrorResponse;
-use astra_runtime::{
-    AgenticRunLifecycleService, FernetTokenEncryptor, MatrixOneSettings, RunEngine,
-};
+#[cfg(feature = "e2e-hooks")]
+use astra_runtime::{AgenticRunLifecycleService, RunEngine};
+use astra_runtime::{FernetTokenEncryptor, MatrixOneSettings};
+#[cfg(feature = "e2e-hooks")]
+use astra_services::InMemoryRunStateStore;
 use astra_services::{
-    InMemoryRunStateStore, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
-    ModelUpdateRequestData, ResolvedActiveLlmModel, ResolvedModelOffering,
+    ModelCreateRequestData, ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData,
+    ResolvedActiveLlmModel, ResolvedModelOffering,
 };
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -115,12 +117,12 @@ impl ModelService for StaticTestModelService {
         Ok(ResolvedModelOffering {
             offering_id,
             model: ResolvedActiveLlmModel {
+                price_snapshot: None,
                 model_name: self.model_name.clone(),
                 wire_model_name: None,
                 api_key: "test-key".to_string(),
                 base_url: "http://127.0.0.1:1".to_string(),
                 provider: "mock".to_string(),
-                fallback_chain: Vec::new(),
                 tags: Vec::new(),
                 request_body_overrides: None,
                 fixed_temperature: None,
@@ -182,12 +184,22 @@ pub fn require_db_it_env() -> MatrixOneSettings {
     MatrixOneSettings::from_env()
 }
 
+#[cfg(feature = "e2e-hooks")]
 pub fn test_run_lifecycle(
     encryptor: Arc<FernetTokenEncryptor>,
     ledger: EdgeCallbackLedger,
 ) -> AgenticRunLifecycleService {
     let run_engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
-    AgenticRunLifecycleService::new(test_matrixone_settings(), encryptor, ledger, run_engine)
+    astra_runtime::server::provider_test_support::configure_workspace_provider(
+        AgenticRunLifecycleService::new(test_matrixone_settings(), encryptor, ledger, run_engine),
+        Arc::new(
+            tempfile::Builder::new()
+                .prefix("astra-workspaces-fixture-")
+                .tempdir()
+                .expect("fixture workspace"),
+        ),
+        "web-fixture-executor",
+    )
 }
 
 pub fn tool_call(id: &str, name: &str, args: Value) -> Value {

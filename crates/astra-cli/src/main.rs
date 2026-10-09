@@ -11,7 +11,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(code);
     }
     let _installation_lease = astra_core::client_installation::acquire(&executable)?;
-    astra_core::client_installation::startup_notice(&executable, &args);
     if astra_core::build_info::write_json_if_requested()? {
         return Ok(());
     }

@@ -178,12 +178,20 @@ slash_dispatch::dispatch("/model", ctx)
 The bare `/` popup always lists every TUI-native root command. Featured
 commands sort first, but the primary marker never filters the list. `/help`
 opens a Featured tab plus task-group tabs whose combined contents are the full
-TUI catalog. Line-mode-only commands stay out of both discovery surfaces and
-show an unavailable message if typed in the workbench.
+TUI catalog. Commands without native workbench actions stay out of both
+discovery surfaces and show an unavailable message if typed. Non-interactive
+CLI commands use `command_router`; there is no console slash frontend.
+
+Catalog lookup and request Offering identity are owned by `session_runtime`.
+Cost presentation uses `session_stats_scan`; MCP command parsing and completions
+live in `slash_dispatch`. Typed workbench inspection lives in `inspection`,
+separate from panel rendering. Clipboard process handling is shared through
+`cli::clipboard`. CLI workspace review/search use `cli::workspace_inspection`,
+not an interactive fallback dispatcher.
 
 ## Resume flow (startup or `/resume`)
 
-1. `handle_resume_command` → `restore_session_into_state` → `apply_restored_session`
+1. Startup or the native TUI picker calls `restore_session_into_state` → `apply_restored_session`
    repopulates `state.history` / `state.session_id` / `state.runtime_continuity`
    / `state.csl_manager` from the session's CSL or journal on disk.
 2. In the TUI, when `state.session_id` changes, `replay_session_into_widget`
@@ -222,13 +230,13 @@ show an unavailable message if typed in the workbench.
 | `Enter` | Composer | Submit text / dispatch slash command |
 | `Shift+Enter` | Composer | Insert newline (multi-line input) |
 | `Ctrl+C` | Turn active | Cancel/interrupt turn |
-| `Ctrl+B` | Turn active with foreground bash/agent | Promote active bash to a background shell task; otherwise promote a foreground sync agent |
+| `Ctrl+B` | Foreground bash, or task navigation | Detach active bash to a background shell task; otherwise open the task panel. Agents already run asynchronously |
 | `Ctrl+C` | Composer non-empty | Clear draft |
 | `Ctrl+C` | Idle | Quit |
 | `Ctrl+D` | Composer empty | Quit |
 | `Ctrl+L` | Any | Force full redraw |
 | `Ctrl+O` | Global, including active turns | Toggle the root conversation workspace; it remains live while the run streams |
-| `Ctrl+G` | Compact chat or conversation workspace | Open the run navigator; Enter/Right switches to the selected root or agent transcript, Left/Esc returns |
+| `Ctrl+G` | Compact chat or conversation workspace | Open active/uncertain runs and their ancestors; H toggles completed history; Enter/Right switches to the selected root or agent transcript, Left/Esc returns |
 | `Ctrl+E` | Transcript / activity | Toggle all expandable reasoning and tool details; in composer it remains line-end |
 | `Alt+E` | Composer | Open the external editor |
 | `Ctrl+R` | Idle, composer empty | Pull last user message back into composer for editing / retry |

@@ -231,7 +231,7 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
             Some("Agent is waiting for input.".to_string()),
             None,
         ),
-        AgentStatus::Waiting { reason } => (
+        AgentStatus::Waiting { reason } | AgentStatus::Paused { reason } => (
             BackgroundTaskStatus::WaitingForInput,
             Some(format!("Agent is waiting: {reason}")),
             None,
@@ -301,8 +301,7 @@ pub(crate) fn background_task_row_for_local_agent_with_fanout_title(
     )
     .with_output_stats(None, total_lines)
     .with_terminal(None, terminal_reason)
-    .with_timing(started_at_ms, ended_at_ms)
-    .with_run_in_background(agent.run_in_background);
+    .with_timing(started_at_ms, ended_at_ms);
 
     Some(if let Some(slot) = agent.fanout_slot.as_ref() {
         row.with_fanout(background_task_fanout_membership(
@@ -676,15 +675,28 @@ pub(crate) async fn stop_background_task_with_agents(
         Ok(()) => Ok(BackgroundTaskStopTarget::Shell),
         Err(BackgroundTaskError::NotFound { .. }) => {
             if let Some(spawner) = agent_spawner {
-                if spawner
-                    .cancel_fanout_group_for_user(
-                        task_id,
-                        "user-requested via background task control",
-                    )
-                    .await
-                    .is_some()
-                {
-                    return Ok(BackgroundTaskStopTarget::FanoutGroup);
+                // Resolve the owning parent from the displayed group, then
+                // recheck it atomically in the spawner's stop operation.
+                if let Some(group) = spawner.fanout_group(task_id).await {
+                    let Some(parent_run_id) = group.parent_run_id.as_deref() else {
+                        return Err(BackgroundTaskError::CannotStop {
+                            task_id: task_id.to_string(),
+                        });
+                    };
+                    if spawner
+                        .cancel_fanout_group_for_user_in_parent(
+                            parent_run_id,
+                            task_id,
+                            "user-requested via background task control",
+                        )
+                        .await
+                        .is_some()
+                    {
+                        return Ok(BackgroundTaskStopTarget::FanoutGroup);
+                    }
+                    return Err(BackgroundTaskError::CannotStop {
+                        task_id: task_id.to_string(),
+                    });
                 }
                 if spawner
                     .cancel_agent_for_user(task_id, "user-requested via background task control")
@@ -694,9 +706,6 @@ pub(crate) async fn stop_background_task_with_agents(
                     return Ok(BackgroundTaskStopTarget::LocalAgent);
                 }
                 match spawner.get_agent_state_any(task_id).await {
-                    Some(state) if !state.run_in_background => {
-                        return Err(BackgroundTaskError::not_found(task_id));
-                    }
                     Some(state) if state.status.is_terminal() => {
                         return Err(BackgroundTaskError::AlreadyTerminated {
                             task_id: task_id.to_string(),

@@ -29,7 +29,6 @@ pub(crate) struct TurnExecutionInput<'a> {
     pub(crate) message: &'a str,
     pub(crate) user_intent: &'a str,
     pub(crate) input_runtime_required_texts: &'a [String],
-    pub(crate) input_active_system_skills: &'a [String],
     pub(crate) input_runtime_volatile_texts: &'a [String],
     /// Canonical session identity established before interactive turn admission.
     ///
@@ -47,6 +46,8 @@ pub(crate) struct TurnExecutionRequest<'a> {
 }
 
 pub(crate) enum TurnAttempt {
+    /// Local preflight rejected the input before execution began.
+    NotStarted(Box<crate::TurnFailure>),
     Completed(Box<Result<StreamResult, crate::TurnFailure>>),
     /// User-cancelled (Ctrl+C / TUI cancel) but the stream was awaited to
     /// completion so partial text + tool records reach the same persistence
@@ -134,17 +135,20 @@ fn build_turn_stream_params<'a>(
         message: input.message,
         user_intent: input.user_intent,
         input_runtime_required_texts: input.input_runtime_required_texts,
-        input_active_system_skills: input.input_active_system_skills,
         input_runtime_volatile_texts: input.input_runtime_volatile_texts,
         input_work_unit_observations: &prepared.input_work_unit_observations,
         semantic_query_override: input.semantic_query_override,
         session_id: Some(input.session_id),
         explain_analyze_terminal_degraded: input.explain_analyze_terminal_degraded,
-        offering_id: crate::cli::slash::slash_config::active_offering_id_for_request(),
+        offering_id: state
+            .model
+            .as_ref()
+            .and_then(|model| model.offering_id())
+            .map(str::to_string),
         model: astra_core::model_override::normalize_model_override(state.model.as_deref()),
         provider: None,
         explain: state.explain,
-        explain_report_format: state.runtime_config.explain.effective_report_format(),
+        runtime_config: std::sync::Arc::new(state.runtime_config.clone()),
         render_md: true,
         history: &state.history,
         perm_manager: &mut state.perm_manager,
@@ -159,12 +163,11 @@ fn build_turn_stream_params<'a>(
         resume_restricted_tools: &state.resume_restricted_tools,
         session_lessons: &state.session_lessons,
         memory_selection_reports: &state.memory_selection_reports,
-        latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
+
         latest_turn_quality_feedback: state.latest_turn_quality_feedback.as_ref(),
         unified_skill_registry: &state.unified_skill_registry,
         is_plan_subtask: false,
         plan_subtask_id: None,
-        delegation_engine: state.delegation_engine.clone(),
         cancel_token: Some(prepared.cancel_token.clone()),
         execution_time_budget: None,
         run_control: Some(prepared.run_control.clone()),
@@ -178,12 +181,9 @@ fn build_turn_stream_params<'a>(
         ask_user_request_tx: state.tui_ask_user_request_tx.clone(),
         plan_review_request_tx: state.tui_plan_review_request_tx.clone(),
         mcp_manager: Some(state.mcp_manager.clone()),
-        skill_quality_tracker: &mut state.skill_quality_tracker,
-        discovered_skills: Some(&mut state.discovered_skills),
-        messaging_metrics: state.messaging_metrics.clone(),
+
         agent_spawner: state.agent_spawner.clone(),
         root_agent_id: Some("main"),
-        root_mailbox_slot: Some(&mut state.root_mailbox),
         observability_hub: prepared.observability_hub.clone(),
         observability_session: prepared.observability_session.clone(),
         file_journal: Some(state.file_journal.clone()),
@@ -210,8 +210,7 @@ fn build_turn_stream_params<'a>(
         append_system_prompt: prepared.append_system_prompt.clone(),
         #[cfg(feature = "harness")]
         harness_sink: Some(state.harness_sink.clone()),
-        #[cfg(feature = "harness")]
-        harness_trace: Some(state.harness_trace.clone()),
+
         #[cfg(feature = "harness")]
         benchmark_profile: None,
     }
@@ -536,7 +535,6 @@ mod tests {
                 message: "what work is running?",
                 user_intent: "what work is running?",
                 input_runtime_required_texts: &[],
-                input_active_system_skills: &[],
                 input_runtime_volatile_texts: &[],
                 session_id: &session_id,
                 semantic_query_override: None,
@@ -556,26 +554,22 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_turn_stream_state_captures_canonical_active_fanout_truth() {
-        let transport = Arc::new(astra_messaging::InProcessTransport::new());
-        let tracker = Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
-        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        use astra_core::work_unit::{
+            WorkUnitObservation, WorkUnitObservationMode, WorkUnitStatus, WorkUnitWakePolicy,
+        };
         let active_work_registry = Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
-        let spawner = Arc::new(
-            astra_runtime::orchestration::DynamicAgentSpawner::new(router)
-                .with_active_work_registry(active_work_registry.clone()),
-        );
-        spawner
-            .declare_fanout_group(
+        active_work_registry.observe(
+            &WorkUnitObservation::new(
                 "review-group",
-                "Three-angle review",
-                3,
-                Some("tool-fanout"),
-                "prior-root-run",
+                "agent_fanout",
+                WorkUnitStatus::Pending,
+                1,
+                WorkUnitObservationMode::Transition,
             )
-            .await
-            .unwrap();
+            .unwrap()
+            .with_wake_policy(WorkUnitWakePolicy::OnAttentionOrTerminal),
+        );
         let state = SessionState {
-            agent_spawner: Some(spawner),
             active_work_registry,
             ..SessionState::default()
         };
@@ -650,7 +644,6 @@ mod tests {
                 message: "continue",
                 user_intent: "continue",
                 input_runtime_required_texts: &[],
-                input_active_system_skills: &[],
                 input_runtime_volatile_texts: &[],
                 session_id: "sess-1",
                 semantic_query_override: None,

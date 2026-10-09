@@ -10,7 +10,6 @@ use astra_services::session_workspace::{
 use serde::{Deserialize, Serialize};
 
 use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
-use astra_core::delegation::DelegationOutcomeTracker;
 use astra_core::feedback::{FeedbackSignal, FeedbackSignalStore, SignalType};
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
 
@@ -22,9 +21,6 @@ pub struct ObservabilityHub {
 
     /// Feedback signal store for observation and SelfModel inputs.
     feedback_signals: FeedbackSignalStore,
-
-    /// Delegation outcome tracker for coordination auto-select.
-    delegation_outcomes: DelegationOutcomeTracker,
 
     /// Active sessions.
     sessions: RwLock<HashMap<String, Arc<RwLock<ObservabilitySession>>>>,
@@ -46,7 +42,6 @@ impl ObservabilityHub {
         Self {
             profile_manager: UserProfileManager::new(profile_store),
             feedback_signals: FeedbackSignalStore::new(),
-            delegation_outcomes: DelegationOutcomeTracker::new(),
             sessions: RwLock::new(HashMap::new()),
             low_confidence_tools: Mutex::new(Vec::new()),
         }
@@ -62,12 +57,10 @@ impl ObservabilityHub {
 
         let profile_path = observability_storage_file(&storage_root, "profiles.json");
         let feedback_path = observability_storage_file(&storage_root, "feedback-signals.json");
-        let outcomes_path = observability_storage_file(&storage_root, "delegation-outcomes.json");
         let profile_store = Arc::new(UserProfileStore::with_storage(profile_path));
         Self {
             profile_manager: UserProfileManager::new(profile_store),
             feedback_signals: FeedbackSignalStore::with_storage(feedback_path),
-            delegation_outcomes: DelegationOutcomeTracker::with_storage(outcomes_path),
             sessions: RwLock::new(HashMap::new()),
             low_confidence_tools: Mutex::new(Vec::new()),
         }
@@ -115,7 +108,6 @@ impl ObservabilityHub {
             turns: session.turn_number,
             detected_scenario: session.profile.current_scenario,
             context_traces: session.context_traces.len() as u32,
-            decisions_explained: session.decision_explanations.len() as u32,
             fuzzy_match_events: session.fuzzy_match_events.len() as u32,
         })
     }
@@ -125,36 +117,6 @@ impl ObservabilityHub {
     /// Record a feedback signal for observation and SelfModel inputs.
     pub fn record_feedback(&self, signal: FeedbackSignal) {
         self.feedback_signals.record(signal);
-    }
-
-    /// Record a batch of streaming speculative tool execution metrics.
-    ///
-    /// Forwards the cumulative counters into the feedback signal store so that
-    /// speculation hit rate can be observed across a session.
-    ///
-    /// Also emits a structured `tracing::info!` event on target
-    /// `astra::streaming_speculation::metrics` for downstream log consumers.
-    pub fn record_streaming_speculation_metrics(
-        &self,
-        metrics: &astra_turn_core::streaming_tool_exec::StreamingSpeculationMetrics,
-    ) {
-        self.feedback_signals.record_streaming_speculation(
-            metrics.started,
-            metrics.hit,
-            metrics.discarded,
-            metrics.total_saved_ms,
-        );
-        tracing::info!(
-            target: "astra::streaming_speculation::metrics",
-            started = metrics.started,
-            hit = metrics.hit,
-            discarded = metrics.discarded,
-            inflight = metrics.inflight,
-            wasted = metrics.wasted(),
-            total_saved_ms = metrics.total_saved_ms,
-            hit_rate = metrics.hit_rate(),
-            "hub.record_streaming_speculation_metrics"
-        );
     }
 
     fn signal_with_session_context(
@@ -205,37 +167,6 @@ impl ObservabilityHub {
             session_id,
             FeedbackSignal::new(SignalType::ThumbsRating { positive }),
         ));
-    }
-
-    // ─── Delegation Outcome Tracking ────────────────────────────────────────
-
-    /// Record a delegation outcome for coordination auto-select learning.
-    pub fn record_delegation_outcome(&self, scenario: &str, pattern: &str, succeeded: bool) {
-        self.delegation_outcomes
-            .record(scenario, pattern, succeeded);
-        if let Err(err) = self.delegation_outcomes.persist() {
-            tracing::warn!(
-                target: "astra.observability",
-                error = %err,
-                "delegation_outcomes persist failed"
-            );
-        }
-    }
-
-    /// Get the historically preferred coordination pattern for a scenario.
-    ///
-    /// Returns `None` if insufficient data (< `min_observations` executions).
-    pub fn preferred_delegation_pattern(
-        &self,
-        scenario: &str,
-        min_observations: u32,
-    ) -> Option<String> {
-        let stats = self.delegation_outcomes.stats_for_scenario(scenario);
-        stats
-            .iter()
-            .filter(|(_, s)| s.total() >= min_observations)
-            .max_by(|(_, a), (_, b)| a.success_rate().partial_cmp(&b.success_rate()).unwrap())
-            .map(|(pattern, _)| pattern.clone())
     }
 
     // ─── Query Observation ──────────────────────────────────────────────────
@@ -307,7 +238,6 @@ pub struct SessionSummary {
     pub turns: u32,
     pub detected_scenario: Option<Scenario>,
     pub context_traces: u32,
-    pub decisions_explained: u32,
     pub fuzzy_match_events: u32,
 }
 

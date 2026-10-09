@@ -46,6 +46,24 @@ The server default runtime must not imply:
 
 Server may expose a tool only when a provider contract explicitly grants that capability and safety policy permits it.
 
+A skill fork isolates model context while inheriting the parent's selected
+execution boundary. For a selected Server sandbox, its file executor and
+sandbox policy use that exact root; a missing or relative root is rejected.
+Edge and Cloud workspace paths remain with their respective providers and
+must not become Server-local filesystem roots.
+
+A managed Server sandbox records the selected executor identity in its
+Workspace source. Its owner, session, executor, root and physical capability
+are immutable; a later run may update only nonphysical metadata. Patch export,
+apply and commit resolve the current Work binding through that same selected
+provider. Another instance must skip the operation without claiming it,
+changing its recovery time, or turning a missing local directory into failure.
+After waiting for the physical workspace lease, the executor rechecks the
+binding and provider identity before durable claim or Git access. Existing
+operations with unknown external effects remain reconciliation work; affinity
+does not authorize replay of a mutation.
+
+
 ## Edge boundary
 
 Edge/CLI local runtime may expose local capabilities only within declared authority:
@@ -58,7 +76,86 @@ Edge/CLI local runtime may expose local capabilities only within declared author
 
 Path authority must be checked before execution. A model-provided path is not authority by itself.
 
+File outlines use the shared AST parser for supported languages, including
+Python stub, JavaScript module and TypeScript module extensions. Unsupported
+languages and comment-only files do not acquire signatures from text-prefix
+heuristics. Outline signatures are redacted for display and do not establish
+full-file delivery or authorize replacement. A bounded prefix is identified as
+partial content; its measured line count does not describe the unread suffix.
+
+
+### Server-owned execution
+
+The CLI admits one Server-owned loop; local tools execute only through the
+Server's authenticated callback requests. Missing terminal execution evidence
+does not transfer continuation authority to the CLI. The adapter preserves
+observed results and usage, reports a typed protocol failure, and uses the
+existing physical-run cleanup path for an unsettled owner. It must not replay
+tools or open another admission to complete an incomplete stream.
+
+A Server-issued read-only ceiling belongs to its exact tool request and travels
+through parsing, batching and execution. Stream completion cannot clear that
+ceiling while the request remains pending. Local approval cannot widen it.
+
+Bash command time is carried by the Server's `command_timeout_cap_ms` request
+metadata. The separate delivery deadline includes callback settlement time and
+must not extend the command budget. Missing or invalid command authority rejects
+a Bash request. Model arguments remain unchanged for approval, invocation identity
+and journal evidence; runtime controls are never injected into those arguments.
+
+### Rename authority
+
+The CLI may modify symbol references only through an active semantic LSP backend
+with a position-based rename request. A text search cannot prove symbol identity
+across scopes, comments, or strings and must not authorize file modifications.
+An explicit `dry_run=true` request may produce a clearly labeled non-semantic
+text preview; it never applies edits or claims semantic reference coverage.
+Missing or failed semantic backends return an actionable error, not a text-based
+mutation fallback.
+
+### File-edit publication
+
+File-edit tools commit the prepared bytes. Write and replacement requests use
+the shared deterministic line-ending and trailing-newline normalization;
+LSP edits publish their computed candidate exactly, preserving bytes outside
+the selected ranges. They do not implicitly launch formatters. Formatting and build checks are explicit tool calls through the
+existing owned shell lifecycle, with its approval, deadline and cancellation
+boundaries. A successful `write_file` proves publication, not syntax validity;
+replacement tools retain their independent parser-based structural checks and
+explicit `allow_structural_change` control.
+Text replacements reject invalid UTF-8 before changing file bytes or recording
+journal entries, rather than silently replacing unrelated bytes during decoding.
+
+Single and batch replacement candidates share the same matching owner, including
+quote-normalized ambiguity rejection, quote-style preservation and structural
+validation. Batch edits resolve sequentially against the current candidate;
+exact anchors may target an earlier edit's result, while a stale fuzzy anchor
+cannot overwrite a previously fuzzy-edited region. Region coordinates follow
+byte-length changes between edits. A failed preparation publishes no files.
+
+CLI same-file batches supply an authorized bound target and captured UTF-8
+preimage to the shared candidate owner. The physical target determines content
+normalization; the logical spelling is a display label. CLI publishes those
+candidate bytes exactly and records the committed bytes in its local journal.
+
+The shared `fs_ops::Prepared*` owner stages files using exclusive sibling
+creation and checks the captured preimage immediately before publication.
+New files use no-clobber publication. The workspace lease coordinates Astra
+writers; preimage checks are not an OS compare-and-swap against external editors.
+Multi-file edits prepare and validate all candidates before publishing;
+`PreparedMultiPathEdit` also stages the complete group first. Publication is
+atomic per file, not across the group. A partial failure must identify the
+already committed paths through the typed tool receipt, including LSP edits.
+Journal after-state, read evidence and displayed diffs
+must describe the bytes actually committed, not an implicit later rewrite.
+
 ## Cloud workspace boundary
+
+The current implementation has no production `gateway_relay` or
+`sandbox_resident_agent` execution adapter. These bindings retain explicit route
+metadata and fail with `transport_unavailable`; they never fall back to
+Server-local execution. A future provider must use the canonical owned
+invocation boundary and supply real enforcement evidence.
 
 A cloud workspace runtime is not the same as the Astra server process. It requires explicit provider binding and isolation metadata.
 
@@ -115,6 +212,12 @@ coordination authority inside the tool-writable workspace.
 - Platforms without an equivalent trusted namespace and tamper watch fail
   closed before launching a local command.
 
+Workspace lease admission uses the asynchronous options APIs with explicit
+cancellation and wait budgets. The unused synchronous acquisition APIs and
+no-options observation wrapper are retired from the Rust source API. Process
+coordination, generation watches, diagnostic paths, and guard cleanup remain
+shared; tests exercise the same acquisition paths as executors.
+
 Receipt attribution and execution coordination are independent. A completed
 foreground process group may be too weak to authorize future fingerprint-based
 receipts: an escaped descendant could write later. That uncertainty quarantines
@@ -122,6 +225,15 @@ receipt attribution, but does not by itself revoke a healthy coordination lease
 or prevent the next command. Unsettled execution ownership and a replaced or
 tampered binding still prevent admission. Every receipt-producing path must
 check receipt authority independently of the coordination check used to launch.
+
+Quarantine is retained per observation root for the executor process lifetime,
+not per conversation. Explicit external-state preimage capture reports
+`external_state_observation_quarantined` separately from ordinary unavailable,
+ambiguous or over-bound fingerprints. The command is not launched in this case.
+Quarantine establishment and later refusals log a root digest, not local paths
+or shell input. A new conversation does not clear quarantine; before restarting
+the affected Astra or astra-edge process, verify that earlier background work
+has stopped. Restart alone does not stop escaped descendants or prove safety.
 
 ### Prepared directory inspection
 
@@ -140,6 +252,13 @@ Working-directory names are verified display labels, not IO authority; an
 unavailable label is reported as unknown rather than silently as the root.
 
 ## Result boundary
+
+Tool-output governance preserves retained plaintext segments and decoded JSON
+string content, including line endings and whitespace. It removes injection lines
+and redacts credentials; JSON serialization may normalize the surrounding format. Reapplying governance must preserve the same governed result; display
+projections cannot replace full journal evidence. CLI and Server journal records
+use the same governed content without UI-only diff attachments; the original
+callback and local UI output remain separate.
 
 Tool output crossing runtime boundaries must be enveloped:
 
@@ -237,3 +356,14 @@ it does not inherit synchronous invocation ownership or post-execution binding
 validation. Its input/output exchange runs concurrently under one five-second
 deadline after spawn, and cancellation drops the kill-on-drop direct child.
 Synchronous repository validation precedes that exchange.
+
+## Shared search execution
+
+CLI grep applies its current path policy, including approved additional paths,
+before invoking the shared search implementation. An authorized external target
+does not become the workspace root or acquire workspace-observation authority.
+Independent User Runner executors continue resolving targets through their own
+workspace boundary. Both paths share search arguments, ignore rules, pagination,
+bounded output, timeout and caller-owned cancellation. The CLI supplies its
+pressure-scaled output budget through the existing execution context. It preserves source
+error and exit metadata instead of reinterpreting result text.

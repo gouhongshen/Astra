@@ -1,9 +1,6 @@
 pub mod session_adaptation;
-pub mod session_checkpointing;
 pub mod session_cleanup;
-pub mod session_compaction;
 pub mod session_continuation;
-pub mod session_diagnosis;
 pub(crate) mod session_execution_lease;
 pub mod session_guard;
 pub mod session_input;

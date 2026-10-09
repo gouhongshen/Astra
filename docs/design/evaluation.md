@@ -63,3 +63,27 @@ A change should not activate if it causes material regression in:
 ## Relationship to learning
 
 Evaluation produces labels and quality signals. It is not itself a training pipeline. Learning artifacts require the additional consent/redaction/lineage rules in [evaluation-and-learning.md](evaluation-and-learning.md).
+
+Execution evidence belongs to the shared turn evaluator and runtime journal.
+Reproducible experiments use the test harness; consent-gated routing datasets
+belong to `services::model_routing::offline`. These contracts do not require a
+separate analytics API or persistence service. Activation belongs to the tuning
+owner.
+
+Runtime tool-boundary feedback and terminal evaluation use thresholds resolved
+once from the admitted execution configuration. Cooperative handoff carries
+those thresholds with the original execution facts; later configuration edits
+do not reinterpret an in-flight run or replenish its recovery permissions.
+Tool batches perform no configuration file I/O.
+
+The Server terminal owner evaluates the complete settled tool and child evidence
+once, before committing `run_finished`. Its `turn_evaluation` carries the
+original journal event, session/run identity, execution generation, frozen
+thresholds and final status. Live delivery and replay project the same fact.
+CLI journals and feedback consume it without re-evaluating partial stream
+records or loading local thresholds. Missing evaluation remains unknown;
+conflicting or incorrectly scoped evaluation is a protocol error.
+
+The CLI sidecar journal adds only its existing projection ID/index for retry
+reconciliation. The Server timestamp, canonical turn, producer scope and
+evaluation metadata remain unchanged; projection retries never re-evaluate.

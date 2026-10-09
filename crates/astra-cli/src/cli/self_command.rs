@@ -100,7 +100,7 @@ pub(crate) async fn execute_self_command(
 ) -> Result<String, String> {
     match cmd {
         SelfCmd::Snapshot(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "snapshot",
                 20,
@@ -133,7 +133,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Profile(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "profile",
                 20,
@@ -142,7 +142,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Goal(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "goal",
                 20,
@@ -151,7 +151,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Trace(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "trace",
                 20,
@@ -160,7 +160,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Budget(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "budget",
                 20,
@@ -169,7 +169,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Signals(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "signals",
                 20,
@@ -178,7 +178,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Health(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "health",
                 20,
@@ -187,7 +187,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Journal(SelfJournalArgs { session_id, limit }) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(session_id.as_deref(), profile).await?,
                 "journal",
                 *limit,
@@ -196,7 +196,7 @@ pub(crate) async fn execute_self_command(
             .await
         }
         SelfCmd::Verify(args) => {
-            render_surface_for_session_with_profile(
+            self_surface::render_surface_for_session_with_profile(
                 &resolve_target_session_id(args.session_id.as_deref(), profile).await?,
                 "verify",
                 20,
@@ -213,48 +213,6 @@ pub(crate) async fn execute_self_command(
             to_json(&persist_config_mutation(&session_id, args)?)
         }
     }
-}
-
-pub(crate) async fn render_surface_for_session(
-    session_id: &str,
-    surface: &str,
-    journal_limit: usize,
-) -> Result<String, String> {
-    render_surface_for_session_with_profile(session_id, surface, journal_limit, None).await
-}
-
-pub(crate) async fn render_surface_for_session_with_profile(
-    session_id: &str,
-    surface: &str,
-    journal_limit: usize,
-    profile: Option<&str>,
-) -> Result<String, String> {
-    self_surface::render_surface_for_session_with_profile(
-        session_id,
-        surface,
-        journal_limit,
-        profile,
-    )
-    .await
-}
-
-pub(crate) async fn render_reflect_surface_for_session(
-    session_id: &str,
-    journal_limit: usize,
-    topic: Option<&str>,
-    facet: Option<&str>,
-    question: Option<&str>,
-) -> Result<String, String> {
-    let request = ReflectRequest::from_observation_params(
-        topic,
-        facet,
-        None,
-        None,
-        i32::try_from(journal_limit).unwrap_or(i32::MAX),
-        question.unwrap_or(""),
-    );
-    let bounded_limit = usize::try_from(request.last_n).unwrap_or(20);
-    render_reflect_surface_for_session_with_profile(session_id, bounded_limit, request, None).await
 }
 
 pub(crate) async fn try_render_reflect_surface_for_session_with_profile(
@@ -290,21 +248,28 @@ pub(crate) async fn render_reflect_surface_for_session_with_profile(
 ) -> Result<String, String> {
     use astra_services::semantic_judgment_observation::{
         SemanticJudgmentCoverage, SemanticJudgmentScope, SemanticJudgmentView,
-        project_local_semantic_judgments, semantic_judgment_facet_enabled,
+        semantic_judgment_facet_enabled,
     };
-    let owner = astra_services::OwnerScope::local_user();
     let local_allowed = !matches!(
         request.source_policy,
         SourcePolicy::CloudOnly | SourcePolicy::LiveOnly
     );
     let window = if local_allowed {
-        session_journal::read_journal_observation_window(&owner, session_id).ok()
+        Some(crate::cli::journal_digest::read_attached_observation_window(session_id, profile)?)
     } else {
         None
     };
+    if window
+        .as_ref()
+        .is_some_and(|window| window.events.is_empty() && window.local_read_error)
+    {
+        return Err(
+            "failed to read session journal: no readable authorized observation source".into(),
+        );
+    }
     let semantic_judgments = semantic_judgment_facet_enabled(request.facet).then(|| {
         if let Some(window) = &window {
-            project_local_semantic_judgments(window, &owner, session_id, request.depth)
+            window.semantic_judgments(session_id, request.depth)
         } else {
             let mut view = SemanticJudgmentView::unavailable(if local_allowed {
                 SemanticJudgmentCoverage::SourceUnavailable
@@ -315,16 +280,25 @@ pub(crate) async fn render_reflect_surface_for_session_with_profile(
             view
         }
     });
-    let artifacts = if request.source_policy == SourcePolicy::LocalOnly {
-        self_surface::load_local_observation_artifacts(
-            session_id,
-            window
-                .as_ref()
-                .map(|window| window.events.clone())
-                .unwrap_or_default(),
-        )?
-    } else {
-        self_surface::load_artifacts(session_id, profile).await?
+    let artifacts = match (&window, request.source_policy) {
+        (None, SourcePolicy::CloudOnly) => {
+            self_surface::load_cloud_observation_artifacts(session_id, profile).await?
+        }
+        (None, SourcePolicy::LiveOnly) => {
+            self_surface::unavailable_observation_artifacts(session_id)?
+        }
+        (Some(window), SourcePolicy::LocalOnly) => {
+            self_surface::load_local_observation_artifacts(session_id, window.events.clone())?
+        }
+        (Some(window), _) => {
+            self_surface::load_observation_artifacts_with_profile(
+                session_id,
+                profile,
+                window.events.clone(),
+            )
+            .await?
+        }
+        (None, _) => unreachable!("all local-capable policies have an observation window"),
     };
     let bounded_limit = usize::try_from(request.last_n).unwrap_or(journal_limit.max(1));
     let mut report = build_reflect_response(&artifacts, bounded_limit, request).await;
@@ -367,25 +341,71 @@ pub(crate) async fn render_reflect_surface_for_session_with_profile(
             report.judgment_usage = Some(usage);
         }
     }
-    if report.source_policy == "local_only" {
-        report.summary.push_str(" Local evidence is a bounded journal window (at most 512 records / 256 KiB), not complete session history.");
-        report.data_coverage.overall = "partial".to_string();
+    if let Some(window) = &window {
+        let account_available = window
+            .account
+            .as_ref()
+            .is_some_and(|account| account.available);
+        let truncated = window.local.truncated
+            || window
+                .account
+                .as_ref()
+                .is_some_and(|account| account.truncated);
+        let missing_source = !window.local.available
+            || window
+                .account
+                .as_ref()
+                .is_some_and(|account| !account.available)
+            || (window.account_owner.is_some() && window.account.is_none());
+        let malformed = window.local.malformed_records > 0
+            || window
+                .account
+                .as_ref()
+                .is_some_and(|account| account.malformed_records > 0);
         report.data_coverage.providers.insert(
-            "local_journal".to_string(),
+            "local_journal".into(),
             ObservationProviderCoverage {
-                status: if window.as_ref().is_some_and(|window| window.available) {
+                status: if window.local.available {
                     "partial"
                 } else {
                     "unavailable"
                 }
-                .to_string(),
+                .into(),
                 freshness_ms: None,
-                reason: Some(
-                    "Bounded local window; missing history and upstream trace loss are unknown."
-                        .to_string(),
-                ),
+                reason: Some(format!(
+                    "bounded observation; truncated={}; malformed={}; read_error={}",
+                    window.local.truncated,
+                    window.local.malformed_records > 0,
+                    window.local_read_error
+                )),
             },
         );
+        if window.account_owner.is_some() {
+            report.data_coverage.providers.insert(
+                "attached_account_journal".into(),
+                ObservationProviderCoverage {
+                    status: if account_available { "partial" } else { "unavailable" }.into(),
+                    freshness_ms: None,
+                    reason: Some(format!(
+                        "bounded owner-authorized observation; truncated={truncated}; missing_source={missing_source}; malformed={malformed}; local_read_error={}; account_read_error={}; conflicting_rounds_excluded={}",
+                        window.local_read_error, window.account_read_error, window.conflicting_round_count
+                    )),
+                },
+            );
+        }
+        if truncated
+            || missing_source
+            || malformed
+            || window.local_read_error
+            || window.account_read_error
+            || window.conflicting_round_count > 0
+        {
+            report.data_coverage.overall = "partial".into();
+        }
+    }
+    if report.source_policy == "local_only" {
+        report.summary.push_str(" Local evidence is a bounded journal window (at most 512 records / 256 KiB), not complete session history.");
+        report.data_coverage.overall = "partial".to_string();
     }
     if let Some(view) = &mut report.view {
         view.data_coverage = report.data_coverage.clone();
@@ -532,7 +552,13 @@ async fn build_reflect_response(
     let data_coverage =
         local_reflect_data_coverage(&request, total_events, warnings.clone(), &recent_events);
     let mut summary = if total_events == 0 {
-        "No local session observations are available yet.".to_string()
+        match request.source_policy {
+            SourcePolicy::CloudOnly => {
+                "No cloud resume snapshot observations are available.".to_string()
+            }
+            SourcePolicy::LiveOnly => "No live CLI observation provider is available.".to_string(),
+            _ => "No local session observations are available yet.".to_string(),
+        }
     } else if adverse_count > 0 {
         format!(
             "Local session artifacts contain {} observed event{}; {} recent adverse or degraded signal{} appear in {} relevant event{} reviewed.",
@@ -562,6 +588,14 @@ async fn build_reflect_response(
         summary.push(' ');
         summary.push_str(&agent_delivery);
     }
+    if matches!(
+        analysis_view.as_str(),
+        "execution_trace" | "execution_tools" | "runtime_performance"
+    ) && let Some(timing) = bounded_execution_timing_summary(&artifacts.journal_events)
+    {
+        summary.push(' ');
+        summary.push_str(&timing);
+    }
     let (observations, evidence, graph_slice) =
         local_reflect_observation_graph(&artifacts.session_id, &request, &summary, &recent_events);
     let view = ObservationView {
@@ -573,7 +607,7 @@ async fn build_reflect_response(
     };
 
     ReflectReport {
-        schema_version: 1,
+        schema_version: 2,
         tool: "reflect".to_string(),
         session_id: artifacts.session_id.clone(),
         analysis_view,
@@ -584,9 +618,9 @@ async fn build_reflect_response(
         source_policy: request.source_policy.as_str().to_string(),
         include_context: request.include_context,
         data_coverage,
+        model_requests: astra_services::reflect::ModelRequestCapture::default(),
         judgment_usage: None,
         semantic_judgments: None,
-        tool_result_judgments: None,
         view: Some(view),
         summary,
         observations,
@@ -597,6 +631,45 @@ async fn build_reflect_response(
         budget_result: ObservationBudgetResult::default(),
     }
     .project_lightweight()
+}
+
+fn bounded_execution_timing_summary(events: &[JournalEvent]) -> Option<String> {
+    let rounds = events
+        .iter()
+        .filter(|event| event.event_type == JournalEventType::LlmRound);
+    let (round_count, slowest_round) =
+        rounds.fold((0usize, None::<u64>), |(count, slowest), event| {
+            let slowest = match (slowest, event.duration_ms) {
+                (Some(previous), Some(ms)) => Some(previous.max(ms)),
+                (None, Some(ms)) => Some(ms),
+                (previous, None) => previous,
+            };
+            (count + 1, slowest)
+        });
+    let slowest_span = events
+        .iter()
+        .filter(|event| event.event_type == JournalEventType::TraceSpan)
+        .filter_map(|event| {
+            let metadata = event.metadata.as_ref()?;
+            let ms = metadata.get("duration_ms")?.as_u64()?;
+            let name = metadata.get("name")?.as_str()?;
+            Some((ms, name))
+        })
+        .max_by_key(|(ms, _)| *ms);
+    if round_count == 0 && slowest_span.is_none() {
+        return None;
+    }
+    let mut parts = vec![format!("bounded journal: {round_count} LLM round(s)")];
+    if let Some(ms) = slowest_round {
+        parts.push(format!("slowest reported round {ms}ms"));
+    }
+    if let Some((ms, name)) = slowest_span {
+        parts.push(format!("longest span {} {ms}ms", truncate(name, 60)));
+    }
+    Some(format!(
+        "{}. Overlapping durations are not additive.",
+        parts.join("; ")
+    ))
 }
 
 fn session_agent_delivery_summary(events: &[JournalEvent]) -> Option<String> {
@@ -664,13 +737,10 @@ fn local_reflect_warnings(request: &ReflectRequest) -> Vec<String> {
     }
     if matches!(request.source_policy, SourcePolicy::CloudOnly) {
         warnings
-            .push("cloud_only source policy is not available from local CLI artifacts".to_string());
+            .push("cloud_only exposes a cloud snapshot, not the cloud event ledger".to_string());
     }
     if matches!(request.source_policy, SourcePolicy::LiveOnly) {
-        warnings.push(
-            "live_only source policy is bounded to persisted local turn artifacts in CLI mode"
-                .to_string(),
-        );
+        warnings.push("live_only has no live observation provider in CLI mode".to_string());
     }
     if request.include_context {
         warnings.push(
@@ -694,7 +764,7 @@ fn local_reflect_data_coverage(
     let has_cloud_resume = recent_events
         .iter()
         .any(|event| event_preview_evidence_source(event) == "cloud_resume");
-    if has_local_journal || recent_events.is_empty() {
+    if has_local_journal {
         providers.insert(
             "local_journal".to_string(),
             ObservationProviderCoverage {
@@ -724,6 +794,16 @@ fn local_reflect_data_coverage(
             },
         );
     }
+    if matches!(request.source_policy, SourcePolicy::LiveOnly) {
+        providers.insert(
+            "live_events".to_string(),
+            ObservationProviderCoverage {
+                status: "unavailable".to_string(),
+                freshness_ms: None,
+                reason: Some("no live CLI observation provider is attached".to_string()),
+            },
+        );
+    }
     if request.include_context {
         providers.insert(
             "visible_context".to_string(),
@@ -741,7 +821,12 @@ fn local_reflect_data_coverage(
         } else {
             "partial".to_string()
         },
-        source: "local_session_artifacts".to_string(),
+        source: match request.source_policy {
+            SourcePolicy::CloudOnly => "cloud_resume_snapshot",
+            SourcePolicy::LiveOnly => "no_live_cli_source",
+            _ => "local_session_artifacts",
+        }
+        .to_string(),
         events: total_events,
         decisions: 0,
         providers,
@@ -862,8 +947,10 @@ fn preview_config_mutation_value(
 ) -> Result<MutatePreviewResponse, String> {
     let workspace = session_workspace::read_workspace(session_id)
         .map_err(|e| format!("workspace metadata missing for session {session_id}: {e}"))?;
-    let base_config = effective_runtime_config(Some(&workspace))?;
-    prepare_config_mutation(session_id, path, new_value, &base_config).map(|(preview, _)| preview)
+    let baseline = RuntimeConfig::load();
+    let base_config = effective_runtime_config(Some(&workspace), &baseline)?;
+    prepare_config_mutation(session_id, path, new_value, &base_config, &baseline)
+        .map(|(preview, _)| preview)
 }
 
 fn prepare_config_mutation(
@@ -871,6 +958,7 @@ fn prepare_config_mutation(
     path: &str,
     new_value: serde_json::Value,
     base_config: &RuntimeConfig,
+    baseline: &RuntimeConfig,
 ) -> Result<(MutatePreviewResponse, RuntimeConfig), String> {
     let base_json = serde_json::to_value(base_config).map_err(|e| e.to_string())?;
     let mut value = base_json.clone();
@@ -880,7 +968,7 @@ fn prepare_config_mutation(
         .map_err(|e| format!("mutation produced invalid RuntimeConfig at '{}': {e}", path))?;
     let candidate_json = serde_json::to_string(&candidate_config).map_err(|e| e.to_string())?;
     let candidate_checks = verify_runtime_config(Some(&candidate_json));
-    let baseline_json = serde_json::to_value(RuntimeConfig::load()).map_err(|e| e.to_string())?;
+    let baseline_json = serde_json::to_value(baseline).map_err(|e| e.to_string())?;
     Ok((
         MutatePreviewResponse {
             session_id: session_id.to_string(),
@@ -901,6 +989,7 @@ pub(crate) fn prepare_governed_config_mutation(
     path: &str,
     new_value: serde_json::Value,
     base_config: &RuntimeConfig,
+    baseline: &RuntimeConfig,
     force: bool,
     drift_ceiling: f64,
 ) -> Result<(MutatePreviewResponse, RuntimeConfig, Option<f64>), serde_json::Value> {
@@ -923,7 +1012,7 @@ pub(crate) fn prepare_governed_config_mutation(
     let base_value = serde_json::to_value(base_config).map_err(
         |error| serde_json::json!({"error": "invalid_config_mutation", "detail": error.to_string()}),
     )?;
-    let baseline = serde_json::to_value(RuntimeConfig::load()).map_err(
+    let baseline = serde_json::to_value(baseline).map_err(
         |error| serde_json::json!({"error": "invalid_config_mutation", "detail": error.to_string()}),
     )?;
     let preview = MutatePreviewResponse {
@@ -957,16 +1046,30 @@ fn persist_config_mutation_value(
     path: &str,
     new_value: serde_json::Value,
 ) -> Result<MutateApplyResponse, String> {
+    let baseline = RuntimeConfig::load();
     let outcome = session_workspace::update_existing_workspace_config(
         session_id,
         |workspace| {
-            let base_config = effective_runtime_config(Some(workspace))
+            let base_config = effective_runtime_config(Some(workspace), &baseline)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            let (preview, candidate_config) =
-                prepare_config_mutation(session_id, path, new_value.clone(), &base_config)
-                    .map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
-                    })?;
+            let (preview, candidate_config) = prepare_config_mutation(
+                session_id,
+                path,
+                new_value.clone(),
+                &base_config,
+                &baseline,
+            )
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            if !preview.valid {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    serde_json::json!({
+                        "error": "invalid_runtime_config",
+                        "checks": preview.checks,
+                    })
+                    .to_string(),
+                ));
+            }
             let candidate_json =
                 serde_json::to_string(&candidate_config).map_err(std::io::Error::other)?;
             workspace.tuned_config_json = if preview.would_clear_override {
@@ -1001,7 +1104,7 @@ fn persist_config_mutation_value(
         } => (
             value.0,
             revision,
-            effective_runtime_config(Some(&workspace))?,
+            effective_runtime_config(Some(&workspace), &baseline)?,
             postcommit,
         ),
         session_workspace::WorkspaceConfigMutationOutcome::Rejected(()) => {
@@ -1023,14 +1126,6 @@ fn persist_config_mutation_value(
     })
 }
 
-pub(crate) fn persist_config_override(
-    session_id: &str,
-    path: &str,
-    new_value: serde_json::Value,
-) -> Result<MutateApplyResponse, String> {
-    persist_config_mutation_value(session_id, path, new_value)
-}
-
 pub(crate) fn persist_governed_config_override(
     session_id: &str,
     path: &str,
@@ -1038,16 +1133,18 @@ pub(crate) fn persist_governed_config_override(
     force: bool,
     drift_ceiling: f64,
 ) -> Result<(MutateApplyResponse, Option<f64>), GovernedConfigMutationError> {
+    let baseline = RuntimeConfig::load();
     let outcome = session_workspace::update_existing_workspace_config(
         session_id,
         |workspace| {
-            let base_config = effective_runtime_config(Some(workspace))
+            let base_config = effective_runtime_config(Some(workspace), &baseline)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
             let prepared = prepare_governed_config_mutation(
                 session_id,
                 path,
                 new_value.clone(),
                 &base_config,
+                &baseline,
                 force,
                 drift_ceiling,
             );
@@ -1102,7 +1199,7 @@ pub(crate) fn persist_governed_config_override(
                 .map(|workspace| workspace.config_mutation_revision);
             let observed_config = observed
                 .as_deref()
-                .and_then(|workspace| effective_runtime_config(Some(workspace)).ok());
+                .and_then(|workspace| effective_runtime_config(Some(workspace), &baseline).ok());
             let retry_revision = session_workspace::exact_workspace_config_owner_revision(
                 revision,
                 &value.4,
@@ -1217,13 +1314,31 @@ fn recent_event_previews(
 }
 
 fn event_preview(event: &JournalEvent) -> EventPreview {
+    let metadata = match event.event_type {
+        JournalEventType::LlmRound => Some(serde_json::json!({
+            "run_id": event.producer_scope.as_ref().map(|scope| scope.run_id.as_str()).or_else(|| event.metadata.as_ref()?.get("run_id")?.as_str()),
+            "model": event.model.as_deref(),
+            "round": event.round,
+            "duration_ms": event.duration_ms,
+            "tokens_in": event.tokens_in,
+            "cache_read_tokens": event.cache_read_tokens,
+            "cache_creation_tokens": event.cache_creation_tokens,
+            "tokens_out": event.tokens_out,
+        })),
+        JournalEventType::TraceSpan => Some(serde_json::json!({
+            "run_id": event.producer_scope.as_ref().map(|scope| scope.run_id.as_str()),
+            "name": event.metadata.as_ref().and_then(|meta| meta.get("name")),
+            "duration_ms": event.metadata.as_ref().and_then(|meta| meta.get("duration_ms")),
+        })),
+        _ => event.metadata.clone(),
+    };
     EventPreview {
         event_type: event_type_name(&event.event_type),
         ts: event.ts.clone(),
         turn: event.turn,
         error: event.error.clone(),
         tools_used: event.tools_used.clone(),
-        metadata: event.metadata.clone(),
+        metadata,
         user_input_preview: event.user_input.as_deref().map(|s| truncate(s, 160)),
         assistant_output_preview: event.assistant_output.as_deref().map(|s| truncate(s, 160)),
     }
@@ -1252,6 +1367,8 @@ fn analysis_view_recent_event_previews(
         "runtime_performance" => &[
             JournalEventType::Turn,
             JournalEventType::TurnError,
+            JournalEventType::LlmRound,
+            JournalEventType::TraceSpan,
             JournalEventType::StallDetected,
             JournalEventType::TurnEvaluation,
             JournalEventType::PipelineAlert,
@@ -1263,6 +1380,8 @@ fn analysis_view_recent_event_previews(
         ],
         "execution_tools" => &[
             JournalEventType::Turn,
+            JournalEventType::LlmRound,
+            JournalEventType::TraceSpan,
             JournalEventType::ToolCallError,
             JournalEventType::TurnGuardVerdict,
             JournalEventType::TurnEvaluation,
@@ -1276,6 +1395,8 @@ fn analysis_view_recent_event_previews(
         "execution_trace" => &[
             JournalEventType::Turn,
             JournalEventType::TurnError,
+            JournalEventType::LlmRound,
+            JournalEventType::TraceSpan,
             JournalEventType::Error,
             JournalEventType::ToolCallError,
             JournalEventType::TurnGuardVerdict,
@@ -1307,7 +1428,17 @@ fn analysis_view_recent_event_previews(
             JournalEventType::AdaptivePerTurnApplied,
         ],
     };
-    let limit = journal_limit.clamp(1, 12);
+    let limit = journal_limit.clamp(
+        1,
+        if matches!(
+            analysis_view,
+            "execution_trace" | "execution_tools" | "runtime_performance"
+        ) {
+            32
+        } else {
+            12
+        },
+    );
     if analysis_view == "execution_errors" {
         return events
             .iter()
@@ -1402,10 +1533,11 @@ fn restored_recent_turn_previews(
 
 fn effective_runtime_config(
     workspace: Option<&WorkspaceMetadata>,
+    baseline: &RuntimeConfig,
 ) -> Result<RuntimeConfig, String> {
     match workspace.and_then(|ws| ws.tuned_config_json.as_deref()) {
         Some(json) => serde_json::from_str(json).map_err(|e| e.to_string()),
-        None => Ok(RuntimeConfig::load()),
+        None => Ok(baseline.clone()),
     }
 }
 
@@ -1442,25 +1574,9 @@ pub(crate) fn verify_runtime_config(tuned_config_json: Option<&str>) -> Vec<Chec
 
     let invariant_validation = astra_config::governed_config_invariant_validation(&config);
     checks.push(CheckResult {
-        name: "verification_bounds".to_string(),
-        ok: invariant_validation.verification_bounds,
-        detail: format!(
-            "min={} strictness={} max={}",
-            config.verification.min_strictness,
-            config.verification.strictness,
-            config.verification.max_strictness
-        ),
-    });
-
-    checks.push(CheckResult {
         name: "compression_bounds".to_string(),
         ok: invariant_validation.compression_bounds,
-        detail: format!(
-            "compression={} window=[{}, {}]",
-            config.compression.compression_threshold,
-            config.context_window.compression_threshold_min,
-            config.context_window.compression_threshold_max
-        ),
+        detail: format!("compression={}", config.compression.compression_threshold,),
     });
 
     let available_tools = cli_provider_visible_tool_names().len();
@@ -1585,6 +1701,20 @@ fn event_preview_summary(event: &EventPreview) -> String {
 
 fn event_metadata_detail(event_type: &str, metadata: &serde_json::Value) -> Option<String> {
     match event_type {
+        "llm_round" => metadata_fields_summary(
+            metadata,
+            &[
+                "run_id",
+                "model",
+                "round",
+                "duration_ms",
+                "tokens_in",
+                "cache_read_tokens",
+                "cache_creation_tokens",
+                "tokens_out",
+            ],
+        ),
+        "trace_span" => metadata_fields_summary(metadata, &["run_id", "name", "duration_ms"]),
         "turn_evaluation" => metadata
             .get("signals")
             .and_then(serde_json::Value::as_array)
@@ -1754,8 +1884,7 @@ mod tests {
     use super::{
         EventPreview, SourcePolicy, analysis_view_recent_event_previews, build_reflect_response,
         cli_provider_visible_tool_names, event_preview_has_adverse_signal, event_preview_summary,
-        execute_self_command, persist_config_override,
-        render_reflect_surface_for_session_with_profile, resolve_session_id,
+        execute_self_command, render_reflect_surface_for_session_with_profile, resolve_session_id,
         restored_recent_turn_previews, session_agent_delivery_summary, verify_runtime_config,
     };
     use crate::cli::cli_config::cli_args::{
@@ -1969,9 +2098,9 @@ mod tests {
         }
     }
 
-    #[test]
+    #[tokio::test]
     #[serial_test::serial]
-    fn config_override_preserves_background_task_projection() {
+    async fn config_override_preserves_background_task_projection() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-config-preserves-background";
@@ -1993,16 +2122,102 @@ mod tests {
             .retrieval_top_k;
         let replacement = if current == 5 { 6 } else { 5 };
 
-        persist_config_override(
-            session_id,
-            "memory.retrieval_top_k",
-            serde_json::json!(replacement),
+        execute_self_command(
+            &SelfCmd::Mutate(SelfMutateCmd::Apply(SelfMutateConfigArgs {
+                session_id: Some(session_id.into()),
+                path: "memory.retrieval_top_k".into(),
+                value: replacement.to_string(),
+            })),
+            None,
         )
+        .await
         .unwrap();
 
         let persisted = session_workspace::read_workspace(session_id).unwrap();
         assert_eq!(persisted.background_shell_tasks.len(), 1);
         assert!(persisted.tuned_config_json.is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mutate_apply_rejects_invalid_candidate_without_persistence() {
+        let temp = tempfile::tempdir().unwrap();
+        let _journals = JournalDirGuard::new(temp.path().join("sessions"));
+        let _root = EnvGuard::set("ASTRA_LOCAL_STATE_ROOT", temp.path().to_str().unwrap());
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        let session_id = "self-invalid-config";
+        session_workspace::write_workspace(&WorkspaceMetadata::new(session_id, "gpt-5")).unwrap();
+        let writer = session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(session_id),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        let workspace = session_workspace::workspace_file_path(session_id).unwrap();
+        let journal = session_journal::journal_file_path(session_id);
+        let workspace_before = std::fs::read(&workspace).unwrap();
+        let journal_before = std::fs::read(&journal).unwrap();
+        let args = || SelfMutateConfigArgs {
+            session_id: Some(session_id.into()),
+            path: "compression.compression_threshold".into(),
+            value: "1.2".into(),
+        };
+        let preview = execute_self_command(&SelfCmd::Mutate(SelfMutateCmd::Preview(args())), None)
+            .await
+            .unwrap();
+        let preview: serde_json::Value = serde_json::from_str(&preview).unwrap();
+        assert_eq!(preview["valid"], false);
+        assert!(
+            preview["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|check| check["name"] == "compression_bounds" && check["ok"] == false)
+        );
+        assert_eq!(std::fs::read(&workspace).unwrap(), workspace_before);
+        assert_eq!(std::fs::read(&journal).unwrap(), journal_before);
+        let error = execute_self_command(&SelfCmd::Mutate(SelfMutateCmd::Apply(args())), None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("compression_bounds"), "{error}");
+        assert_eq!(std::fs::read(workspace).unwrap(), workspace_before);
+        assert_eq!(std::fs::read(journal).unwrap(), journal_before);
+
+        let mut invalid = astra_config::RuntimeConfig::load();
+        invalid.compression.compression_threshold = 1.2;
+        session_workspace::update_existing_workspace_config(
+            session_id,
+            |workspace| {
+                workspace.tuned_config_json = Some(serde_json::to_string(&invalid).unwrap());
+                Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue(()))
+            },
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        let seeded = session_workspace::read_workspace(session_id).unwrap();
+        let saved: astra_config::RuntimeConfig =
+            serde_json::from_str(seeded.tuned_config_json.as_deref().unwrap()).unwrap();
+        assert_eq!(saved.compression.compression_threshold, 1.2);
+        let mut repair = args();
+        repair.value = "0.8".into();
+        execute_self_command(&SelfCmd::Mutate(SelfMutateCmd::Apply(repair)), None)
+            .await
+            .unwrap();
+        let repaired = session_workspace::read_workspace(session_id).unwrap();
+        assert_eq!(
+            repaired.config_mutation_revision,
+            seeded.config_mutation_revision + 1
+        );
+        let config = repaired
+            .tuned_config_json
+            .as_deref()
+            .map(|json| serde_json::from_str::<astra_config::RuntimeConfig>(json).unwrap())
+            .unwrap_or_else(astra_config::RuntimeConfig::load);
+        assert_eq!(config.compression.compression_threshold, 0.8);
     }
 
     #[tokio::test]
@@ -2123,19 +2338,6 @@ mod tests {
     }
 
     #[test]
-    fn verify_runtime_config_flags_invalid_bounds() {
-        let checks = verify_runtime_config(Some(
-            r#"{"verification":{"strictness":0.2,"min_strictness":0.6,"max_strictness":0.9}}"#,
-        ));
-
-        assert!(
-            checks
-                .iter()
-                .any(|check| { check.name == "verification_bounds" && !check.ok })
-        );
-    }
-
-    #[test]
     fn self_runtime_tool_names_use_provider_visible_cli_surface() {
         let names = cli_provider_visible_tool_names();
         assert!(names.contains(&"bash".to_string()));
@@ -2163,14 +2365,15 @@ mod tests {
         assert!(error.contains("no session journal or workspace matches"));
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn snapshot_aggregates_workspace_and_journal_state() {
+        let _api_url = EnvGuard::set("ASTRA_API_URL", "");
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-snapshot-session";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
         ws.discovered_skills = vec!["goal-driven-evolution".to_string()];
-        ws.active_experiment_id = Some("exp-42".to_string());
         ws.last_context_trace = Some(ContextTraceSignal {
             turn_id: "turn-7".to_string(),
             captured_at: Some(Utc::now().to_rfc3339()),
@@ -2281,8 +2484,10 @@ mod tests {
         assert_eq!(value["acceptance"]["ok"], true);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn snapshot_surfaces_persistence_error_field() {
+        let _api_url = EnvGuard::set("ASTRA_API_URL", "");
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-snapshot-persistence";
@@ -2362,8 +2567,10 @@ mod tests {
         );
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn health_surface_exposes_risk_flags_and_acceptance() {
+        let _api_url = EnvGuard::set("ASTRA_API_URL", "");
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-health-session";
@@ -2473,8 +2680,10 @@ mod tests {
         assert_eq!(value["acceptance_ok"], true);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
     async fn verify_surface_reports_acceptance_gaps() {
+        let _api_url = EnvGuard::set("ASTRA_API_URL", "");
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-verify-session";
@@ -2870,6 +3079,112 @@ mod tests {
         assert!(value["budget_result"]["omitted"]["nodes"].as_i64().unwrap() > 0);
     }
 
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn reflect_source_policy_excludes_disallowed_observation_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let _creds_guard = crate::tests::isolate_credentials();
+        let server = MockServer::start().await;
+        let _api_url = EnvGuard::set("ASTRA_API_URL", &server.uri());
+        let _token = EnvGuard::set("ASTRA_ACCESS_TOKEN", "test-token");
+        let session_id = "33333333-3333-3333-3333-333333333333";
+        let local_path = session_journal::journal_file_path(session_id);
+        std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &local_path,
+            format!(
+                "{{\"type\":\"turn\",\"ts\":\"2026-01-01T00:00:00Z\",\"session_id\":\"{session_id}\",\"turn\":1,\"user_input\":\"PRIVATE_LOCAL_MARKER\",\"assistant_output\":\"done\"}}\n"
+            ),
+        )
+        .unwrap();
+        let restored = astra_services::session_restore::RestoredSession {
+            session_id: session_id.to_string(),
+            turn_count: 1,
+            restored_from_cloud: true,
+            conversation_messages: vec![
+                serde_json::json!({"role":"user","content":"CLOUD_MARKER"}),
+                serde_json::json!({"role":"assistant","content":"done"}),
+            ],
+            ..Default::default()
+        };
+        mock_cloud_resume(&server, session_id, &restored).await;
+        let mut request =
+            ReflectRequest::from_observation_params(None, Some("execution"), None, None, 20, "");
+        request.source_policy = SourcePolicy::CloudOnly;
+        let cloud =
+            render_reflect_surface_for_session_with_profile(session_id, 20, request.clone(), None)
+                .await
+                .unwrap();
+        assert!(cloud.contains("CLOUD_MARKER"));
+        assert!(!cloud.contains("PRIVATE_LOCAL_MARKER"));
+        request.source_policy = SourcePolicy::LiveOnly;
+        let live = render_reflect_surface_for_session_with_profile(session_id, 20, request, None)
+            .await
+            .unwrap();
+        assert!(!live.contains("PRIVATE_LOCAL_MARKER"));
+        assert!(!live.contains("CLOUD_MARKER"));
+        let live: serde_json::Value = serde_json::from_str(&live).unwrap();
+        assert_eq!(
+            live["data_coverage"]["providers"]["live_events"]["status"],
+            "unavailable"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        for policy in [
+            SourcePolicy::Auto,
+            SourcePolicy::LiveFirst,
+            SourcePolicy::DurableFirst,
+            SourcePolicy::LocalOnly,
+        ] {
+            let mut request = ReflectRequest::from_observation_params(
+                None,
+                Some("execution"),
+                None,
+                None,
+                20,
+                "",
+            );
+            request.source_policy = policy;
+            let body =
+                render_reflect_surface_for_session_with_profile(session_id, 20, request, None)
+                    .await
+                    .unwrap();
+            assert!(body.contains("PRIVATE_LOCAL_MARKER"), "policy={policy:?}");
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn malformed_local_observation_is_reported_as_partial_coverage() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "44444444-4444-4444-4444-444444444444";
+        let path = session_journal::journal_file_path(session_id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "not-json\n{{\"type\":\"turn\",\"ts\":\"2026-01-01T00:00:00Z\",\"session_id\":\"{session_id}\",\"turn\":1,\"user_input\":\"hello\",\"assistant_output\":\"hi\"}}\n"
+            ),
+        )
+        .unwrap();
+        let mut request =
+            ReflectRequest::from_observation_params(None, Some("execution"), None, None, 20, "");
+        request.source_policy = SourcePolicy::LocalOnly;
+        let body = render_reflect_surface_for_session_with_profile(session_id, 20, request, None)
+            .await
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(report["data_coverage"]["overall"], "partial");
+        assert!(
+            report["data_coverage"]["providers"]["local_journal"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("malformed=true")
+        );
+    }
+
     #[tokio::test]
     async fn reflect_marks_local_journal_events_with_local_provenance() {
         let session_id = "reflect-local-provenance-session";
@@ -3085,6 +3400,42 @@ mod tests {
         assert_eq!(previews[0].event_type, "tool_call_error");
     }
 
+    #[test]
+    fn trace_view_explains_round_and_span_without_raw_metadata() {
+        let round: astra_services::session_journal::JournalEvent = serde_json::from_str(
+            r#"{"type":"llm_round","ts":"2026-01-01T00:00:01Z","session_id":"S","producer_scope":{"run_id":"child-run","agent_id":"child"},"round":0,"model":"glm-5.2","tokens_in":10,"cache_read_tokens":90,"tokens_out":5,"duration_ms":40,"metadata":{"source":"child_agent","private_note":"must_not_surface"}}"#,
+        ).unwrap();
+        let span: astra_services::session_journal::JournalEvent = serde_json::from_str(
+            r#"{"type":"trace_span","ts":"2026-01-01T00:00:02Z","session_id":"S","metadata":{"name":"delegation_selector","duration_ms":854,"attrs":{"private_note":"must_not_surface"}}}"#,
+        ).unwrap();
+        let events = [round, span];
+        let previews = analysis_view_recent_event_previews(&events, 20, "execution_trace");
+        assert!(
+            super::bounded_execution_timing_summary(&events)
+                .unwrap()
+                .contains("slowest reported round 40ms")
+        );
+        assert_eq!(previews.len(), 2);
+        assert!(
+            previews
+                .iter()
+                .any(|preview| event_preview_summary(preview).contains("glm-5.2"))
+        );
+        assert!(
+            previews
+                .iter()
+                .any(|preview| event_preview_summary(preview).contains("delegation_selector"))
+        );
+        assert!(previews.iter().all(|preview| {
+            !preview
+                .metadata
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("must_not_surface")
+        }));
+    }
+
     #[tokio::test]
     async fn reflect_response_includes_persistence_warning_from_workspace() {
         let session_id = "reflect-persistence-session";
@@ -3270,6 +3621,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn snapshot_surfaces_session_journal_io_error() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());

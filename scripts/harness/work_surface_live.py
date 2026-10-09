@@ -457,6 +457,7 @@ class PtyTui:
                     "XDG_CONFIG_HOME": str(self.home / ".config"),
                     "XDG_CACHE_HOME": str(self.home / ".cache"),
                     "XDG_DATA_HOME": str(self.home / ".local/share"),
+                    "ASTRA_LOCAL_STATE_ROOT": str(self.home / ".astra"),
                     "ASTRA_ACCESS_TOKEN": self.token,
                     "ASTRA_API_URL": self.api_url,
                     "TERM": "xterm-256color",
@@ -822,6 +823,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if sys.platform != "linux":
+        print(json.dumps({"status": "not_tested", "error": "Work live journey requires Linux process supervision"}), file=sys.stderr)
+        return 2
     root = Path(__file__).resolve().parents[2]
     binary = (args.astra_bin or root / "target/debug/astra").resolve()
     if not binary.is_file() or not os.access(binary, os.X_OK):

@@ -445,7 +445,6 @@ PY
     crates/services/src/storage.rs
     crates/services/src/work.rs
     crates/services/src/work/establishment_operation.rs
-    crates/services/src/config_version_cloud.rs
     crates/services/src/resource_governor.rs
     crates/services/src/workspace_records.rs
     crates/services/src/context_manifest.rs
@@ -712,6 +711,7 @@ print(name, thinking)
   echo "astra harness: model seed result is malformed" >&2
   exit 78
 fi
+export ASTRA_HARNESS_CONTROL_API_URL="http://127.0.0.1:${api_port}"
 export ASTRA_HARNESS_MODEL_BASE="$selected_model_base"
 export ASTRA_HARNESS_MODEL_THINKING="$selected_model_thinking"
 

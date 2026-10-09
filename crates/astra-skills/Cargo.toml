@@ -34,10 +34,6 @@ serde_yaml_ng.workspace = true
 # TOML for manifest parsing
 toml = { workspace = true }
 
-# Tar/gzip for packing
-flate2 = { workspace = true }
-tar = { workspace = true }
-
 # HTTP types (for database provider error handling)
 axum = { workspace = true }
 
@@ -45,12 +41,6 @@ axum = { workspace = true }
 astra-services.workspace = true
 astra-core.workspace = true
 astra-runtime-env.workspace = true
-
-# Crash recovery (optional)
-astra-pipeline = { workspace = true, optional = true }
-
-[features]
-crash-recovery = ["astra-pipeline"]
 
 [dev-dependencies]
 astra-core = { workspace = true, features = ["dev-defaults"] }

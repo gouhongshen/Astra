@@ -1,6 +1,7 @@
 //! Journeys that do not belong in the monolithic product matrix: session cancel/delete, `/chat/stream`,
 //! auth/session negative paths (replaces stub `auth_contract` / `session_contract` coverage),
 //! models admin CRUD with DB checks (replaces `model_crud_contract`).
+use super::harness::{ProviderResponse, ProviderScript};
 use axum::http::StatusCode;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -8,8 +9,8 @@ use sqlx::Row;
 use std::time::Duration;
 
 use super::harness::{
-    E2E_PASSWORD, MATRIX_E2E_EDGE_WORKSPACE_ROOT, bootstrap, collect_sse_body_text, delete_json,
-    delete_no_content, durable_interaction_event_count, get_json, grant_astra_admin_role,
+    E2E_PASSWORD, MATRIX_E2E_EDGE_WORKSPACE_ROOT, bootstrap, delete_json, delete_no_content,
+    durable_interaction_event_count, get_json, grant_astra_admin_role,
     maybe_tool_result_payload_from_sse, parse_sse_events, post_empty, post_json, put_json,
     seed_pending_approval, seeded_model_selection, tool_result_payload,
 };
@@ -219,10 +220,12 @@ pub async fn run_chat_stream_session_info_smoke() {
     let auth = &b.auth_header;
     let session_id = ctx.session_id.clone();
 
-    // The one admission is handled by the ServerAgenticLoopHost; mock rounds
-    // are request context for the legacy test-only inference hook.
+    // Exercise admission and completion through the actual provider request.
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(&b.auth_header,vec![ProviderScript::new("run_chat_stream_session_info_smoke",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="matrix e2e stream smoke")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"stream smoke reply","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{ "prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8 }}))])]).await;
     let body = json!({
         "message": "matrix e2e stream smoke",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "session_id": session_id,
         "model_selection": seeded_model_selection(ctx),
         "execution_budget": {
@@ -230,10 +233,7 @@ pub async fn run_chat_stream_session_info_smoke() {
             "hard_turn_limit": 1
         },
         "context": {
-            "test_llm_rounds": [{
-                "full_text": "stream smoke reply",
-                "usage": { "prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8 }
-            }]
+
         }
     });
     let req = Request::builder()
@@ -243,7 +243,7 @@ pub async fn run_chat_stream_session_info_smoke() {
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .expect("stream request");
-    let (st, text) = collect_sse_body_text(app, req, 512 * 1024).await;
+    let (st, text) = super::journey_stream_persistence::collect_full_sse_stream(app, req, 30).await;
     assert_eq!(
         st,
         StatusCode::OK,
@@ -256,6 +256,14 @@ pub async fn run_chat_stream_session_info_smoke() {
         &text[..text.len().min(500)]
     );
 
+    let events = parse_sse_events(&text);
+    assert!(events.iter().any(|event| event["type"] == "session_info"));
+    assert!(events.iter().any(|event| event["type"] == "turn_complete"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "text_delta" && event["content"] == "stream smoke reply")
+    );
     ctx.close().await;
 }
 
@@ -382,6 +390,15 @@ pub async fn run_duplicate_tool_result_server_stream_is_idempotent() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let tool_output = "duplicate tool result ok";
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(&b.auth_header,vec![ProviderScript::new("run_duplicate_tool_result_server_stream_is_idempotent",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="read the duplicate path")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[{
+                        "id": "tc-dup-tool-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"dup.txt\"}"
+                        }
+                    }]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Done after duplicate tool result.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let payload = json!({
         "agent_id": "system-matrix-dup-tool-agent",
         "session_id": ctx.session_id,
@@ -404,6 +421,7 @@ pub async fn run_duplicate_tool_result_server_stream_is_idempotent() {
             "status": "online"
         },
         "message": "read the duplicate path",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "model_selection": seeded_model_selection(ctx),
         "context": {
             "edge_profile": {
@@ -422,23 +440,7 @@ pub async fn run_duplicate_tool_result_server_stream_is_idempotent() {
                         "required": ["path"]
                     }
                 }
-            }],
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [{
-                        "id": "tc-dup-tool-1",
-                        "type": "function",
-                        "function": {
-                            "name": "read_file",
-                            "arguments": "{\"path\":\"dup.txt\"}"
-                        }
-                    }]
-                },
-                {
-                    "full_text": "Done after duplicate tool result."
-                }
-            ]
-        }
+            }]}
     });
 
     let req = Request::builder()
@@ -610,12 +612,29 @@ pub async fn run_duplicate_approval_response_is_idempotent() {
 }
 
 pub async fn run_server_stream_partial_batch_failure() {
-    let b = tokio::time::timeout(std::time::Duration::from_secs(10), bootstrap())
-        .await
-        .expect("partial-batch bootstrap exceeded its bounded setup budget");
+    let b = bootstrap().await;
     let ctx = &b.ctx;
     let ok_output = "partial batch first ok";
     let err_output = "partial batch second failed";
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(&b.auth_header,vec![ProviderScript::new("run_server_stream_partial_batch_failure",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="read two files and continue even if one fails")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
+                        {
+                            "id": "tc-partial-1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"a.txt\"}"
+                            }
+                        },
+                        {
+                            "id": "tc-partial-2",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"b.txt\"}"
+                            }
+                        }
+                    ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Handled the partial batch failure.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let payload = json!({
         "agent_id": "system-matrix-partial-batch-agent",
         "session_id": ctx.session_id,
@@ -638,6 +657,7 @@ pub async fn run_server_stream_partial_batch_failure() {
             "status": "online"
         },
         "message": "read two files and continue even if one fails",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "model_selection": seeded_model_selection(ctx),
         "context": {
             "edge_profile": {
@@ -656,33 +676,7 @@ pub async fn run_server_stream_partial_batch_failure() {
                         "required": ["path"]
                     }
                 }
-            }],
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
-                        {
-                            "id": "tc-partial-1",
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": "{\"path\":\"a.txt\"}"
-                            }
-                        },
-                        {
-                            "id": "tc-partial-2",
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": "{\"path\":\"b.txt\"}"
-                            }
-                        }
-                    ]
-                },
-                {
-                    "full_text": "Handled the partial batch failure."
-                }
-            ]
-        }
+            }]}
     });
 
     let req = Request::builder()
@@ -908,6 +902,25 @@ pub async fn run_server_stream_out_of_order_tool_results() {
     let ctx = &b.ctx;
     let first_output = "race first ok";
     let second_output = "race second ok";
+    let fixture_model = format!("mock-{}", ctx.suffix);
+    ctx.install_native_provider(&b.auth_header,vec![ProviderScript::new("run_server_stream_out_of_order_tool_results",move |request| request.path=="/v1/chat/completions" && request.body["model"]==fixture_model && request.body["stream"]==true && request.body["messages"].as_array().is_some_and(|messages| messages.iter().any(|message|message["role"]=="user" && message["content"]=="read two files even if callbacks arrive out of order")),vec![ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning_content":"","tool_calls":[
+                        {
+                            "id": "tc-race-1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"race-a.txt\"}"
+                            }
+                        },
+                        {
+                            "id": "tc-race-2",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"race-b.txt\"}"
+                            }
+                        }
+                    ]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}})),ProviderResponse::OpenAi(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"Handled out-of-order callback delivery.","reasoning_content":"","tool_calls":[]},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}))])]).await;
     let payload = json!({
         "agent_id": "system-matrix-race-agent",
         "session_id": ctx.session_id,
@@ -930,6 +943,7 @@ pub async fn run_server_stream_out_of_order_tool_results() {
             "status": "online"
         },
         "message": "read two files even if callbacks arrive out of order",
+    "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
         "model_selection": seeded_model_selection(ctx),
         "context": {
             "edge_profile": {
@@ -948,33 +962,7 @@ pub async fn run_server_stream_out_of_order_tool_results() {
                         "required": ["path"]
                     }
                 }
-            }],
-            "test_llm_rounds": [
-                {
-                    "tool_calls": [
-                        {
-                            "id": "tc-race-1",
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": "{\"path\":\"race-a.txt\"}"
-                            }
-                        },
-                        {
-                            "id": "tc-race-2",
-                            "type": "function",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": "{\"path\":\"race-b.txt\"}"
-                            }
-                        }
-                    ]
-                },
-                {
-                    "full_text": "Handled out-of-order callback delivery."
-                }
-            ]
-        }
+            }]}
     });
 
     let req = Request::builder()

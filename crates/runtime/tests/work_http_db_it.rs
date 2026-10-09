@@ -4,16 +4,12 @@ use std::sync::{Arc, Mutex};
 
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool};
 use astra_runtime::{AppState, HealthChecker, ServiceInfo, build_app};
-use astra_runtime_env::{
-    WorkspaceAuthority, WorkspaceBindingKind, WorkspaceOwnerScope, WorkspacePersistence,
-    WorkspaceRecord, WorkspaceSource,
-};
+
 use astra_server_types::WORK_API_MAJOR_HEADER;
 use astra_services::{
     AcquireWriterOutcome, DatabaseSessionContextCoordinator, DatabaseSessionForkCoordinator,
-    DatabaseSessionHandoffService, DatabaseWorkspaceRecordStore, ExecutionGrantSigner,
-    PrepareSessionForkV1, ReserveTurnOutcome, SessionContextCoordinator, WorkspaceRecordEntry,
-    WorkspaceRecordStore,
+    DatabaseSessionHandoffService, ExecutionGrantSigner, PrepareSessionForkV1, ReserveTurnOutcome,
+    SessionContextCoordinator,
     auth::{
         AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
         AuthTokenRecord, AuthUserRecord, ReauthenticationPurpose,
@@ -27,17 +23,20 @@ use astra_services::{
     work::{
         CheckCoverage, CheckEvidenceRef, CheckOutcome, CheckRunId, CheckVerifierKind,
         CriterionCommand, CriterionDefinition, CriterionId, CriterionRevision,
-        CriterionRevisionRef, CriterionSetMemberChange, CriterionSetRevision, CriterionStatement,
+        CriterionRevisionRef, CriterionSetRevision, CriterionStatement,
         DatabaseWorkBranchControlService, DatabaseWorkBranchCreationService,
         DatabaseWorkRepository, ForkCursorRef, GraphRevision, InternalSessionId, NewWorkCheckRun,
-        NewWorkCriteriaProposal, NewWorkCriterion, OriginalIntentRef, WorkBranchBasisChange,
+        NewWorkCriteriaProposal, OriginalIntentRef, WorkBranchBasisChange,
         WorkBranchCreationRequest, WorkBranchId, WorkBranchRevision, WorkBranchSubjectChange,
-        WorkChangeRef, WorkContentHash, WorkCriteriaChange, WorkCriteriaProposalMember,
-        WorkGenesis, WorkGenesisParts, WorkGoal, WorkId, WorkItemAttemptId, WorkItemId,
-        WorkItemRevision, WorkItemRevisionRef, WorkOwnerId, WorkProposalId, WorkProposalSourceKind,
-        WorkRepository, WorkRepositoryError, WorkRevision, WorkSubjectRef,
+        WorkChangeRef, WorkContentHash, WorkCriteriaProposalMember, WorkGenesis, WorkGenesisParts,
+        WorkGoal, WorkId, WorkItemAttemptId, WorkItemId, WorkItemRevision, WorkItemRevisionRef,
+        WorkOwnerId, WorkProposalId, WorkProposalSourceKind, WorkRepository, WorkRepositoryError,
+        WorkRevision, WorkSubjectRef,
     },
 };
+#[cfg(feature = "e2e-hooks")]
+use astra_services::{DatabaseWorkspaceRecordStore, WorkspaceRecordEntry, WorkspaceRecordStore};
+#[cfg(feature = "e2e-hooks")]
 use astra_tools::patch_materialization::observe_git_worktree_revision;
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
@@ -200,7 +199,7 @@ impl RunLifecycleService for WorkTurnRecordingLifecycle {
         _run_id: String,
         _user_id: String,
         _last_index: u32,
-    ) -> Result<Vec<Value>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         unreachable!()
     }
 
@@ -220,7 +219,7 @@ impl RunLifecycleService for WorkTurnRecordingLifecycle {
         Ok(astra_services::runs::CancelSessionRecord {
             runs: Vec::new(),
             execution_settled: true,
-            workspace_blocker: None,
+            execution_blocker: None,
         })
     }
 
@@ -356,7 +355,6 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
         ("session_attachments", "owner_user_id"),
         ("session_handoff_slots", "owner_user_id"),
         ("session_execution_switches", "owner_user_id"),
-        ("session_execution_workspace_claims", "owner_user_id"),
         ("session_execution_bindings", "owner_user_id"),
         ("work_branch_creation_operations", "owner_id"),
         ("work_branch_control_operations", "owner_id"),
@@ -365,6 +363,11 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
         ("tool_invocation_ledger", "user_id"),
         ("agent_runs", "user_id"),
         ("work_item_attempts", "owner_id"),
+        ("work_recovery_points", "owner_id"),
+        ("session_artifact_content_refs", "user_id"),
+        ("session_artifact_content_upload_leases", "user_id"),
+        ("session_artifact_content_reservations", "user_id"),
+        ("session_artifact_content_chunks", "user_id"),
         ("session_artifact_references", "user_id"),
         ("session_artifacts", "user_id"),
         ("work_patch_commit_operations", "owner_id"),
@@ -404,6 +407,7 @@ async fn cleanup_owner(pool: &SharedPool, owner_id: &str) {
     }
 }
 
+#[cfg(feature = "e2e-hooks")]
 async fn post_work_patch_export(
     app: Router,
     user_id: &str,
@@ -434,6 +438,7 @@ async fn post_work_patch_export(
     )
 }
 
+#[cfg(feature = "e2e-hooks")]
 async fn get_work_patch_content(
     app: Router,
     user_id: &str,
@@ -458,6 +463,7 @@ async fn get_work_patch_content(
     (status, headers, bytes.to_vec())
 }
 
+#[cfg(feature = "e2e-hooks")]
 async fn get_work_patch_artifacts(
     app: Router,
     user_id: &str,
@@ -484,6 +490,7 @@ async fn get_work_patch_artifacts(
     )
 }
 
+#[cfg(feature = "e2e-hooks")]
 async fn get_work_patch_materializations(
     app: Router,
     user_id: &str,
@@ -510,6 +517,7 @@ async fn get_work_patch_materializations(
     )
 }
 
+#[cfg(feature = "e2e-hooks")]
 async fn post_work_patch_commit(
     app: Router,
     user_id: &str,
@@ -540,6 +548,7 @@ async fn post_work_patch_commit(
     )
 }
 
+#[cfg(feature = "e2e-hooks")]
 async fn get_work_patch_commits(
     app: Router,
     user_id: &str,
@@ -566,6 +575,7 @@ async fn get_work_patch_commits(
     )
 }
 
+#[cfg(feature = "e2e-hooks")]
 async fn delete_work_patch_commit(
     app: Router,
     user_id: &str,
@@ -1650,10 +1660,31 @@ async fn post_work_is_atomic_owner_scoped_and_exactly_idempotent_under_race() {
     cleanup_owner(&pool, &other_owner_id).await;
 }
 
+#[cfg(feature = "e2e-hooks")]
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn patch_export_is_server_owned_exact_and_idempotent() {
-    let Some((app, pool)) = setup().await else {
+    let directory = Arc::new(tempfile::tempdir().expect("managed workspace base"));
+    let lifecycle = Arc::new(
+        astra_runtime::server::provider_test_support::configure_workspace_provider(
+            astra_runtime::AgenticRunLifecycleService::new(
+                MatrixOneSettings::from_env(),
+                Arc::new(
+                    astra_runtime::FernetTokenEncryptor::new(
+                        "cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=",
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                astra_runtime::RunEngine::new(Arc::new(
+                    astra_services::InMemoryRunStateStore::new(),
+                )),
+            ),
+            directory,
+            "patch-http-executor",
+        ),
+    );
+    let Some((app, pool)) = setup_with_run_lifecycle(lifecycle.clone()).await else {
         return;
     };
     let owner_id = id("patch-export-owner");
@@ -1688,11 +1719,17 @@ async fn patch_export_is_server_owned_exact_and_idempotent() {
         .await
         .expect("branch runtime binding");
 
-    let workspace = tempfile::tempdir().expect("Git workspace");
+    let workspace_record =
+        astra_runtime::server::provider_test_support::provision_workspace_fixture(
+            &lifecycle,
+            binding.session_id.as_str(),
+        )
+        .expect("managed workspace");
+    let workspace = std::path::PathBuf::from(&workspace_record.root_or_volume_ref);
     let git = |args: &[&str]| {
         let status = std::process::Command::new("git")
             .arg("-C")
-            .arg(workspace.path())
+            .arg(workspace.as_path())
             .args(args)
             .env("GIT_AUTHOR_NAME", "Astra Test")
             .env("GIT_AUTHOR_EMAIL", "astra@example.invalid")
@@ -1703,11 +1740,11 @@ async fn patch_export_is_server_owned_exact_and_idempotent() {
         assert!(status.success(), "Git fixture command failed: {args:?}");
     };
     git(&["init", "--quiet"]);
-    std::fs::write(workspace.path().join("file.txt"), "before\n").expect("seed file");
+    std::fs::write(workspace.as_path().join("file.txt"), "before\n").expect("seed file");
     git(&["add", "file.txt"]);
     git(&["commit", "--quiet", "-m", "initial"]);
-    std::fs::write(workspace.path().join("file.txt"), "after\n").expect("source change");
-    let result_revision = observe_git_worktree_revision(workspace.path())
+    std::fs::write(workspace.as_path().join("file.txt"), "after\n").expect("source change");
+    let result_revision = observe_git_worktree_revision(workspace.as_path())
         .await
         .expect("observe source result");
     let subject_ref = WorkSubjectRef::parse(format!("workspace/{}", binding.session_id.as_str()))
@@ -1730,17 +1767,7 @@ async fn patch_export_is_server_owned_exact_and_idempotent() {
             owner_id.clone(),
             Some(binding.session_id.as_str().to_string()),
             None,
-            WorkspaceRecord {
-                workspace_id: binding.session_id.as_str().to_string(),
-                owner_scope: WorkspaceOwnerScope::Tenant,
-                kind: WorkspaceBindingKind::ServerSandbox,
-                authority: WorkspaceAuthority::ReadWrite,
-                root_or_volume_ref: workspace.path().display().to_string(),
-                source: WorkspaceSource::Scratch,
-                persistence: WorkspacePersistence::Session,
-                revision: "workspace-revision-1".into(),
-                display_name: "Patch export fixture".into(),
-            },
+            workspace_record,
         ))
         .await
         .expect("persist Server-owned workspace");
@@ -1824,9 +1851,9 @@ async fn patch_export_is_server_owned_exact_and_idempotent() {
     .await;
     assert_eq!(replay, first, "same request and basis must converge");
 
-    std::fs::write(workspace.path().join("file.txt"), "second\n")
+    std::fs::write(workspace.as_path().join("file.txt"), "second\n")
         .expect("advance workspace for a second exact export");
-    let second_result_revision = observe_git_worktree_revision(workspace.path())
+    let second_result_revision = observe_git_worktree_revision(workspace.as_path())
         .await
         .expect("observe second source result");
     let second_subject = repository
@@ -2103,7 +2130,7 @@ async fn patch_export_is_server_owned_exact_and_idempotent() {
     assert_eq!(aborted_commit.1["state"], "aborted");
     assert_eq!(aborted_commit.1["phase"], "complete");
 
-    std::fs::write(workspace.path().join("file.txt"), "unobserved\n")
+    std::fs::write(workspace.as_path().join("file.txt"), "unobserved\n")
         .expect("advance workspace without canonical observation");
     let stale = post_work_patch_export(
         app.clone(),
@@ -2280,7 +2307,7 @@ async fn work_catalog_is_owner_scoped_keyset_bounded_and_server_classified() {
             checkpoint_json: None,
             error_code: None,
             error_message: None,
-            retry_count: 0,
+
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_tool_calls: 0,
@@ -3624,26 +3651,52 @@ async fn work_criteria_route_is_bounded_owner_scoped_and_revision_pinned() {
     assert_eq!(other_status, StatusCode::NOT_FOUND);
     assert_eq!(other["code"], "work_not_found");
 
-    DatabaseWorkRepository::new(pool.clone())
-        .accept_criteria(WorkCriteriaChange {
+    let branch_id = created["overview"]["delivery_branch"]["branch_id"]
+        .as_str()
+        .expect("branch id");
+    let proposed = DatabaseWorkRepository::new(pool.clone())
+        .propose_criteria(NewWorkCriteriaProposal {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
             work_id: WorkId::parse(work_id).expect("work"),
+            branch_id: WorkBranchId::parse(branch_id).expect("branch"),
+            proposal_id: WorkProposalId::parse(id("criteria-proposal")).expect("proposal"),
+            expected_goal_revision: astra_services::work::GoalRevision::INITIAL,
+            expected_branch_revision: WorkBranchRevision::INITIAL,
+            expected_graph_revision: GraphRevision::INITIAL,
             expected_work_revision: WorkRevision::INITIAL,
             expected_criteria_set_revision: CriterionSetRevision::INITIAL,
             members: ["review-complete", "tests-pass"]
                 .into_iter()
-                .map(|criterion_id| {
-                    CriterionSetMemberChange::Existing(CriterionRevisionRef {
-                        criterion_id: CriterionId::parse(criterion_id).expect("criterion"),
-                        revision: CriterionRevision::INITIAL,
-                    })
+                .map(|criterion_id| WorkCriteriaProposalMember::Existing {
+                    criterion_id: CriterionId::parse(criterion_id).expect("criterion"),
+                    revision: CriterionRevision::INITIAL,
                 })
                 .collect(),
             source_ref: WorkChangeRef::parse(id("criteria-change")).expect("source"),
-            reason: None,
+            source_kind: WorkProposalSourceKind::Model,
         })
         .await
         .expect("advance criterion set");
+    let (status, accepted, _) = criteria_proposal_request(
+        app.clone(), &owner_id, "PUT", work_id, branch_id,
+        Some(proposed.proposal.proposal_id.as_str()),
+        Some(serde_json::json!({
+            "request_id": "accept-fixture-criteria",
+            "decision": "accept",
+            "payload_hash": proposed.payload_hash.as_str(),
+            "expected_work_revision": proposed.proposal.expected_work_revision.get(),
+            "expected_goal_revision": proposed.proposal.expected_goal_revision.get(),
+            "expected_criteria_set_revision": proposed.proposal.expected_criteria_set_revision.get(),
+            "expected_branch_revision": proposed.proposal.expected_branch_revision.get(),
+            "expected_graph_revision": proposed.proposal.expected_graph_revision.get(),
+        })),
+    ).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "accepted criterion proposal: {accepted}"
+    );
+
     let (stale_status, stale, _) = get_work_criteria(
         app.clone(),
         &owner_id,
@@ -5425,13 +5478,18 @@ async fn task_graph_route_is_bounded_owner_scoped_and_revision_pinned() {
 
     let criterion_id = id("criterion");
     let repository = DatabaseWorkRepository::new(pool.clone());
-    repository
-        .accept_criteria(WorkCriteriaChange {
+    let proposed = DatabaseWorkRepository::new(pool.clone())
+        .propose_criteria(NewWorkCriteriaProposal {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
             work_id: WorkId::parse(work_id).expect("work"),
+            branch_id: WorkBranchId::parse(branch_id).expect("branch"),
+            proposal_id: WorkProposalId::parse(id("criteria-proposal")).expect("proposal"),
+            expected_goal_revision: astra_services::work::GoalRevision::INITIAL,
+            expected_branch_revision: WorkBranchRevision::INITIAL,
+            expected_graph_revision: GraphRevision::INITIAL,
             expected_work_revision: WorkRevision::INITIAL,
             expected_criteria_set_revision: CriterionSetRevision::INITIAL,
-            members: vec![CriterionSetMemberChange::New(NewWorkCriterion {
+            members: vec![WorkCriteriaProposalMember::New {
                 criterion_id: CriterionId::parse(&criterion_id).expect("criterion"),
                 definition: CriterionDefinition::TestCheck {
                     statement: astra_services::work::CriterionStatement::parse(
@@ -5441,12 +5499,32 @@ async fn task_graph_route_is_bounded_owner_scoped_and_revision_pinned() {
                     command: CriterionCommand::parse("cargo test -p example exact_test")
                         .expect("command"),
                 },
-            })],
+            }],
             source_ref: WorkChangeRef::parse(id("criteria-source")).expect("source"),
-            reason: None,
+            source_kind: WorkProposalSourceKind::Model,
         })
         .await
         .expect("accept typed criterion");
+    let (status, accepted, _) = criteria_proposal_request(
+        app.clone(), &owner_id, "PUT", work_id, branch_id,
+        Some(proposed.proposal.proposal_id.as_str()),
+        Some(serde_json::json!({
+            "request_id": "accept-fixture-criteria",
+            "decision": "accept",
+            "payload_hash": proposed.payload_hash.as_str(),
+            "expected_work_revision": proposed.proposal.expected_work_revision.get(),
+            "expected_goal_revision": proposed.proposal.expected_goal_revision.get(),
+            "expected_criteria_set_revision": proposed.proposal.expected_criteria_set_revision.get(),
+            "expected_branch_revision": proposed.proposal.expected_branch_revision.get(),
+            "expected_graph_revision": proposed.proposal.expected_graph_revision.get(),
+        })),
+    ).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "accepted criterion proposal: {accepted}"
+    );
+
     repository
         .adopt_branch_basis(WorkBranchBasisChange {
             owner_id: WorkOwnerId::parse(&owner_id).expect("owner"),
@@ -6441,4 +6519,239 @@ async fn put_read_cursor_is_exact_monotonic_owner_scoped_and_conflict_typed() {
 
     cleanup_owner(&pool, &owner_id).await;
     cleanup_owner(&pool, &other_owner_id).await;
+}
+
+// Exercise the public byte-upload and canonical publication seam against the
+// same database; no private capture or claim API substitutes for these routes.
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn workspace_package_http_upload_seal_and_publication_preserve_integrity() {
+    let Some((app, pool)) = setup().await else {
+        return;
+    };
+    let owner = id("workspace-package-owner");
+    let foreign = id("workspace-package-foreign");
+    use futures_util::FutureExt;
+    let outcome = std::panic::AssertUnwindSafe(async {
+        let (status, created) = post_work(app.clone(), &owner, serde_json::json!({
+            "request_id": "workspace-package-work", "goal": "Save a portable workspace boundary", "criteria": []
+        })).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let work = created["overview"]["work_id"].as_str().unwrap();
+        let branch = created["overview"]["delivery_branch"]["branch_id"]
+            .as_str()
+            .unwrap();
+        let session: String = sqlx::query_scalar(
+            "SELECT session_id FROM work_branches WHERE owner_id = ? AND work_id = ? AND branch_id = ?",
+        )
+        .bind(&owner)
+        .bind(work)
+        .bind(branch)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        let cursor = commit_test_conversation_turn(&pool, &owner, &session, None, 1).await;
+        let prefix = format!("/v1/works/{work}/branches/{branch}");
+        let (status, basis) = workspace_package_request(
+            app.clone(),
+            &owner,
+            "GET",
+            &format!("{prefix}/workspace-recovery-basis"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{basis}");
+        use sha2::{Digest, Sha256};
+        let bytes = b"portable workspace\n";
+        let digest = format!("sha256:{:x}", Sha256::digest(bytes));
+        let mut manifest: astra_runtime_env::WorkspaceSnapshotManifestV1 = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "snapshot_id": "http-snapshot", "logical_workspace_id": basis["logical_workspace_id"],
+            "repository": {"repository_id": "http-repository", "submodules": []},
+            "capture": {"fingerprint_before": digest, "fingerprint_after": digest, "captured_at": "2026-10-03T00:00:00Z", "consistent": true},
+            "entries": [{"path": "README.txt", "kind": "file", "change": "added", "mode": 420, "size": bytes.len(), "digest": digest, "blob_ref": "readme"}],
+            "content": {"content_root": digest, "total_bytes": bytes.len(), "blob_count": 1}
+        })).unwrap();
+        manifest.content.content_root = manifest.computed_content_root().unwrap();
+        manifest.validate().unwrap();
+        let begin = serde_json::json!({
+            "request_id": "save-workspace", "basis": {
+                "work_revision": basis["work_revision"], "branch_revision": basis["branch_revision"], "graph_revision": basis["graph_revision"],
+                "context_head_hash": basis["context_head_hash"], "execution_binding_hash": basis["execution_binding_hash"]
+            }, "snapshot_manifest": manifest, "content_digest": digest, "byte_size": bytes.len(), "chunk_count": 1
+        });
+        let upload_uri = format!("{prefix}/workspace-recovery-artifacts");
+        let (status, upload) = workspace_package_request(
+            app.clone(),
+            &owner,
+            "POST",
+            &upload_uri,
+            Some(begin.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{upload}");
+        assert_eq!(upload["sealed"], false);
+        let artifact = upload["artifact_id"].as_str().unwrap();
+        let artifact_uri = format!("{upload_uri}/{artifact}");
+        let capture = serde_json::json!({"request_id": "save-workspace", "expected_work_revision": basis["work_revision"],
+            "expected_branch_revision": basis["branch_revision"], "reason": "user_requested", "workspace_artifact_id": artifact});
+        let (status, unsealed) =
+            post_work_recovery_point(app.clone(), &owner, work, branch, capture.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "unsealed: {unsealed}");
+        assert_eq!(unsealed["code"], "workspace_recovery_artifact_not_sealed");
+        let (status, _) = workspace_package_bytes(app.clone(), &owner, "PUT", &format!("{artifact_uri}/chunks/{digest}"), bytes.to_vec()).await;
+        assert_eq!(status, StatusCode::OK);
+        let seal = serde_json::json!({"chunks": [{"chunk_index": 0, "digest": digest, "byte_size": bytes.len()}]});
+        let (status, sealed) = workspace_package_request(
+            app.clone(),
+            &owner,
+            "POST",
+            &format!("{artifact_uri}/seal"),
+            Some(seal.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{sealed}");
+        assert_eq!(sealed["sealed"], true);
+        assert_eq!(sealed["verified"], true);
+        let (status, downloaded) =
+            workspace_package_request(app.clone(), &owner, "GET", &artifact_uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{downloaded}");
+        assert_eq!(downloaded, sealed);
+        let (status, downloaded_blob) = workspace_package_bytes(app.clone(), &owner, "GET", &format!("{artifact_uri}/chunks/{digest}"), Vec::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(downloaded_blob, bytes);
+
+        let (status, replay_seal) = workspace_package_request(
+            app.clone(),
+            &owner,
+            "POST",
+            &format!("{artifact_uri}/seal"),
+            Some(seal),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replay_seal}");
+        assert_eq!(replay_seal, sealed);
+        let (status, foreign_result) =
+            post_work_recovery_point(app.clone(), &foreign, work, branch, capture.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "foreign: {foreign_result}");
+
+        // Tampering after seal must still be rejected inside publication. The
+        // metadata-only HTTP read cannot authorize a corrupted content row.
+        sqlx::query("UPDATE session_artifact_content_chunks SET content = ? WHERE user_id = ? AND content_digest = ?")
+            .bind(vec![b'x'; bytes.len()]).bind(&owner).bind(&digest).execute(pool.get()).await.unwrap();
+        let (status, corrupted) =
+            post_work_recovery_point(app.clone(), &owner, work, branch, capture.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "corrupted: {corrupted}");
+        assert_eq!(corrupted["code"], "workspace_recovery_package_invalid");
+        assert_eq!(corrupted["retryable"], false);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_recovery_points WHERE owner_id = ? AND work_id = ?",
+        )
+        .bind(&owner)
+        .bind(work)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "rejected publication leaves no recovery point");
+        sqlx::query("UPDATE session_artifact_content_chunks SET content = ? WHERE user_id = ? AND content_digest = ?")
+            .bind(bytes.as_slice()).bind(&owner).bind(&digest).execute(pool.get()).await.unwrap();
+        let (status, captured) =
+            post_work_recovery_point(app.clone(), &owner, work, branch, capture.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{captured}");
+        assert_eq!(captured["coverage"]["workspace"], true);
+        assert_eq!(captured["coverage"]["artifacts"], true);
+        assert_eq!(captured["capabilities"]["has_portable_workspace"], true);
+        let (status, replay) =
+            post_work_recovery_point(app.clone(), &owner, work, branch, capture.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay, captured);
+        sqlx::query("UPDATE session_artifact_content_chunks SET content = ? WHERE user_id = ? AND content_digest = ?")
+            .bind(vec![b'x'; bytes.len()]).bind(&owner).bind(&digest).execute(pool.get()).await.unwrap();
+        let (status, receipt) =
+            post_work_recovery_point(app.clone(), &owner, work, branch, capture.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "original committed receipt: {receipt}"
+        );
+        assert_eq!(receipt, captured);
+        let (status, invalid_read) =
+            workspace_package_request(app.clone(), &owner, "GET", &artifact_uri, None).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "current content: {invalid_read}"
+        );
+        assert_eq!(invalid_read["code"], "workspace_recovery_package_invalid");
+        sqlx::query("UPDATE session_artifact_content_chunks SET content = ? WHERE user_id = ? AND content_digest = ?")
+            .bind(bytes.as_slice()).bind(&owner).bind(&digest).execute(pool.get()).await.unwrap();
+
+        // A different upload request captures the old basis, then the real Session
+        // advances. Publication must reject it without inventing a new basis.
+        let mut stale_begin = begin;
+        stale_begin["request_id"] = serde_json::json!("save-stale-workspace");
+        let (status, stale_upload) =
+            workspace_package_request(app.clone(), &owner, "POST", &upload_uri, Some(stale_begin))
+                .await;
+        assert_eq!(status, StatusCode::OK, "{stale_upload}");
+        let stale_artifact = stale_upload["artifact_id"].as_str().unwrap();
+        let (status, _) = workspace_package_bytes(app.clone(), &owner, "PUT", &format!("{upload_uri}/{stale_artifact}/chunks/{digest}"), bytes.to_vec()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, stale_seal) = workspace_package_request(app.clone(), &owner, "POST", &format!("{upload_uri}/{stale_artifact}/seal"), Some(serde_json::json!({"chunks": [{"chunk_index": 0, "digest": digest, "byte_size": bytes.len()}]}))).await;
+        assert_eq!(status, StatusCode::OK, "{stale_seal}");
+        commit_test_conversation_turn(&pool, &owner, &session, Some(&cursor), 2).await;
+        let mut stale_capture = capture;
+        stale_capture["request_id"] = serde_json::json!("save-stale-workspace");
+        stale_capture["workspace_artifact_id"] = serde_json::json!(stale_artifact);
+        let (status, stale) = post_work_recovery_point(app, &owner, work, branch, stale_capture).await;
+        assert_eq!(status, StatusCode::CONFLICT, "stale Session basis: {stale}");
+    }).catch_unwind().await;
+    cleanup_owner(&pool, &owner).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn workspace_package_request(
+    app: Router,
+    owner: &str,
+    method: &str,
+    uri: &str,
+    payload: Option<Value>,
+) -> (StatusCode, Value) {
+    let bytes = payload
+        .map(|value| serde_json::to_vec(&value).unwrap())
+        .unwrap_or_default();
+    let (status, bytes) = workspace_package_bytes(app, owner, method, uri, bytes).await;
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+async fn workspace_package_bytes(
+    app: Router,
+    owner: &str,
+    method: &str,
+    uri: &str,
+    bytes: Vec<u8>,
+) -> (StatusCode, Vec<u8>) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {owner}"))
+        .header(WORK_API_MAJOR_HEADER, "1")
+        .header(
+            "content-type",
+            if method == "PUT" {
+                "application/octet-stream"
+            } else {
+                "application/json"
+            },
+        )
+        .body(body::Body::from(bytes))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
 }

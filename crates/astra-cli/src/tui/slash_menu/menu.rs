@@ -72,12 +72,32 @@ impl SlashItem {
 }
 
 /// Should the menu be open for the given composer buffer?
-pub(crate) fn is_open_for(buffer: &str) -> bool {
-    buffer
-        .lines()
-        .next()
-        .map(|first| first.starts_with('/'))
-        .unwrap_or(false)
+pub(crate) fn is_open_for(buffer: &str, items: &[SlashItem]) -> bool {
+    if !buffer.starts_with('/') || buffer.contains(['\n', '\r']) {
+        return false;
+    }
+    let Some((command, suffix)) = buffer.split_once(char::is_whitespace) else {
+        return true;
+    };
+    let Some(item) = items.iter().find(|item| item.name == command) else {
+        return false;
+    };
+    let suffix = suffix.trim_start().to_ascii_lowercase();
+    let completed_prefix = suffix
+        .rfind(char::is_whitespace)
+        .map(|index| &suffix[..=index]);
+    item.subcommands
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(item.extra_subcommands.iter().map(|(name, _)| name.as_str()))
+        .any(|name| {
+            // Once a complete path is followed by arguments, the composer
+            // owns every key. Longer registered paths can still complete.
+            completed_prefix.is_none_or(|prefix| {
+                name.to_ascii_lowercase().starts_with(prefix)
+                    && score_token(&suffix, name).is_some()
+            })
+        })
 }
 
 /// Which completion axis the menu is filtering.

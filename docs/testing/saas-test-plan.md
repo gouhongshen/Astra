@@ -51,7 +51,7 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 | **接入与认证** | 注册/登录/刷新/登出；未授权 401/403 明确 | Auth E2E + 安全测试 |
 | **Thin Client 协议** | CLI、SDK、Web 共用同一 HTTP 协议，无 hidden state | SDK E2E + §4 场景 |
 | **Cloud 运行时** | `/chat/stream` server-owned loop、SSE、审计链完整 | Server/Edge callback E2E（system_matrix + legacy mock hook） |
-| **租户与用户隔离** | 用户 A 无法读/写用户 B 的 Session/Memory/Team | 隔离矩阵测试 |
+| **租户与用户隔离** | 用户 A 无法读/写用户 B 的 Session/Memory | 隔离矩阵测试 |
 | **资源治理** | 超配额拒绝；Admin 可 override；计量准确 | ResourceGovernor + Admin API |
 | **Admin 运维** | 冷启动、模型加载、用户/Token/配置管理 | Admin smoke + 部署验收 |
 | **弹性与可用性** | 多副本无状态；HPA 扩缩；依赖故障可恢复 | K8s 压测 + 混沌 |
@@ -192,7 +192,6 @@ Admin 操作必须 **`astra_admin` 角色**，普通用户 403。
 | `POST /admin/users/grant-role` | 授予 admin | Admin smoke |
 | `POST /admin/cleanup` | 触发过期数据清理 | 手工 + DB 断言 |
 | `GET /admin/audit` | 审计导出 | 手工 |
-| `GET /admin/feedback/stats` | 反馈统计 | 手工 |
 
 **专项流程：**
 ```
@@ -234,7 +233,6 @@ SaaS 按用户计量与限流，表：`resource_limits`、`resource_usage`。
 |------|------|
 | Session | 用户 A 的 `GET /sessions/{id}` 对用户 B → 404/403 |
 | Memory | Memoria 代理以 JWT user 为准；body 伪造无效 |
-| Team | `e2e_matrix_team_*` 跨用户 negative |
 | Audit / Events | 无法读取他人 causal chain |
 | Skills 配置 | user scope 互不可见 |
 | Resource usage | 计量按 user_id 独立 |
@@ -289,9 +287,6 @@ astra login
 astra chat "分析 src/main.rs"
   → Cloud /chat/stream ×1（同一 admission 内含 N 个 model rounds/callbacks，包括本地 read_file）
 astra session list          → GET /sessions
-Replay routes are reserved; an owned session currently receives HTTP 501
-from POST /sessions/{id}/replay and GET /sessions/{id}/replay/compare
-(foreign or missing sessions receive HTTP 404).
 ```
 
 **验收：** 全程无 `--local`；`~/.astra/credentials.json` 有效；审计链完整。
@@ -386,7 +381,7 @@ helm install astra deployment/kubernetes/chart \
 | 单 API Pod 终止 | 其他副本接管；客户端重试成功 |
 | MatrixOne 30s 不可用 | `/health` unhealthy；恢复后 OK |
 | Memoria 不可用 | 记忆跳过；Chat 可用 |
-| LLM 区域故障 | fallback_chain 切换模型 |
+| LLM 区域故障 | 返回可观察的 provider 失败；不静默切换已准入模型 |
 
 ### 7.4 可观测性
 

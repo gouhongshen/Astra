@@ -1,727 +1,272 @@
-//! End-to-end prompt-cache verification driven by the mock-LLM path.
-//!
-//! These tests pin the wire-layer contract between the context pipeline and
-//! the real provider-facing request shape without making any network calls.
-//! They use `ServerAgenticLoopHost::run_one_mock_turn_for_test` to drive
-//! `execute_mock_turn`, which builds the exact system messages, annotated
-//! tool schemas, and message list that a real LLM call would see (including
-//! Anthropic `cache_control` blocks and the OpenAI stable prefix / dynamic
-//! split).
-//!
-//! # Scope vs. related files
-//!
-//! - `cache_provider_matrix_e2e.rs` — cross-provider invariants (I1/I2/I3
-//!   at the provider boundary, volatile lane, consolidation).
-//! - `phase_j_prompt_cache_gaps.rs` — Anthropic cache-budget edge cases
-//!   (4-marker budget, long-history budget fit, model-id passthrough).
-//! - **this file** — core wire invariants that don't need the whole matrix:
-//!   tool-schema churn invalidates the prefix, cache-disabled env kills all
-//!   annotations, usage-token passthrough, single-tail-breakpoint invariants,
-//!   SSE event order, empty-history no-panic, cross-session prefix stability.
-//!
-//! Each test attaches an `Arc<Mutex<Vec<CapturedLlmRequest>>>` via
-//! `with_llm_request_capture(...)` and asserts on the structure of the
-//! captured payloads.
-
+//! Cache configuration, native usage and schema stability on real Server HTTP.
 #![cfg(feature = "e2e-hooks")]
 
-use std::sync::{Arc, Mutex};
+use std::ffi::OsString;
+use std::path::Path;
 
-use astra_runtime::server::server_loop_host::{CapturedLlmRequest, ServerAgenticLoopHostBuilder};
-use astra_runtime::turn::agentic_loop::host::make_test_loop_state;
-use astra_runtime::{FernetTokenEncryptor, MatrixOneSettings};
+use astra_runtime::server::provider_test_support::{
+    InferenceLedgerFixture, ProviderGateway, ProviderResponse, ProviderScript,
+    bind_server_workspace, loop_state, server_host_builder,
+};
+use astra_runtime::server::tool_transport::{
+    ExecutionBindingSnapshot, ExecutorBinding, WorkspaceBinding,
+};
+use astra_runtime::turn::agentic_loop::finalization::run_agentic_loop_with_host;
+use astra_runtime::turn::agentic_loop::host::AgenticLoopState;
+use astra_services::models::{
+    PromptCacheCapabilityData, PromptCacheProtocolData, PromptCacheVolatileDeliveryData,
+    PromptCacheVolatilePlacementData,
+};
 use serde_json::{Value, json};
 
-const VALID_FERNET_KEY: &str = "cJ8pxr3t6iJmSYqe6wD7vu2rN_C3ovGUxkC5H3NXFNY=";
-
-fn mock_matrixone() -> MatrixOneSettings {
-    MatrixOneSettings::mock()
+fn schema(name: &str, description: &str) -> Value {
+    json!({"type":"function","function":{"name":name,"description":description,"parameters":{"type":"object","properties":{}}}})
 }
 
-fn mock_encryptor() -> Arc<FernetTokenEncryptor> {
-    Arc::new(FernetTokenEncryptor::new(VALID_FERNET_KEY).unwrap())
-}
-
-fn sample_edge_tools() -> Vec<Value> {
-    vec![
-        json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "description": "Execute a bash command",
-                "parameters": { "type": "object", "properties": {} }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read a file",
-                "parameters": { "type": "object", "properties": {} }
-            }
-        }),
-    ]
-}
-
-fn scripted_round(text: &str) -> Value {
-    json!({
-        "full_text": text,
-        "tool_calls": [],
-        "usage": {
-            "prompt_tokens": 42,
-            "completion_tokens": 7,
-            "cache_read_tokens": 0,
-            "cache_creation_tokens": 0,
-        }
-    })
-}
-
-fn tool_named(name: &str, desc: &str) -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": desc,
-            "parameters": { "type": "object", "properties": {} }
-        }
-    })
-}
-
-fn build_host(
-    rounds: Vec<Value>,
-    provider: Option<(&str, &str)>,
-    capture: Arc<Mutex<Vec<CapturedLlmRequest>>>,
-) -> astra_runtime::server::server_loop_host::ServerAgenticLoopHost {
-    build_host_with_tools(rounds, provider, sample_edge_tools(), capture)
-}
-
-fn build_host_with_tools(
-    rounds: Vec<Value>,
-    provider: Option<(&str, &str)>,
+async fn actual_requests(
+    provider: &'static str,
     tools: Vec<Value>,
-    capture: Arc<Mutex<Vec<CapturedLlmRequest>>>,
-) -> astra_runtime::server::server_loop_host::ServerAgenticLoopHost {
-    let mut b = ServerAgenticLoopHostBuilder::new(
-        mock_matrixone(),
-        mock_encryptor(),
-        "test-user".to_string(),
-        "test-session".to_string(),
+    workspace: &Path,
+    turns: usize,
+    usage: Value,
+) -> (Vec<Value>, AgenticLoopState) {
+    let responses = (0..turns).map(|index| {
+        let text = format!("Explanation {index} is complete.");
+        if provider == "anthropic" {
+            ProviderResponse::Anthropic(json!({"id":format!("response-{index}"),"model":"cache-fixture-model","content":[{"type":"text","text":text}],"stop_reason":"end_turn","usage":usage}))
+        } else {
+            ProviderResponse::Bedrock(json!({"output":{"message":{"role":"assistant","content":[{"text":text}]}},"stopReason":"end_turn","usage":usage}))
+        }
+    }).collect();
+    let gateway = ProviderGateway::start(vec![ProviderScript::new(
+        format!("native {provider} cache responses"),
+        move |request| {
+            if provider == "anthropic" {
+                request.path == "/v1/messages" && request.body["model"] == "cache-fixture-model"
+            } else {
+                request.path == "/model/cache-fixture-model/converse-stream"
+            }
+        },
+        responses,
+    )])
+    .await;
+    let cache = (provider == "bedrock").then_some(PromptCacheCapabilityData {
+        protocol: PromptCacheProtocolData::BedrockCachePoint,
+        volatile_placement: PromptCacheVolatilePlacementData::MarkerIsolated,
+        volatile_delivery: PromptCacheVolatileDeliveryData::All,
+        reuse_scope: None,
+    });
+    let session = format!("cache-core-{}", uuid::Uuid::new_v4());
+    let ledger = InferenceLedgerFixture::default();
+    let mut host = server_host_builder(
+        &gateway,
+        &ledger,
+        &session,
+        provider,
+        "cache-fixture-model",
+        cache,
     )
-    .with_server_sandbox_workspace("/tmp/astra-mock-prompt-cache")
+    .with_static_tool_catalog_admissible(true)
+    .with_execution_binding_snapshot(ExecutionBindingSnapshot::inferred(
+        WorkspaceBinding::server_sandbox(workspace),
+        ExecutorBinding::server_local(),
+    ))
     .with_edge_tools(tools)
-    .with_test_llm_rounds(rounds)
-    .with_llm_request_capture(capture);
-    if let Some((provider, model)) = provider {
-        b = b.with_mock_provider(provider, model);
+    .build();
+    let mut prefix = Vec::new();
+    let mut last = None;
+    for index in 0..turns {
+        let mut state = loop_state(
+            &session,
+            prefix,
+            &format!("Explain user turn {index} without making changes."),
+        );
+        bind_server_workspace(&mut state, workspace).await;
+        state.skills.request_constraints.allowed_tools = Some(
+            ["read_file", "glob", "grep", "web_fetch"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        run_agentic_loop_with_host(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.final_text,
+            format!("Explanation {index} is complete.")
+        );
+        assert_eq!(state.llm_rounds_completed, 1);
+        prefix = state.messages.clone();
+        last = Some(state);
     }
-    b.build()
+    assert_eq!(ledger.attempt_count(), turns);
+    ledger.assert_quiescent();
+    gateway.assert_complete();
+    let requests = gateway.requests.lock().await;
+    assert_eq!(requests.len(), turns);
+    (
+        requests
+            .iter()
+            .map(|request| request.body.clone())
+            .collect(),
+        last.unwrap(),
+    )
 }
 
-// ── pc-tool-schema-churn ────────────────────────────────────────────────────
-//
-// When a runtime provider supplies a schema for a server-available tool, the
-// runtime provider owns the wire schema. This is the concrete cache-sensitive
-// duplicate-provider case: edge/CLI `web_fetch` must beat server `web_fetch`
-// without relying on server fallback.
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(prompt_cache_env)]
-async fn duplicate_runtime_web_fetch_schema_overrides_server_schema() {
-    unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
-
-    let baseline = sample_edge_tools();
-    let mut edge_web_fetch = sample_edge_tools();
-    edge_web_fetch.push(tool_named(
-        "web_fetch",
-        "EDGE web_fetch schema should override server schema",
-    ));
-    let cap_base = Arc::new(Mutex::new(Vec::new()));
-    let cap_changed = Arc::new(Mutex::new(Vec::new()));
-    let mut host_base = build_host_with_tools(
-        vec![scripted_round("a")],
-        Some(("anthropic", "claude-sonnet-4")),
-        baseline,
-        cap_base.clone(),
-    );
-    let mut host_changed = build_host_with_tools(
-        vec![scripted_round("b")],
-        Some(("anthropic", "claude-sonnet-4")),
-        edge_web_fetch,
-        cap_changed.clone(),
-    );
-    let mut s1 = make_test_loop_state();
-    let mut s2 = make_test_loop_state();
-    s1.max_turn_input_tokens = 200_000;
-    s2.max_turn_input_tokens = 200_000;
-    host_base.run_one_mock_turn_for_test(&mut s1).await.unwrap();
-    host_changed
-        .run_one_mock_turn_for_test(&mut s2)
-        .await
-        .unwrap();
-
-    let a = cap_base.lock().unwrap();
-    let b = cap_changed.lock().unwrap();
-    assert_ne!(
-        tool_description(&a[0].tools, "web_fetch"),
-        tool_description(&b[0].tools, "web_fetch"),
-        "edge-provided duplicate web_fetch schema must replace the server schema in the wire payload",
-    );
-    assert_eq!(
-        tool_description(&b[0].tools, "web_fetch").as_deref(),
-        Some("EDGE web_fetch schema should override server schema"),
-    );
+fn native_cache_marker_count(value: &Value) -> usize {
+    match value {
+        Value::Object(map) => {
+            usize::from(map.contains_key("cache_control") || map.contains_key("cachePoint"))
+                + map.values().map(native_cache_marker_count).sum::<usize>()
+        }
+        Value::Array(values) => values.iter().map(native_cache_marker_count).sum(),
+        _ => 0,
+    }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(prompt_cache_env)]
-async fn tool_schema_input_order_jitter_does_not_churn_wire_tools() {
-    unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
+fn cached_prefix(wire: &Value) -> Value {
+    let blocks = wire["system"].as_array().unwrap();
+    let boundary = blocks
+        .iter()
+        .rposition(|block| native_cache_marker_count(block) > 0)
+        .expect("actual system cache boundary");
+    json!(&blocks[..=boundary])
+}
 
+#[tokio::test]
+#[serial_test::serial(prompt_cache_env)]
+async fn runtime_schema_override_and_input_order_preserve_real_wire_contract() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    let usage = json!({"input_tokens":10,"output_tokens":5});
     let baseline = vec![
-        tool_named("bash", "Execute a bash command"),
-        tool_named("read_file", "Read a file"),
-        tool_named("custom_cache_probe", "Custom cache probe"),
+        schema("read_file", "Read a file"),
+        schema("glob", "Find files"),
+        schema("grep", "Search files"),
     ];
-    let order_swapped = vec![
-        tool_named("custom_cache_probe", "Custom cache probe"),
-        tool_named("read_file", "Read a file"),
-        tool_named("bash", "Execute a bash command"),
-    ];
-    let cap_base = Arc::new(Mutex::new(Vec::new()));
-    let cap_changed = Arc::new(Mutex::new(Vec::new()));
-    let mut host_base = build_host_with_tools(
-        vec![scripted_round("a")],
-        Some(("anthropic", "claude-sonnet-4")),
-        baseline,
-        cap_base.clone(),
-    );
-    let mut host_changed = build_host_with_tools(
-        vec![scripted_round("b")],
-        Some(("anthropic", "claude-sonnet-4")),
-        order_swapped,
-        cap_changed.clone(),
-    );
-    let mut s1 = make_test_loop_state();
-    let mut s2 = make_test_loop_state();
-    s1.max_turn_input_tokens = 200_000;
-    s2.max_turn_input_tokens = 200_000;
-    host_base.run_one_mock_turn_for_test(&mut s1).await.unwrap();
-    host_changed
-        .run_one_mock_turn_for_test(&mut s2)
-        .await
-        .unwrap();
-
-    let a = cap_base.lock().unwrap();
-    let b = cap_changed.lock().unwrap();
-    assert_eq!(
-        a[0].tools, b[0].tools,
-        "same tool set in a different request order must not churn the provider wire schema",
-    );
-}
-
-fn tool_description(tools: &[Value], name: &str) -> Option<String> {
-    tools
-        .iter()
-        .find(|tool| {
-            tool.get("function")
-                .and_then(Value::as_object)
-                .and_then(|function| function.get("name"))
-                .and_then(Value::as_str)
-                == Some(name)
-        })
-        .and_then(|tool| {
-            tool.get("function")
-                .and_then(Value::as_object)
-                .and_then(|function| function.get("description"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-}
-
-// ── pc-disabled-flag ─────────────────────────────────────────────────────────
-//
-// Both `ASTRA_TEST_PROMPT_CACHE_DISABLED=1` and `=true` must suppress every
-// annotation end-to-end, on every turn. This replaces two earlier tests
-// (one per string value) with a single parameterized loop.
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(prompt_cache_env)]
-async fn cache_disabled_env_suppresses_all_annotations() {
-    struct EnvGuard;
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe { std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED") };
-        }
-    }
-    for flag_value in ["1", "true"] {
-        unsafe { std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", flag_value) };
-        let _guard = EnvGuard;
-
-        let capture = Arc::new(Mutex::new(Vec::new()));
-        let mut host = build_host(
-            vec![scripted_round("ok"), scripted_round("ok2")],
-            Some(("anthropic", "claude-sonnet-4")),
-            capture.clone(),
-        );
-        let mut state = make_test_loop_state();
-        state
-            .messages
-            .push(json!({ "role": "user", "content": "turn 1" }));
-        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-        state
-            .messages
-            .push(json!({ "role": "assistant", "content": "ok" }));
-        state
-            .messages
-            .push(json!({ "role": "user", "content": "turn 2" }));
-        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-
-        let g = capture.lock().unwrap();
-        assert_eq!(g.len(), 2, "[{flag_value}] two captured payloads");
-        for (i, c) in g.iter().enumerate() {
-            assert!(
-                !c.cache_enabled,
-                "[{flag_value}] turn {i}: cache_enabled must latch false"
-            );
-            assert!(
-                c.is_anthropic,
-                "[{flag_value}] turn {i}: anthropic latching is independent of disable flag"
-            );
+    let reversed: Vec<_> = baseline.iter().rev().cloned().collect();
+    let (a, _) = actual_requests(
+        "anthropic",
+        baseline.clone(),
+        workspace.path(),
+        1,
+        usage.clone(),
+    )
+    .await;
+    let (b, _) = actual_requests("anthropic", reversed, workspace.path(), 1, usage.clone()).await;
+    for wire in [&a[0], &b[0]] {
+        let tools = wire["tools"].as_array().unwrap();
+        for name in ["read_file", "glob", "grep"] {
             assert_eq!(
-                c.system_cache_control_count, 0,
-                "[{flag_value}] turn {i}: no cache_control blocks allowed when disabled (got {})",
-                c.system_cache_control_count
-            );
-            assert!(
-                !c.last_tool_has_cache_control,
-                "[{flag_value}] turn {i}: tool schemas must not carry cache_control when disabled"
+                tools.iter().filter(|tool| tool["name"] == name).count(),
+                1,
+                "actual native declaration {name}"
             );
         }
-        // Prefix hash must still be stable across turns even without annotations —
-        // the disabled path cannot introduce non-determinism.
-        assert_eq!(
-            g[0].cacheable_prefix_sha256, g[1].cacheable_prefix_sha256,
-            "[{flag_value}] disabled cache must not churn the prefix hash"
-        );
     }
-}
-
-// ── pc-global-scope-cross-session ────────────────────────────────────────────
-//
-// Prefix hashes must match across independent host instances for the same
-// provider/tool catalogue — that's what enables caching across sessions.
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(prompt_cache_env)]
-async fn prefix_hash_stable_across_independent_host_instances() {
-    let cap_a = Arc::new(Mutex::new(Vec::new()));
-    let cap_b = Arc::new(Mutex::new(Vec::new()));
-    let mut host_a = build_host(
-        vec![scripted_round("a")],
-        Some(("anthropic", "claude-sonnet-4")),
-        cap_a.clone(),
-    );
-    let mut host_b = build_host(
-        vec![scripted_round("b")],
-        Some(("anthropic", "claude-sonnet-4")),
-        cap_b.clone(),
-    );
-    let mut state_a = make_test_loop_state();
-    let mut state_b = make_test_loop_state();
-    host_a
-        .run_one_mock_turn_for_test(&mut state_a)
-        .await
-        .unwrap();
-    host_b
-        .run_one_mock_turn_for_test(&mut state_b)
-        .await
-        .unwrap();
-    let h_a = cap_a.lock().unwrap()[0].cacheable_prefix_sha256.clone();
-    let h_b = cap_b.lock().unwrap()[0].cacheable_prefix_sha256.clone();
+    assert_eq!(a[0]["tools"], b[0]["tools"]);
     assert_eq!(
-        h_a, h_b,
-        "prefix hash must match across independent sessions"
+        cached_prefix(&a[0]),
+        cached_prefix(&b[0]),
+        "independent actual sessions retain the complete stable prefix"
     );
-}
-
-// ── pc-usage-tokens-passthrough ──────────────────────────────────────────────
-//
-// Verifies that `cache_read_tokens` / `cache_creation_tokens` from the mock
-// usage dict flow through the accumulator. This is the signal surface real
-// callers use to detect cache hits.
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(prompt_cache_env)]
-async fn cache_token_metrics_pass_through_from_mock_usage() {
-    let capture = Arc::new(Mutex::new(Vec::new()));
-    let rounds = vec![json!({
-        "full_text": "ok",
-        "tool_calls": [],
-        "usage": {
-            "prompt_tokens": 100,
-            "completion_tokens": 20,
-            "cache_read_input_tokens": 88,
-            "cache_creation_input_tokens": 12,
-        }
-    })];
-    let mut host = build_host(rounds, Some(("anthropic", "claude-sonnet-4")), capture);
-    let mut state = make_test_loop_state();
-    let result = host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-    assert_eq!(result.accum.cache_read_tokens, 88);
-    assert_eq!(result.accum.cache_creation_tokens, 12);
-    assert_eq!(result.accum.prompt_tokens, 100);
-    assert_eq!(result.accum.completion_tokens, 20);
-}
-
-// ── pc-empty-messages-noop ──────────────────────────────────────────────────
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(prompt_cache_env)]
-async fn empty_message_history_does_not_panic() {
-    let capture = Arc::new(Mutex::new(Vec::new()));
-    let mut host = build_host(
-        vec![scripted_round("x")],
-        Some(("anthropic", "claude-sonnet-4")),
-        capture.clone(),
-    );
-    let mut state = make_test_loop_state();
-    // Do not push any messages.
-    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-    let g = capture.lock().unwrap();
-    assert_eq!(g.len(), 1);
-    assert!(
-        !g[0].last_message_has_cache_control,
-        "empty history must not fake a cache_control marker"
-    );
-}
-
-// ── cp-interleaved-tool-text ────────────────────────────────────────────────
-//
-// Drives three consecutive mock rounds through execute_mock_turn that
-// interleave text-only, tool_call-only, and mixed text+tool_call shapes,
-// verifying:
-//   * HostTurnResult preserves typed tool calls while host-local progress keeps
-//     text_delta before usage; admitted tool_call SSE belongs to the outer loop
-//   * History messages grow monotonically between rounds (no loss or reorder)
-//   * Cacheable prefix stays stable across all three rounds (system + tools
-//     unchanged — only message list grows)
-//   * Usage events carry the per-round prompt/completion token counts
-//     independently (no leakage between rounds)
-fn round_with_tool_calls(text: &str, tool_names: &[&str]) -> Value {
-    round_with_tool_calls_tagged(text, tool_names, text)
-}
-
-fn round_with_tool_calls_tagged(text: &str, tool_names: &[&str], round_tag: &str) -> Value {
-    let round_slug: String = round_tag
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-    let round_slug = if round_slug.is_empty() {
-        "r".to_string()
-    } else {
-        round_slug
-    };
-    let tool_calls: Vec<Value> = tool_names
+    let (builtin, _) =
+        actual_requests("anthropic", Vec::new(), workspace.path(), 1, usage.clone()).await;
+    let server_read = builtin[0]["tools"]
+        .as_array()
+        .unwrap()
         .iter()
-        .enumerate()
-        .map(|(i, n)| {
-            json!({
-                "id": format!("tc_{round_slug}_{n}_{i}"),
-                "type": "function",
-                "function": {"name": *n, "arguments": "{}"}
-            })
-        })
-        .collect();
-    json!({
-        "full_text": text,
-        "tool_calls": tool_calls,
-        "usage": {
-            "prompt_tokens": 50 + tool_names.len() as u64,
-            "completion_tokens": 12,
-            "cache_read_tokens": 0,
-            "cache_creation_tokens": 0,
-        }
-    })
-}
-
-fn event_types_in_order(events: &[Value]) -> Vec<String> {
-    events
-        .iter()
-        .filter_map(|e| e.get("type").and_then(Value::as_str).map(String::from))
-        .collect()
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(prompt_cache_env)]
-async fn interleaved_tool_and_text_rounds_preserve_typed_results_and_history() {
-    let capture = Arc::new(Mutex::new(Vec::new()));
-    let rounds = vec![
-        scripted_round("greeting"),
-        round_with_tool_calls("", &["bash", "read_file"]),
-        round_with_tool_calls_tagged("here is the answer", &["bash"], "r3"),
-    ];
-    let mut host = build_host(
-        rounds,
-        Some(("anthropic", "claude-sonnet-4")),
-        capture.clone(),
-    );
-    let mut state = make_test_loop_state();
-    state
-        .messages
-        .push(json!({ "role": "user", "content": "please help" }));
-
-    // Round 1 — text only.
-    let result_r1 = host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-    assert!(result_r1.accum.tool_calls.is_empty());
-    let events_r1 = host.take_emitted_events();
-    let types_r1 = event_types_in_order(&events_r1);
-    assert!(
-        types_r1.iter().any(|t| t == "text_delta"),
-        "round 1 must emit text_delta, got {types_r1:?}"
-    );
-    assert!(
-        !types_r1.iter().any(|t| t == "tool_call"),
-        "round 1 has no tool_calls, got {types_r1:?}"
-    );
-    let text_pos_r1 = types_r1.iter().position(|t| t == "text_delta").unwrap();
-    let usage_pos_r1 = types_r1.iter().position(|t| t == "usage").unwrap();
-    assert!(
-        text_pos_r1 < usage_pos_r1,
-        "text_delta must come before usage, got {types_r1:?}"
-    );
-
-    // Simulate tool-result injection between turns (as the real loop would).
-    state
-        .messages
-        .push(json!({"role": "assistant", "content": "greeting"}));
-    state
-        .messages
-        .push(json!({"role": "user", "content": "now run some tools"}));
-
-    // Round 2 — tool_calls only, no text.
-    let result_r2 = host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-    assert_eq!(
-        result_r2.accum.tool_calls.len(),
-        2,
-        "round 2 typed result must preserve both tool calls"
-    );
-    assert!(result_r2.accum.full_text.is_empty());
-    let events_r2 = host.take_emitted_events();
-    let types_r2 = event_types_in_order(&events_r2);
-    assert!(
-        !types_r2.iter().any(|event_type| event_type == "tool_call"),
-        "host-only helper must not fabricate the outer loop's admitted tool lifecycle"
-    );
-    assert!(types_r2.iter().any(|event_type| event_type == "usage"));
-
-    // Append synthetic tool_result messages and a follow-up to simulate
-    // the agentic loop feeding tool outputs back to the LLM.
-    state.messages.push(json!({
-        "role": "assistant",
-        "content": "",
-        "tool_calls": [
-            {"id": "tc_bash_0", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
-            {"id": "tc_read_file_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
-        ]
-    }));
-    state
-        .messages
-        .push(json!({"role": "tool", "tool_call_id": "tc_bash_0", "content": "ok"}));
-    state
-        .messages
-        .push(json!({"role": "tool", "tool_call_id": "tc_read_file_1", "content": "hello"}));
-
-    // Round 3 — mixed text + tool_call.
-    let result_r3 = host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-    assert_eq!(
-        result_r3.accum.tool_calls.len(),
+        .find(|tool| tool["name"] == "read_file")
+        .expect("actual server workspace read_file baseline");
+    let (changed, _) = actual_requests(
+        "anthropic",
+        vec![schema("read_file", "Runtime provider read schema")],
+        workspace.path(),
         1,
-        "round 3 typed result must preserve its tool call"
-    );
-    assert_eq!(result_r3.accum.full_text, "here is the answer");
-    let events_r3 = host.take_emitted_events();
-    let types_r3 = event_types_in_order(&events_r3);
-    let text_pos_r3 = types_r3.iter().position(|t| t == "text_delta").unwrap();
-    let usage_pos_r3 = types_r3.iter().position(|t| t == "usage").unwrap();
-    assert!(
-        text_pos_r3 < usage_pos_r3,
-        "mixed round must emit text before usage, got {types_r3:?}"
-    );
-    assert!(
-        !types_r3.iter().any(|event_type| event_type == "tool_call"),
-        "outer-loop tool admission remains outside the host-only helper"
-    );
-
-    // Cacheable prefix stable across all 3 rounds (tools + system unchanged).
-    let g = capture.lock().unwrap();
-    assert_eq!(g.len(), 3);
-    assert_eq!(
-        g[0].cacheable_prefix_sha256, g[1].cacheable_prefix_sha256,
-        "interleaving tool calls must not churn the cacheable prefix"
-    );
-    assert_eq!(
-        g[1].cacheable_prefix_sha256, g[2].cacheable_prefix_sha256,
-        "mixed text+tool must not churn the cacheable prefix"
-    );
-
-    // History grows strictly between rounds — no message loss or reordering
-    // of the captured snapshot lengths.
-    assert!(g[0].messages.len() <= g[1].messages.len());
-    assert!(g[1].messages.len() < g[2].messages.len());
-}
-
-// ── pc-single-tail-breakpoint: the reference agent message marker semantics ─────────
-//
-// Captured production traffic (~/.astra/sessions/<sid>/llm_capture_*.json)
-// showed `cache_read` pinned at ~10 688 tokens for ~60 consecutive rounds —
-// the exact size of `system + tools`. Message history contributed zero cache
-// hits despite conversations spanning tens of thousands of tokens.
-//
-// the reference agent's Anthropic/Bedrock contract is stricter: exactly one
-// message-level `cache_control` marker on the last non-system message.
-// Historical messages must remain byte-stable across rounds because they
-// are never rewritten to carry an older marker.
-
-fn assistant_reply(text: &str) -> Value {
-    json!({ "role": "assistant", "content": text })
-}
-
-fn user_msg(text: &str) -> Value {
-    json!({ "role": "user", "content": text })
-}
-
-fn advance_turn(
-    state: &mut astra_runtime::turn::agentic_loop::host::AgenticLoopState,
-    reply: &str,
-    next_q: &str,
-) {
-    state.messages.push(assistant_reply(reply));
-    state.messages.push(user_msg(next_q));
-}
-
-/// The full single-tail-breakpoint contract in one test: count, position, and
-/// byte-identity all hang off the same 4-round fixture and share state.
-///
-///   * count:         every round carries exactly 1 message marker.
-///   * position:      the marker sits on the last non-system message.
-///   * byte identity: historical messages remain bit-for-bit stable across
-///                    adjacent rounds because no older round is rewritten.
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(prompt_cache_env)]
-async fn single_tail_breakpoint_count_position_and_bytes_invariants() {
-    let capture = Arc::new(Mutex::new(Vec::new()));
-    let rounds = vec![
-        scripted_round("r1 reply"),
-        scripted_round("r2 reply"),
-        scripted_round("r3 reply"),
-        scripted_round("r4 reply"),
-    ];
-    let mut host = build_host(
-        rounds,
-        Some(("anthropic", "claude-sonnet-4")),
-        capture.clone(),
-    );
-    let mut state = make_test_loop_state();
-    state.max_turn_input_tokens = 200_000;
-
-    state.messages.push(user_msg("q1"));
-    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-    advance_turn(&mut state, "r1 reply", "q2");
-    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-    advance_turn(&mut state, "r2 reply", "q3");
-    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-    advance_turn(&mut state, "r3 reply", "q4");
-    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-
-    let g = capture.lock().unwrap();
-    assert_eq!(g.len(), 4);
-
-    for (round, captured) in g.iter().enumerate() {
-        let marker_index = single_message_marker_index(captured);
-        let last_non_system = last_non_system_message_index(captured);
-        assert_eq!(
-            marker_index,
-            last_non_system,
-            "round {} must emit exactly one marker on the latest user tail",
-            round + 1,
-        );
-        assert!(
-            captured.last_message_has_cache_control,
-            "round {} last non-system message must carry cache_control",
-            round + 1,
-        );
-    }
-
-    // ── byte identity: historical messages stay bit-for-bit stable ──
-    for i in 0..g[1].message_cache_control_indices[0] {
-        assert_eq!(
-            g[1].message_sha256[i], g[2].message_sha256[i],
-            "round 3 historical message[{i}] bytes must equal round 2",
-        );
-    }
-    for i in 0..g[2].message_cache_control_indices[0] {
-        assert_eq!(
-            g[2].message_sha256[i], g[3].message_sha256[i],
-            "round 4 historical message[{i}] bytes must equal round 3",
-        );
-    }
-}
-
-fn single_message_marker_index(captured: &CapturedLlmRequest) -> usize {
-    assert_eq!(
-        captured.message_cache_control_indices.len(),
-        1,
-        "captured request must carry exactly one message cache marker"
-    );
-    captured.message_cache_control_indices[0]
-}
-
-fn last_non_system_message_index(captured: &CapturedLlmRequest) -> usize {
-    captured
-        .messages
+        usage,
+    )
+    .await;
+    let matches: Vec<_> = changed[0]["tools"]
+        .as_array()
+        .unwrap()
         .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, message)| message.get("role").and_then(Value::as_str) != Some("system"))
-        .map(|(index, _)| index)
-        .expect("captured request must contain a non-system message")
+        .filter(|tool| tool["name"] == "read_file")
+        .collect();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["description"], "Runtime provider read schema");
+    assert_ne!(server_read["description"], matches[0]["description"]);
 }
 
-// ── pc-provider-neutral-noop ───────────────────────────────────────────────
-//
-// Message-level cache breakpoints are Anthropic-only. For OpenAI-compatible providers
-// (OpenAI, MiniMax, Qwen, DeepSeek, etc.) no cache_control may leak into
-// the serialized messages — those providers reject or silently ignore the
-// field, and byte-stability is achieved by keeping messages untouched.
-#[tokio::test(flavor = "multi_thread")]
-#[serial_test::serial(prompt_cache_env)]
-async fn message_breakpoint_noop_for_openai_compatible_providers() {
-    for (provider, model) in [
-        ("openai", "gpt-4o-mini"),
-        ("minimax", "MiniMax-M2.7"),
-        ("deepseek", "deepseek-chat"),
-    ] {
-        let capture = Arc::new(Mutex::new(Vec::new()));
-        let rounds = vec![
-            scripted_round("a"),
-            scripted_round("b"),
-            scripted_round("c"),
-        ];
-        let mut host = build_host(rounds, Some((provider, model)), capture.clone());
-        let mut state = make_test_loop_state();
-        state.messages.push(user_msg("q1"));
-        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-        advance_turn(&mut state, "a", "q2");
-        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
-        advance_turn(&mut state, "b", "q3");
-        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+struct CacheDisableGuard(Option<OsString>);
 
-        let g = capture.lock().unwrap();
-        for (i, c) in g.iter().enumerate() {
-            assert!(
-                !c.is_anthropic,
-                "{provider}: must not latch anthropic mode (round {i})"
-            );
-            assert!(
-                c.message_cache_control_indices.is_empty(),
-                "{provider}: messages must carry zero cache_control markers, got {:?} (round {i})",
-                c.message_cache_control_indices,
-            );
+impl CacheDisableGuard {
+    fn set(value: &str) -> Self {
+        let previous = std::env::var_os("ASTRA_TEST_PROMPT_CACHE_DISABLED");
+        // Every cache test in this process joins the same serial group; all
+        // provider work is awaited before restoring the caller's environment.
+        unsafe {
+            std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", value);
         }
+        Self(previous)
+    }
+}
+
+impl Drop for CacheDisableGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.0 {
+                Some(value) => std::env::set_var("ASTRA_TEST_PROMPT_CACHE_DISABLED", value),
+                None => std::env::remove_var("ASTRA_TEST_PROMPT_CACHE_DISABLED"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(prompt_cache_env)]
+async fn cache_disabled_suppresses_native_annotations_across_user_turns() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    for flag in ["1", "true"] {
+        let _guard = CacheDisableGuard::set(flag);
+        for provider in ["anthropic", "bedrock"] {
+            let usage = if provider == "anthropic" {
+                json!({"input_tokens":10,"output_tokens":5})
+            } else {
+                json!({"inputTokens":10,"outputTokens":5,"totalTokens":15})
+            };
+            let (requests, _) =
+                actual_requests(provider, Vec::new(), workspace.path(), 2, usage).await;
+            assert_eq!(requests.len(), 2);
+            for request in requests {
+                assert_eq!(
+                    native_cache_marker_count(&request),
+                    0,
+                    "{provider}/{flag}: no Astra annotations"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(prompt_cache_env)]
+async fn native_cache_usage_is_settled_as_disjoint_buckets() {
+    let workspace = tempfile::TempDir::new().unwrap();
+    for provider in ["anthropic", "bedrock"] {
+        let usage = if provider == "anthropic" {
+            json!({"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":88,"cache_creation_input_tokens":12})
+        } else {
+            json!({"inputTokens":100,"outputTokens":20,"cacheReadInputTokens":88,"cacheWriteInputTokens":12})
+        };
+        let (_, state) = actual_requests(provider, Vec::new(), workspace.path(), 1, usage).await;
+        assert_eq!(
+            (
+                state.total_prompt,
+                state.total_completion,
+                state.total_cache_read,
+                state.total_cache_creation
+            ),
+            (100, 20, 88, 12),
+            "{provider}: actual usage buckets"
+        );
     }
 }

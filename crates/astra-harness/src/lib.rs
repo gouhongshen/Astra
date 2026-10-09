@@ -1,24 +1,14 @@
-pub mod adjust;
 pub mod capability_matrix;
-pub mod debug;
-pub mod forensics;
 mod kernel;
-pub mod query;
-pub mod rollback;
-pub mod scenario;
 mod snapshot_diff;
 pub mod trace;
 pub mod verifiers;
 
-pub use adjust::{AdjustCommand, AdjustSender, adjust_channel};
 pub use capability_matrix::{
     CAPABILITY_CASES, CapabilityCase, CapabilityQuadrant, CaseKind, MatrixIssue, ModelValidation,
     Topology, TraceContractViolation, validate_capability_matrix, verify_trace_contract,
 };
-pub use debug::{Breakpoint, DebugKernel};
 pub use kernel::{HarnessLimits, HarnessProfile, StandardKernel};
-pub use query::{HarnessQueryReceiver, HarnessQuerySender, query_channel};
-pub use rollback::RollbackAssessment;
 pub use snapshot_diff::SnapshotDiff;
 pub use trace::{PrivacyPolicy, RecordingKernel, SessionTrace, TraceOutcome};
 
@@ -87,9 +77,7 @@ pub struct RuntimeSnapshot {
     #[serde(default)]
     pub redundant_read_count: u32,
 
-    // ── Delegation (Phase 4) ──
-    #[serde(default)]
-    pub delegations_this_turn: u32,
+    // ── Delegation depth ──
     #[serde(default)]
     pub recursion_depth: u8,
 
@@ -145,7 +133,6 @@ impl RuntimeSnapshot {
             last_tool_result_class: None,
             read_only_round_streak: 0,
             redundant_read_count: 0,
-            delegations_this_turn: 0,
             recursion_depth: 0,
             consecutive_errors: 0,
             captured_at_unix_millis: 0,
@@ -385,7 +372,6 @@ mod tests {
             last_tool_result_class: Some("success".into()),
             read_only_round_streak: 0,
             redundant_read_count: 0,
-            delegations_this_turn: 0,
             recursion_depth: 0,
             consecutive_errors: 0,
             captured_at_unix_millis: 1_700_000_000_000,

@@ -41,13 +41,14 @@ pub trait HeadlessActionFence: Send + Sync {
     async fn allow_action(&self, action_id: &str) -> Result<bool, String>;
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct HeadlessRoundOutcome {
     pub superseded_before_action: bool,
     pub action_admission_error: Option<String>,
     /// Exact server call IDs whose terminal event is owned by the shared
     /// headless loop. Runtime-route and edge-owned calls are excluded.
     pub shared_loop_terminal_call_ids: HashSet<String>,
+    pub(crate) accepted_sends: Vec<crate::orchestration::agent_tool::AcceptedAgentSend>,
 }
 
 /// Ordered views of one provider batch at the history/execution boundary.
@@ -79,8 +80,6 @@ impl<'a> HeadlessToolCallViews<'a> {
 
 /// Typed execution context for one headless tool round.
 pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
-    pub task_resolution_authority:
-        Option<&'a astra_turn_types::task_resolution::TaskResolutionSubmissionAuthority>,
     /// Internal agentic step index (0-based) for cache and loop accounting.
     pub turn_index: usize,
     /// User-visible session turn currently in progress (1-based).
@@ -99,6 +98,9 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     /// capability in the same transaction as `Prepared -> Dispatched`.
     pub durable_dispatch_admission:
         Option<crate::server::tool_invocation_runtime::DurableDispatchAdmission>,
+    pub delegation_model_admissions: Option<
+        &'a HashMap<String, crate::turn::agentic_loop::host::PreparedDelegationModelAdmission>,
+    >,
     /// Exact provider calls, used only to append the assistant transcript.
     pub physical_tool_calls: &'a [Value],
     /// Admitted execution targets, used by policy, scheduling, and execution.
@@ -162,7 +164,7 @@ struct HeadlessPreparedRound<'a> {
     effective_permission_timeout: Duration,
     logical_tool_calls: &'a [Value],
     pre_resolved_ids: HashSet<String>,
-    indices: Vec<astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx>,
+    indices: Vec<usize>,
     step_deadline: HeadlessStepDeadline,
     consumed_edge: Vec<bool>,
 }
@@ -200,7 +202,6 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
         || astra_turn_core::edge_ledger::history_has_reasoning(messages);
     let opening = begin_headless_tool_round_opening_ext(
         physical_tool_calls,
-        edge_tool_round,
         reasoning_content,
         reasoning_signature,
         force_reasoning,
@@ -236,14 +237,7 @@ async fn prepare_headless_tool_round<'a, E: EdgeToolRoundRow>(
         .indices
         .iter()
         .map(|idx| {
-            let slot = resolve_headless_tool_slot(*idx, logical_tool_calls, |edge_idx| {
-                let edge = &edge_tool_round[edge_idx];
-                (
-                    edge.assistant_tool_call_id(edge_idx),
-                    edge.tool_name().to_string(),
-                    edge.tool_args().clone(),
-                )
-            });
+            let slot = resolve_headless_tool_slot(*idx, logical_tool_calls);
             ExecutionSlotSpec {
                 args_preview: make_args_preview(&slot.name, &slot.args),
                 tool_name: slot.name,
@@ -283,7 +277,6 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
     action_fence: Option<&dyn HeadlessActionFence>,
 ) -> HeadlessRoundOutcome {
     let HeadlessToolRoundCtx {
-        task_resolution_authority,
         turn_index,
         session_turn,
         quiet,
@@ -294,6 +287,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
         current_run_id,
         current_turn_chain_id,
         durable_dispatch_admission,
+        delegation_model_admissions,
         physical_tool_calls,
         logical_tool_calls,
         deferred_activations_by_call_id,
@@ -394,15 +388,11 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             ..Default::default()
         };
     }
-    if logical_tool_calls.is_empty()
-        && edge_tool_round.is_empty()
-        && pre_resolved_results.is_empty()
-    {
+    if logical_tool_calls.is_empty() {
         return HeadlessRoundOutcome {
             superseded_before_action: false,
             action_admission_error: Some(
-                "headless tool round requires at least one admitted, rejected, or edge carrier"
-                    .to_string(),
+                "headless tool round requires a provider request batch".to_string(),
             ),
             ..Default::default()
         };
@@ -440,7 +430,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             current_run_id,
             current_turn_chain_id,
             durable_dispatch_admission,
-            task_resolution_authority,
+            delegation_model_admissions,
             tool_calls: logical_tool_calls,
             deferred_activations_by_call_id,
             runtime_control_calls_by_id,
@@ -546,9 +536,7 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             }
         }
     }
-    let superseded_before_action = pipeline.action_fence_superseded();
-    let action_admission_error = pipeline.action_fence_error().map(ToString::to_string);
-    let shared_loop_terminal_call_ids = pipeline.into_shared_loop_terminal_call_ids();
+    let outcome = pipeline.into_round_outcome();
     for message in messages.iter_mut().skip(history_start) {
         if message.get("role").and_then(Value::as_str) != Some("tool") {
             continue;
@@ -563,31 +551,22 @@ pub async fn run_agentic_headless_tool_round_with_action_fence<E: EdgeToolRoundR
             );
         }
     }
-    HeadlessRoundOutcome {
-        superseded_before_action,
-        action_admission_error,
-        shared_loop_terminal_call_ids,
-    }
+    outcome
 }
 
-use astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx;
-
 pub(crate) enum ToolBatch {
-    Concurrent(Vec<HeadlessRoundToolIdx>),
-    Serial(HeadlessRoundToolIdx),
+    Concurrent(Vec<usize>),
+    Serial(usize),
 }
 
 #[cfg(test)]
-pub(crate) fn partition_tool_batches(
-    indices: &[HeadlessRoundToolIdx],
-    tool_calls: &[Value],
-) -> Vec<ToolBatch> {
+pub(crate) fn partition_tool_batches(indices: &[usize], tool_calls: &[Value]) -> Vec<ToolBatch> {
     partition_tool_batches_with_provider_policy(indices, tool_calls, |_| None)
 }
 
 #[cfg(test)]
 pub(crate) fn partition_tool_batches_with_provider_policy<F>(
-    indices: &[HeadlessRoundToolIdx],
+    indices: &[usize],
     tool_calls: &[Value],
     provider_parallelizable: F,
 ) -> Vec<ToolBatch>
@@ -603,7 +582,7 @@ where
 }
 
 pub(crate) fn partition_tool_batches_with_provider_policy_and_serial_gate<F, G>(
-    indices: &[HeadlessRoundToolIdx],
+    indices: &[usize],
     tool_calls: &[Value],
     provider_parallelizable: F,
     force_serial: G,
@@ -616,27 +595,19 @@ where
     use astra_turn_core::tool_policy::is_tool_concurrency_safe;
 
     let mut batches = Vec::new();
-    let mut concurrent_buf: Vec<HeadlessRoundToolIdx> = Vec::new();
+    let mut concurrent_buf: Vec<usize> = Vec::new();
 
     for &idx in indices {
-        let (tool_name, tool_args, serial_boundary) = match &idx {
-            HeadlessRoundToolIdx::ServerToolCall(i) => {
-                let call = tool_calls.get(*i);
-                (
-                    call.and_then(|tc| tc.get("function"))
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or(""),
-                    call.and_then(astra_turn_core::parallel_tool_exec::parse_tool_args),
-                    call.is_some_and(|call| force_serial(call)),
-                )
-            }
-            HeadlessRoundToolIdx::SyntheticEdge(_) => ("synthetic_edge", None, false),
-        };
+        let call = tool_calls.get(idx);
+        let tool_name = call
+            .and_then(|call| call.get("function"))
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let tool_args = call.and_then(astra_turn_core::parallel_tool_exec::parse_tool_args);
+        let serial_boundary = call.is_some_and(|call| force_serial(call));
 
-        let is_readonly = if tool_name == "synthetic_edge" {
-            true
-        } else if let Some(parallelizable) = provider_parallelizable(tool_name) {
+        let is_readonly = if let Some(parallelizable) = provider_parallelizable(tool_name) {
             parallelizable
         } else {
             READ_ONLY_TOOLS.contains(&tool_name)
@@ -663,8 +634,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn server_idx(i: usize) -> HeadlessRoundToolIdx {
-        HeadlessRoundToolIdx::ServerToolCall(i)
+    fn server_idx(i: usize) -> usize {
+        i
     }
 
     #[test]

@@ -8,7 +8,9 @@ The completion line shows elapsed time, time to first token (`ttft`), primary
 model tokens, and cache usage when reported. Complete input accounting shows
 the cached-input percentage; incomplete accounting shows lower bounds such as
 `≥19.9k tokens · ≥17.9k cached`. Missing cache measurements are omitted, not
-reported as zero. Session totals remain separate in parentheses.
+reported as zero. The `≥` counts are reported lower bounds; no cache
+percentage is shown without a complete input total. Session totals remain
+separate in parentheses.
 
 ## Personal BYOK model setup
 
@@ -116,12 +118,10 @@ astra chat -m "继续" --session-id <session_id> --model gpt-4o
 
 # Sessions
 astra session list [--agent-id AGENT] [--status open] [--limit 20] [--offset 0]
-astra session show <session_id>
+astra session show <session_id> [--execution [--transcript] [--run-events]] # bounded read-only facts; optional transcript and recent run-event tails
 astra session close <session_id>
 astra session delete <session_id>
 astra session judge --model MODEL --message 'Rubric and evidence' [--timeout-seconds 120]
-
-# Replay (reserved; currently unavailable for owned sessions and returns HTTP 501)
 
 # Models
 astra model list                         # consumes the complete paginated catalog
@@ -192,7 +192,6 @@ astra admin skill versions <skill_name>
 
 # Prompt / feedback
 astra admin prompt optimize --agent-id <agent_id> [--optimization-type quality]
-astra admin feedback stats [--agent-id <agent_id>] [--since 2026-02-01T00:00:00]
 astra admin feedback export [--agent-id <agent_id>] [--format jsonl]
 ```
 
@@ -201,4 +200,5 @@ astra admin feedback export [--agent-id <agent_id>] [--format jsonl]
 - CLIs share credential storage: `~/.astra/credentials.json` (tests may set `ASTRA_CREDENTIALS_DIR`)
 - `--profile` lets you isolate credentials by environment/user
 - API errors are returned with HTTP status and compact response body for easier debugging
-- Interactive mode launches the TUI (requires a TTY; use `astra chat -m` or `--print` for non-interactive invocations)
+- Once a chat stream has started, `astra chat --json` and `--print --output-format json` also return a structured result on hard failure (exit code 3). It retains the validated root run identity, partial output and observed usage, with `success: false` and partial evidence coverage. A request rejected before Run admission has no run identity; an error does not imply successful or resumable execution.
+- Interactive mode launches the TUI (requires a TTY; use `astra chat -m` or `--print` for non-interactive invocations). There is no separate console slash frontend.

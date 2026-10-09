@@ -118,6 +118,9 @@ export type RunResumedEvent = {
 export type RunFinishedEvent = {
   type: "run_finished";
   run_id?: string;
+  owner_generation?: number;
+  /** Original Server journal fact; clients must not re-evaluate partial tool events. */
+  turn_evaluation?: Record<string, unknown> | null;
   status?: string;
   error?: string | null;
   interrupted?: boolean;
@@ -399,8 +402,7 @@ export type ExplainAnalyzeUsageV1 = {
 export type ExplainAnalyzeContextSourceKindV1 =
   | "identity" | "self_model" | "project_context" | "deferred_tools"
   | "available_skills" | "memory" | "working_memory" | "history" | "constraints"
-  | "skills" | "runtime_identity" | "runtime_volatile" | "emergent_skills"
-  | "emergent_memory" | "emergent_summary";
+  | "skills" | "runtime_identity" | "runtime_volatile";
 
 export type ExplainAnalyzeContextBudgetV1 = {
   basis: "pre_provider_estimate";
@@ -577,6 +579,12 @@ export type ExplainAnalyzeAuxiliaryDetailsV1 = {
   admission?: ExplainAnalyzeAdmissionSettlementV1;
 };
 
+export type ExplainAnalyzeDecisionDetailV1 = {
+  kind: "delegation_catalog_resolution";
+  requirement_index: number;
+  match_count: number;
+};
+
 export type ExplainAnalyzeEventV1 = {
   type: "explain_analyze";
   schema_version: 1;
@@ -597,6 +605,7 @@ export type ExplainAnalyzeEventV1 = {
   start_elapsed_ms?: number;
   duration_ms?: number;
   outcome?: ExplainAnalyzeOutcomeV1;
+  decision_detail?: ExplainAnalyzeDecisionDetailV1;
   usage?: ExplainAnalyzeUsageV1;
   auxiliary_usage?: ExplainAnalyzeAuxiliaryUsageV1;
   auxiliary_details?: ExplainAnalyzeAuxiliaryDetailsV1;
@@ -1228,8 +1237,24 @@ export type WorkBinding = {
   branchId: string;
 };
 
+/** Verification obligations, executed through ordinary tool admission. */
+export type CompletionCheckDeclarations = {
+  stop: CompletionCheck[];
+  task_completed: CompletionCheck[];
+};
+
+export type CompletionCheck = {
+  label: string;
+  command: string;
+  working_dir: string | null;
+  depends_on: string[];
+  timeout_secs: number | null;
+  authoritative: boolean;
+};
+
 export type ChatRequest = {
   message: string;
+  completionChecks?: CompletionCheckDeclarations;
   parts?: unknown[];
   attachments?: unknown[];
   sessionId?: string;
@@ -1238,7 +1263,7 @@ export type ChatRequest = {
   agentId?: string;
   modelSelection: {
     offeringId: string;
-  };
+  } | "auto";
   agentBinding?: AgentBindingSelection;
   runtimeAuth?: {
     authorization: string;
@@ -1412,13 +1437,13 @@ export type SessionInfo = {
 /** A cancellation request is complete only when executionSettled is true. */
 export type SessionCancellationResult = SessionInfo & {
   executionSettled: boolean;
-  workspaceBlocker?: string | null;
+  executionBlocker?: string | null;
   runs: Array<{ runId: string; status: string; executionSettled: boolean }>;
 };
 
 export type RuntimeSessionCancellationResponse = RuntimeSessionResponse & {
   execution_settled: boolean;
-  workspace_blocker?: string | null;
+  execution_blocker?: string | null;
   runs: Array<{ run_id: string; status: string; execution_settled: boolean }>;
 };
 
@@ -1497,13 +1522,26 @@ export type RuntimeTranscriptParams = {
 
 export type RuntimeModelAccessKind =
   | "astra_cloud"
+  | "cloud_byok"
   | "workspace"
   | "this_device"
   | "self_hosted";
 
 export type RuntimeModelExecutionPlacement = "server" | "edge";
 
+export type RuntimeModelCatalogPricing = {
+  currency: "USD";
+  unit: "per_token";
+  source: "configured";
+  prompt: number;
+  completion: number;
+  cache_read: number | null;
+  cache_write: number | null;
+  configuration_updated_at: string;
+};
+
 export type RuntimeModelListItem = {
+  thinking_protocol: "unknown" | "enable_thinking" | "thinking_object" | "reasoning_effort" | "moonshot" | null;
   offering_id: string;
   access_id: string;
   access_kind: RuntimeModelAccessKind;
@@ -1517,6 +1555,7 @@ export type RuntimeModelListItem = {
   max_completion_tokens: number | null;
   architecture: unknown | null;
   thinking_capability: "both" | "effort_only" | "native_only" | "none" | null;
+  pricing: RuntimeModelCatalogPricing | null;
 };
 
 export type RuntimeModelCatalogCursor = {
@@ -1749,21 +1788,26 @@ export type SessionActivity = {
   details: Record<string, unknown>;
 };
 
-/** Nullable lanes retain incomplete evidence; zero is an observed count. */
+/** Known sum and physical attempts that observed it; unknown is not zero. */
+export type ObservedTokenLane = {
+  known_tokens: number | null;
+  observed_attempts: number;
+};
+
 export type SessionRequestUsageSummary = {
   scope: "session_all_runs";
   request_count: number;
-  fresh_input_tokens: number | null;
-  cache_read_tokens: number | null;
-  cache_creation_tokens: number | null;
-  output_tokens: number | null;
+  nonterminal_attempt_count: number;
+  fresh_input_tokens: ObservedTokenLane;
+  cache_read_tokens: ObservedTokenLane;
+  cache_creation_tokens: ObservedTokenLane;
+  output_tokens: ObservedTokenLane;
 };
 
+/** Admission-rate estimate for retained physical attempts, not a provider bill. */
 export type SessionCostSummary = {
   estimated_cost_usd?: number;
-  per_model_cost_usd?: Record<string, number>;
-  priced_turn_count: number;
-  unpriced_turn_count: number;
+  unavailable_reason?: "historical_attempt_coverage_incomplete";
 };
 
 /** `GET /sessions/{id}/audit/summary` — matches the services response. */
@@ -1987,11 +2031,6 @@ export type EdgeRegisterRequestBody = {
 
 export type EdgeHeartbeatRequestBody = {
   edge_agent_id: string;
-};
-
-export type TaskLeaseMutationRequestBody = {
-  edge_agent_id: string;
-  ttl_sec?: number;
 };
 
 // ─── Work-first public contract ────────────────────────────────────
@@ -3053,7 +3092,6 @@ export type WorkReadCursorReceiptV1 = {
 
 export type WorkEventKind =
   | "work_created"
-  | "goal_revised"
   | "criteria_accepted"
   | "branch_basis_adopted"
   | "graph_replaced"

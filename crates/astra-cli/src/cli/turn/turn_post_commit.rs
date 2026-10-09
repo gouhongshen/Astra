@@ -4,11 +4,8 @@ use std::time::{Duration, Instant};
 
 use super::turn_commit::DeferredTurnSidecarWork;
 use crate::cli::notifications;
-use crate::cli::session::session_projection::{
-    CslCheckpointFields, build_full_session_state_compact,
-};
+use crate::cli::session::session_projection::build_full_session_state_compact;
 use crate::cli::session::session_state::SessionState;
-use crate::cli::stream::streaming_types::StreamResult;
 
 /// CSL is a local continuation projection of a primary journal turn, not its
 /// durability boundary. It runs on the post-commit worker, so latency must not
@@ -53,7 +50,6 @@ pub(crate) fn prepare_turn_post_commit_job(
     _api: &astra_thin_client::ThinClient,
     _profile: Option<&str>,
     final_messages: Vec<serde_json::Value>,
-    csl_checkpoint_fields: CslCheckpointFields,
     turn_start: Instant,
 ) -> TurnPostCommitJob {
     let expected_cursor = state
@@ -68,8 +64,7 @@ pub(crate) fn prepare_turn_post_commit_job(
     let csl_state = state
         .csl_manager
         .as_ref()
-        .map(|manager| manager.last_session_state().clone())
-        .map(|previous| build_full_session_state_compact(state, csl_checkpoint_fields, &previous))
+        .map(|_| build_full_session_state_compact(state))
         .unwrap_or_default();
     let notification = notification_for_turn(state, turn_start.elapsed());
     // The active session keeps its manager while this job is queued. The
@@ -303,18 +298,12 @@ fn notification_for_turn(
         .then_some((notif_config, elapsed))
 }
 
-pub(crate) fn extract_csl_fields_from_result(_result: &StreamResult) -> CslCheckpointFields {
-    CslCheckpointFields
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        TurnPostCommitCompletion, apply_turn_post_commit_completion,
-        build_full_session_state_compact, execute_turn_post_commit_job,
-        extract_csl_fields_from_result, prepare_turn_post_commit_job,
+        TurnPostCommitCompletion, apply_turn_post_commit_completion, execute_turn_post_commit_job,
+        prepare_turn_post_commit_job,
     };
-    use crate::cli::session::session_projection::CslCheckpointFields;
     use crate::cli::session::session_state::SessionState;
     use astra_turn_core::conversation_log::{AppendMeta, CslEntry, CslStore, CslStoreError};
     use std::time::Instant;
@@ -370,27 +359,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn extract_csl_fields_from_result_without_checkpoint_returns_empty_projection() {
-        let result = crate::tests::stub_stream_result("done");
-
-        let state = SessionState {
-            recent_tools: vec!["bash".into()],
-            ..Default::default()
-        };
-        let compact = build_full_session_state_compact(
-            &state,
-            extract_csl_fields_from_result(&result),
-            &Default::default(),
-        );
-
-        assert_eq!(compact.recent_tools, vec!["bash".to_string()]);
-        assert!(compact.blocked_tools.is_empty());
-        assert!(compact.approval_overrides.is_none());
-        assert!(compact.interruption.is_none());
-        assert!(compact.compaction_tracker.is_none());
-    }
-
     #[tokio::test]
     #[serial_test::serial]
     async fn csl_projection_uses_the_committed_active_conversation() {
@@ -443,14 +411,8 @@ mod tests {
         );
 
         let api = test_api();
-        let job = prepare_turn_post_commit_job(
-            &mut state,
-            &api,
-            None,
-            final_messages,
-            CslCheckpointFields,
-            Instant::now(),
-        );
+        let job =
+            prepare_turn_post_commit_job(&mut state, &api, None, final_messages, Instant::now());
         let completion = execute_turn_post_commit_job(job).await;
         assert!(completion.errors.is_empty(), "{:?}", completion.errors);
         apply_turn_post_commit_completion(completion, &mut state);
@@ -482,14 +444,7 @@ mod tests {
         };
 
         let api = test_api();
-        let job = prepare_turn_post_commit_job(
-            &mut state,
-            &api,
-            None,
-            Vec::new(),
-            CslCheckpointFields,
-            Instant::now(),
-        );
+        let job = prepare_turn_post_commit_job(&mut state, &api, None, Vec::new(), Instant::now());
         let completion = execute_turn_post_commit_job(job).await;
         assert!(completion.errors.is_empty(), "{:?}", completion.errors);
         assert!(completion.csl_manager.is_some());
@@ -510,14 +465,8 @@ mod tests {
             ..Default::default()
         };
 
-        let _job = prepare_turn_post_commit_job(
-            &mut state,
-            &test_api(),
-            None,
-            Vec::new(),
-            CslCheckpointFields,
-            Instant::now(),
-        );
+        let _job =
+            prepare_turn_post_commit_job(&mut state, &test_api(), None, Vec::new(), Instant::now());
         assert!(state.csl_manager.is_some());
     }
 

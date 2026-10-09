@@ -21,7 +21,7 @@ path = "src/lib.rs"
 default = ["harness"]
 harness = ["astra-runtime/harness", "dep:astra-harness"]
 release-vendored-openssl = ["astra-services/openssl-vendored"]
-e2e-hooks = ["astra-services/e2e-hooks"]
+e2e-hooks = ["astra-services/e2e-hooks", "astra-runtime/e2e-hooks"]
 
 [dependencies]
 astra-core.workspace = true
@@ -63,7 +63,6 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
-similar.workspace = true
 base64.workspace = true
 sqlx.workspace = true
 supports-color = "3"
@@ -108,6 +107,7 @@ fs2 = "0.4"
 shell-words = "1.1.1"
 
 [dev-dependencies]
+astra-runtime = { workspace = true, features = ["e2e-hooks"] }
 tokio = { workspace = true, features = ["test-util"] }
 itertools = "0.13"
 http = "1"

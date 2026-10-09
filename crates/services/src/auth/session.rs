@@ -34,6 +34,94 @@ const SESSION_ACTIVITY_SELECT_AFTER_SQL: &str = "SELECT log_id, action, \
        AND (created_at < ? OR (created_at = ? AND log_id < ?)) \
      ORDER BY created_at DESC, log_id DESC LIMIT ?";
 
+/// Non-secret proof that a local Astra session was active when a run started.
+/// It is an absolute ceiling, not a token, refresh credential, or new session
+/// authority. Reauthorization requires the original session to remain active
+/// and this frozen ceiling to remain unexpired, even after session refresh.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionContinuationGrant {
+    pub user_id: String,
+    pub session_id: String,
+    pub expires_at_unix: i64,
+}
+
+impl ExecutionContinuationGrant {
+    pub(super) fn from_active_session(
+        user_id: String,
+        session_id: String,
+        expires_at_unix: i64,
+    ) -> Self {
+        Self {
+            user_id,
+            session_id,
+            expires_at_unix,
+        }
+    }
+
+    pub(super) fn belongs_to(&self, user_id: &str, session_id: &str) -> bool {
+        !self.user_id.is_empty()
+            && !self.session_id.is_empty()
+            && self.user_id == user_id
+            && self.session_id == session_id
+            && self.expires_at_unix > 0
+    }
+}
+
+impl super::AuthPrincipal {
+    pub fn internal(user: super::AuthUserRecord) -> Self {
+        Self {
+            user,
+            session_id: None,
+            execution_continuation: None,
+            origin: super::AuthPrincipalOrigin::Internal,
+        }
+    }
+
+    pub(super) fn from_local_jwt(
+        user: super::AuthUserRecord,
+        session_id: String,
+        execution_continuation: ExecutionContinuationGrant,
+    ) -> Self {
+        Self {
+            user,
+            session_id: Some(session_id),
+            execution_continuation: Some(execution_continuation),
+            origin: super::AuthPrincipalOrigin::Internal,
+        }
+    }
+
+    pub(super) fn from_verified_provider_session(
+        user: super::AuthUserRecord,
+        session_id: String,
+        provider_id: String,
+        external_subject: String,
+        execution_continuation: Option<ExecutionContinuationGrant>,
+    ) -> Self {
+        Self {
+            user,
+            session_id: Some(session_id),
+            execution_continuation,
+            origin: super::AuthPrincipalOrigin::VerifiedProvider {
+                provider_id,
+                external_subject,
+            },
+        }
+    }
+
+    pub(super) fn from_provider_request(
+        user: super::AuthUserRecord,
+        context: super::AuthProviderAuthorizedRequestContext,
+    ) -> Self {
+        Self {
+            user,
+            session_id: None,
+            execution_continuation: None,
+            origin: super::AuthPrincipalOrigin::ProviderAuthorizedRequest(context),
+        }
+    }
+}
+
 #[async_trait]
 pub trait SessionService: Send + Sync {
     async fn create_session(
@@ -443,7 +531,6 @@ pub struct DatabaseSessionService {
 struct SessionDeletionOutcome {
     session: SessionRecord,
     database_rows_deleted: u64,
-    session_references_cleared: u64,
     workspace_cleanup_debts_enqueued: u64,
     database_tables_deleted: Vec<SessionTableDeleteOutcome>,
     local_bytes_freed: u64,
@@ -656,7 +743,6 @@ impl DatabaseSessionService {
         Ok(SessionDeletionOutcome {
             session: existing,
             database_rows_deleted: hard_delete.database_rows_deleted,
-            session_references_cleared: hard_delete.session_references_cleared,
             workspace_cleanup_debts_enqueued: hard_delete.workspace_cleanup_debts_enqueued,
             database_tables_deleted: hard_delete.database_tables_deleted,
             local_bytes_freed: hard_delete.local_bytes_freed,
@@ -1004,7 +1090,6 @@ impl SessionService for DatabaseSessionService {
         let details = serde_json::json!({
             "title": outcome.session.title,
             "database_rows_deleted": outcome.database_rows_deleted,
-            "session_references_cleared": outcome.session_references_cleared,
             "workspace_cleanup_debts_enqueued": outcome.workspace_cleanup_debts_enqueued,
             "database_tables_deleted": outcome.database_tables_deleted,
             "local_bytes_freed": outcome.local_bytes_freed,
@@ -1178,24 +1263,21 @@ mod tests {
     use super::*;
 
     fn provider_principal(provider: &str, subject: &str, scope: &str) -> crate::AuthPrincipal {
-        crate::AuthPrincipal {
-            user: crate::AuthUserRecord {
+        crate::AuthPrincipal::from_provider_request(
+            crate::AuthUserRecord {
                 user_id: "mapped-user".to_string(),
                 username: "mapped-user".to_string(),
                 email: "mapped@example.test".to_string(),
                 display_name: None,
             },
-            session_id: None,
-            origin: crate::AuthPrincipalOrigin::ProviderAuthorizedRequest(
-                crate::AuthProviderAuthorizedRequestContext {
-                    provider_id: provider.to_string(),
-                    external_subject: subject.to_string(),
-                    provider_scope_id: scope.to_string(),
-                    request_authorization_id: "request-1".to_string(),
-                    edge_agent_id: None,
-                },
-            ),
-        }
+            crate::AuthProviderAuthorizedRequestContext {
+                provider_id: provider.to_string(),
+                external_subject: subject.to_string(),
+                provider_scope_id: scope.to_string(),
+                request_authorization_id: "request-1".to_string(),
+                edge_agent_id: None,
+            },
+        )
     }
 
     #[test]

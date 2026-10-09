@@ -15,6 +15,61 @@ This document defines the target lifecycle contract. Current code can be evaluat
 - Cancel, delete, archive, pause, blocked, and resume must have explicit transitions.
 - Recovery correctness depends on durable state, checkpoints, transcript, and events.
 
+## Source API retirement
+
+The unused `LoopDispatcher` source API is retired; production hosts invoke the
+canonical agentic loop directly. CLI source APIs for the old registry completion
+algorithms, command-usage cache, table/not-found renderers, Git snapshot helper
+and disconnected session-end preference push are also retired. Their dedicated
+self-tests did not provide a product entrypoint. The current TUI menu,
+journal projection, error formatting and preference pull/outbox paths remain
+the owners of those supported interactions.
+
+CLI admission publishes capability, workspace and model-selection facts;
+Server owns model-round preparation and continuation. The former client
+model-request constructor, tool-result continuation parameters and their source
+APIs are retired. CLI retains callback delivery, permission filtering, health
+statistics and recovery projections. Its continuity checkpoint records zero
+local remaining rounds rather than guessing a Server allowance; authoritative
+execution budgets and interruption details remain Server-owned.
+
+The unused in-memory session-state delta accumulator is also retired. Session
+lineage, canonical journal append/replay and cloud synchronization retain their
+existing owners; no parallel mutation log is provided. The unused
+`find_stale_sessions` scanner and `StaleSessionInfo` source APIs are retired;
+startup maintenance still uses the owner-scoped maintenance entrypoint.
+
+Tool-result persistence stores one immutable document per run, call and document
+kind. Typed journal descriptors bind recovery to exact bytes; a display envelope
+alone does not authorize materialization. The former run-less persistence,
+call-id-only readers and URI generator are retired source APIs. There is no
+mutable call-id replica or fallback read; existing descriptor reads, atomic
+publication and same-byte retry remain the supported path.
+
+Retired storage APIs are `maybe_persist_tool_result`,
+`persist_tool_result_with_replacement`, `maybe_persist_tool_result_unconditional`,
+`maybe_persist_tool_result_with_descriptor`, `read_persisted_result`,
+`read_persisted_result_window`, and `session_tool_result_artifact_uri`.
+
+Tool-stream ingestion uses provider requests or the authoritative Server summary
+for tool counts and names. The former Edge-result count and name-closure inputs
+are retired source API parameters. Completion-action constraints are checked
+before dispatch. Interception preserves the provider batch order and rejects
+dispositions without a corresponding provider request instead of reconstructing
+requests from admission outcomes.
+
+Host turn responses carry the provider observation, timing and error only.
+Tool callbacks enter through admitted invocations and match exact provider
+request IDs. Tool-round indices, assistant messages and stall signatures come
+from those provider requests; callbacks do not create additional tool slots or
+replacement identities. A callback without a request ID cannot establish
+execution custody or recovery evidence.
+
+A successful executor-owned verify-mode v2 receipt proves that the bound
+workspace did not change. Parallel verification calls carrying that receipt do
+not invalidate each other's evidence. Opaque commands, failed or malformed
+receipts, and a concurrent writer retain the freshness barrier.
+
 ## State hierarchy
 
 ```text
@@ -33,6 +88,31 @@ session
 A session is the continuity boundary for user-visible conversation, context, memory references, provider bindings, and task board projection.
 
 A session may span Web, CLI, Edge, and multiple devices. Surface changes do not create a new backbone.
+
+Each CLI SSE invocation publishes its server-verified session and run identity
+before terminal output, including resumed sessions. A previously installed
+session id does not bind a new stream observer or authorize timeout cleanup.
+
+CLI session exit commits the local journal end and workspace boundary before
+optional remote maintenance. A failed local write remains observable and
+retryable; an ambiguous sync result is retried against the journal rather than
+an independent process-wide completion flag. Remote governance and consolidation
+share one bounded deadline, including authentication transitions.
+Canonical continuation, owner/cursor/root checks and the execution lease remain
+the recovery authority. The CLI has no manual history-edit/checkpoint frontend.
+Only the root execution publishes the local session checkpoint timeline.
+Delegated warning checkpoints remain in memory; they must not replace the
+parent session recovery artifact.
+Recorder observations live in the event journal and active execution cursor;
+there is no separate CLI recorder summary or profiling history. Checkpoint file
+numbers are allocated from the persisted session timeline at publication.
+Startup retention maintenance runs on a blocking worker with a captured owner
+path and protects the explicit resume target, including compressed journals.
+
+Run state/event transitions and delegation outcomes use the execution owner's
+captured generation. The obsolete unowned CAS/delegation source APIs and the
+test-only alternate approval submission protocol are retired; tests use the
+same fenced transition and atomic batch registration as production.
 
 ## Run
 
@@ -55,9 +135,35 @@ archived
 
 A run may be resumed when its state and checkpoint indicate resumability. Resume must not guess from UI state.
 
+Authenticated CLI session continuation reads the Server-owned canonical resume
+bundle. A local replica cannot override Server ownership, deletion, or a failed
+restore request. Local-only continuation remains available without Server
+authentication; clearing a stale remote pointer does not delete the replica.
+
+Server recovery preserves the opaque execution handoff checkpoint and fences
+its custody to the adopted owner generation. It does not reconstruct execution
+of the original run. Continuing a session in a new run consumes canonical
+conversation history under that new run's admission and ownership; retaining or
+adopting a checkpoint alone does not authorize executing its saved tool calls.
+
 ## Turn
 
 A turn is the user/agent interaction unit used for context, prompt, trace, and tool sequencing. Tool calls inside a turn inherit provider decisions from the capability system.
+
+When a current request supplies an empty `message` and a nonempty `user_intent`,
+the intent is its human prompt. Initial conversation history and the task profile
+use that same effective input. A nonempty `message` remains the prompt text.
+
+Queued run intents use persisted event indices, including gaps, rather than
+positions within a filtered control page. A page with a missing or invalid
+durable index is rejected in full: no intent is delivered and its cursor stays
+unchanged. Malformed intent content with a valid identity remains individually
+diagnosable.
+
+After durable acknowledgement, a guidance batch freezes semantic evidence on
+its exact combined canonical user message and preceding response. An earlier
+turn's source or the batch's last individual input cannot own its observations.
+Failed acknowledgements and replay without new guidance retain the prior source.
 
 ### Bounded continuation and completion
 
@@ -151,6 +257,11 @@ unknown. Effect-owner domain is independent of this scope. Read-only references
 create no mutation obligation. All judgment carriers share this semantic
 contract; the existing typed receipt checks still own completion evidence.
 
+The same distinction applies to delegated agents and fanout children: inferred
+read-only task intent does not create an execution permission ceiling. Children
+retain explicit parent permissions, read-only agent profiles, and physical
+workspace authority; those restrictions remain effective regardless of intent.
+
 Mutation classification concerns requested task-resource effects, not runtime
 checkpoint, audit, trace, usage or scheduling writes. Explicit Astra Work
 tracking, board and graph changes remain obligations of the Work lifecycle and
@@ -194,75 +305,49 @@ Tool results retain their source status, exit semantics, output, and invocation
 identity. Classification uses supported evidence; an unknown cause stays unknown.
 The Agent interprets the impact on the user's task. A later unrelated success
 must not clear a failure, and changing a command does not prove equivalence.
+An executed validation-shaped command can retain exact-operation failure debt
+without proving a successful validation when its arguments have ambiguous
+execution semantics. An ambiguous success clears only its own failure debt;
+Work delivery still requires a proof-eligible validation, with one bounded
+direct revalidation opportunity or a truthful failed/blocked settlement.
+At each completion boundary, the current Work attempt's validation projection
+collects operation debts, freshness and recovery targets together. It is
+short-lived evidence rather than another persisted state or global cache.
+Reopening an action window does not itself replenish its mismatch or repair
+budget; only the corresponding typed transition may reserve a dependent round.
+Argument proof follows the tool's option/operand boundary: a TypeScript `@file`
+is opaque only when parsed as a top-level response-file argument, not when a
+known value-taking option consumes it as an ordinary path or package name.
 
-At completion, an unresolved failure with a later-round observation candidate,
-or the existing repeated-failure signal, permits one evidence-linked
-`submit_task_resolution` proposal through the existing `invoke_tool` carrier
-when the task has a real execution contract. The completion path first
-projects the retained failures into terminally relevant obligations: possible
-bound-workspace mutation, a recognized validation command, declared external
-state, unfinished child/fanout execution, or an invocation that cannot be
-rejoined to durable authority. Ordinary diagnostic probes remain in the full
-ledger and final explanation, but do not turn the answer into
-`ExecutionIncomplete` merely because a later observation exists. This keeps
-the rule semantic rather than tied to one command name. If the runtime cannot
-classify a failed invocation because its authority is missing, it fails closed
-and retains the strict path. The full schema is supplied only in that
-boundary's hint, not added to resident tools. The proposal identifies the
-verification target, failed and later evidence calls,
-`supported`/`partial`/`unknown`, rationale, and remaining gaps. This is a model
-assessment, not a verification receipt.
-The wire contract bounds the target and each gap to 256 characters, rationale to
-1024 characters, and each evidence list to 32 call IDs; runtime validation uses
-the same character-count limits as the provider schema.
-Candidate existence does not establish semantic relevance. Same-round sibling
-results are not later evidence, and exact-operation recovery needs no proposal.
-The transient hint supplies bounded, source-owned execution IDs and typed
-status from the retained policy window, so the Agent can reference evidence
-without inventing identities or performing discovery. Submission transport and
-evidence validation have distinct feedback; neither replaces final coverage.
-Scheduling pressure may decrease after healthy progress; once this bounded
-assessment starts, final coverage is checked against the remaining failure facts,
-not the scheduling stage or whether the proposal tool itself returned success.
+Tool failures are execution facts, not automatically unmet task obligations.
+Return their typed outcome and diagnostic to the model through the normal tool
+result path. A failed exploratory command, repeated failure, later observation,
+or missing recovery assessment must not itself reserve a model round, require
+a submission tool, or replace the final answer with a request to continue.
+Runtime policy may advise the model using the existing bounded evidence window;
+that advice does not grant execution or terminal authority.
 
-If the provider schema rejects this submission before dispatch, the runtime
-records that typed pre-dispatch stage separately from an executed tool failure.
-The same reconciliation boundary may receive one argument correction; that
-budget survives checkpoint recovery and cannot be reopened by handler failures,
-unknown tools, a different boundary, or another invalid submission.
+The model must distinguish observed conclusions from unavailable evidence and
+failed required checks. A cleanly completed conversation can deliver a report
+with explicit limitations; it is not a receipt that every command succeeded or
+that every requested effect was verified. Raw failures remain in journals,
+trace and usage accounting even when another approach answers the question.
 
-Admission binds the call to the current run, turn chain, Work subject and user
-intent. The model supplies only the interpretation; the handler binds scope and
-boundary from current invocation authority. Model-supplied control fields are
-rejected, not silently overridden. Acceptance resolves exact, authority-tagged completion references in the
-existing owner-scoped invocation ledger or Edge dispatch store. Edge references
-bind the selected executor and canonical result hash, and are attached by the
-Server only after durable acceptance; local-only delivery grants no such proof.
-Durable result bodies use lossless text storage: database JSON normalization
-must not change the numeric representation covered by the accepted hash.
-With a configured durable Edge owner, direct tool delivery admits and claims the
-dispatch after guarded run admission and before publishing the request. Existing
-in-flight or terminal dispatches are observed, not re-executed. A durable
-admission failure must not silently downgrade to local-only delivery; an
-ambiguous outcome remains unknown. Explicit local-only hosts can still execute
-through guarded callback delivery without gaining durable assessment authority.
-HTTP callback replay compares original callback content, not the Server's added
-provenance, and never upgrades or overwrites the first delivered reference.
-Task-level resolution requires coverage of all current terminally relevant
-unresolved failures and must not reuse stale workspace evidence after a later
-writer. Advisory failures remain observable evidence and are not silently
-dropped from the journal or answer context. Missing, ambiguous, foreign, or
-unavailable evidence remains unresolved.
-The bounded policy window retains original references across checkpoint recovery;
-local display text and absence from a recovered suffix are not authority.
-Edge workspace evidence without a retained trustworthy ordering relative to a
-known writer remains unresolved after recovery. This does not expand the
-authority of deterministic invocation-backed verification contracts.
+Concrete execution obligations keep their existing owners: permissions and
+provider admission, canonical Work settlement, explicit verification hooks,
+workspace/external-effect receipts, unsettled execution ownership, and child
+completion/reply obligations. None can be discharged by assistant prose or an
+unrelated successful tool. Their interruption status is separate from useful
+partial assistant output; runtime diagnostics must not overwrite that output.
 
-Raw execution failures remain in accounting even when another approach satisfies
-the task. Explicit deterministic checks and canonical Work settlement keep their
-own authority. A rejected submission or unavailable capability produces an honest
-partial/unknown report, not another unrestricted execution loop.
+Durable Edge completion references bind the authenticated invocation identity,
+selected executor and accepted result hash. Local-only delivery grants no such
+proof. Result bodies retain lossless text so normalization cannot change the
+accepted hash. Durable admission failure must not downgrade to local delivery;
+in-flight or terminal dispatches are observed rather than re-executed. Callback
+replay compares original content without replacing the first accepted reference.
+These facts serve journals, recovery and deterministic verification, not a
+second model-assessment ledger.
 
 ## Tasks
 
@@ -385,7 +470,9 @@ Required invariants:
 
 ## Plan mode
 
-Plan mode is a policy overlay.
+Plan mode is a policy overlay. Plan persistence owns authoring state and active
+session bindings. Execution attempts, cancellation and custody remain in Work
+and Run; there is no separate plan-step attempt audit.
 
 Allowed by default:
 
@@ -403,6 +490,12 @@ Blocked by default unless explicitly approved:
 - write-shaped MCP calls.
 
 A denial must explain policy and continuation options. It must not pretend the tool does not exist.
+
+Server root executors share the host’s plan authoring and resume-context handles
+through the same construction path for Run and SSE entrypoints. Entering plan
+mode refreshes the next provider request and the host permission gate. Trusted
+approval clears the complete plan hint, including its multiline guidance, while
+other turn-start facts remain fixed. Model tool arguments cannot approve a plan.
 
 ## Cancellation
 
@@ -428,7 +521,7 @@ Only HTTP 200 with `status: "cancelled"` and `execution_settled: true` reports
 convergence. Pending responses do not write a cancelled Session projection.
 Clients may repeat the same owner-scoped endpoint; a deadline, missing proof,
 or storage failure must not become cancellation success.
-Pending responses may include `workspace_blocker`, the typed result of the
+Pending responses may include `execution_blocker`, the typed result of the
 latest canonical idle proof. Missing proof is not an inferred blocker or
 success. The database Run store publishes all currently active Runs' existing
 cancellation markers in one owner/Session-scoped atomic write, with a bounded,
@@ -442,9 +535,9 @@ their own hard deadline.
 Active-run enumeration is insufficient: terminal runs can retain live
 executors, owner leases, tool invocations or canonical turn authority. Retries
 rediscover that retained authority and preserve the targets observed while
-waiting. The coordinator owns one fenced idle proof shared with checkout
-reuse, including slots, active execution, generation-scoped durable settlement
-fences (started without finished or accounting-finalized), writer/reservation authority,
+waiting. The coordinator owns one fenced Session execution-settlement proof,
+including slots, active execution, generation-scoped durable settlement fences
+(started without finished or accounting-finalized), writer/reservation authority,
 unresolved invocations and unfinished execution-binding switches. Run statuses
 remain truthful when completion wins a cancellation race.
 
@@ -460,11 +553,12 @@ Cancellation invokes the existing terminal tool reconciler promptly. A
 prepared invocation with no dispatch attempts becomes a durable rejection;
 dispatched or unknown outcomes retain their safety obligations. Lease expiry,
 disconnect, terminal status and cancellation intent cannot prove external
-effects stopped. `execution_settled: true` requires this Session no longer to
-block checkout reuse; it does not reserve the checkout against another Session
-or prohibit a later explicitly admitted turn. Session history and execution
-bindings are retained, and new-conversation admission performs its own claim
-check.
+effects stopped. `execution_settled: true` requires this Session to have no
+remaining execution debt for its own cancellation or binding transition; it
+does not reserve the checkout against another Session or prohibit a later
+explicitly admitted turn. Session history and execution bindings are retained,
+and the executor lease—not a database claim row—serializes conflicting
+physical operations.
 
 ## Recovery
 
@@ -478,6 +572,13 @@ Recovery uses:
 - provider binding projection.
 
 Prompt cache artifacts are not recovery correctness inputs.
+
+Local checkpoint recovery validates the checkpoint and its owner-scoped journal;
+it does not replay tools or reconstruct the original Server execution. Unknown
+side effects require explicit acknowledgment before continuing the conversation,
+or the user can abort. This acknowledgment cannot bypass checkpoint or journal
+integrity checks. Ordinary audit recovery can report a bounded or degraded tail;
+crash recovery requires a complete journal window since its checkpoint.
 
 ### Provider chat session lookup
 
@@ -539,3 +640,42 @@ Runtime lifecycle migration should proceed in stages:
 | Deleted task in old UI cache | Durable projection wins; task remains hidden. |
 | Owner lease expired | New owner may recover without double-executing non-idempotent side effects. |
 | Buffered completion exists | Finalize without resuming execution when safe. |
+
+The legacy webhook and schedule trigger APIs are retired. They did not admit a Run: webhook firing only returned `fired: true`, and stored cron expressions had no scheduler consumer. Executed work uses the existing Run admission and lifecycle boundaries.
+
+Run control submits zero, one, or multiple supplied events through the same
+atomic status-and-event batch store boundary. The store owns status CAS, typed
+cancellation authority, interaction closure, guidance return, Work outbox and
+commit-outcome recovery. Session-guarded resume still performs its blocking-run
+and open-settlement checks in its dedicated atomic store operation.
+
+The shared model boundary always records the provider attempt, including a
+Work lifecycle carrier substituted after a real provider response. The unused
+`ControlPlaneTurnBoundary` source API and its providerless path are retired;
+there is no separate no-provider accounting mode. Embedded provider errors
+still restore leased volatile authority, while successful responses commit it.
+Manifest owner and request-identity validation remain unchanged.
+
+The Server semantic task owns both Work classification and optional observations
+of the latest canonical human message. Full admission observes both in one
+request; an already-bound or ordinary continuation uses three observational
+questions without manufacturing a Work decision. Observation-only requests obey
+the existing optional auxiliary capacity policy: disabled, boundary-only, and
+capacity-aware mode with provider admission enabled suppress them. Necessary
+Work admission retains its own boundary policy. Judgment effects settle before
+provider context construction. Only the first successful canonical source marker
+applies feedback or changes WorkingMemory, using the frozen message text; hard
+capability restrictions survive re-anchoring. The same task owner handles deadline,
+cancellation, usage and phase receipts. Observation failures never change Work
+admission status, capabilities or graph ownership.
+
+Semantic effects are published by the Server-owned pending task through the
+canonical message marker. The unused synchronous Intent/Delegated judge outcomes,
+optional-intent wrapper, mandatory-sidecar opt-in, and separate scenario/profile
+projection are retired. Work control still uses its existing admission and owner
+fences; lifecycle phase outcomes retain their independent meaning.
+
+Server semantic phase facts are emitted only by actual pending tasks. Work and
+user observation use distinct purpose slots within a model round; these slots
+are not provider retries. A skipped dispatch does not create a synthetic timed
+admission. Cancellation and completion use the same slot as task startup.

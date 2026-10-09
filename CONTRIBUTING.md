@@ -87,6 +87,20 @@ Required check names remain present when their heavy work is skipped, so this
 routing is compatible with branch protection and the merge queue. The routing
 contract and its tests live in [`scripts/ci/`](scripts/ci/).
 
+CLI tests build and run their complete inventory once, after building the
+standalone mock MCP server. Five protected check labels require that same
+completed job; they do not repeat setup, builds, archive downloads, or tests.
+Failed, cancelled, or unexpectedly skipped required execution fails closed.
+Caches retain existing trust boundaries, and fork PRs run without privileged
+access. JUnit timings are retained on success and failure to assess total CI
+cost. Rerunning a failed CLI execution repeats the combined build/test job;
+there is no archived-test fallback or artifact-expiry dependency.
+On macOS, the default terminal-reader lane also runs the CLI Bash regression
+using its existing default-feature test executable. Tools lint and serial
+workspace-coordination tests remain parallel; the protected coordination check
+requires both paths to succeed. Feature-specific terminal tests remain separate.
+The lint gate retains restored artifacts; age-based cleanup is not a lint prerequisite.
+
 For fork pull requests, an update may require maintainer approval before the
 replacement test run can enter the normal concurrency group. A separate
 trusted-workflow-revision controller cancels active runs for earlier heads

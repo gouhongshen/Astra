@@ -11,7 +11,8 @@
 use std::collections::BTreeSet;
 
 /// Anomaly signals the circuit breaker observes each round.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoundSignal {
     /// Opaque stall-equivalence signatures for this round; no raw arguments.
     pub tool_signatures: BTreeSet<crate::stall::StallSignature>,
@@ -22,7 +23,7 @@ pub struct RoundSignal {
 }
 
 /// Circuit breaker state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BreakerState {
     /// Normal operation — no intervention.
     Closed,
@@ -67,7 +68,8 @@ pub enum BreakerAction {
 }
 
 /// Configuration for the loop circuit breaker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BreakerConfig {
     /// Consecutive stall rounds before tripping (Closed → Open).
     pub stall_threshold: usize,
@@ -100,7 +102,7 @@ pub struct BreakerConfig {
     /// **Sentinel**: `0` here means **unbounded** (no cap on introspect emissions).
     ///
     /// **Note**: if this config is populated from `ToolPolicyConfig`
-    /// (via the CLI adapter), `circuit_breaker_max_introspect_emissions = 0`
+    /// (via the shared runtime composition), `circuit_breaker_max_introspect_emissions = 0`
     /// in the user config means "use default (3)", NOT unbounded — the
     /// `0 = unbounded` sentinel only applies directly to `BreakerConfig`.
     /// Use a very large explicit value (e.g. `1000`) in user config to
@@ -118,6 +120,14 @@ pub struct BreakerConfig {
 }
 
 impl BreakerConfig {
+    fn history_limit(&self) -> usize {
+        self.stall_threshold
+            .saturating_mul(3)
+            .max(self.repetition_threshold)
+            .max(self.read_only_stall_threshold)
+            .max(1)
+    }
+
     /// Keep breaker sensitivity independent from the inferred task profile.
     ///
     /// The `detect_prolonged_read_only_stall` detector is already progress-aware:
@@ -149,12 +159,16 @@ impl Default for BreakerConfig {
 
 /// The loop circuit breaker. Created per-turn, observes round signals,
 /// and decides when to intervene.
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoopCircuitBreaker {
     config: BreakerConfig,
     state: BreakerState,
-    /// All round signals observed so far.
+    /// Only the history required by the existing sliding-window detectors.
     rounds: Vec<RoundSignal>,
+    total_observed: usize,
+    /// Fixed at admission; recovery may tighten thresholds, never discard more history.
+    history_limit: usize,
     /// How many rounds spent in HalfOpen since last trip.
     half_open_rounds: usize,
     /// Consecutive read-only rounds since last mutation (for periodic introspection).
@@ -178,11 +192,30 @@ pub struct LoopCircuitBreaker {
 }
 
 impl LoopCircuitBreaker {
+    /// Captured control state is not execution authority. Validate it before reuse.
+    pub fn validate_continuation(&self) -> Result<(), &'static str> {
+        let required = self.config.history_limit();
+        if self.config.stall_threshold == 0
+            || self.config.repetition_threshold == 0
+            || self.history_limit < required
+            || self.rounds.len() != self.total_observed.min(self.history_limit)
+            || self.consecutive_read_only > self.total_observed
+            || self.introspect_emissions_since_last_write > self.total_observed
+            || self.half_open_rounds > self.total_observed
+        {
+            return Err("invalid circuit-breaker continuation");
+        }
+        Ok(())
+    }
+
     pub fn new(config: BreakerConfig) -> Self {
+        let history_limit = config.history_limit();
         Self {
             config,
             state: BreakerState::Closed,
             rounds: Vec::new(),
+            total_observed: 0,
+            history_limit,
             half_open_rounds: 0,
             consecutive_read_only: 0,
             introspect_emissions_since_last_write: 0,
@@ -203,7 +236,7 @@ impl LoopCircuitBreaker {
 
     /// Total rounds observed.
     pub fn rounds_completed(&self) -> usize {
-        self.rounds.len()
+        self.total_observed
     }
 
     /// Consecutive read-only rounds since the last reset point.
@@ -234,12 +267,6 @@ impl LoopCircuitBreaker {
         self.advisory_threshold_emitted = false;
     }
 
-    /// Override the read-only stall threshold (e.g., use a tighter threshold
-    /// after recovery to prevent repeated waste).
-    pub fn set_read_only_threshold(&mut self, threshold: usize) {
-        self.config.read_only_stall_threshold = threshold;
-    }
-
     /// Current read-only stall threshold.
     pub fn read_only_threshold(&self) -> usize {
         self.config.read_only_stall_threshold
@@ -266,13 +293,17 @@ impl LoopCircuitBreaker {
         }
 
         self.rounds.push(signal);
+        self.total_observed = self.total_observed.saturating_add(1);
+        if self.rounds.len() > self.history_limit {
+            self.rounds.drain(..self.rounds.len() - self.history_limit);
+        }
 
         // Infrastructure hard ceiling — an actual budget boundary, distinct
         // from all behavioral pattern observations.
-        if self.rounds.len() >= self.config.absolute_max_rounds {
+        if self.total_observed >= self.config.absolute_max_rounds {
             self.state = BreakerState::Open;
             return BreakerAction::HardRoundLimitReached {
-                rounds: self.rounds.len(),
+                rounds: self.total_observed,
                 limit: self.config.absolute_max_rounds,
             };
         }
@@ -464,7 +495,7 @@ impl LoopCircuitBreaker {
     fn no_new_patterns_in_tail(&self, n: usize) -> bool {
         let split = self.rounds.len() - n;
         // Look back at most 2*N rounds before the tail as the comparison window.
-        let window_start = split.saturating_sub(2 * n);
+        let window_start = split.saturating_sub(n.saturating_mul(2));
         let prior_sigs: BTreeSet<&crate::stall::StallSignature> = self.rounds[window_start..split]
             .iter()
             .flat_map(|r| r.tool_signatures.iter())
@@ -509,6 +540,90 @@ mod tests {
     }
 
     // ─── Normal operation: no intervention ───────────────────────────────
+
+    #[test]
+    fn trimmed_history_preserves_detection_and_cumulative_hard_limit() {
+        let mut cb = LoopCircuitBreaker::new(BreakerConfig {
+            stall_threshold: 3,
+            repetition_threshold: 3,
+            read_only_stall_threshold: 4,
+            absolute_max_rounds: 110,
+            ..Default::default()
+        });
+        for index in 0..100 {
+            assert_eq!(
+                cb.observe(signal(&[&format!("write-{index}")], true)),
+                BreakerAction::Continue,
+                "novel mutation at round {index}"
+            );
+        }
+        assert_eq!(cb.rounds_completed(), 100);
+        assert_eq!(cb.rounds.len(), 9);
+        for _ in 0..2 {
+            assert_eq!(
+                cb.observe(signal(&["read"], false)),
+                BreakerAction::Continue
+            );
+        }
+        assert_eq!(
+            cb.observe(signal(&["read"], false)),
+            BreakerAction::PatternObserved
+        );
+        cb.acknowledge_pattern_observation();
+        let wire = serde_json::to_value(&cb).unwrap();
+        let mut restored: LoopCircuitBreaker = serde_json::from_value(wire.clone()).unwrap();
+        restored.validate_continuation().unwrap();
+        assert_eq!(restored.state(), BreakerState::HalfOpen);
+        assert_eq!(restored.rounds_completed(), 103);
+        assert_eq!(
+            restored.observe(signal(&["read"], false)),
+            BreakerAction::Continue
+        );
+        assert_eq!(
+            restored.observe(signal(&["read"], false)),
+            BreakerAction::AdvisoryThresholdReached
+        );
+        let mut latched: LoopCircuitBreaker =
+            serde_json::from_value(serde_json::to_value(&restored).unwrap()).unwrap();
+        latched.validate_continuation().unwrap();
+        assert_eq!(
+            latched.observe(signal(&["read"], false)),
+            BreakerAction::Continue,
+            "restoring an emitted advisory must not emit it again"
+        );
+        for field in ["total_observed", "history_limit"] {
+            let mut invalid = wire.clone();
+            invalid[field] = serde_json::json!(0);
+            let invalid: LoopCircuitBreaker = serde_json::from_value(invalid).unwrap();
+            assert!(invalid.validate_continuation().is_err());
+        }
+        assert_eq!(
+            restored.observe(signal(&["write"], true)),
+            BreakerAction::Continue,
+        );
+        assert_eq!(restored.state(), BreakerState::Closed);
+        assert_eq!(
+            cb.observe(signal(&["write"], true)),
+            BreakerAction::Continue
+        );
+        assert!(cb.apply_pause_recovery(Some(2)));
+        assert_eq!(cb.history_limit, 9);
+        for index in 104..109 {
+            assert_eq!(
+                cb.observe(signal(&[&format!("write-{index}")], true)),
+                BreakerAction::Continue
+            );
+        }
+        assert_eq!(
+            cb.observe(signal(&["write"], true)),
+            BreakerAction::HardRoundLimitReached {
+                rounds: 110,
+                limit: 110
+            }
+        );
+        assert_eq!(cb.rounds_completed(), 110);
+        assert_eq!(cb.rounds.len(), 9);
+    }
 
     #[test]
     fn normal_progress_never_trips() {

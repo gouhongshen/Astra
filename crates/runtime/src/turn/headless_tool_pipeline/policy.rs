@@ -263,21 +263,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
     pub(super) fn handle_empty_tool_name(
         &mut self,
-        item: HeadlessRoundToolIdx,
+        item: usize,
         slot: &HeadlessResolvedToolSlot,
     ) -> HeadlessToolSlotControl {
         self.consecutive_empty_name = self.consecutive_empty_name.saturating_add(1);
-        let raw_tc = match item {
-            HeadlessRoundToolIdx::ServerToolCall(i) => {
-                self.ctx.tool_calls.get(i).map(|v| v.to_string())
-            }
-            _ => None,
-        };
+        let raw_tc = self.ctx.tool_calls.get(item).map(Value::to_string);
         agent_warn!(
             "step",
             "Empty tool name in slot {item:?} (id={}), raw tool_call: {}",
             slot.id,
-            raw_tc.as_deref().unwrap_or("(synthetic edge)")
+            raw_tc.as_deref().unwrap_or("(missing provider index)")
         );
         let err_msg = validator_denial_body(
             &slot.name,
@@ -335,16 +330,14 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
 
     pub(super) fn validate_slot(
         &mut self,
-        item: HeadlessRoundToolIdx,
+        item: usize,
     ) -> HeadlessPipelineStage<ValidatedExecution> {
         let mut slot = self.resolve_slot(item);
-        if slot.synthetic_edge_index.is_none() {
-            super::inherit_external_effect_recovery_scope(
-                &slot.name,
-                &mut slot.args,
-                self.ctx.external_effect_recovery_paths,
-            );
-        }
+        super::inherit_external_effect_recovery_scope(
+            &slot.name,
+            &mut slot.args,
+            self.ctx.external_effect_recovery_paths,
+        );
 
         if self.ctx.pre_resolved_ids.contains(slot.id.as_str()) {
             return HeadlessPipelineStage::ShortCircuit;
@@ -354,10 +347,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // settled result is historical fact, so post-execution retry and
         // budget policy must not replace it with a synthetic skip.  A
         // signature-only match is intentionally insufficient authority.
-        let has_exact_edge_result = self.exact_edge_callback_index(&slot).is_some_and(|index| {
-            self.ctx.edge_tool_round[index].has_explicit_assistant_tool_call_id()
-                && !self.consumed_edge[index]
-        });
+        let has_exact_edge_result = self
+            .exact_edge_callback_index(&slot)
+            .is_some_and(|index| !self.consumed_edge[index]);
 
         if !has_exact_edge_result && self.executed_this_turn >= self.ctx.max_tools_per_turn {
             self.emit_turn_budget_stub(&slot);
@@ -437,11 +429,16 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         }
 
         if !has_exact_edge_result
+            && !(slot.name == "agent"
+                && self
+                    .ctx
+                    .runtime_tool_executor
+                    .is_some_and(|executor| executor.has_retained_agent_result(&slot.args)))
             && let Some((repeat_count, remaining_secs)) =
                 should_backoff_from_nonprogress(&self.ctx.turn_guard.health, &health_identity)
         {
             let (reason_code, err_msg, status_line) =
-                nonprogress_backoff_message(&slot.name, repeat_count, remaining_secs);
+                nonprogress_backoff_message(&slot.name, &slot.args, repeat_count, remaining_secs);
             emit_blocked_tool_result(
                 HeadlessBlockedTool {
                     id: &slot.id,
@@ -742,6 +739,24 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         let Some(mut cached) = self.ctx.idempotency_cache.check(idem_key).cloned() else {
             return false;
         };
+        let catalog_replay = execution.name == "model_catalog";
+        if catalog_replay {
+            let Ok(page) = serde_json::from_str::<astra_turn_core::model_catalog::ModelCatalogPage>(
+                &cached.output,
+            ) else {
+                return false;
+            };
+            if page.error.is_some()
+                || page.purpose != "chat"
+                || page.to_json() != cached.output
+                || cached.output.len() > astra_turn_core::model_catalog::MODEL_CATALOG_MAX_BYTES
+                || astra_turn_core::safety_middleware::sanitize_tool_output_for_llm(&cached.output)
+                    .content
+                    != cached.output
+            {
+                return false;
+            }
+        }
         let cache_key = idem_key.cache_key();
         let args_preview = safe_args_preview(&execution.name, &execution.args);
         if !self.ctx.tool_event_hooks.is_empty()
@@ -753,6 +768,11 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             )
             .await
         {
+            // A catalog page is an authority-bearing observation. Re-execute
+            // through the normal governance path when a replay hook edits it.
+            if catalog_replay {
+                return false;
+            }
             cached.output = modified;
         }
         if !self.ctx.quiet {
@@ -768,12 +788,21 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 false,
             );
         }
-        let (mut tool_msg, tr) = headless_idempotency_hit_openai_pair(
-            &execution.id,
-            &execution.name,
-            &cached.output,
-            astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
-        );
+        let (mut tool_msg, tr) = if catalog_replay {
+            openai_tool_roundtrip_values(
+                &execution.id,
+                &execution.name,
+                &cached.output,
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
+            )
+        } else {
+            headless_idempotency_hit_openai_pair(
+                &execution.id,
+                &execution.name,
+                &cached.output,
+                astra_turn_core::tool_result_semantics::ToolResultStatus::Completed,
+            )
+        };
         if let Some(obj) = tool_msg.as_object_mut() {
             obj.insert(
                 "_round_index".to_string(),
@@ -1214,9 +1243,20 @@ fn outcome_memory_block_message(
 
 fn nonprogress_backoff_message(
     tool_name: &str,
+    args: &Value,
     repeat_count: usize,
     remaining_secs: u64,
 ) -> (&'static str, String, String) {
+    if tool_name == "agent" && args.get("action").and_then(Value::as_str) == Some("get_result") {
+        return (
+            "nonprogress_retry_deferred",
+            format!(
+                "retry_deferred: agent.get_result was deferred because prior calls had no terminal result; current child status is unknown. If the result has since completed or was truncated, retrieve it with agent.get_result when the retry is available. {}",
+                astra_turn_core::orchestration::agent_result_wire::PENDING_CHILD_RUNTIME_WAIT_GUIDANCE
+            ),
+            format!("  ⚠ Busy-poll backoff: {tool_name} (~{remaining_secs}s)"),
+        );
+    }
     (
         "nonprogress_retry_deferred",
         format!(
@@ -1234,6 +1274,13 @@ fn nonprogress_backoff_message(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn ordinary_nonprogress_backoff_still_exposes_its_cooldown() {
+        let (_, message, _) =
+            nonprogress_backoff_message("read_file", &serde_json::json!({"path":"example"}), 2, 7);
+        assert!(message.contains("Wait about 7s"));
+    }
 
     fn names<const N: usize>(values: [&str; N]) -> HashSet<String> {
         values.into_iter().map(str::to_string).collect()

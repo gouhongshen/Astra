@@ -47,10 +47,22 @@ successful chunk put, plus a temporary reservation edge for every chunk. The
 lease is the only upload lifetime authority; the edges describe which chunks
 must remain reachable. Retention GC fences the lease before removing its edges,
 so a reused chunk cannot be collected between puts and seal, and uploads do not
-perform an O(n²) renewal of every earlier chunk. Sealing atomically replaces
+perform an O(n²) renewal of every earlier chunk. Seal returns its already verified bytes and catalog from the same transaction,
+including exact replay; the HTTP response verifies that bundle without
+loading the full content again. Sealing atomically replaces
 the temporary edges with ordered artifact-to-content references. The first
 workspace package uses one typed artifact containing the snapshot manifest plus
-deduplicated file bytes, rather than one catalog row per file.
+deduplicated file bytes, rather than one catalog row per file. The content
+store admits at most 64 MiB of logical chunk bytes, 4,096 chunks and 16 MiB per
+chunk. Repeated chunk positions count toward the byte budget; a workspace
+package uploads each unique blob once, so its budget is the deduplicated blob
+sum, not the sum of every file path's size. Begin, upload, seal and verified
+reads enforce the same limits, including recovery publication. Shared chunks
+are read in batches of up to 128 unique digests while preserving global
+owner/digest lock order and the existing GC fencing. Stored sizes must match the admitted plan
+before bytes leave the database. Package validation borrows these bytes and
+hashes each unique blob once per validation; it does not retain a validation
+cache across authorization or transaction boundaries.
 
 ## Tool-output previews
 
@@ -82,6 +94,10 @@ Requirements:
 - delete/export operations;
 - redaction boundary;
 - exclusion from default learning pipeline.
+
+CLI context dumps use `astra.context_dump/v2`. They retain the recorded prompt
+trace, conversation, usage and compaction facts; the empty local built-in skill
+selection field is retired. Actual skill injection remains in the trace.
 
 ## Tool output handling
 

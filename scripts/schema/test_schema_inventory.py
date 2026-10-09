@@ -53,7 +53,6 @@ class SchemaInventoryTest(unittest.TestCase):
             "llm_provider_admission_windows": "runtime_admission",
             "workspace_records": "workspace_records",
             "workspace_cleanup_debts": "workspace_records",
-            "config_versions": "config_versions",
         }
         for table, domain in expected.items():
             with self.subTest(table=table):
@@ -454,12 +453,10 @@ fn char_literal() { let slash = '/'; }
 
     def test_state_task_workspace_tables_have_semantic_metadata(self) -> None:
         second_batch = {
-            "config_versions",
             "context_manifests",
             "session_device_leases",
             "session_device_lease_events",
             "session_state_items",
-            "session_delegations",
             "data_versioning_checkpoints",
             "sweeper_leases",
             "workspace_records",
@@ -500,10 +497,6 @@ fn char_literal() { let slash = '/'; }
         self.assertIn(
             "append-only audit",
             self.tables["session_device_lease_events"]["merge_guidance"],
-        )
-        self.assertIn(
-            "do not merge into agent_runs",
-            self.tables["session_delegations"]["merge_guidance"],
         )
         self.assertIn(
             "DatabaseDataVersioningService reads and writes",
@@ -697,12 +690,7 @@ fn char_literal() { let slash = '/'; }
             "user_preferences",
             "edge_agent_registry",
             "plans",
-            "plan_step_runs",
-            "wf_triggers",
             "infra_sandbox_metadata",
-            "team_definitions",
-            "team_execution_history",
-            "team_snapshots",
         }
         for table in session_workflow_tables:
             with self.subTest(table=table):
@@ -749,123 +737,10 @@ fn char_literal() { let slash = '/'; }
             self.tables["plans"]["merge_guidance"],
         )
         self.assertIn(
-            "append-only attempt history",
-            self.tables["plan_step_runs"]["merge_guidance"],
-        )
-        self.assertIn(
-            "separate activation lifecycle",
-            self.tables["wf_triggers"]["merge_guidance"],
-        )
-        self.assertIn(
             "workspace_records track reusable workspaces",
             self.tables["infra_sandbox_metadata"]["merge_guidance"],
         )
-        self.assertIn(
-            "mutable team config",
-            self.tables["team_definitions"]["merge_guidance"],
-        )
-        self.assertIn(
-            "execution history",
-            self.tables["team_execution_history"]["merge_guidance"],
-        )
-        self.assertIn(
-            "point-in-time audit records",
-            self.tables["team_snapshots"]["merge_guidance"],
-        )
 
-    def test_ctx_eval_harness_preview_tables_have_semantic_metadata(self) -> None:
-        ctx_eval_harness_preview_tables = {
-            "ctx_decision_audits",
-            "ctx_snapshots",
-            "eval_calibration_assessments",
-            "eval_gate_results",
-            "eval_quality_assessments",
-            "eval_training_datasets",
-            "eval_user_feedback",
-            "harness_citations",
-            "harness_items",
-            "harness_runs",
-            "harness_skill_drafts",
-            "harness_skill_rules",
-            "harness_snapshots",
-            "llm_provider_admission_pacing",
-        }
-        for table in ctx_eval_harness_preview_tables:
-            with self.subTest(table=table):
-                row = self.tables[table]
-                for field in [
-                    "semantic_owner",
-                    "state_class",
-                    "primary_query",
-                    "retention_policy",
-                    "rebuildability",
-                    "merge_guidance",
-                    "migration_owner",
-                    "product_owner",
-                ]:
-                    self.assertNotEqual(
-                        row[field],
-                        "unclassified",
-                        f"{table}.{field} must be explicit metadata",
-                    )
-
-    def test_ctx_eval_harness_preview_metadata_locks_boundary_decisions(self) -> None:
-        self.assertIn(
-            "avoid polluting session event counts",
-            self.tables["harness_snapshots"]["merge_guidance"],
-        )
-        self.assertIn(
-            "product workflow parents",
-            self.tables["harness_runs"]["merge_guidance"],
-        )
-        self.assertIn(
-            "higher cardinality",
-            self.tables["harness_items"]["merge_guidance"],
-        )
-        self.assertIn(
-            "pre-publication generated skill candidates",
-            self.tables["harness_skill_drafts"]["merge_guidance"],
-        )
-        self.assertIn(
-            "fan out from a draft",
-            self.tables["harness_skill_rules"]["merge_guidance"],
-        )
-        self.assertIn(
-            "evidence fanout rows",
-            self.tables["harness_citations"]["merge_guidance"],
-        )
-        self.assertIn(
-            "not timeline events or manifest item ordering",
-            self.tables["ctx_snapshots"]["merge_guidance"],
-        )
-        self.assertIn(
-            "capture model/routing decisions",
-            self.tables["ctx_decision_audits"]["merge_guidance"],
-        )
-        self.assertIn(
-            "change-level release decisions",
-            self.tables["eval_gate_results"]["merge_guidance"],
-        )
-        self.assertIn(
-            "target-level assessment state",
-            self.tables["eval_quality_assessments"]["merge_guidance"],
-        )
-        self.assertIn(
-            "confidence reliability",
-            self.tables["eval_calibration_assessments"]["merge_guidance"],
-        )
-        self.assertIn(
-            "materialized training/eval corpora",
-            self.tables["eval_training_datasets"]["merge_guidance"],
-        )
-        self.assertIn(
-            "feedback is evaluation input",
-            self.tables["eval_user_feedback"]["merge_guidance"],
-        )
-        self.assertIn(
-            "virtual-time concurrency smoothing",
-            self.tables["llm_provider_admission_pacing"]["merge_guidance"],
-        )
 
     def test_high_growth_tables_have_retention_metadata(self) -> None:
         high_growth_tables = [
@@ -921,8 +796,8 @@ fn char_literal() { let slash = '/'; }
         state_sync = (
             schema_inventory.REPO_ROOT / "crates/services/src/state_sync.rs"
         ).read_text(encoding="utf-8")
-        self.assertIn("SyncAuditWriter", state_sync)
-        self.assertIn("Audit is intentionally not persisted to MatrixOne", state_sync)
+        self.assertIn("pull_all_preferences", state_sync)
+        self.assertIn("user_preferences", state_sync)
         self.assertNotIn("session_sync_log", state_sync)
 
     def test_session_deletion_tombstones_are_removed_from_production_schema(self) -> None:
@@ -944,9 +819,13 @@ fn char_literal() { let slash = '/'; }
 
     def test_retired_session_projection_tables_are_absent_from_production_schema(self) -> None:
         retired = {
+            "config_versions",
+            "plan_step_runs",
             "session_state_revisions",
             "session_history_chunks",
             "session_artifacts_grants",
+            "tool_result_projection_decisions",
+            "tool_result_projection_receipts",
         }
         for table in retired:
             self.assertNotIn(table, self.tables)
@@ -974,8 +853,6 @@ fn char_literal() { let slash = '/'; }
             "session_history_chunks",
             "session_artifacts_grants",
             "data_versioning_checkpoints",
-            "harness_skill_drafts + harness_skill_rules",
-            "team_execution_history + team_snapshots",
         }
         self.assertEqual(set(self.p1_5_reviews), expected)
 
@@ -997,7 +874,7 @@ fn char_literal() { let slash = '/'; }
                     self.assertNotEqual(review[field], "")
                     self.assertNotIn("TBD", review[field])
 
-        self.assertIn("tracing-only", self.p1_5_reviews["session_sync_log"]["user_api_impact"])
+        self.assertIn("no storage", self.p1_5_reviews["session_sync_log"]["user_api_impact"])
         self.assertIn(
             "hydration",
             self.p1_5_reviews["session_state_revisions"]["rationale"],
@@ -1014,24 +891,12 @@ fn char_literal() { let slash = '/'; }
             "rollback/list",
             self.p1_5_reviews["data_versioning_checkpoints"]["user_api_impact"],
         )
-        self.assertIn(
-            "distinct cardinality",
-            self.p1_5_reviews[
-                "harness_skill_drafts + harness_skill_rules"
-            ]["user_api_impact"],
-        )
-        self.assertIn(
-            "different resources",
-            self.p1_5_reviews[
-                "team_execution_history + team_snapshots"
-            ]["user_api_impact"],
-        )
 
     def test_p1_5_consolidation_source_evidence_still_exists(self) -> None:
         expectations = {
             "crates/services/src/state_sync.rs": [
-                "SyncAuditWriter",
-                "Audit is intentionally not persisted to MatrixOne",
+                "pull_all_preferences",
+                "user_preferences",
             ],
             "crates/services/src/data_versioning.rs": [
                 "data_versioning_checkpoints",
@@ -1041,20 +906,6 @@ fn char_literal() { let slash = '/'; }
             "crates/services/src/storage.rs": [
                 "validate_core_schema_table_claim",
                 "verify_core_schema_shape",
-            ],
-            "crates/services/src/harness.rs": [
-                "harness_skill_drafts",
-                "harness_skill_rules",
-                "INSERT INTO harness_skill_drafts",
-                "INSERT INTO harness_skill_rules",
-            ],
-            "crates/services/src/team_persistence.rs": [
-                "team_execution_history",
-                "team_snapshots",
-                "record_execution_start",
-                "list_executions_page",
-                "save_snapshot",
-                "list_snapshots_page",
             ],
         }
 

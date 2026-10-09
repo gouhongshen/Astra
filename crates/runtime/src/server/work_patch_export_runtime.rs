@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::time::Duration;
 
 use astra_core::SharedPool;
 use astra_services::work::{
@@ -7,11 +7,12 @@ use astra_services::work::{
     WorkProviderInvocationRef, WorkRepository, WorkRepositoryError,
 };
 use astra_services::{
-    DatabaseSessionArtifactStore, DatabaseWorkspaceRecordStore, SessionArtifactJsonRecord,
-    SessionArtifactJsonStore, SessionArtifactReference, SessionArtifactReferenceKind,
-    WorkspaceRecordStore,
+    DatabaseSessionArtifactStore, SessionArtifactJsonRecord, SessionArtifactJsonStore,
+    SessionArtifactReference, SessionArtifactReferenceKind, runs::RunLifecycleService,
 };
-use astra_tools::patch_materialization::{GitWorktreePatchExportError, export_git_worktree_patch};
+use astra_tools::patch_materialization::{
+    GitWorktreePatchExportError, export_git_worktree_patch_with_workspace_lease,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -45,6 +46,7 @@ pub(crate) enum WorkPatchExportError {
 
 pub(crate) async fn export_work_patch(
     pool: SharedPool,
+    lifecycle: &dyn RunLifecycleService,
     command: WorkPatchExportCommand,
 ) -> Result<WorkPatchArtifact, WorkPatchExportError> {
     let repository = DatabaseWorkRepository::new(pool.clone());
@@ -64,18 +66,28 @@ pub(crate) async fn export_work_patch(
     {
         return Err(WorkPatchExportError::BasisConflict);
     }
-    let workspace = DatabaseWorkspaceRecordStore::new(pool.clone())
-        .load_workspace_record(command.owner_id.as_str(), binding.session_id.as_str())
+    let resolve = || {
+        super::work_patch_workspace::resolve_workspace(
+            &pool,
+            lifecycle,
+            &command.owner_id,
+            &command.work_id,
+            &command.branch_id,
+        )
+    };
+    let workspace = resolve().await.map_err(map_workspace_error)?;
+    let workspace_lease =
+        astra_tools::workspace_observation::acquire_workspace_observation_lease_with_options(
+            &workspace,
+            None,
+            Duration::from_secs(120),
+        )
         .await
-        .map_err(|error| WorkPatchExportError::Unavailable(error.to_string()))?
-        .filter(|entry| entry.session_id.as_deref() == Some(binding.session_id.as_str()))
-        .filter(|entry| {
-            entry.record.kind == astra_runtime_env::WorkspaceBindingKind::ServerSandbox
-                && entry.record.authority == astra_runtime_env::WorkspaceAuthority::ReadWrite
-                && entry.record.persistence == astra_runtime_env::WorkspacePersistence::Session
-        })
-        .ok_or_else(|| WorkPatchExportError::Unavailable("workspace is unavailable".into()))?;
-    let exported = export_git_worktree_patch(Path::new(&workspace.record.root_or_volume_ref))
+        .ok_or_else(|| WorkPatchExportError::Unavailable("workspace lease unavailable".into()))?;
+    if resolve().await.map_err(map_workspace_error)? != workspace {
+        return Err(WorkPatchExportError::BasisConflict);
+    }
+    let exported = export_git_worktree_patch_with_workspace_lease(&workspace, &workspace_lease)
         .await
         .map_err(map_provider_error)?;
     if exported.result_subject_revision != subject.subject_revision {
@@ -223,5 +235,18 @@ fn map_repository_error(error: WorkRepositoryError) -> WorkPatchExportError {
         | WorkRepositoryError::StaleSubjectBasis { .. }
         | WorkRepositoryError::Conflict { .. } => WorkPatchExportError::BasisConflict,
         error => WorkPatchExportError::Unavailable(error.to_string()),
+    }
+}
+
+fn map_workspace_error(
+    error: super::work_patch_workspace::WorkspaceResolutionError,
+) -> WorkPatchExportError {
+    match error {
+        super::work_patch_workspace::WorkspaceResolutionError::NotThisExecutor => {
+            WorkPatchExportError::Unavailable("workspace is not owned by this executor".into())
+        }
+        super::work_patch_workspace::WorkspaceResolutionError::UnverifiedUnavailable(message) => {
+            WorkPatchExportError::Unavailable(message)
+        }
     }
 }

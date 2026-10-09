@@ -33,6 +33,7 @@ mod frame_requester;
 mod glyphs;
 mod history_cell;
 mod insert_history;
+pub(crate) mod inspection;
 mod keymap;
 mod local_agent_journal;
 mod local_agent_snapshot;

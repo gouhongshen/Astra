@@ -12,18 +12,13 @@
 //!      throws away 80% of the usable window.
 //!   2. The budget-exhausted volatile injection must be factual. No
 //!      "Do NOT call any more tools", no "Summarize your progress".
-//!   3. The adaptive 85%-usage auto-reduction of max_turn_input_tokens
-//!      must NOT be active by default — it lowers the ceiling precisely
-//!      when the agent most needs headroom (see session 0e37eb46).
 //!
 //! Test 1 is a behaviour check on `RuntimeLimits::effective_max_turn_input_tokens`.
 //! Test 2 asserts the text content of the two volatile templates.
-//! Test 3 asserts the default value of `ContextWindowConfig::adaptive_budget`.
 //!
-//! All three target PUBLIC surfaces so this file compiles as a normal
+//! Both target PUBLIC surfaces so this file compiles as a normal
 //! integration test.
 
-use astra_config::runtime_config::ContextWindowConfig;
 use astra_core::RuntimeLimits;
 use astra_runtime::turn::budget_messaging::{BUDGET_REACHED_ADVISORY, COMPACT_RESUME_DIRECTIVE};
 
@@ -177,22 +172,5 @@ fn compact_resume_directive_is_pure_fact() {
     assert!(
         !msg.contains("do not") && !msg.contains("don't") && !msg.contains("avoid "),
         "compact-resume directive must not contain imperatives, got: {COMPACT_RESUME_DIRECTIVE:?}"
-    );
-}
-
-// ─── 3. Adaptive auto-reduction is off by default ────────────────────────
-
-#[test]
-fn adaptive_budget_reduction_is_opt_in_not_default() {
-    // The 85% -> reduce-budget path in agentic::adaptive_runtime is a
-    // self-defeating loop: at high pressure it LOWERS the ceiling the
-    // next turn must fit under, which raises the probability of another
-    // high-pressure event, which lowers the ceiling again. Default off;
-    // keep it reachable via config for deployments that want it.
-    let cfg = ContextWindowConfig::default();
-    assert!(
-        !cfg.adaptive_budget_reduction,
-        "adaptive budget reduction must default to OFF to prevent \
-         the shrink-spiral pattern seen in session 0e37eb46"
     );
 }

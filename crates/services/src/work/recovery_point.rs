@@ -1,13 +1,10 @@
 //! Durable storage for immutable Work recovery points.
 //!
-//! This repository owns the recovery-point record only. Edge/User Runner code
-//! captures files and uploads content; this layer validates the declared
-//! manifest and stores one owner-scoped, idempotent `preparing` record.
-//! A canonical verifier can advance it to `captured` after proving the
-//! immutable Work/Session basis and the current execution identity. `captured`
-//! is a logical progress boundary, not a promise that code, artifacts, or an
-//! unfinished Run can be restored. A future `ready` state requires a separate
-//! verifier for those durable payloads and effect receipts.
+//! Canonical capture verifies the immutable Work/Session basis and current
+//! execution identity in one transaction. A `captured` point is logical
+//! progress, not a promise that files or an unfinished Run can be restored.
+//! Workspace publication verifies its sealed Artifact and links its retention
+//! edge in that same transaction; the published point remains `captured`.
 
 use astra_core::SharedPool;
 use astra_turn_types::{
@@ -64,18 +61,6 @@ impl WorkRecoveryPointStatus {
             _ => None,
         }
     }
-}
-
-/// A declared capture request.  Recording it is durable progress for an
-/// upload, not proof that the capture can be restored.  The repository keeps
-/// the status `preparing` until a canonical publication verifier exists.
-#[derive(Debug, Clone)]
-pub struct NewWorkRecoveryPoint {
-    pub owner_id: WorkOwnerId,
-    pub work_id: WorkId,
-    pub branch_id: WorkBranchId,
-    pub request_id: WorkChangeRef,
-    pub manifest: RecoveryPointManifestV1,
 }
 
 /// A request to record a canonical, between-Run progress boundary.
@@ -187,10 +172,9 @@ impl DatabaseWorkRecoveryPointRepository {
 
     /// Capture the current canonical Work/Session boundary atomically.
     ///
-    /// This is intentionally a single transaction rather than a public
-    /// `record_preparing`/`mark_captured` wrapper: there is no asynchronous
-    /// payload upload in this path, so exposing two commits would let a retry
-    /// observe a manifest generated from a different clock or context head.
+    /// There is no asynchronous payload upload in this path. A single
+    /// transaction prevents a retry from observing a manifest generated from
+    /// a different clock or context head between separate commits.
     /// The request fingerprint contains only stable caller parameters. A
     /// replay therefore returns the original immutable point even after the
     /// Work has advanced.
@@ -645,363 +629,6 @@ impl DatabaseWorkRecoveryPointRepository {
         Ok(record)
     }
 
-    /// Record a declared capture idempotently.  The Work and branch identity
-    /// are checked in the same transaction as the insert, while the immutable
-    /// manifest hash prevents a request id from being reused for a different
-    /// capture.  This deliberately returns `preparing`; it must not expose a
-    /// caller-supplied manifest as a restorable `ready` point.
-    pub async fn record_preparing(
-        &self,
-        request: NewWorkRecoveryPoint,
-    ) -> Result<WorkRecoveryPointRecord, WorkRepositoryError> {
-        validate_request(&request)?;
-        let manifest_hash = manifest_hash(&request.manifest)?;
-        let request_hash = request_hash(&request, &manifest_hash)?;
-
-        let mut transaction = self.pool.get().begin().await.map_err(|source| {
-            WorkRepositoryError::persistence("begin Work recovery point capture", source)
-        })?;
-
-        let branch_row = query(
-            "SELECT b.session_id
-             FROM works w
-             INNER JOIN work_branches b
-               ON b.owner_id = w.owner_id AND b.work_id = w.work_id
-              AND b.branch_id = ?
-             WHERE w.owner_id = ? AND w.work_id = ?
-             LIMIT 1
-             FOR UPDATE",
-        )
-        .bind(request.branch_id.as_str())
-        .bind(request.owner_id.as_str())
-        .bind(request.work_id.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::persistence("lock Work recovery point owner", source)
-        })?;
-        let Some(branch_row) = branch_row else {
-            return Err(WorkRepositoryError::NotFound);
-        };
-        let branch_session_id = branch_row
-            .try_get::<String, _>("session_id")
-            .map_err(|source| WorkRepositoryError::corrupt("Work recovery point", source))?;
-        if branch_session_id != request.manifest.session_key.session_id {
-            return Err(WorkRepositoryError::Conflict {
-                resource: WorkConflictResource::RecoveryPointIdentity,
-            });
-        }
-
-        if let Some(row) = query(
-            "SELECT owner_id, work_id, branch_id, recovery_point_id, request_id,
-                    request_hash, status, manifest_json, manifest_hash, failure_reason,
-                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS created_at,
-                    DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS updated_at,
-                    DATE_FORMAT(ready_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS ready_at
-             FROM work_recovery_points
-             WHERE owner_id = ? AND work_id = ? AND request_id = ?
-             LIMIT 1 FOR UPDATE",
-        )
-        .bind(request.owner_id.as_str())
-        .bind(request.work_id.as_str())
-        .bind(request.request_id.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::persistence("load Work recovery point request", source)
-        })? {
-            let stored_hash = row
-                .try_get::<String, _>("request_hash")
-                .map_err(|source| WorkRepositoryError::corrupt("Work recovery point", source))?;
-            if stored_hash != request_hash.as_str() {
-                return Err(WorkRepositoryError::Conflict {
-                    resource: WorkConflictResource::RecoveryPointRequest,
-                });
-            }
-            let record = decode_record(row)?;
-            transaction.commit().await.map_err(|source| {
-                WorkRepositoryError::persistence("commit idempotent Work recovery point", source)
-            })?;
-            return Ok(record);
-        }
-
-        query(
-            "INSERT INTO work_recovery_points
-             (owner_id, work_id, branch_id, recovery_point_id, request_id,
-              request_hash, status, manifest_json, manifest_hash, failure_reason,
-              created_at, updated_at, ready_at)
-             VALUES (?, ?, ?, ?, ?, ?, 'preparing', ?, ?, NULL, NOW(6), NOW(6), NULL)",
-        )
-        .bind(request.owner_id.as_str())
-        .bind(request.work_id.as_str())
-        .bind(request.branch_id.as_str())
-        .bind(request.manifest.recovery_point_id.as_str())
-        .bind(request.request_id.as_str())
-        .bind(request_hash.as_str())
-        .bind(serde_json::to_string(&request.manifest).map_err(|source| {
-            WorkRepositoryError::ManifestEncoding {
-                entity: "Work recovery point manifest",
-                source,
-            }
-        })?)
-        .bind(manifest_hash.as_str())
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::insert(
-                "record Work recovery point capture",
-                WorkConflictResource::RecoveryPointIdentity,
-                source,
-            )
-        })?;
-
-        let row = query(
-            "SELECT owner_id, work_id, branch_id, recovery_point_id, request_id,
-                    request_hash, status, manifest_json, manifest_hash, failure_reason,
-                    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS created_at,
-                    DATE_FORMAT(updated_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS updated_at,
-                    DATE_FORMAT(ready_at, '%Y-%m-%dT%H:%i:%s.%fZ') AS ready_at
-             FROM work_recovery_points
-             WHERE owner_id = ? AND work_id = ? AND recovery_point_id = ?
-             LIMIT 1",
-        )
-        .bind(request.owner_id.as_str())
-        .bind(request.work_id.as_str())
-        .bind(request.manifest.recovery_point_id.as_str())
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::persistence("load recorded Work recovery point", source)
-        })?;
-        let record = decode_record(row)?;
-        transaction.commit().await.map_err(|source| {
-            WorkRepositoryError::persistence("commit Work recovery point capture", source)
-        })?;
-        Ok(record)
-    }
-
-    /// Canonically capture the logical Work boundary represented by a
-    /// preparing row. The caller supplies only the row identity; all
-    /// authoritative revisions, context-head facts, and execution-binding
-    /// identity are read while the Work, branch, recovery row, and Session
-    /// context are locked in that order. No filesystem, Artifact, or active
-    /// Run claim is made here, so the result is intentionally `captured` and
-    /// carries no restore/continue capability by itself.
-    pub async fn mark_captured(
-        &self,
-        owner_id: &WorkOwnerId,
-        work_id: &WorkId,
-        branch_id: &WorkBranchId,
-        recovery_point_id: &str,
-    ) -> Result<WorkRecoveryPointRecord, WorkRepositoryError> {
-        if recovery_point_id.is_empty()
-            || recovery_point_id.len() > RECOVERY_POINT_ID_MAX_BYTES
-            || recovery_point_id
-                .bytes()
-                .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-        {
-            return Err(WorkRepositoryError::corrupt(
-                "Work recovery point",
-                std::io::Error::other("invalid recovery point identity"),
-            ));
-        }
-
-        let mut transaction = self.pool.get().begin().await.map_err(|source| {
-            WorkRepositoryError::persistence("begin Work recovery point capture", source)
-        })?;
-
-        // Keep this lock order identical to capture admission and branch
-        // deletion: Work/branch first, then the recovery row. Reversing it
-        // would allow a publisher and deletion executor to deadlock.
-        let branch_row = query(
-            "SELECT b.session_id, b.branch_revision, b.goal_revision_ref,
-                    b.criteria_set_revision_ref, b.current_graph_revision,
-                    b.deletion_operation_id,
-                    CASE WHEN b.archived_at IS NULL THEN 0 ELSE 1 END AS branch_archived,
-                    CASE WHEN w.archived_at IS NULL THEN 0 ELSE 1 END AS work_archived
-             FROM works w
-             INNER JOIN work_branches b
-               ON b.owner_id = w.owner_id AND b.work_id = w.work_id
-              AND b.branch_id = ?
-             WHERE w.owner_id = ? AND w.work_id = ?
-             LIMIT 1
-             FOR UPDATE",
-        )
-        .bind(branch_id.as_str())
-        .bind(owner_id.as_str())
-        .bind(work_id.as_str())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::persistence("lock Work recovery capture basis", source)
-        })?
-        .ok_or(WorkRepositoryError::NotFound)?;
-        let branch_session_id =
-            branch_row
-                .try_get::<String, _>("session_id")
-                .map_err(|source| {
-                    WorkRepositoryError::corrupt("Work recovery capture basis", source)
-                })?;
-        let branch_archived =
-            branch_row
-                .try_get::<i64, _>("branch_archived")
-                .map_err(|source| {
-                    WorkRepositoryError::corrupt("Work recovery capture basis", source)
-                })?
-                != 0;
-        let work_archived = branch_row
-            .try_get::<i64, _>("work_archived")
-            .map_err(|source| {
-                WorkRepositoryError::corrupt("Work recovery capture basis", source)
-            })?
-            != 0;
-        if work_archived || branch_archived {
-            return Err(WorkRepositoryError::Archived);
-        }
-        if branch_row
-            .try_get::<Option<String>, _>("deletion_operation_id")
-            .map_err(|source| WorkRepositoryError::corrupt("Work recovery capture basis", source))?
-            .is_some()
-        {
-            return Err(WorkRepositoryError::BranchDeleting);
-        }
-
-        let recovery_row = query(&format!(
-            "{RECOVERY_POINT_SELECT_SQL}
-             WHERE owner_id = ? AND work_id = ? AND branch_id = ?
-               AND recovery_point_id = ?
-             LIMIT 1 FOR UPDATE"
-        ))
-        .bind(owner_id.as_str())
-        .bind(work_id.as_str())
-        .bind(branch_id.as_str())
-        .bind(recovery_point_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|source| WorkRepositoryError::persistence("lock Work recovery point", source))?
-        .ok_or(WorkRepositoryError::NotFound)?;
-        let record = decode_record(recovery_row)?;
-        if record.status == WorkRecoveryPointStatus::Captured {
-            transaction.commit().await.map_err(|source| {
-                WorkRepositoryError::persistence("commit idempotent Work recovery capture", source)
-            })?;
-            return Ok(record);
-        }
-        if record.status != WorkRecoveryPointStatus::Preparing {
-            return Err(WorkRepositoryError::Conflict {
-                resource: WorkConflictResource::RecoveryPointIdentity,
-            });
-        }
-        let manifest = record.manifest.as_ref().ok_or_else(|| {
-            WorkRepositoryError::corrupt(
-                "Work recovery point",
-                std::io::Error::other("preparing recovery point has no manifest"),
-            )
-        })?;
-        if manifest.session_key.session_id != branch_session_id {
-            return Err(WorkRepositoryError::Conflict {
-                resource: WorkConflictResource::RecoveryPointIdentity,
-            });
-        }
-
-        let basis =
-            load_recovery_basis_in_transaction(&mut transaction, owner_id, work_id, branch_id)
-                .await?;
-        if !revisions_match_manifest(&basis, manifest) {
-            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::BasisChanged,
-            });
-        }
-        if manifest.run.is_some() {
-            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::RunFrontierUnavailable,
-            });
-        }
-
-        let context = lock_recovery_context_in_transaction(&mut transaction, &manifest.session_key)
-            .await
-            .map_err(map_context_verification_error)?;
-        if context.head != manifest.context_head || context.head.cursor != manifest.session_cursor {
-            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::ContextChanged,
-            });
-        }
-        if context.has_active_reservation {
-            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::ActiveReservation,
-            });
-        }
-        if context.has_unresolved_invocations {
-            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::UnresolvedInvocation,
-            });
-        }
-        let current_execution =
-            canonical_execution_binding(&manifest.session_key, context.execution_binding.as_ref())?;
-        if current_execution != manifest.execution {
-            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::ExecutionChanged,
-            });
-        }
-        // Workspace-capable points may only be published through
-        // `capture_workspace_canonical`, which proves the sealed package and
-        // binds it to the current logical execution workspace.  The older
-        // preparing/marking API has no package verifier and must fail closed
-        // instead of turning a caller-shaped `complete=true` into a restore
-        // capability.
-        if manifest.workspace.is_some()
-            || manifest
-                .artifacts
-                .iter()
-                .any(|artifact| artifact.artifact_type == "workspace_snapshot_package_v1")
-        {
-            return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
-            });
-        }
-
-        let updated = query(
-            "UPDATE work_recovery_points
-             SET status = 'captured', updated_at = NOW(6), failure_reason = NULL, ready_at = NULL
-             WHERE owner_id = ? AND work_id = ? AND branch_id = ?
-               AND recovery_point_id = ? AND status = 'preparing'",
-        )
-        .bind(owner_id.as_str())
-        .bind(work_id.as_str())
-        .bind(branch_id.as_str())
-        .bind(recovery_point_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::persistence("publish captured Work recovery point", source)
-        })?;
-        if updated.rows_affected() != 1 {
-            return Err(WorkRepositoryError::Conflict {
-                resource: WorkConflictResource::RecoveryPointIdentity,
-            });
-        }
-        let captured_row = query(&format!(
-            "{RECOVERY_POINT_SELECT_SQL}
-             WHERE owner_id = ? AND work_id = ? AND branch_id = ?
-               AND recovery_point_id = ?
-             LIMIT 1"
-        ))
-        .bind(owner_id.as_str())
-        .bind(work_id.as_str())
-        .bind(branch_id.as_str())
-        .bind(recovery_point_id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(|source| {
-            WorkRepositoryError::persistence("load captured Work recovery point", source)
-        })?;
-        let captured = decode_record(captured_row)?;
-        transaction.commit().await.map_err(|source| {
-            WorkRepositoryError::persistence("commit captured Work recovery point", source)
-        })?;
-        Ok(captured)
-    }
-
     pub async fn load(
         &self,
         owner_id: &WorkOwnerId,
@@ -1105,20 +732,6 @@ impl DatabaseWorkRepository {
     }
 }
 
-fn revisions_match_manifest(
-    basis: &super::WorkPlanBasis,
-    manifest: &RecoveryPointManifestV1,
-) -> bool {
-    u64::try_from(basis.work_revision.get()).ok() == Some(manifest.work_revision)
-        && u64::try_from(basis.branch_revision.get()).ok() == Some(manifest.branch_revision)
-        && u64::try_from(basis.graph_revision.get()).ok() == Some(manifest.graph_revision)
-        && u64::try_from(basis.goal_revision.get()).ok() == Some(manifest.goal_revision)
-        && u64::try_from(basis.criteria_set_revision.get()).ok()
-            == Some(manifest.criteria_set_revision)
-        && basis.branch_goal_revision == basis.goal_revision
-        && basis.branch_criteria_set_revision == basis.criteria_set_revision
-}
-
 struct WorkspaceArtifactVerificationInput<'a> {
     owner_id: &'a str,
     session_id: &'a str,
@@ -1152,7 +765,7 @@ async fn verify_sealed_workspace_artifact_in_transaction(
         || workspace.logical_workspace_id.trim().is_empty()
     {
         return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
         });
     }
     let row = query(
@@ -1191,34 +804,39 @@ async fn verify_sealed_workspace_artifact_in_transaction(
     })?;
     let descriptor = content.get("content").cloned().ok_or_else(|| {
         WorkRepositoryError::RecoveryPointNotCapturable {
-            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
         }
     })?;
     let descriptor: crate::session_artifact_store::SessionArtifactContentDescriptorV1 =
         serde_json::from_value(descriptor).map_err(|_| {
             WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
             }
+        })?;
+    descriptor
+        .validate()
+        .map_err(|_| WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
         })?;
     let manifest_value = content.get("manifest").cloned().ok_or_else(|| {
         WorkRepositoryError::RecoveryPointNotCapturable {
-            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
         }
     })?;
     let package_manifest: astra_runtime_env::WorkspaceSnapshotManifestV1 =
         serde_json::from_value(manifest_value).map_err(|_| {
             WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
             }
         })?;
     package_manifest
         .validate()
         .map_err(|_| WorkRepositoryError::RecoveryPointNotCapturable {
-            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
         })?;
     let package_manifest_hash = package_manifest.content_hash().map_err(|_| {
         WorkRepositoryError::RecoveryPointNotCapturable {
-            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
         }
     })?;
     let sealed = descriptor.sealed;
@@ -1298,7 +916,7 @@ async fn verify_sealed_workspace_artifact_in_transaction(
         && package_manifest.content.total_bytes >= workspace.byte_size;
     if !package_identity_matches {
         return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
         });
     }
 
@@ -1344,7 +962,7 @@ async fn verify_sealed_workspace_artifact_in_transaction(
     }
     if !metadata_matches {
         return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
         });
     }
 
@@ -1361,8 +979,7 @@ async fn verify_sealed_workspace_artifact_in_transaction(
         if let Some((existing_digest, existing_size)) = layout.get(blob_ref) {
             if existing_digest != entry_digest || *existing_size != entry.size {
                 return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                    reason:
-                        super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+                    reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
                 });
             }
         } else {
@@ -1371,8 +988,7 @@ async fn verify_sealed_workspace_artifact_in_transaction(
                 && existing_ref != *blob_ref
             {
                 return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                    reason:
-                        super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+                    reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
                 });
             }
             layout.insert(blob_ref.clone(), (entry_digest.clone(), entry.size));
@@ -1380,7 +996,7 @@ async fn verify_sealed_workspace_artifact_in_transaction(
     }
     if descriptor.chunk_count != layout.len() as u64 {
         return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
         });
     }
     // Lock artifact-local references first, then shared content rows through
@@ -1395,10 +1011,10 @@ async fn verify_sealed_workspace_artifact_in_transaction(
         artifact.artifact_id.as_str(),
     )
     .await
-    .map_err(|source| WorkRepositoryError::corrupt("workspace artifact references", source))?;
+    .map_err(map_workspace_content_verification_error)?;
     if chunk_refs.len() != layout.len() {
         return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
         });
     }
     let stored_chunks = crate::session_artifact_store::load_and_verify_content_chunks(
@@ -1407,7 +1023,7 @@ async fn verify_sealed_workspace_artifact_in_transaction(
         &chunk_refs,
     )
     .await
-    .map_err(|source| WorkRepositoryError::corrupt("workspace artifact chunks", source))?;
+    .map_err(map_workspace_content_verification_error)?;
     let mut blobs = std::collections::BTreeMap::new();
     let expected_order = layout.values().collect::<Vec<_>>();
     let mut aggregate = Sha256::new();
@@ -1418,28 +1034,27 @@ async fn verify_sealed_workspace_artifact_in_transaction(
         let bytes = chunk.bytes;
         let Some((expected_digest, expected_size)) = expected_order.get(index) else {
             return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
             });
         };
         let Some((blob_ref, _)) = digest_to_ref.get(&chunk_digest) else {
             return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
             });
         };
         if chunk_index != index as u64
             || chunk_digest != *expected_digest
             || bytes.len() as u64 != *expected_size
-            || format!("sha256:{:x}", Sha256::digest(&bytes)) != chunk_digest
         {
             return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
             });
         }
         aggregate.update(&bytes);
         aggregate_size = aggregate_size
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| WorkRepositoryError::RecoveryPointNotCapturable {
-                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+                reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
             })?;
         blobs.insert(blob_ref.clone(), bytes);
     }
@@ -1447,7 +1062,7 @@ async fn verify_sealed_workspace_artifact_in_transaction(
         || aggregate_size != descriptor.byte_size
     {
         return Err(WorkRepositoryError::RecoveryPointNotCapturable {
-            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
         });
     }
     astra_runtime_env::WorkspaceSnapshotPackage {
@@ -1456,9 +1071,22 @@ async fn verify_sealed_workspace_artifact_in_transaction(
     }
     .verify()
     .map_err(|_| WorkRepositoryError::RecoveryPointNotCapturable {
-        reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactUnavailable,
+        reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
     })?;
     Ok(())
+}
+
+fn map_workspace_content_verification_error(
+    error: crate::session_artifact_store::SessionArtifactStoreError,
+) -> WorkRepositoryError {
+    match error {
+        crate::session_artifact_store::SessionArtifactStoreError::Database(source) => {
+            WorkRepositoryError::persistence("verify workspace content", source)
+        }
+        _ => WorkRepositoryError::RecoveryPointNotCapturable {
+            reason: super::repository::WorkRecoveryPointBlocker::WorkspaceArtifactInvalid,
+        },
+    }
 }
 
 fn canonical_execution_binding(
@@ -1518,16 +1146,6 @@ fn map_context_verification_error(error: SessionContextCoordinatorError) -> Work
             reason: super::repository::WorkRecoveryPointBlocker::ContextUnavailable,
         },
     }
-}
-
-#[derive(Serialize)]
-struct RequestHashInput<'a> {
-    schema_version: u16,
-    owner_id: &'a WorkOwnerId,
-    work_id: &'a WorkId,
-    branch_id: &'a WorkBranchId,
-    request_id: &'a WorkChangeRef,
-    manifest_hash: &'a WorkContentHash,
 }
 
 #[derive(Serialize)]
@@ -1641,28 +1259,6 @@ fn capture_recovery_point_id(
     Ok(format!("rp-{digest}"))
 }
 
-fn validate_request(request: &NewWorkRecoveryPoint) -> Result<(), WorkRepositoryError> {
-    request
-        .manifest
-        .validate()
-        .map_err(|source| WorkRepositoryError::corrupt("Work recovery point manifest", source))?;
-    if request.manifest.owner_id != request.owner_id.as_str()
-        || request.manifest.work_id != request.work_id.as_str()
-        || request.manifest.branch_id != request.branch_id.as_str()
-    {
-        return Err(WorkRepositoryError::Conflict {
-            resource: WorkConflictResource::RecoveryPointIdentity,
-        });
-    }
-    if request.manifest.recovery_point_id.len() > RECOVERY_POINT_ID_MAX_BYTES {
-        return Err(WorkRepositoryError::corrupt(
-            "Work recovery point manifest",
-            std::io::Error::other("recovery_point_id exceeds storage width"),
-        ));
-    }
-    Ok(())
-}
-
 fn manifest_hash(
     manifest: &RecoveryPointManifestV1,
 ) -> Result<WorkContentHash, WorkRepositoryError> {
@@ -1672,30 +1268,6 @@ fn manifest_hash(
     WorkContentHash::parse(value).map_err(|source| {
         WorkRepositoryError::corrupt(
             "Work recovery point manifest hash",
-            std::io::Error::other(source),
-        )
-    })
-}
-
-fn request_hash(
-    request: &NewWorkRecoveryPoint,
-    manifest_hash: &WorkContentHash,
-) -> Result<WorkContentHash, WorkRepositoryError> {
-    let payload = serde_json::to_vec(&RequestHashInput {
-        schema_version: REQUEST_HASH_SCHEMA_VERSION,
-        owner_id: &request.owner_id,
-        work_id: &request.work_id,
-        branch_id: &request.branch_id,
-        request_id: &request.request_id,
-        manifest_hash,
-    })
-    .map_err(|source| WorkRepositoryError::ManifestEncoding {
-        entity: "Work recovery point request",
-        source,
-    })?;
-    WorkContentHash::parse(format!("sha256:{:x}", Sha256::digest(payload))).map_err(|source| {
-        WorkRepositoryError::corrupt(
-            "Work recovery point request hash",
             std::io::Error::other(source),
         )
     })
@@ -1830,11 +1402,6 @@ fn decode_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_turn_types::{
-        RECOVERY_POINT_MANIFEST_SCHEMA_VERSION, RecoveryPointBindingStateV1,
-        RecoveryPointExecutionBindingV1, RecoveryPointExecutorKindV1, RecoveryPointReasonV1,
-        SessionCursorV1, SessionKeyV1,
-    };
 
     #[test]
     fn query_defaults_to_a_small_user_facing_page() {
@@ -1844,95 +1411,6 @@ mod tests {
         );
         assert_eq!(query.limit, 32);
         assert!(query.branch_id.is_none());
-    }
-
-    #[test]
-    fn request_hash_changes_when_manifest_changes() {
-        let owner = WorkOwnerId::parse("owner").unwrap();
-        let work = WorkId::parse("work").unwrap();
-        let branch = WorkBranchId::parse("branch").unwrap();
-        let session_key = SessionKeyV1::owner_session("tenant", "owner", "session", "main");
-        let mut manifest = RecoveryPointManifestV1 {
-            schema_version: RECOVERY_POINT_MANIFEST_SCHEMA_VERSION,
-            recovery_point_id: "rp".into(),
-            owner_id: "owner".into(),
-            work_id: "work".into(),
-            branch_id: "branch".into(),
-            work_revision: 1,
-            branch_revision: 1,
-            graph_revision: 1,
-            goal_revision: 1,
-            criteria_set_revision: 1,
-            session_key: session_key.clone(),
-            session_cursor: SessionCursorV1 {
-                schema_version: 1,
-                owner_id: "owner".into(),
-                session_id: "session".into(),
-                branch_id: "main".into(),
-                completed_turn: 1,
-                journal_event_seq: 1,
-                conversation_seq: 1,
-                canonical_root_hash: "a".repeat(64),
-                projection_schema: 1,
-                compaction_generation: 0,
-                config_version_id: None,
-            },
-            context_head: astra_turn_types::SessionContextHeadV1 {
-                schema_version: 1,
-                key: session_key.clone(),
-                cursor: SessionCursorV1 {
-                    schema_version: 1,
-                    owner_id: "owner".into(),
-                    session_id: "session".into(),
-                    branch_id: "main".into(),
-                    completed_turn: 1,
-                    journal_event_seq: 1,
-                    conversation_seq: 1,
-                    canonical_root_hash: "a".repeat(64),
-                    projection_schema: 1,
-                    compaction_generation: 0,
-                    config_version_id: None,
-                },
-                latest_manifest_root: "a".repeat(64),
-                total_canonical_bytes: 1,
-                total_message_count: 1,
-                writer_epoch: 1,
-            },
-            run: None,
-            execution: RecoveryPointExecutionBindingV1 {
-                binding_generation: 1,
-                binding_state: RecoveryPointBindingStateV1::Ready,
-                logical_workspace_id: "workspace".into(),
-                executor_kind: RecoveryPointExecutorKindV1::Server,
-                executor_id: "server".into(),
-                binding_hash: String::new(),
-                physical_workspace_id: None,
-            },
-            workspace: None,
-            artifacts: vec![],
-            environment: Default::default(),
-            reason: RecoveryPointReasonV1::RunSettled,
-            created_at: "2026-09-16T00:00:00Z".into(),
-        };
-        manifest.execution.binding_hash = manifest.execution.content_hash();
-        let first = NewWorkRecoveryPoint {
-            owner_id: owner.clone(),
-            work_id: work.clone(),
-            branch_id: branch.clone(),
-            request_id: WorkChangeRef::parse("request").unwrap(),
-            manifest: manifest.clone(),
-        };
-        validate_request(&first).unwrap();
-        let first_manifest_hash = manifest_hash(&manifest).unwrap();
-        let first_hash = request_hash(&first, &first_manifest_hash).unwrap();
-        manifest.created_at = "2026-09-16T00:00:01Z".into();
-        let second = NewWorkRecoveryPoint {
-            manifest,
-            ..first.clone()
-        };
-        let second_manifest_hash = manifest_hash(&second.manifest).unwrap();
-        let second_hash = request_hash(&second, &second_manifest_hash).unwrap();
-        assert_ne!(first_hash, second_hash);
     }
 
     #[test]

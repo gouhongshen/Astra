@@ -1,0 +1,66 @@
+name: flash_rejected_delegation_preserves_parent_tools
+description: |
+  Rejected delegation must preserve independent parent catalog work without
+  starting a substitute child.
+prompt: |
+  先只尝试一次委派，让 glm-99.99 模型的子代理回答 ASTRA-MISSING-MODEL-MUST-NOT-RUN。
+  若委派失败，不要重试或换模型。之后由当前代理通过 model_catalog 查询可用的 Chat 模型，
+  如实告诉我委派结果及可用模型；最后包含 ASTRA-PARENT-CATALOG-CHECKED。
+debug_log: true
+capability: delegation
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: execution_tool_count
+    name: agent
+    min: 1
+    max: 1
+    root_only: true
+    predicates:
+      - document: arguments
+        path: /action
+        equals: spawn
+  - type: execution_tool_count
+    name: agent
+    min: 1
+    max: 1
+    root_only: true
+    ok: false
+  - type: execution_tool_count
+    name: agent
+    min: 1
+    max: 1
+    ok: false
+    root_only: true
+    predicates:
+      - document: arguments
+        path: /action
+        equals: spawn
+      - document: result
+        path: /error_kind
+        equals: invalid_request
+      - document: result
+        path: /status
+        equals: failed
+  - type: text_contains
+    needle: ASTRA-PARENT-CATALOG-CHECKED
+  - type: execution_child_count
+    min: 0
+    max: 0
+  - type: execution_tool_count
+    name: reflect
+    min: 0
+    max: 0
+  - type: execution_tool_count
+    name: model_catalog
+    min: 1
+    max: 4294967295
+    root_only: true
+    ok: true
+    predicates:
+      - document: result
+        path: /purpose
+        equals: chat
+  - type: execution_tool_sequence
+    tools: [agent, model_catalog]

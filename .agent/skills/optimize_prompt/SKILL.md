@@ -142,24 +142,3 @@ Do not change:
 Verify:
 - <digest/checkpoint/test command>
 ```
-
-```skill-diagnosis
-{
-  "schema_version": 2,
-  "skill": "optimize_prompt",
-  "cause": "budget_pressure",
-  "headline": "system prompt and tool surface contribute 60% of token budget with low tool utilization",
-  "findings": ["visible_tools_count=45 but only 3 tools used across 12 turns"],
-  "recommended_action": "defer rarely-used tools and trim system prompt static sections",
-  "success_criteria": [
-    {
-      "metric": "budget_pressure",
-      "operator": "lte",
-      "threshold": 0.85,
-      "window_turns": 3,
-      "description": "sustained budget pressure drops below threshold"
-    }
-  ],
-  "source": "real_skill"
-}
-```

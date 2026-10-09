@@ -128,16 +128,8 @@ pub(super) fn build_core_state(
             .with_uc_native(uc_provider)
             .with_pool(shared_pool.clone()),
     ))
-    .with_job_service(Arc::new(InMemoryJobService::new()))
-    .with_trigger_service(Arc::new(
-        DatabaseTriggerService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_workflow_service(Arc::new(UnconfiguredWorkflowService))
     .with_sandbox_service(Arc::new(
         DatabaseSandboxService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_branch_service(Arc::new(
-        DatabaseBranchService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
     .with_data_versioning_service(Arc::new(
         DatabaseDataVersioningService::new(settings.matrixone.clone())
@@ -149,9 +141,6 @@ pub(super) fn build_core_state(
     .with_marketplace_stats_service(Arc::new(
         DatabaseMarketplaceStatsService::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone()),
-    ))
-    .with_replay_service(Arc::new(
-        DatabaseReplayService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
     .with_session_audit_service(Arc::new(
         DatabaseSessionAuditService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
@@ -175,14 +164,6 @@ pub(super) fn build_core_state(
             .with_pool(shared_pool.clone()),
     ))
     .with_fernet_encryptor(shared_encryptor.as_ref().clone())
-    .with_evaluation_service(Arc::new(
-        DatabaseEvaluationService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone())
-            .with_memoria_config(
-                settings.memoria.base_url.clone(),
-                settings.memoria.master_key.clone(),
-            ),
-    ))
     .with_introspection_service(Arc::new(
         DatabaseIntrospectionService::new(settings.matrixone.clone())
             .with_pool(shared_pool.clone()),
@@ -253,10 +234,6 @@ pub(super) fn install_admin_services(
         ))
         .with_admin_audit_reader(Arc::new(
             DatabaseAdminAuditReader::new(settings.matrixone.clone()).with_pool(pool.clone()),
-        ))
-        .with_admin_feedback_stats_reader(Arc::new(
-            DatabaseAdminFeedbackStatsReader::new(settings.matrixone.clone())
-                .with_pool(pool.clone()),
         ))
         .with_admin_user_role_manager(Arc::new(
             DatabaseAdminUserRoleManager::new(settings.matrixone.clone()).with_pool(pool.clone()),

@@ -2,8 +2,10 @@ use serde_json::{Map, Value};
 
 use astra_core::work_unit::{WORK_UNIT_OBSERVATION_FIELD, WorkUnitObservation};
 use astra_turn_core::orchestration::agent_result_wire::{
-    agent_fanout_result_looks_like, agent_fanout_structured_result_class,
-    agent_tool_result_looks_like, agent_tool_structured_result_class,
+    AGENT_RESULT_CLASS_AGENT_INCOMPLETE, AgentFanoutControlReceiptKind, AgentToolResultStatusKind,
+    DecodedAgentToolResult, agent_fanout_control_receipt_kind,
+    agent_fanout_structured_result_class, agent_tool_structured_result_class,
+    decode_agent_tool_result,
 };
 
 use super::tool_transport_metadata::{
@@ -22,53 +24,6 @@ fn parsed_work_unit_observation(parsed: Option<&Value>) -> Option<WorkUnitObserv
 fn insert_parsed_work_unit_observation(parsed: Option<&Value>, metadata: &mut Map<String, Value>) {
     if let Some(observation) = parsed_work_unit_observation(parsed) {
         observation.insert_into(metadata);
-    }
-}
-
-/// Carry a producer-owned control execution fact through the server tool
-/// boundary.  Control tools may reject a request after inspecting durable
-/// state (for example, a duplicate fanout start) while returning a structured
-/// error that still contains the existing group.  The JSON fact must reach the
-/// journal as `Rejected`; otherwise the record fallback promotes the request
-/// to `Executed` and completion policy treats a request that never ran as a
-/// failed execution.
-fn insert_parsed_execution_fact(parsed: Option<&Value>, metadata: &mut Map<String, Value>) {
-    let Some(executed) = parsed.and_then(|value| {
-        value
-            .get("executed")
-            .or_else(|| value.pointer("/advisory/executed"))
-    }) else {
-        return;
-    };
-    match executed {
-        Value::Bool(false) => {
-            metadata.insert("execution_started".to_string(), Value::Bool(false));
-            metadata.insert(
-                "disposition".to_string(),
-                Value::String("rejected".to_string()),
-            );
-            metadata.insert(
-                "execution_fact".to_string(),
-                Value::String("not_executed".to_string()),
-            );
-        }
-        Value::Bool(true) => {
-            metadata.insert("execution_started".to_string(), Value::Bool(true));
-            metadata.insert(
-                "execution_fact".to_string(),
-                Value::String("executed".to_string()),
-            );
-        }
-        Value::Null => {
-            // `null` is an explicit outcome-unknown fact. Do not turn it into
-            // `execution_started=false`: the operation may already have had
-            // side effects and must remain fail-closed for settlement.
-            metadata.insert(
-                "execution_fact".to_string(),
-                Value::String("unknown".to_string()),
-            );
-        }
-        _ => {}
     }
 }
 
@@ -104,7 +59,7 @@ pub(crate) fn tool_result_from_output(output: String) -> astra_tools::ToolResult
     }
     if parsed.is_some() {
         let metadata = result.metadata.get_or_insert_with(Map::new);
-        insert_parsed_execution_fact(parsed.as_ref(), metadata);
+        astra_tools::execution_outcome::insert_producer_execution_fact(parsed.as_ref(), metadata);
     }
     if let Some(observation) = parsed_work_unit_observation(parsed.as_ref()) {
         let metadata = result.metadata.get_or_insert_with(Map::new);
@@ -137,34 +92,46 @@ fn execution_boundary_wait_error_kind(reason: &str) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::ToolResult {
+pub(crate) fn agent_tool_result_from_output(
+    tool_name: &str,
+    output: String,
+) -> astra_tools::ToolResult {
     let parsed = serde_json::from_str::<Value>(&output).ok();
-    let result_class = parsed.as_ref().and_then(|value| {
-        if agent_fanout_result_looks_like(value) {
-            agent_fanout_structured_result_class(value)
-        } else if agent_tool_result_looks_like(value) {
-            agent_tool_structured_result_class(value)
-        } else {
-            None
+    let result_class = match parsed.as_ref() {
+        None => Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE),
+        Some(value) => {
+            if tool_name == "agent_fanout" {
+                agent_fanout_structured_result_class(value).or_else(|| {
+                    // Acceptance is not a failed child result. The canonical
+                    // control parser owns the receipt identity; child settlement
+                    // remains enforced by the direct-child completion barrier.
+                    let accepted = value["status"] == "started"
+                        && agent_fanout_control_receipt_kind(&output)
+                            == Some(AgentFanoutControlReceiptKind::Group);
+                    (!accepted).then_some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
+                })
+            } else {
+                agent_tool_structured_result_class(value)
+            }
         }
-    });
+    };
     let interrupted_agent = parsed.as_ref().and_then(|value| {
-        let status = value.get("status").and_then(Value::as_str)?;
-        if !matches!(status, "waiting" | "interrupted") {
+        let Some(DecodedAgentToolResult::ChildResult(status)) = decode_agent_tool_result(value)
+        else {
             return None;
-        }
-        let reason = match status {
-            "waiting" => value
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("waiting"),
-            "interrupted" => value
-                .get("finish_reason")
-                .and_then(Value::as_str)
-                .unwrap_or("interrupted"),
-            _ => unreachable!("status is constrained above"),
         };
-        Some((status, reason))
+        let (reason_field, default_reason) = match status {
+            AgentToolResultStatusKind::Waiting | AgentToolResultStatusKind::Paused => {
+                ("reason", status.as_str())
+            }
+            AgentToolResultStatusKind::Interrupted => ("finish_reason", "interrupted"),
+            _ => return None,
+        };
+        let reason = value
+            .get(reason_field)
+            .and_then(Value::as_str)
+            .unwrap_or(default_reason);
+        Some((status.as_str(), reason))
     });
 
     let Some((agent_status, reason)) = interrupted_agent else {
@@ -203,11 +170,11 @@ pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::Tool
     {
         metadata.insert("agent_id".to_string(), Value::String(agent_id.to_string()));
     }
-    // Waiting/interrupted agent results take a specialized metadata path, but
+    // Blocked/interrupted agent results take a specialized metadata path, but
     // their producer-owned execution fact must still reach the canonical
     // invocation ledger. In particular, `executed=null` remains outcome
     // unknown and `executed=false` remains a pre-dispatch rejection.
-    insert_parsed_execution_fact(parsed.as_ref(), &mut metadata);
+    astra_tools::execution_outcome::insert_producer_execution_fact(parsed.as_ref(), &mut metadata);
     insert_parsed_work_unit_observation(parsed.as_ref(), &mut metadata);
     if let Some(result_class) = result_class {
         metadata.insert(
@@ -284,6 +251,36 @@ pub(crate) fn workspace_path_mismatch_tool_result(message: String) -> astra_tool
             Value::String(TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH.to_string()),
         ),
         ("blocked".to_string(), Value::Bool(true)),
+        (
+            "disposition".to_string(),
+            Value::String("rejected".to_string()),
+        ),
+        ("execution_started".to_string(), Value::Bool(false)),
+        (
+            "execution_fact".to_string(),
+            Value::String("not_executed".to_string()),
+        ),
+    ]));
+    result
+}
+
+/// Return a typed result for an admission/preflight rejection. The executor
+/// did not own a process, so lifecycle evaluation must not treat this as a
+/// failed execution that needs reconciliation.
+pub(crate) fn pre_dispatch_rejection_tool_result(
+    message: impl Into<String>,
+) -> astra_tools::ToolResult {
+    let mut result = astra_tools::ToolResult::error(message.into());
+    result.metadata = Some(Map::from_iter([
+        (
+            "disposition".to_string(),
+            Value::String("rejected".to_string()),
+        ),
+        ("execution_started".to_string(), Value::Bool(false)),
+        (
+            "execution_fact".to_string(),
+            Value::String("not_executed".to_string()),
+        ),
     ]));
     result
 }
@@ -357,37 +354,134 @@ mod tests {
 
     #[test]
     fn blocked_agent_result_preserves_work_observation_metadata() {
-        let result = agent_tool_result_from_output(
+        for status in ["waiting", "paused"] {
+            let result = agent_tool_result_from_output(
+                "agent",
+                serde_json::json!({
+                    "result_family": "child_result",
+                    "status": status,
+                    "agent_id": "future-agent-1",
+                    "reason": "executor_offline",
+                    "work_unit_observation": {
+                        "id": "future-agent-1",
+                        "kind": "future_capability",
+                        "status": "waiting_for_input",
+                        "revision": 10,
+                        "mode": "wait",
+                        "wake_policy": "on_attention_or_terminal"
+                    }
+                })
+                .to_string(),
+            );
+
+            assert!(result.is_error);
+            assert_eq!(result_metadata_str(&result, "agent_status"), Some(status));
+            assert_eq!(
+                result_metadata_str(&result, "error_kind"),
+                Some("executor_offline")
+            );
+            let observation = result
+                .metadata
+                .as_ref()
+                .and_then(WorkUnitObservation::from_fields)
+                .expect("specialized waiting metadata must retain the generic observation");
+            assert_eq!(observation.id, "future-agent-1");
+            assert_eq!(observation.status, WorkUnitStatus::WaitingForInput);
+            assert_eq!(observation.mode, WorkUnitObservationMode::Wait);
+        }
+    }
+
+    #[test]
+    fn control_receipt_metadata_is_neutral_and_malformed_receipts_fail_closed() {
+        let opaque = agent_tool_result_from_output("agent", "opaque executor failure".into());
+        assert_eq!(
+            result_metadata_str(&opaque, "result_class"),
+            Some("agent_incomplete")
+        );
+        for receipt in [
             serde_json::json!({
-                "status": "waiting",
-                "agent_id": "future-agent-1",
-                "reason": "executor_offline",
-                "work_unit_observation": {
-                    "id": "future-agent-1",
-                    "kind": "future_capability",
-                    "status": "waiting_for_input",
-                    "revision": 10,
-                    "mode": "wait",
-                    "wake_policy": "on_attention_or_terminal"
-                }
-            })
-            .to_string(),
+                "result_family":"control_receipt", "action":"wait", "success":true,
+                "status":"wait_admitted", "result_class":"success",
+                "wait_request":{"parent_run_id":"parent", "tool_call_id":"call", "timeout_ms":1}
+            }),
+            serde_json::json!({
+                "result_family":"control_receipt", "action":"send_message", "success":true,
+                "status":"queued", "result_class":"success", "run_id":"r",
+                "message_id":"m", "target":"parent", "message_type":"text", "recipients":null
+            }),
+        ] {
+            let result = agent_tool_result_from_output("agent", receipt.to_string());
+            assert!(!result.is_error);
+            assert_eq!(result_metadata_str(&result, "result_class"), None);
+            for (field, invalid) in [
+                ("result_family", serde_json::json!("unknown")),
+                ("success", serde_json::json!(false)),
+                ("status", serde_json::json!("failed")),
+                ("status", serde_json::json!("delivery_unknown")),
+                ("status", serde_json::json!("ok")),
+                ("status", serde_json::json!("completed")),
+                ("result", serde_json::json!("")),
+            ] {
+                let mut invalid_receipt = receipt.clone();
+                invalid_receipt[field] = invalid;
+                invalid_receipt["group_id"] = serde_json::json!("group");
+                invalid_receipt["results"] = serde_json::json!([]);
+                let result = agent_tool_result_from_output("agent", invalid_receipt.to_string());
+                assert_eq!(
+                    result_metadata_str(&result, "result_class"),
+                    Some("agent_incomplete")
+                );
+            }
+            let mut missing_status = receipt;
+            missing_status.as_object_mut().unwrap().remove("status");
+            let result = agent_tool_result_from_output("agent", missing_status.to_string());
+            assert_eq!(
+                result_metadata_str(&result, "result_class"),
+                Some("agent_incomplete")
+            );
+        }
+    }
+
+    #[test]
+    fn fanout_acceptance_is_not_a_failed_child_result() {
+        let receipt = serde_json::json!({
+            "status": "started",
+            "group_id": "group",
+            "target_count": 1,
+            "agents": [{"agent_id": "child", "run_id": "run", "status": "launched"}]
+        });
+        let result = agent_tool_result_from_output("agent_fanout", receipt.to_string());
+        assert!(!result.is_error);
+        assert_eq!(result_metadata_str(&result, "result_class"), None);
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.output).unwrap(),
+            receipt
         );
 
-        assert!(result.is_error);
-        let observation = result
-            .metadata
-            .as_ref()
-            .and_then(WorkUnitObservation::from_fields)
-            .expect("specialized waiting metadata must retain the generic observation");
-        assert_eq!(observation.id, "future-agent-1");
-        assert_eq!(observation.status, WorkUnitStatus::WaitingForInput);
-        assert_eq!(observation.mode, WorkUnitObservationMode::Wait);
+        // The same envelope is not an agent child result. Dispatch identity,
+        // not a coincidental field in the payload, selects the wire contract.
+        let wrong_tool = agent_tool_result_from_output("agent", receipt.to_string());
+        assert_eq!(
+            result_metadata_str(&wrong_tool, "result_class"),
+            Some("agent_incomplete")
+        );
+        for malformed in [
+            serde_json::json!({"status": "started"}),
+            serde_json::json!({"status": "started", "group_id": ""}),
+            serde_json::json!({"status": "unknown", "executed": null}),
+        ] {
+            let result = agent_tool_result_from_output("agent_fanout", malformed.to_string());
+            assert_eq!(
+                result_metadata_str(&result, "result_class"),
+                Some("agent_incomplete")
+            );
+        }
     }
 
     #[test]
     fn fanout_partial_completion_retains_typed_result_class() {
         let result = agent_tool_result_from_output(
+            "agent_fanout",
             serde_json::json!({
                 "status": "completed_with_issues",
                 "group_id": "fanout-1",
@@ -411,8 +505,36 @@ mod tests {
     }
 
     #[test]
+    fn preparation_failure_is_a_rejected_request_not_a_started_child() {
+        let output =
+            astra_turn_core::orchestration::agent_result_wire::render_agent_tool_admission_error(
+                "the requested execution control is unsupported",
+            );
+        for tool in ["agent", "agent_fanout"] {
+            let result = agent_tool_result_from_output(tool, output.clone());
+            assert!(result.is_error);
+            let metadata = result.metadata.unwrap();
+            assert_eq!(metadata["execution_started"], false);
+            assert_eq!(metadata["disposition"], "rejected");
+        }
+        let launched = agent_tool_result_from_output(
+            "agent",
+            astra_turn_core::orchestration::agent_result_wire::render_agent_tool_error(
+                Some("child-identity"),
+                "child execution failed",
+            ),
+        );
+        assert!(launched.is_error);
+        let metadata = launched.metadata.unwrap();
+        assert_eq!(metadata["result_class"], "agent_incomplete");
+        assert!(!metadata.contains_key("execution_started"));
+        assert!(!metadata.contains_key("disposition"));
+    }
+
+    #[test]
     fn fanout_rejection_preserves_not_executed_fact_for_the_journal() {
         let result = agent_tool_result_from_output(
+            "agent_fanout",
             serde_json::json!({
                 "status": "failed",
                 "error_kind": "fanout_group_already_started",
@@ -438,6 +560,7 @@ mod tests {
     #[test]
     fn fanout_unknown_execution_fact_does_not_become_rejection() {
         let result = agent_tool_result_from_output(
+            "agent_fanout",
             serde_json::json!({
                 "status": "unknown",
                 "error_kind": "action_outcome_unknown",

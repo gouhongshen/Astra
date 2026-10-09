@@ -4,6 +4,8 @@
 //!   --test runs_db_batch_it -- --ignored --test-threads=1
 
 mod common;
+#[path = "common/isolated_database.rs"]
+mod isolated_database;
 
 use astra_core::SharedPool;
 use astra_services::auth::session::{DatabaseSessionService, SessionService};
@@ -60,7 +62,7 @@ fn durable_run_record(run_id: String, user_id: String, session_id: String) -> Du
         checkpoint_json: None,
         error_code: None,
         error_message: None,
-        retry_count: 0,
+
         total_prompt_tokens: 0,
         total_completion_tokens: 0,
         total_tool_calls: 0,
@@ -1224,6 +1226,49 @@ async fn single_event_append_uses_batch_path() {
         "genesis plus three appended events must be stored"
     );
 
+    for (limit, expected) in [(1, 1), (2, 2), (4, 4), (64, 4)] {
+        let observation = store
+            .load_run_observation(&user_id, &run_id, limit)
+            .await
+            .unwrap()
+            .expect("existing run observation");
+        assert_eq!(observation.total_event_count, 4);
+        assert_eq!(observation.run.events.len(), expected);
+        assert_eq!(observation.run.events[0]["event_type"], "run_created");
+        if limit > 1 {
+            assert_eq!(
+                observation.run.events.last().unwrap()["event_type"],
+                "run_finished"
+            );
+        }
+    }
+    assert!(
+        store
+            .load_run_observation("unrelated-owner", &run_id, 4)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store.append_event(&user_id, &session_id, &run_id, make_event(
+        "agent_progress",
+        json!({"large_payload": "x".repeat(astra_services::runs::MAX_RUN_OBSERVATION_BYTES / 4 + 1)}),
+    )).await.unwrap();
+    let observation = store
+        .load_run_observation(&user_id, &run_id, 4)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observation.total_event_count, 5);
+    assert_eq!(observation.run.events.len(), 3);
+    assert!(
+        observation
+            .run
+            .events
+            .iter()
+            .all(|event| event.get("large_payload").is_none()
+                && event.pointer("/data/large_payload").is_none())
+    );
+
     // Cleanup
     let _ = sqlx::query("DELETE FROM agent_run_events WHERE run_id = ?")
         .bind(&run_id)
@@ -1904,17 +1949,35 @@ async fn terminal_transition_persists_error_code_with_event_batch() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
-async fn explain_root_discovery_is_owner_scoped_root_only_and_decodes_narrow_identity() {
+async fn root_discovery_uses_admission_order_and_decodes_narrow_owner_scoped_identity() {
     let (pool, store) = setup().await;
     let suffix = uuid::Uuid::new_v4();
     let user_id = format!("explain-discovery-user-{suffix}");
     let session_id = format!("explain-discovery-session-{suffix}");
     let older_root = format!("explain-older-{suffix}");
-    let newer_root = format!("explain-newer-{suffix}");
+    let tied_root = format!("ordinary-a-{suffix}");
+    let newer_root = format!("ordinary-z-{suffix}");
+    let current_root = format!("current-root-{suffix}");
+    let later_root = format!("later-root-{suffix}");
     let child = format!("explain-child-{suffix}");
+    let other_user = format!("other-user-{suffix}");
+    let other_session = format!("other-session-{suffix}");
+    let foreign_user_root = format!("foreign-user-root-{suffix}");
+    let foreign_session_root = format!("foreign-session-root-{suffix}");
+    let fixtures = [
+        (&older_root, &user_id, &session_id, 1),
+        (&tied_root, &user_id, &session_id, 2),
+        (&newer_root, &user_id, &session_id, 2),
+        (&current_root, &user_id, &session_id, 3),
+        (&later_root, &user_id, &session_id, 4),
+        (&child, &user_id, &session_id, 5),
+        (&foreign_user_root, &other_user, &session_id, 5),
+        (&foreign_session_root, &user_id, &other_session, 5),
+    ];
 
-    for run_id in [&older_root, &newer_root, &child] {
-        let mut run = durable_run_record(run_id.clone(), user_id.clone(), session_id.clone());
+    for (run_id, owner, session, day) in fixtures {
+        let mut run = durable_run_record(run_id.clone(), owner.clone(), session.clone());
+        run.status = "completed".into();
         run.checkpoint_json = Some("x".repeat(512 * 1024));
         if run_id == &child {
             run.depth = 1;
@@ -1925,57 +1988,88 @@ async fn explain_root_discovery_is_owner_scoped_root_only_and_decodes_narrow_ide
         insert_run_fixture(&pool, store.as_ref(), run).await;
         store
             .append_event(
-                &user_id,
-                &session_id,
+                owner,
+                session,
                 run_id,
                 make_event(
                     "run_started",
-                    json!({"data": {"explain_analyze_requested": true}}),
+                    json!({"data": {"explain_analyze_requested": run_id == &older_root}}),
                 ),
             )
             .await
-            .expect("append Explain request marker");
+            .expect("append run start");
+        let created_at = format!("2026-01-{day:02} 00:00:00.000000");
+        let updated_at = if run_id == &older_root {
+            "2026-02-01 00:00:00.000000"
+        } else {
+            &created_at
+        };
+        sqlx::query(
+            "UPDATE agent_runs SET created_at = ?, updated_at = ? WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(&created_at)
+        .bind(updated_at)
+        .bind(owner)
+        .bind(run_id)
+        .execute(pool.get())
+        .await
+        .expect("set deterministic admission and update ordering");
     }
-    sqlx::query(
-        "UPDATE agent_runs SET updated_at = CASE run_id
-             WHEN ? THEN '2026-01-01 00:00:00.000000'
-             WHEN ? THEN '2026-01-02 00:00:00.000000'
-             ELSE '2026-01-03 00:00:00.000000' END
-         WHERE user_id = ? AND run_id IN (?, ?, ?)",
-    )
-    .bind(&older_root)
-    .bind(&newer_root)
-    .bind(&user_id)
-    .bind(&older_root)
-    .bind(&newer_root)
-    .bind(&child)
-    .execute(pool.get())
-    .await
-    .expect("set deterministic Explain ordering");
 
     assert_eq!(
         store
-            .find_latest_explain_analyze_root(&user_id, &session_id, None)
+            .find_latest_root_run(&user_id, &session_id, None)
             .await
-            .expect("discover latest Explain root"),
+            .expect("discover latest root"),
+        Some((later_root.clone(), 1)),
+        "newer child and foreign roots must not affect selection"
+    );
+    for (owner, session) in [
+        ("not-the-owner", session_id.as_str()),
+        (user_id.as_str(), "not-the-session"),
+    ] {
+        assert_eq!(
+            store
+                .find_latest_root_run(owner, session, None)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    assert_eq!(
+        store
+            .find_latest_root_run(&user_id, &session_id, Some(&current_root))
+            .await
+            .expect("select strictly before current root"),
         Some((newer_root.clone(), 1)),
-        "newer root must win even when a child has the newest timestamp"
+        "ordinary previous wins over later roots and the later-updated older Explain root"
     );
     assert_eq!(
         store
-            .find_latest_explain_analyze_root("not-the-owner", &session_id, None)
+            .find_latest_root_run(&user_id, &session_id, Some(&newer_root))
             .await
-            .expect("wrong owner lookup"),
-        None
+            .unwrap(),
+        Some((tied_root.clone(), 1)),
+        "run ID is the strict upper bound when admission timestamps tie"
     );
-
-    assert_eq!(
-        store
-            .find_latest_explain_analyze_root(&user_id, &session_id, Some(&newer_root))
-            .await
-            .expect("exclude current root"),
-        Some((older_root.clone(), 1)),
-    );
+    let missing_root = format!("missing-root-{suffix}");
+    for current in [
+        &older_root,
+        &missing_root,
+        &foreign_user_root,
+        &foreign_session_root,
+        &child,
+    ] {
+        assert_eq!(
+            store
+                .find_latest_root_run(&user_id, &session_id, Some(current))
+                .await
+                .unwrap(),
+            None,
+            "earliest or invalid current root must not select a later root or older Explain: {current}"
+        );
+    }
 
     sqlx::query("UPDATE agent_runs SET run_generation = -1 WHERE user_id = ? AND run_id = ?")
         .bind(&user_id)
@@ -1984,31 +2078,274 @@ async fn explain_root_discovery_is_owner_scoped_root_only_and_decodes_narrow_ide
         .await
         .expect("seed invalid stored generation");
     let error = store
-        .find_latest_explain_analyze_root(&user_id, &session_id, None)
+        .find_latest_root_run(&user_id, &session_id, Some(&current_root))
         .await
-        .expect_err("negative generation must fail closed");
+        .expect_err(
+            "invalid selected generation must fail closed, not select an older Explain root",
+        );
     assert!(error.contains("run_generation") || error.contains("negative"));
 
-    sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id IN (?, ?, ?)")
-        .bind(&user_id)
-        .bind(&older_root)
-        .bind(&newer_root)
-        .bind(&child)
-        .execute(pool.get())
+    for (run_id, owner, _, _) in fixtures {
+        sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?")
+            .bind(owner)
+            .bind(run_id)
+            .execute(pool.get())
+            .await
+            .expect("clean discovery events");
+        sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?")
+            .bind(owner)
+            .bind(run_id)
+            .execute(pool.get())
+            .await
+            .expect("clean discovery runs");
+    }
+    for (owner, session) in [
+        (&user_id, &session_id),
+        (&other_user, &session_id),
+        (&user_id, &other_session),
+    ] {
+        sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+            .bind(owner)
+            .bind(session)
+            .execute(pool.get())
+            .await
+            .expect("clean discovery session");
+    }
+}
+
+async fn assert_auto_model_routing_commit(store: &dyn RunStateStore, run: &DurableRunRecord) {
+    use astra_services::model_routing::{DECISION_KEY, EVENT_TYPE, ModelRoutingDecision};
+    use astra_turn_types::model_routing::{AutoModelRoutingPolicy, ModelRoutingReason};
+    let decision = ModelRoutingDecision {
+        rollout: None,
+        schema_version: 2,
+        features: None,
+        policy_version: "easy-read-only-v1".into(),
+        policy: AutoModelRoutingPolicy {
+            revision: "test-qualified-v1".into(),
+            economy_offering_id: "economy".into(),
+            strong_offering_id: "strong".into(),
+        },
+        run_id: run.run_id.clone(), session_id: run.session_id.clone(),
+        selected_offering_id: "economy".into(), selected_model: "economy-model".into(),
+        selected_contract_root: "test-contract".into(), input_reference: None,
+        assessment: None, reason: ModelRoutingReason::EasyReadOnly,
+        work_admission: Some(astra_services::parse_work_admission_response(r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary"}"#).unwrap()),
+        work_admission_skill_revision: 0,
+        delegation_model_requirement: None,
+        delegation_model_source: None,
+    };
+    let event =
+        json!({"event_type": EVENT_TYPE, "idempotency_key": DECISION_KEY, "data": decision});
+    let mut batch = vec![event.clone()];
+    batch.extend((0..24).map(|index| {
+        json!({
+            "event_type":"explain_analyze", "idempotency_key":format!("explain-{index}"),
+            "data": {"schema_version":1, "event_id":format!("fact-{index}"),
+                "run_id":run.run_id, "turn_id":"turn", "node_id":format!("node-{index}"),
+                "producer_id":"server", "clock_domain_id":"clock", "kind":"turn",
+                "label":"Turn", "transition":"finished", "elapsed_ms":10,
+                "start_elapsed_ms":0, "duration_ms":10, "outcome":"completed"}
+        })
+    }));
+    batch.push(batch[1].clone());
+    for (owner, session, generation, status) in [
+        (
+            "wrong-owner",
+            run.session_id.as_str(),
+            run.run_generation,
+            "running",
+        ),
+        (
+            run.user_id.as_str(),
+            "wrong-session",
+            run.run_generation,
+            "running",
+        ),
+        (
+            run.user_id.as_str(),
+            run.session_id.as_str(),
+            run.run_generation + 1,
+            "running",
+        ),
+        (
+            run.user_id.as_str(),
+            run.session_id.as_str(),
+            run.run_generation,
+            "paused",
+        ),
+    ] {
+        assert!(
+            !store
+                .append_events_if_current_generation_and_status(
+                    owner,
+                    session,
+                    &run.run_id,
+                    generation,
+                    &[status],
+                    &batch,
+                )
+                .await
+                .unwrap()
+        );
+    }
+    let mut invalid = event.clone();
+    invalid["data"]["policy"]["strong_offering_id"] = json!("wrong-baseline");
+    assert!(
+        store
+            .append_events_if_current_generation_and_status(
+                &run.user_id,
+                &run.session_id,
+                &run.run_id,
+                run.run_generation,
+                &["running"],
+                &[invalid, batch[1].clone()],
+            )
+            .await
+            .is_err()
+    );
+    let mut staged_conflict = batch[1].clone();
+    staged_conflict["data"]["outcome"] = json!("failed");
+    assert!(
+        store
+            .append_events_if_current_generation_and_status(
+                &run.user_id,
+                &run.session_id,
+                &run.run_id,
+                run.run_generation,
+                &["running"],
+                &[event.clone(), batch[1].clone(), staged_conflict],
+            )
+            .await
+            .is_err()
+    );
+    let unchanged = store
+        .load_run(&run.user_id, &run.run_id)
         .await
-        .expect("clean Explain events");
-    sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND run_id IN (?, ?, ?)")
-        .bind(&user_id)
-        .bind(&older_root)
-        .bind(&newer_root)
-        .bind(&child)
-        .execute(pool.get())
+        .unwrap()
+        .unwrap();
+    assert_eq!(unchanged.model_offering_id.as_deref(), Some("strong"));
+    assert!(
+        !unchanged
+            .events
+            .iter()
+            .any(|event| event["event_type"] == "explain_analyze")
+    );
+    assert!(
+        !unchanged
+            .events
+            .iter()
+            .any(|e| e["event_type"] == EVENT_TYPE)
+    );
+    for _ in 0..2 {
+        assert!(
+            store
+                .append_events_if_current_generation_and_status(
+                    &run.user_id,
+                    &run.session_id,
+                    &run.run_id,
+                    run.run_generation,
+                    &["running"],
+                    &batch,
+                )
+                .await
+                .unwrap()
+        );
+    }
+    let committed = store
+        .load_run(&run.user_id, &run.run_id)
         .await
-        .expect("clean Explain runs");
-    sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
-        .bind(&user_id)
-        .bind(&session_id)
-        .execute(pool.get())
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.model_offering_id.as_deref(), Some("economy"));
+    assert_eq!(
+        committed.resolved_model_name.as_deref(),
+        Some("economy-model")
+    );
+    assert_eq!(
+        committed
+            .events
+            .iter()
+            .filter(|e| e["event_type"] == EVENT_TYPE)
+            .count(),
+        1
+    );
+    let facts = committed
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "explain_analyze")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        facts.len(),
+        24,
+        "same-batch and committed retries must not duplicate facts"
+    );
+    let mut fact_conflict = batch[1].clone();
+    fact_conflict["data"]["outcome"] = json!("failed");
+    assert!(
+        store
+            .append_events_if_current_generation_and_status(
+                &run.user_id,
+                &run.session_id,
+                &run.run_id,
+                run.run_generation,
+                &["running"],
+                &[fact_conflict],
+            )
+            .await
+            .is_err()
+    );
+    let mut conflict = event;
+    conflict["data"]["selected_offering_id"] = json!("strong");
+    assert!(
+        store
+            .append_events_if_current_generation_and_status(
+                &run.user_id,
+                &run.session_id,
+                &run.run_id,
+                run.run_generation,
+                &["running"],
+                &[conflict],
+            )
+            .await
+            .is_err()
+    );
+    let after = store
+        .load_run(&run.user_id, &run.run_id)
         .await
-        .expect("clean Explain session");
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.model_offering_id, committed.model_offering_id);
+    assert_eq!(after.events, committed.events);
+}
+
+#[tokio::test]
+async fn auto_model_routing_memory_commit_is_atomic_and_fenced() {
+    let store = astra_services::runs::InMemoryRunStateStore::new();
+    let mut run = durable_run_record(
+        "routing-memory".into(),
+        "routing-user".into(),
+        "routing-session".into(),
+    );
+    run.model_offering_id = Some("strong".into());
+    run.resolved_model_name = Some("strong-model".into());
+    store.insert_run(run.clone()).await.unwrap();
+    assert_auto_model_routing_commit(&store, &run).await;
+}
+
+#[tokio::test]
+#[ignore = "requires disposable MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn auto_model_routing_database_commit_is_atomic_and_fenced() {
+    isolated_database::require_isolated_database(&common::require_db_it_env().database);
+    let (pool, store) = setup().await;
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut run = durable_run_record(
+        format!("routing-{id}"),
+        format!("routing-user-{id}"),
+        format!("routing-session-{id}"),
+    );
+    run.model_offering_id = Some("strong".into());
+    run.resolved_model_name = Some("strong-model".into());
+    insert_run_fixture(&pool, store.as_ref(), run.clone()).await;
+    assert_auto_model_routing_commit(store.as_ref(), &run).await;
 }

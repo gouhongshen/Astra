@@ -144,7 +144,8 @@ pub struct ExecutionTraceReport {
     pub runtime_rejection_reasons: BTreeMap<String, u32>,
     /// False when the journal capture dropped or skipped rows, or detected an
     /// integrity conflict. Counters are then lower bounds (or unavailable)
-    /// and must not be read as a complete execution trace.
+    /// and must not be read as complete journal tool attribution. This does
+    /// not certify child provider usage, whole-tree expenses or task success.
     #[serde(default = "default_evidence_complete")]
     pub evidence_complete: bool,
     #[serde(default)]
@@ -594,18 +595,9 @@ fn raw_llm_response_cache_hit_ratio(event: &crate::session_capture::JournalEvent
         .and_then(|response| response.get("response"))
         .and_then(|response| response.get("usage"))?;
 
-    let input_tokens = usage
-        .get("input_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let cache_read_tokens = usage
-        .get("cached_input_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let cache_creation_tokens = usage
-        .get("cache_creation_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let input_tokens = usage.get("input_tokens")?.as_u64()?;
+    let cache_read_tokens = usage.get("cached_input_tokens")?.as_u64()?;
+    let cache_creation_tokens = usage.get("cache_creation_tokens")?.as_u64()?;
     let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
         input_tokens,
         cache_read_tokens,
@@ -735,132 +727,6 @@ fn content_value_text(value: &Value) -> String {
             .map(str::to_string)
             .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default()),
         _ => value.to_string(),
-    }
-}
-
-/// Render a human-readable pipeline health summary.
-pub fn render_pipeline_health(report: &PipelineHealthReport) -> String {
-    let mut out = String::new();
-    out.push_str("── Pipeline Health ──\n");
-
-    out.push_str(&format!(
-        "  Feedback observations: {}\n",
-        report.feedback_observations
-    ));
-    out.push_str(&format!(
-        "  Mean primary request-group cache-read share: {}\n",
-        report.cache_read_share_label()
-    ));
-    if let Some(coverage) = report.stable_prefix_cache_coverage {
-        out.push_str(&format!(
-            "  Stable-prefix cache coverage: {:.1}% ({}/{} tokens, {} provider-prefix-v1 observations)\n",
-            coverage * 100.0,
-            report.stable_prefix_cache_read_tokens,
-            report.stable_prefix_cache_eligible_tokens,
-            report.provider_prefix_cache_observations,
-        ));
-    }
-    if report.invalid_events > 0 {
-        out.push_str(&format!(
-            "  ⚠ Invalid pipeline event payloads: {} (evidence incomplete)\n",
-            report.invalid_events
-        ));
-    }
-
-    if let Some(ratios) = &report.cache_hit_ratios
-        && let (Some(first), Some(last)) = (ratios.first(), ratios.last())
-    {
-        let trend = if last > first {
-            "↑"
-        } else if last < first {
-            "↓"
-        } else {
-            "→"
-        };
-        out.push_str(&format!(
-            "  Cache trend: {:.0}% → {:.0}% {}\n",
-            first * 100.0,
-            last * 100.0,
-            trend
-        ));
-    }
-
-    if report.compaction_count > 0 {
-        out.push_str(&format!(
-            "  Compactions: {} ({} tokens freed)\n",
-            report.compaction_count, report.total_tokens_freed
-        ));
-    }
-
-    if report.cascade_detected {
-        out.push_str("  ⚠ Compaction cascade detected\n");
-    }
-    if report.prompt_cache_breaks > 0 {
-        out.push_str(&format!(
-            "  ⚠ Prompt cache breaks: {}\n",
-            report.prompt_cache_breaks
-        ));
-    }
-
-    if !report.alerts.is_empty() {
-        out.push_str(&format!("  Alerts: {}\n", report.alerts.len()));
-        for alert in &report.alerts {
-            out.push_str(&format!(
-                "    T{}: [{}] {}\n",
-                alert.turn, alert.severity, alert.rule
-            ));
-        }
-    }
-
-    render_execution_summary(report, &mut out);
-
-    out
-}
-
-fn render_execution_summary(report: &PipelineHealthReport, out: &mut String) {
-    let execution = &report.execution;
-    if execution.total_tool_calls == 0 && execution.evidence_complete {
-        return;
-    }
-    let scope = match execution.scope {
-        ExecutionTraceScope::Session => "session",
-        ExecutionTraceScope::CaseAttempts => "case_attempts",
-    };
-    out.push_str(&format!(
-        "  Execution scope: {scope} captures={}/{}\n",
-        execution.captured_capture_count, execution.expected_capture_count,
-    ));
-    if !execution.evidence_complete {
-        out.push_str(&format!(
-            "  Execution evidence: incomplete (counts are lower bounds; skipped_lines={} dropped_lines={} integrity_errors={})\n",
-            execution.skipped_lines,
-            execution.dropped_lines,
-            execution.integrity_errors,
-        ));
-    }
-    out.push_str(&format!(
-        "  Execution: tools={} executed={} success={} failed={} rejected={} reused={} suppressed={} deferred={} unknown={} unknown_disposition={}\n",
-        execution.total_tool_calls,
-        execution.executed_tool_calls,
-        execution.successful_tool_calls,
-        execution.failed_tool_calls,
-        execution.rejected_tool_calls,
-        execution.reused_tool_calls,
-        execution.suppressed_tool_calls,
-        execution.deferred_tool_calls,
-        execution.unknown_outcome_tool_calls,
-        execution.unknown_disposition_tool_calls,
-    ));
-    if execution.settlement_attempts > 0 {
-        out.push_str(&format!(
-            "  Work settlements: attempts={} success={} rejected={}\n",
-            execution.settlement_attempts,
-            execution.successful_settlements,
-            execution.rejected_settlements,
-        ));
-    }
-    for (reason, count) in &execution.runtime_rejection_reasons {
-        out.push_str(&format!("  Runtime rejections: {} × {}\n", count, reason));
     }
 }
 
@@ -1064,17 +930,14 @@ mod tests {
         assert_eq!(report.feedback_observations, 0);
         assert_eq!(report.cache_hit_ratios, Some(vec![0.9, 0.1]));
         assert_eq!(report.avg_cache_hit_ratio, Some(0.5));
-        assert!(render_pipeline_health(&report).contains("cache-read share: 50.0%"));
         let zero = cache_request_outcome("zero", "t", &[(0, 0, 0)]);
         let zero_report = analyze_pipeline_health(&capture, &[&zero]);
         assert_eq!(zero_report.cache_hit_ratios, Some(vec![]));
         assert_eq!(zero_report.avg_cache_hit_ratio, None);
-        assert!(render_pipeline_health(&zero_report).contains("n/a (zero input)"));
         let missing = crate::runner::RunOutcome::new("m");
         let unknown = analyze_pipeline_health(&capture, &[&out, &missing]);
         assert_eq!(unknown.cache_hit_ratios, None);
         assert_eq!(unknown.avg_cache_hit_ratio, None);
-        assert!(render_pipeline_health(&unknown).contains("unknown (incomplete input evidence)"));
         for report in [report, zero_report, unknown] {
             let json = serde_json::to_value(&report).unwrap();
             let restored: PipelineHealthReport = serde_json::from_value(json.clone()).unwrap();
@@ -1132,10 +995,6 @@ mod tests {
                 .get("work_settlement_evidence_required"),
             Some(&1)
         );
-
-        let rendered = render_pipeline_health(&report);
-        assert!(rendered.contains("Work settlements: attempts=3 success=2 rejected=1"));
-        assert!(rendered.contains("Runtime rejections: 1 × work_settlement_evidence_required"));
     }
 
     #[test]
@@ -1200,11 +1059,6 @@ mod tests {
         assert_eq!(report.execution.settlement_attempts, 3);
         assert_eq!(report.execution.successful_settlements, 1);
         assert_eq!(report.execution.rejected_settlements, 1);
-
-        let rendered = render_pipeline_health(&report);
-        assert!(rendered.contains(
-            "Execution: tools=7 executed=3 success=2 failed=1 rejected=1 reused=0 suppressed=2 deferred=1 unknown=0 unknown_disposition=0"
-        ));
     }
 
     #[test]
@@ -1348,9 +1202,6 @@ mod tests {
         assert!(!report.execution.evidence_complete);
         assert_eq!(report.execution.total_tool_calls, 1);
         assert_eq!(report.execution.skipped_lines, 2);
-        let rendered = render_pipeline_health(&report);
-        assert!(rendered.contains("counts are lower bounds"));
-        assert!(rendered.contains("skipped_lines=2"));
     }
 
     #[test]
@@ -1369,9 +1220,6 @@ mod tests {
         assert!(!report.execution.evidence_complete);
         assert_eq!(report.execution.total_tool_calls, 0);
         assert_eq!(report.execution.integrity_errors, 1);
-        let rendered = render_pipeline_health(&report);
-        assert!(rendered.contains("Execution evidence: incomplete"));
-        assert!(rendered.contains("integrity_errors=1"));
     }
 
     #[test]
@@ -1386,6 +1234,38 @@ mod tests {
         assert_eq!(report.feedback_observations, 4);
         assert_eq!(report.cache_hit_ratios, None);
         assert_eq!(report.avg_cache_hit_ratio, None);
+    }
+
+    #[test]
+    fn zero_input_feedback_is_valid_without_a_cache_percentage() {
+        let mut output_only = make_feedback_event(1, 0.0);
+        output_only.raw["metadata"]["runtime_feedback"]["request_usage"]["prompt"] =
+            serde_json::json!(0);
+        output_only.raw["metadata"]["runtime_feedback"]["run_usage"]["prompt"] =
+            serde_json::json!(0);
+        let report = analyze_pipeline_health(&make_capture(vec![output_only.clone()]), &[]);
+        assert_eq!(report.invalid_events, 0);
+        assert_eq!(report.feedback_observations, 1);
+        assert_eq!(report.cache_hit_ratios, None);
+        assert_eq!(report.avg_cache_hit_ratio, None);
+        for optional in [false, true] {
+            let result = crate::criteria::evaluate_deterministic_with_session(
+                &[crate::criteria::Criterion::PipelineAvgCacheHitRatio { min: 0.5, optional }],
+                &crate::runner::RunOutcome::new("m"),
+                Some(&make_capture(vec![output_only.clone()])),
+            );
+            assert_eq!(result[0].passed, optional);
+            assert!(
+                result[0]
+                    .detail
+                    .contains("unknown (incomplete input evidence)")
+            );
+            if optional {
+                assert!(result[0].detail.contains("optional criterion skipped"));
+            } else {
+                assert!(result[0].detail.contains("cannot evaluate cache ratio"));
+            }
+        }
     }
 
     #[test]
@@ -1440,10 +1320,6 @@ mod tests {
         assert_eq!(report.stable_prefix_cache_observations, 2);
         assert_eq!(report.provider_prefix_cache_observations, 2);
         assert_eq!(report.stable_prefix_cache_coverage, Some(0.8125));
-        let rendered = render_pipeline_health(&report);
-        assert!(rendered.contains("Mean primary request-group cache-read share: unknown"));
-        assert!(rendered.contains("Stable-prefix cache coverage: 81.2%"));
-        assert!(rendered.contains("2 provider-prefix-v1 observations"));
     }
 
     #[test]
@@ -1566,25 +1442,5 @@ mod tests {
         let report = analyze_pipeline_health(&capture, &[]);
         assert!(report.cascade_detected);
         assert_eq!(report.alerts.len(), 1);
-    }
-
-    #[test]
-    fn render_produces_readable_output() {
-        let capture = make_capture(vec![
-            make_feedback_event(1, 0.0),
-            make_feedback_event(2, 0.8),
-            make_feedback_event(3, 0.9),
-            make_compaction_event(2, 1500),
-        ]);
-        let out = crate::exec::test_support::cache_request_outcome(
-            "r",
-            "t",
-            &[(100, 0, 0), (20, 80, 0), (10, 90, 0)],
-        );
-        let report = analyze_pipeline_health(&capture, &[&out]);
-        let rendered = render_pipeline_health(&report);
-        assert!(rendered.contains("Mean primary request-group cache-read share"));
-        assert!(rendered.contains("Compactions: 1"));
-        assert!(rendered.contains("Cache trend"));
     }
 }

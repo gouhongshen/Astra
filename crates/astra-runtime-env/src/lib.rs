@@ -25,7 +25,7 @@ mod runtime_environment;
 mod tool;
 mod workspace;
 mod workspace_snapshot;
-mod workspace_snapshot_capture;
+mod workspace_snapshot_package;
 
 pub use binding::*;
 pub use capability::*;
@@ -37,4 +37,4 @@ pub use runtime_environment::*;
 pub use tool::*;
 pub use workspace::*;
 pub use workspace_snapshot::*;
-pub use workspace_snapshot_capture::*;
+pub use workspace_snapshot_package::*;

@@ -16,6 +16,30 @@ Data and storage owns platform state layering, MatrixOne usage, retention, archi
 | C4 debug bundle | short-lived raw diagnostics and manifests. |
 | C5 learning artifacts | redacted, consent-gated derived data. |
 
+Delegation topology, status, retry lineage, usage, and terminal evidence are owned
+by `agent_runs` and `agent_run_events`. Run admission and owner-fenced transitions
+persist these canonical facts; there is no separate delegation table or
+delegation-state mirror. The run display projection and bounded terminal-receipt
+repair remain derived from canonical run facts.
+
+Session state projections remain owned by personal-skill activation and
+user-anchor memory. The unused general state-item upsert API and generic mutation
+validator are retired. Session lifecycle fencing, projection reads, artifact
+reference accounting, and retention remain owned by the existing storage
+boundaries.
+
+The unused general authority-event query source API is retired; canonical
+Session authority still persists owner-scoped audit facts. Handoff fencing
+verification reads the exact rejected reservation, including its old lease and
+expected root, rather than accepting an unrelated rejection event.
+
+Execution bindings are initialized once as Ready at generation 1. Subsequent
+provider switches use the controller-authorized durable begin/complete/retry
+receipt contract; the unused general binding CAS source API is retired.
+Generation fencing, quiescence checks, and owner-scoped binding reads remain
+part of the canonical coordinator. Edge handoff requires verifiable source
+and target materializations; it does not convert a Server binding into Edge.
+
 ## MatrixOne role
 
 MatrixOne is the platform state store and analytic substrate. It should support:
@@ -36,12 +60,29 @@ An older completion marker is rejected and requires a new database. Interrupted
 fresh bootstrap can retry under the existing database lease, with readiness
 published only after schema validation succeeds.
 
+Agent metadata is persisted by the database service. Its unused alternative
+in-memory CRUD implementation and self-tests are retired; the unconfigured
+service remains explicit. The owner/name unique constraint is enforced by the
+database, and create or rename conflicts now return HTTP 409 rather than 500.
+Other SQL and malformed persisted-data errors retain their 500 behavior.
+
 ## Transcript persistence
 
-Fresh schema contract `2026-09-22-v89` stores transcript items and their
+Fresh schema contract `2026-10-07-v100` stores transcript items and their
 committed projection head. Physical page metadata and the unused source event
 position column are removed. The run lookup index is `(user_id, run_id)`.
-There is no migration, replacement table, page cache, or rebuild job.
+Model thinking observations use only the configuration-bound snapshot; obsolete
+capability and error mirror columns are absent.
+The retired tool-result projection decision/receipt tables and special event
+field are absent. Current provider-wire and accepted-to-terminal recovery
+contracts remain unchanged.
+The retired session-level physical-workspace claim, unexecuted workflow-trigger
+and plan-step attempt tables are not part of this contract. The unused cloud
+configuration-body mirror is also absent; configuration version changes retain
+their canonical journal audit and local content-addressed bodies. Plans retain their
+owner-scoped authoring state and session binding; execution and attempt evidence
+remain with Work and Run. There is no migration, replacement table, page cache, or rebuild job;
+an older database must be recreated from the current schema.
 
 One append implementation requires canonical session admission in the same
 transaction. Canonical/core event writers reuse their admission; standalone
@@ -156,3 +197,27 @@ Archival should preserve allowed metadata while removing or redacting payloads a
 - debug bundles;
 - artifact manifests;
 - eval cases that include private payloads.
+
+## Router deployment state
+
+Fresh schema contract `2026-09-27-v90` adds `model_router_deployments`, keyed by
+owner, with a compare-and-swap revision and typed deployment/revocation JSON. This
+is C0 tuning control state. Mutations and existing `auth_audit_logs` entries share
+one transaction. Routing decisions and reviewed outcomes continue to use
+`agent_run_events`; dashboard queries are bounded projections of that ledger.
+As with the canonical bootstrap policy above, older schema markers are rejected;
+this change does not implement an in-place migration or backfill.
+
+Compressed conversation history is an immutable `context_history_v1` session
+artifact, referenced by `session_transcript` with the owning session ID. It
+remains reachable until the existing owned-session deletion releases its
+references. Server introspect reads bounded UTF-8 windows from the authenticated
+artifact store; client-local file paths are not recovery authority.
+
+The unused `storage::delete_agent_event_edges_for_owned_event_ids` source API
+is retired. Event deletion keeps edge removal in the existing owner-scoped
+transaction, and session deletion retains bounded owner/session cleanup.
+
+The durable run retry counter is retired from the fresh schema and Rust record.
+Verification retries retain their `retry_of` and `retry_scope` lineage; recovery
+generations and provider-attempt retry accounting remain separate authorities.

@@ -4,11 +4,6 @@
 //! Identifiers are backtick-quoted, and embedded backticks are escaped to prevent
 //! SQL injection.
 //! Syntax: ``CREATE SNAPSHOT `{name}` FOR DATABASE `{db}` ``
-//! Restore: ``RESTORE ACCOUNT `{account}` DATABASE `{db}` FROM SNAPSHOT `{name}` ``
-
-use std::sync::OnceLock;
-
-use sqlx::Row;
 
 /// Validate a SQL identifier: non-empty, alphanumeric + underscore only.
 /// Rejects backticks, quotes, spaces, and other special characters.
@@ -34,24 +29,6 @@ pub(crate) fn quote_mysql_identifier(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
 }
 
-/// Cached account name — queried once per process via `SELECT current_account_name()`.
-static ACCOUNT_NAME: OnceLock<String> = OnceLock::new();
-
-/// Resolve the current MatrixOne account name, caching the result for the process lifetime.
-pub async fn resolve_account_name(pool: &sqlx::Pool<sqlx::MySql>) -> Result<String, String> {
-    if let Some(name) = ACCOUNT_NAME.get() {
-        return Ok(name.clone());
-    }
-    let row = sqlx::query("SELECT current_account_name() AS name")
-        .fetch_one(pool)
-        .await
-        .map_err(|e| format!("resolve_account_name: {e}"))?;
-    let name: String = row
-        .try_get("name")
-        .map_err(|e| format!("resolve_account_name column: {e}"))?;
-    Ok(ACCOUNT_NAME.get_or_init(|| name).clone())
-}
-
 /// ``CREATE SNAPSHOT `{name}` FOR DATABASE `{db}` ``.
 ///
 /// All identifiers are backtick-quoted, with embedded backticks escaped.
@@ -63,16 +40,19 @@ pub fn create_snapshot_for_db_sql(name: &str, db: &str) -> String {
     )
 }
 
-/// ``RESTORE ACCOUNT `{account}` DATABASE `{db}` FROM SNAPSHOT `{snap}` ``.
-///
-/// All identifiers are backtick-quoted, with embedded backticks escaped.
-pub fn restore_snapshot_db_sql(snapshot: &str, account: &str, db: &str) -> String {
+/// Restore one database from its snapshot within the explicitly selected account.
+pub fn restore_database_from_snapshot_sql(name: &str, account: &str, db: &str) -> String {
     format!(
         "RESTORE ACCOUNT {} DATABASE {} FROM SNAPSHOT {}",
         quote_mysql_identifier(account),
         quote_mysql_identifier(db),
-        quote_mysql_identifier(snapshot)
+        quote_mysql_identifier(name)
     )
+}
+
+/// Remove a snapshot after its restore has completed.
+pub fn drop_snapshot_sql(name: &str) -> String {
+    format!("DROP SNAPSHOT IF EXISTS {}", quote_mysql_identifier(name))
 }
 
 #[cfg(test)]
@@ -88,14 +68,6 @@ mod tests {
     }
 
     #[test]
-    fn restore_snapshot_for_database() {
-        assert_eq!(
-            restore_snapshot_db_sql("sp1", "sys", "astra_runtime"),
-            "RESTORE ACCOUNT `sys` DATABASE `astra_runtime` FROM SNAPSHOT `sp1`"
-        );
-    }
-
-    #[test]
     fn create_snapshot_escapes_backticks() {
         assert_eq!(
             create_snapshot_for_db_sql("sp`1", "astra`runtime"),
@@ -104,11 +76,12 @@ mod tests {
     }
 
     #[test]
-    fn restore_snapshot_escapes_backticks() {
+    fn restore_and_drop_escape_every_identifier() {
         assert_eq!(
-            restore_snapshot_db_sql("sp`1", "sy`s", "astra`runtime"),
-            "RESTORE ACCOUNT `sy``s` DATABASE `astra``runtime` FROM SNAPSHOT `sp``1`"
+            restore_database_from_snapshot_sql("sp`1", "tenant`a", "db`1"),
+            "RESTORE ACCOUNT `tenant``a` DATABASE `db``1` FROM SNAPSHOT `sp``1`"
         );
+        assert_eq!(drop_snapshot_sql("sp`1"), "DROP SNAPSHOT IF EXISTS `sp``1`");
     }
 
     #[test]

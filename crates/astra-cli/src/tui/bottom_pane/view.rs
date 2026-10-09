@@ -140,10 +140,6 @@ pub(crate) struct ViewCompletion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BottomPaneViewAction {
-    /// Open the root conversation in the same transcript browser used for
-    /// delegated runs. The run navigator owns selection only; it never
-    /// substitutes its summary for this conversation.
-    OpenRootTranscript,
     /// Return from a focused conversation to the run navigator while keeping
     /// the conversation tab alive. If no navigator exists, the dispatcher
     /// closes the current transcript instead of inventing a parent surface.
@@ -160,16 +156,16 @@ pub(crate) enum BottomPaneViewAction {
         action: astra_thin_client::SessionRunAction,
     },
     BeginAgentGuide {
-        agent_id: String,
         agent_name: String,
         run_id: String,
         target: AgentControlTarget,
     },
     SubmitAgentGuide {
-        agent_id: String,
-        agent_name: String,
-        run_id: String,
-        target: AgentControlTarget,
+        target: crate::tui::event_loop::AgentGuideTarget,
+        content: String,
+    },
+    SubmitSessionContinuation {
+        target: crate::tui::event_loop::SessionContinuationTarget,
         content: String,
     },
     LoadAgentTranscript {
@@ -263,18 +259,6 @@ pub(crate) trait BottomPaneView: Send {
 
     fn pre_draw_tick(&mut self, _now: std::time::Instant) {}
 
-    fn refresh_task_cell(
-        &mut self,
-        _id: &str,
-        _cell: &crate::tui::history_cell::task::TaskCell,
-    ) -> bool {
-        false
-    }
-
-    fn live_task_id(&self) -> Option<&str> {
-        None
-    }
-
     fn refresh_agent_monitor(
         &mut self,
         _snapshot: crate::tui::bottom_pane::in_flight_agents_view::AgentMonitorSnapshot,
@@ -307,10 +291,11 @@ pub(crate) trait BottomPaneView: Send {
     }
 
     /// Refresh the current local root suffix without promoting it to durable
-    /// history. Only the durable root transcript browser consumes this; the
-    /// local fallback browser already receives the full live snapshot.
+    /// history. The whole-session browser and exact-run tabs consume the same
+    /// update; exact-run tabs require its matching session/run binding.
     fn refresh_root_transcript_live(
         &mut self,
+        _binding: Option<(&str, &str)>,
         _item: Option<crate::tui::bottom_pane::transcript_view::TranscriptItem>,
     ) -> bool {
         false

@@ -1,7 +1,7 @@
 use super::ToolExecutor;
 use serde_json::json;
 
-fn init_temp_git_repo() -> tempfile::TempDir {
+pub(crate) fn init_temp_git_repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp repo");
     std::process::Command::new("git")
         .arg("init")

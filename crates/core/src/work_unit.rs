@@ -194,7 +194,8 @@ pub enum WorkUnitObservationOutcome {
     Terminal,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkUnitCursor {
     id: String,
     kind: String,
@@ -222,7 +223,8 @@ pub struct ActiveWorkUnit {
 /// Progress tracker shared by every asynchronous work producer.
 ///
 /// It deliberately knows nothing about tool names or argument shapes.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkUnitObservationTracker {
     cursors: BTreeMap<String, WorkUnitCursor>,
     /// Terminal truth is retained until the turn settles. A snapshot captured
@@ -233,6 +235,38 @@ pub struct WorkUnitObservationTracker {
 }
 
 impl WorkUnitObservationTracker {
+    /// Validate captured observation state without treating it as execution authority.
+    pub fn validate_continuation(&self) -> Result<(), &'static str> {
+        for (identity, cursor) in &self.cursors {
+            let observation = WorkUnitObservation {
+                id: cursor.id.clone(),
+                kind: cursor.kind.clone(),
+                status: cursor.status,
+                revision: cursor.revision,
+                mode: cursor.mode,
+                wake_policy: cursor.wake_policy,
+            };
+            if !observation.is_valid()
+                || !observation.mode.tracks_live_progress()
+                || observation.status.is_terminal()
+                || observation.identity() != *identity
+                || self.terminal.contains_key(identity)
+            {
+                return Err("invalid active work observation continuation");
+            }
+        }
+        for (identity, observation) in &self.terminal {
+            if !observation.is_valid()
+                || !observation.mode.tracks_live_progress()
+                || !observation.status.is_terminal()
+                || observation.identity() != *identity
+            {
+                return Err("invalid terminal work observation continuation");
+            }
+        }
+        Ok(())
+    }
+
     pub fn observe(&mut self, observation: &WorkUnitObservation) -> WorkUnitObservationOutcome {
         if !observation.is_valid() || !observation.mode.tracks_live_progress() {
             return WorkUnitObservationOutcome::Ignored;
@@ -453,6 +487,76 @@ mod tests {
         mode: WorkUnitObservationMode,
     ) -> WorkUnitObservation {
         WorkUnitObservation::new("work-1", "test", status, revision, mode).unwrap()
+    }
+
+    #[test]
+    fn continuation_retains_progress_cursor_and_terminal_tombstone() {
+        let active = observation(1, WorkUnitStatus::Running, WorkUnitObservationMode::Current)
+            .with_wake_policy(WorkUnitWakePolicy::OnTerminal);
+        let mut finished = active.clone();
+        finished.id = "finished".into();
+        finished.status = WorkUnitStatus::Completed;
+        finished.revision = 2;
+        let mut tracker = WorkUnitObservationTracker::default();
+        tracker.observe(&active);
+        tracker.observe(&active);
+        tracker.observe(&active);
+        tracker.observe(&finished);
+        tracker.validate_continuation().unwrap();
+        let value = serde_json::to_value(&tracker).unwrap();
+        let mut restored: WorkUnitObservationTracker =
+            serde_json::from_value(value.clone()).unwrap();
+        restored.validate_continuation().unwrap();
+        assert_eq!(restored.active_work_units(), tracker.active_work_units());
+        assert_eq!(
+            restored.observe(&active),
+            WorkUnitObservationOutcome::Unchanged { consecutive: 3 }
+        );
+        finished.status = WorkUnitStatus::Running;
+        finished.revision = 1;
+        assert_eq!(
+            restored.observe(&finished),
+            WorkUnitObservationOutcome::Ignored
+        );
+        finished.status = WorkUnitStatus::Failed;
+        finished.revision = 3;
+        assert_eq!(
+            restored.observe(&finished),
+            WorkUnitObservationOutcome::Terminal
+        );
+        finished.status = WorkUnitStatus::Running;
+        finished.revision = 4;
+        assert_eq!(
+            restored.observe(&finished),
+            WorkUnitObservationOutcome::Ignored,
+            "a newer nonterminal observation cannot resurrect a settled child"
+        );
+        restored.validate_continuation().unwrap();
+        assert_eq!(restored.active_work_units().len(), 1);
+        for (section, identity, field, invalid) in [
+            ("cursors", "test:work-1", "revision", serde_json::json!(0)),
+            ("cursors", "test:work-1", "id", serde_json::json!("another")),
+            (
+                "cursors",
+                "test:work-1",
+                "mode",
+                serde_json::json!("historical"),
+            ),
+            (
+                "terminal",
+                "test:finished",
+                "status",
+                serde_json::json!("running"),
+            ),
+        ] {
+            let mut malformed = value.clone();
+            malformed[section][identity][field] = invalid;
+            let malformed: WorkUnitObservationTracker = serde_json::from_value(malformed).unwrap();
+            assert!(malformed.validate_continuation().is_err());
+        }
+        let mut missing = value;
+        missing.as_object_mut().unwrap().remove("terminal");
+        assert!(serde_json::from_value::<WorkUnitObservationTracker>(missing).is_err());
     }
 
     #[test]

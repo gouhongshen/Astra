@@ -16,6 +16,66 @@ use super::tool_execution_binding::{
     ToolTransportKind, WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
 };
 
+pub(crate) fn edge_tool_allowed_by_workspace_authority(
+    authority: WorkspaceAuthority,
+    tool_name: &str,
+    registry: &astra_runtime_env::ToolRegistry,
+) -> bool {
+    authority != WorkspaceAuthority::ReadOnly
+        || registry
+            .get(tool_name)
+            .is_some_and(astra_runtime_env::ToolSpec::is_read_only_execution_capability)
+}
+
+/// One authorization boundary's provider projection, shared by all tool decisions.
+/// Callers must build a fresh snapshot after approval or another await boundary.
+pub(crate) struct ToolBindingAdmissionSnapshot<'a> {
+    schemas: &'a [Value],
+    workspace: &'a WorkspaceBinding,
+    executor: &'a ExecutorBinding,
+    runtime: Option<&'a astra_runtime_env::RuntimeBinding>,
+    registry: &'a astra_runtime_env::ToolRegistry,
+    context: ToolAdmissionContext,
+    providers: Vec<astra_runtime_env::CapacityProviderDeclaration>,
+}
+
+impl<'a> ToolBindingAdmissionSnapshot<'a> {
+    pub(crate) fn new(
+        schemas: &'a [Value],
+        workspace: &'a WorkspaceBinding,
+        executor: &'a ExecutorBinding,
+        runtime: Option<&'a astra_runtime_env::RuntimeBinding>,
+        registry: &'a astra_runtime_env::ToolRegistry,
+        context: ToolAdmissionContext,
+    ) -> Self {
+        let providers = active_provider_declarations_for_binding(
+            schemas, workspace, executor, runtime, registry, &context,
+        );
+        Self {
+            schemas,
+            workspace,
+            executor,
+            runtime,
+            registry,
+            context,
+            providers,
+        }
+    }
+
+    pub(crate) fn decision(&self, tool_name: &str) -> ToolAdmissionDecision {
+        resolve_tool_visibility_for_providers_with_context_and_schemas(
+            tool_name,
+            self.schemas,
+            self.workspace,
+            self.executor,
+            self.runtime,
+            &self.providers,
+            self.registry,
+            &self.context,
+        )
+    }
+}
+
 const EDGE_CLIENT_WORKSPACE_SENTINEL_CWD: &str = "__edge_client_provided_workspace__";
 
 pub fn capability_filter_tool_schemas_for_binding(
@@ -41,13 +101,13 @@ pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
     admission_context: ToolAdmissionContext,
 ) -> Vec<Value> {
     let registry = astra_runtime_env::ToolRegistry::builtins();
-    let providers = active_provider_declarations_for_binding(
+    let snapshot = ToolBindingAdmissionSnapshot::new(
         &schemas,
         workspace,
         executor,
         runtime,
         &registry,
-        &admission_context,
+        admission_context,
     );
     let prompt_schema_conflicts =
         astra_core::tool_schema::prompt_schema_conflicting_tool_names(&schemas);
@@ -66,22 +126,14 @@ pub(crate) fn capability_filter_tool_schemas_for_binding_with_context(
                     return false;
                 }
             }
-            if !providers
+            if !snapshot
+                .providers
                 .iter()
                 .any(|provider| provider.declares_tool(tool_name))
             {
                 return false;
             }
-            let admission = resolve_tool_visibility_for_providers_with_context_and_schemas(
-                tool_name,
-                &schemas,
-                workspace,
-                executor,
-                runtime,
-                &providers,
-                &registry,
-                &admission_context,
-            );
+            let admission = snapshot.decision(tool_name);
             admission.visible
         })
         .cloned()
@@ -97,24 +149,15 @@ pub(crate) fn resolve_tool_visibility_for_binding_with_context(
     registry: &astra_runtime_env::ToolRegistry,
     admission_context: ToolAdmissionContext,
 ) -> ToolAdmissionDecision {
-    let providers = active_provider_declarations_for_binding(
+    ToolBindingAdmissionSnapshot::new(
         schemas,
         workspace,
         executor,
         runtime,
         registry,
-        &admission_context,
-    );
-    resolve_tool_visibility_for_providers_with_context_and_schemas(
-        tool_name,
-        schemas,
-        workspace,
-        executor,
-        runtime,
-        &providers,
-        registry,
-        &admission_context,
+        admission_context,
     )
+    .decision(tool_name)
 }
 
 fn resolve_tool_visibility_for_providers_with_context_and_schemas(
@@ -167,6 +210,13 @@ fn runtime_surface_allows_selected_decision(
     context: &ToolAdmissionContext,
 ) -> bool {
     let tool_name = admission.tool_name.as_str();
+    // An immutable Edge execution ceiling must constrain both discovery and
+    // dispatch. A provider declaration cannot make an unexecutable tool visible.
+    if admission.selected_route() == ToolExecutionRouteKind::EdgeBound
+        && !edge_tool_allowed_by_workspace_authority(workspace.authority, tool_name, registry)
+    {
+        return false;
+    }
     // A capability-scoped runtime provider may own a schema that is not in the
     // server builtin registry. It is admitted only when the exact full schema
     // carried by the provider matches the digest bound into the selected
@@ -864,23 +914,28 @@ mod tests {
 
     #[test]
     fn request_scoped_mcp_provider_does_not_hide_server_control_plane_tools() {
-        let names = schema_names(capability_filter_tool_schemas_for_binding(
-            vec![
-                schema("ask_user"),
-                schema("tool_search"),
-                schema("enter_plan_mode"),
-                schema("mcp__weather"),
-            ],
-            &no_workspace(),
-            &mcp_executor(),
-            None,
-        ));
+        for workspace in [
+            no_workspace(),
+            WorkspaceBinding::edge_workspace("Edge", "/repo", WorkspaceAuthority::ReadOnly),
+        ] {
+            let names = schema_names(capability_filter_tool_schemas_for_binding(
+                vec![
+                    schema("ask_user"),
+                    schema("tool_search"),
+                    schema("enter_plan_mode"),
+                    schema("mcp__weather"),
+                ],
+                &workspace,
+                &mcp_executor(),
+                None,
+            ));
 
-        for expected in ["ask_user", "tool_search", "enter_plan_mode", "mcp__weather"] {
-            assert!(
-                names.contains(expected),
-                "{expected} should remain visible when request-scoped MCP is also bound: {names:?}"
-            );
+            for expected in ["ask_user", "tool_search", "enter_plan_mode", "mcp__weather"] {
+                assert!(
+                    names.contains(expected),
+                    "{expected} should remain visible when request-scoped MCP is also bound: {names:?}"
+                );
+            }
         }
     }
 
@@ -1506,6 +1561,19 @@ mod tests {
             context.clone(),
         );
         assert_eq!(projected, vec![tool.clone()]);
+        let mut read_only = workspace.clone();
+        read_only.authority = WorkspaceAuthority::ReadOnly;
+        assert!(
+            capability_filter_tool_schemas_for_binding_with_context(
+                vec![tool.clone()],
+                &read_only,
+                &executor,
+                None,
+                context.clone(),
+            )
+            .is_empty(),
+            "a matching schema does not prove an unknown tool is read-only"
+        );
         let mut changed = tool;
         changed["function"]["description"] = serde_json::json!("changed contract");
         assert!(
@@ -1947,7 +2015,7 @@ mod prompt_cache_provider_decision_tests {
     #[test]
     fn read_only_policy_changes_visibility_not_schema_bytes_for_surviving_tools() {
         let runtime = edge_runtime();
-        let schemas = vec![schema("read_file"), schema("write_file")];
+        let schemas = vec![schema("read_file"), schema("write_file"), schema("bash")];
         let read_write =
             names_and_schemas(capability_filter_tool_schemas_for_binding_with_context(
                 schemas.clone(),
@@ -1964,8 +2032,10 @@ mod prompt_cache_provider_decision_tests {
             ToolAdmissionContext::default(),
         ));
 
-        assert!(read_write.iter().any(|(name, _)| name == "write_file"));
-        assert!(!read_only.iter().any(|(name, _)| name == "write_file"));
+        for denied in ["write_file", "bash"] {
+            assert!(read_write.iter().any(|(name, _)| name == denied));
+            assert!(!read_only.iter().any(|(name, _)| name == denied));
+        }
         let read_write_read_file = read_write
             .iter()
             .find(|(name, _)| name == "read_file")

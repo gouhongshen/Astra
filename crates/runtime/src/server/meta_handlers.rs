@@ -788,7 +788,7 @@ mod tests {
         let cooldown = crate::turn::model_cooldown::rate_limit_cooldown();
         cooldown.reset_for_tests();
         cooldown.with("metrics-model", |rl| {
-            rl.record_429(None, false);
+            rl.record_429(None);
         });
 
         let response = metrics_handler(State(state)).await.into_response();
@@ -817,10 +817,6 @@ mod tests {
         );
         assert!(
             text.contains("# TYPE astra_edge_dispatch_deliver_misses_total counter"),
-            "{text}"
-        );
-        assert!(
-            text.contains("# TYPE astra_interaction_ask_user_wait_total counter"),
             "{text}"
         );
         assert!(

@@ -77,7 +77,7 @@ impl EdgeContext {
 }
 
 /// Structured edge environment profile.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EdgeProfile {
     /// Current working directory on the edge.
     #[serde(default)]

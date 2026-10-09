@@ -246,16 +246,6 @@ pub fn session_artifacts(id: &str) -> String {
     format!("/sessions/{id}/artifacts")
 }
 
-#[inline]
-pub fn session_replay(id: &str) -> String {
-    format!("/sessions/{id}/replay")
-}
-
-#[inline]
-pub fn session_replay_compare(id: &str) -> String {
-    format!("/sessions/{id}/replay/compare")
-}
-
 /// Returns `None` if `artifact_kind` contains path-unsafe characters.
 #[inline]
 pub fn session_artifact_latest(session_id: &str, artifact_kind: &str) -> Option<String> {
@@ -365,6 +355,7 @@ pub const HEALTH: &str = "/health";
 
 pub const MODELS: &str = "/models";
 pub const MODEL_ACCESS: &str = "/model-access";
+pub const MODEL_ACCESS_ADMIT: &str = "/model-access/admit";
 pub const ME_MODELS: &str = "/me/models";
 pub const ME_MODEL_VALIDATE_ENDPOINT: &str = "/me/models/validate-endpoint";
 
@@ -428,7 +419,6 @@ pub const ADMIN_USERS_GRANT_ROLE: &str = "/admin/users/grant-role";
 pub const ADMIN_USERS_REVOKE_ROLE: &str = "/admin/users/revoke-role";
 pub const ADMIN_TOKENS: &str = "/admin/tokens";
 pub const ADMIN_PROMPTS_OPTIMIZE: &str = "/admin/prompts/optimize";
-pub const ADMIN_FEEDBACK_STATS: &str = "/admin/feedback/stats";
 pub const ADMIN_FEEDBACK_EXPORT: &str = "/admin/feedback/export";
 pub const ADMIN_CONFIG: &str = "/admin/config";
 
@@ -526,7 +516,6 @@ mod tests {
             ADMIN_USERS_REVOKE_ROLE,
             ADMIN_TOKENS,
             ADMIN_PROMPTS_OPTIMIZE,
-            ADMIN_FEEDBACK_STATS,
             ADMIN_FEEDBACK_EXPORT,
             ADMIN_CONFIG,
             AUDIT_SESSIONS,
@@ -583,16 +572,6 @@ mod tests {
     #[test]
     fn session_artifacts_path() {
         assert_eq!(session_artifacts("s1"), "/sessions/s1/artifacts");
-    }
-
-    #[test]
-    fn session_replay_path() {
-        assert_eq!(session_replay("s1"), "/sessions/s1/replay");
-    }
-
-    #[test]
-    fn session_replay_compare_path() {
-        assert_eq!(session_replay_compare("s1"), "/sessions/s1/replay/compare");
     }
 
     #[test]

@@ -1011,12 +1011,14 @@ mod tests {
         admission_source: Option<ToolInvocationAdmissionSource>,
     ) -> ToolInvocationMetadata<'a> {
         ToolInvocationMetadata {
+            admission_deadline: None,
             run_id: Some("run-1"),
             turn_chain_id: Some("turn-1"),
             tool_call_id: Some(call_id),
             admission_source,
             expected_control_epoch: None,
-            task_resolution_authority: None,
+            command_timeout_cap_ms: None,
+            delegation_model_admission: None,
         }
     }
 

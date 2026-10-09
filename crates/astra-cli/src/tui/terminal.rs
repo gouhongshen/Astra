@@ -7,7 +7,10 @@ use std::sync::{
 
 use crossterm::{
     SynchronizedUpdate, cursor,
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute, queue,
     style::Print,
     terminal::{disable_raw_mode, enable_raw_mode, is_raw_mode_enabled},
@@ -22,16 +25,77 @@ use super::render::line_utils::{history_cell_lines_for_terminal, sanitize_lines_
 
 pub(crate) type CustomTerminal = custom_terminal::Terminal<CrosstermBackend<Stdout>>;
 
+/// Only disambiguates otherwise-plain-Enter-shaped combinations (e.g.
+/// Shift+Enter, Ctrl+Enter) instead of the fuller Kitty flag set. The
+/// composer's own key handling already expects modifiers on Enter
+/// (`bottom_pane/textarea.rs`); a legacy terminal simply never reports them
+/// without this. Deliberately avoids `REPORT_EVENT_TYPES` and
+/// `REPORT_ALTERNATE_KEYS`, which would also start delivering key-release
+/// events and shifted-character codepoints the rest of the input pipeline
+/// does not expect.
+const KEYBOARD_ENHANCEMENT_FLAGS: KeyboardEnhancementFlags =
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES;
+
+/// Whether Astra currently owns an outstanding `PushKeyboardEnhancementFlags`
+/// entry -- a fact distinct from whether the terminal *supports* the
+/// protocol at all. The Kitty protocol's push/pop is a stack, not an
+/// idempotent toggle like bracketed paste: a parent program (tmux, an outer
+/// shell) may already have its own entry pushed before Astra starts, and
+/// popping when Astra never pushed -- or popping twice for one push --
+/// removes that entry instead of being a no-op. Every push/pop site in this
+/// file goes through `push_keyboard_enhancement`/
+/// `pop_keyboard_enhancement_if_owned` so ownership is consumed exactly
+/// once no matter which cleanup path runs first: the panic hook, the early
+/// `RawModeGuard`, `with_restored`, or the final `Drop`.
+static KEYBOARD_ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
+
+fn push_keyboard_enhancement() -> io::Result<()> {
+    execute!(
+        stdout(),
+        PushKeyboardEnhancementFlags(KEYBOARD_ENHANCEMENT_FLAGS)
+    )?;
+    // Only mark ownership after the write actually succeeds, so a failed
+    // push (e.g. a broken pipe) never causes an unpaired pop later.
+    KEYBOARD_ENHANCEMENT_PUSHED.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// Unlike `DisableBracketedPaste`, this only ever writes the escape sequence
+/// if Astra's own push is still outstanding; the `swap` ensures a
+/// concurrent/repeated call consumes it exactly once. Propagates the write's
+/// own error for callers in a normal fallible path (`with_restored`) that
+/// already propagate the surrounding raw-mode/bracketed-paste calls instead
+/// of swallowing them.
+fn pop_keyboard_enhancement_if_owned_fallible() -> io::Result<()> {
+    if KEYBOARD_ENHANCEMENT_PUSHED.swap(false, Ordering::AcqRel) {
+        execute!(stdout(), PopKeyboardEnhancementFlags)?;
+    }
+    Ok(())
+}
+
+/// Best-effort wrapper for cleanup paths (Drop, the panic hook, the early
+/// `RawModeGuard`) that cannot propagate an error and already treat the rest
+/// of their own terminal-mode teardown the same way.
+fn pop_keyboard_enhancement_if_owned() {
+    let _ = pop_keyboard_enhancement_if_owned_fallible();
+}
+
 pub(crate) struct TerminalGuard {
     pub terminal: CustomTerminal,
     pending_history: VecDeque<PendingHistory>,
     is_zellij: bool,
     pub(crate) resize_pending: Arc<AtomicBool>,
     clipped_reflow_below_cursor: Option<u16>,
+    unreconciled_width: bool,
     /// Scrollback is deliberately drained over several frames for very long
     /// replies. This keeps terminal writes from monopolising the same event
     /// loop that owns keyboard input and the composer.
     history_drain_requester: Option<FrameRequester>,
+    /// Set once from the startup capability query and never changed. Gates
+    /// every `PushKeyboardEnhancementFlags` call; `Pop` is issued best-effort
+    /// regardless, matching how `DisableBracketedPaste` is already handled
+    /// in this file.
+    keyboard_enhancement_supported: bool,
 }
 
 // A terminal write can block on a slow terminal emulator or remote PTY. Keep
@@ -80,17 +144,19 @@ impl Drop for LayoutPreparationWake {
 struct RawModeGuard;
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        pop_keyboard_enhancement_if_owned();
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), DisableBracketedPaste, cursor::Show);
     }
 }
 
 impl TerminalGuard {
-    pub fn init() -> io::Result<Self> {
+    pub fn init(keyboard_enhancement_supported: bool) -> io::Result<Self> {
         static PANIC_HOOK_INSTALLED: std::sync::Once = std::sync::Once::new();
         PANIC_HOOK_INSTALLED.call_once(|| {
             let original_hook = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |panic_info| {
+                pop_keyboard_enhancement_if_owned();
                 let _ = disable_raw_mode();
                 let _ = execute!(stdout(), DisableBracketedPaste, cursor::Show);
                 original_hook(panic_info);
@@ -98,9 +164,15 @@ impl TerminalGuard {
         });
 
         enable_raw_mode()?;
-        execute!(stdout(), EnableBracketedPaste)?;
-
+        // Construct the rollback guard before the push, not after: if the
+        // push succeeds but the very next fallible write (bracketed paste)
+        // does not, returning via `?` below must still run RawModeGuard's
+        // Drop so that successful push is not left unpaired forever.
         let early_guard = RawModeGuard;
+        if keyboard_enhancement_supported {
+            push_keyboard_enhancement()?;
+        }
+        execute!(stdout(), EnableBracketedPaste)?;
 
         let backend = CrosstermBackend::new(stdout());
         let mut terminal = CustomTerminal::with_options(backend)?;
@@ -122,7 +194,9 @@ impl TerminalGuard {
             is_zellij,
             resize_pending: Arc::new(AtomicBool::new(false)),
             clipped_reflow_below_cursor: None,
+            unreconciled_width: false,
             history_drain_requester: None,
+            keyboard_enhancement_supported,
         };
         // Tell display_sixel the TUI owns the terminal, so it queues images for
         // the event loop to blit on a paused screen instead of writing bytes the
@@ -142,6 +216,9 @@ impl TerminalGuard {
         let raw = is_raw_mode_enabled()?;
         if !raw {
             enable_raw_mode()?;
+            if self.keyboard_enhancement_supported {
+                push_keyboard_enhancement()?;
+            }
             execute!(stdout(), EnableBracketedPaste)?;
         }
         Ok(())
@@ -244,8 +321,13 @@ impl TerminalGuard {
         let size = self.terminal.size()?;
         // Treat out-of-screen replies as missing, never as scroll distances.
         let cursor = cursor.filter(|&(x, y)| x < queried_size.0 && y < queried_size.1);
+        self.unreconciled_width |= size.width != self.terminal.last_known_screen_size.width
+            || queried_size.0 != self.terminal.last_known_screen_size.width;
         self.resize_pending.store(
-            interrupted || size.width != queried_size.0 || size.height != queried_size.1,
+            interrupted
+                || size.width != queried_size.0
+                || size.height != queried_size.1
+                || (self.unreconciled_width && cursor.is_none()),
             Ordering::Release,
         );
         if self.resize_pending.load(Ordering::Acquire) {
@@ -260,7 +342,9 @@ impl TerminalGuard {
             }
             return Ok(());
         }
-        if self.clipped_reflow_below_cursor.is_none()
+        let unreconciled_width = std::mem::take(&mut self.unreconciled_width);
+        if !unreconciled_width
+            && self.clipped_reflow_below_cursor.is_none()
             && size == self.terminal.last_known_screen_size
             && cursor.is_none_or(|(_, y)| y == self.terminal.last_known_cursor_pos.y)
         {
@@ -290,8 +374,19 @@ impl TerminalGuard {
         let mut area = self.terminal.viewport_area;
         area.y =
             (i32::from(area.y) + offset).clamp(0, i32::from(size.height.saturating_sub(1))) as u16;
+        // A coalesced resize can return to the last drawn dimensions while
+        // leaving the old frame at its original rows. If the cursor moved down,
+        // clearing only from the recovered origin would leave that frame above
+        // the repaint. On an actual width change, the old origin can now hold
+        // reflowed history, so keep clearing from the recovered origin there.
+        let clear_y = if size == self.terminal.last_known_screen_size {
+            self.terminal.viewport_area.y.min(area.y)
+        } else {
+            area.y
+        };
         self.terminal.set_viewport_area(area);
-        self.terminal.clear()?;
+        self.terminal
+            .clear_after_position(ratatui::layout::Position { x: 0, y: clear_y })?;
         self.terminal.resize(size)?;
         Ok(())
     }
@@ -433,7 +528,12 @@ impl TerminalGuard {
         // Position cursor at viewport top and show it
         execute!(stdout(), cursor::MoveTo(0, area.top()), cursor::Show)?;
 
-        // Leave TUI modes
+        // Leave TUI modes. Pop while still in the raw-mode session that
+        // pushed it, mirroring the enable/disable ordering below. Consumes
+        // ownership rather than gating on `keyboard_enhancement_supported`:
+        // that flag only says the terminal understands the protocol, not
+        // that Astra's own push is still outstanding right now.
+        pop_keyboard_enhancement_if_owned_fallible()?;
         disable_raw_mode()?;
         execute!(stdout(), DisableBracketedPaste)?;
 
@@ -635,6 +735,7 @@ impl Drop for TerminalGuard {
         astra_tools::display_sixel::set_tui_active(false);
         let area = self.terminal.viewport_area;
         let _ = execute!(stdout(), cursor::MoveTo(0, area.bottom()), cursor::Show);
+        pop_keyboard_enhancement_if_owned();
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), DisableBracketedPaste);
         let _ = stdout_println!();

@@ -67,11 +67,13 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             system_prompt_addendum: EXPLORE_PROMPT.to_string(),
             max_turns: 20,
             allowed_tools: [
+                "agent",
                 "bash",
                 "glob",
                 "grep",
                 "list_dir",
                 "read_file",
+                "tool_search",
                 "web_fetch",
                 "web_search",
             ]
@@ -85,10 +87,18 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             description: "Review code changes with high signal-to-noise ratio.".to_string(),
             system_prompt_addendum: CODE_REVIEW_PROMPT.to_string(),
             max_turns: 12,
-            allowed_tools: ["bash", "glob", "grep", "list_dir", "read_file"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            allowed_tools: [
+                "agent",
+                "bash",
+                "glob",
+                "grep",
+                "list_dir",
+                "read_file",
+                "tool_search",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
             read_only: true,
         },
         AgentTypeDefinition {
@@ -178,6 +188,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing built-in agent type {agent_type}"));
             assert!(def.allowed_tools.contains("read_file"));
             assert!(def.allowed_tools.contains("list_dir"));
+            assert!(def.allowed_tools.contains("agent"));
             assert!(!def.allowed_tools.contains("view"));
         }
     }

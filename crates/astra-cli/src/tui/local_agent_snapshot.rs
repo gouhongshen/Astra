@@ -103,30 +103,10 @@ impl LocalAgentSnapshot {
                 } else {
                     title
                 };
-                let member_ids = group
-                    .slots
-                    .iter()
-                    .filter_map(|slot| slot.agent_id.as_deref())
-                    .collect::<std::collections::BTreeSet<_>>();
-                let members = self
-                    .agents
-                    .iter()
-                    .filter(|agent| member_ids.contains(agent.agent_id.as_str()))
-                    .collect::<Vec<_>>();
-                let explicitly_background = !member_ids.is_empty()
-                    && members.len() == member_ids.len()
-                    && members.iter().all(|agent| agent.run_in_background);
-                if explicitly_background {
-                    format!(
-                        "{title} · {} parallel agents started in background · one update after the group settles · Shift+↓ inspect",
-                        group.target_count
-                    )
-                } else {
-                    format!(
-                        "{title} · {} parallel agents started · parent waits for the complete group before synthesizing · Shift+↓ inspect · Ctrl+B move to background",
-                        group.target_count
-                    )
-                }
+                format!(
+                    "{title} · {} parallel agents started in background · one update after the group settles · Shift+↓ inspect",
+                    group.target_count
+                )
             })
             .collect::<Vec<_>>();
 
@@ -154,15 +134,9 @@ impl LocalAgentSnapshot {
                     } else {
                         title
                     };
-                    if agent.run_in_background {
-                        format!(
-                            "{title} started in background · Astra will update once it needs attention or finishes · Shift+↓ inspect"
-                        )
-                    } else {
-                        format!(
-                            "{title} started · parent waits for its result · Shift+↓ inspect · Ctrl+B move to background"
-                        )
-                    }
+                    format!(
+                        "{title} started in background · Astra will update once it needs attention or finishes · Shift+↓ inspect"
+                    )
                 }),
         );
         receipts
@@ -248,16 +222,12 @@ impl LocalAgentSnapshot {
         let mut updates = self
             .agents
             .iter()
-            // Foreground children return through the tool result that is
-            // already blocking their parent.  Waking a second model turn for
-            // the same terminal fact is both wasteful and user-visible as
-            // repeated analysis.
-            .filter(|agent| agent.run_in_background)
             .filter(|agent| {
                 !fanout_agent_ids.contains(agent.agent_id.as_str())
                     && (matches!(
                         agent.status,
                         astra_turn_core::orchestration_types::AgentStatus::Waiting { .. }
+                            | astra_turn_core::orchestration_types::AgentStatus::Paused { .. }
                     ) || agent.status.is_terminal())
             })
             .filter(|agent| {
@@ -282,6 +252,9 @@ impl LocalAgentSnapshot {
                     } => ("cancelled", reason.as_str()),
                     astra_turn_core::orchestration_types::AgentStatus::Waiting { reason } => {
                         ("needs_input", reason.as_str())
+                    }
+                    astra_turn_core::orchestration_types::AgentStatus::Paused { reason } => {
+                        ("paused", reason.as_str())
                     }
                     _ => unreachable!("filtered to attention-worthy states"),
                 };
@@ -466,7 +439,6 @@ mod tests {
             started_at: std::time::SystemTime::now(),
             metrics: SpawnedAgentMetrics::default(),
             has_permission_issues: false,
-            run_in_background: true,
             spawn_tool_call_id: None,
             fanout_slot: None,
         }
@@ -786,39 +758,6 @@ mod tests {
     }
 
     #[test]
-    fn foreground_child_terminal_result_does_not_schedule_a_second_model_turn() {
-        let mut running = agent(
-            "foreground",
-            "run-foreground",
-            AgentStatus::Running {
-                activity: "reviewing".into(),
-            },
-        );
-        running.run_in_background = false;
-        let before = LocalAgentSnapshot {
-            available: true,
-            agents: vec![running],
-            ..LocalAgentSnapshot::default()
-        };
-        let mut completed = agent(
-            "foreground",
-            "run-foreground",
-            AgentStatus::Completed {
-                result: "done".into(),
-                finish_reason: None,
-            },
-        );
-        completed.run_in_background = false;
-        let after = LocalAgentSnapshot {
-            available: true,
-            agents: vec![completed],
-            ..LocalAgentSnapshot::default()
-        };
-
-        assert!(after.attention_updates_since(&before).is_empty());
-    }
-
-    #[test]
     fn background_child_terminal_transition_has_one_receipt_and_one_wake() {
         let before = LocalAgentSnapshot {
             available: true,
@@ -864,14 +803,13 @@ mod tests {
         group
             .record_spawn_accepted_with_run(0, "reviewer-0", Some("run-0".into()))
             .unwrap();
-        let mut first_agent = agent(
+        let first_agent = agent(
             "reviewer-0",
             "run-0",
             AgentStatus::Running {
                 activity: "reviewing".into(),
             },
         );
-        first_agent.run_in_background = false;
         let first = LocalAgentSnapshot {
             available: true,
             agents: vec![first_agent],
@@ -881,21 +819,22 @@ mod tests {
         let receipts = first.launch_receipts_since(&LocalAgentSnapshot::default());
         assert_eq!(receipts.len(), 1, "{receipts:?}");
         assert!(receipts[0].contains("3 parallel agents"), "{receipts:?}");
-        assert!(receipts[0].contains("parent waits"), "{receipts:?}");
+        assert!(
+            receipts[0].contains("started in background"),
+            "{receipts:?}"
+        );
         assert!(receipts[0].contains("Shift+↓ inspect"), "{receipts:?}");
-        assert!(receipts[0].contains("Ctrl+B"), "{receipts:?}");
 
         group
             .record_spawn_accepted_with_run(1, "reviewer-1", Some("run-1".into()))
             .unwrap();
-        let mut second_agent = agent(
+        let second_agent = agent(
             "reviewer-1",
             "run-1",
             AgentStatus::Running {
                 activity: "reviewing".into(),
             },
         );
-        second_agent.run_in_background = false;
         let later = LocalAgentSnapshot {
             available: true,
             agents: vec![first.agents[0].clone(), second_agent],

@@ -1,0 +1,61 @@
+name: flash_fanout_two_models_high
+description: |
+  Deterministic two-slot control journey. The parent fixes one child to
+  GLM-5.2 and one child to DeepSeek Flash with adaptive high reasoning. Each
+  child returns a fixed marker, so the oracle measures admission, execution,
+  configuration and handoff rather than task quality.
+prompt: |
+  Run exactly one agent_fanout.start group with group_id
+  two-model-marker and target_count 2. Use two explore slots.
+  Slot 0 must use configured model glm-5.2 and reply exactly
+  GLM-SLOT-MARKER-OK.
+  Slot 1 must use configured model deepseek-v4-flash with reasoning
+  {"mode":"adaptive","effort":"high"} and reply exactly
+  FLASH-HIGH-SLOT-MARKER-OK.
+  Do not retry, replace or add slots. Do not busy-poll. Report both exact
+  markers and 2/2 after the group reaches its terminal boundary. Do not call
+  Reflect or another diagnostic tool.
+debug_log: true
+capability: delegation
+timeout_seconds: 240
+criteria:
+  - type: exit_code
+    code: 0
+  - type: execution_tool_count
+    name: agent_fanout
+    root_only: true
+    min: 1
+    max: 1
+    predicates:
+      - document: arguments
+        path: /action
+        equals: start
+  - type: execution_tool_count
+    name: agent_fanout
+    root_only: true
+    min: 1
+    max: 1
+    predicates:
+      - document: arguments
+        path: /target_count
+        equals: 2
+  - type: execution_child_results_adopted
+    fanout_group: two-model-marker
+    children:
+      - slot_index: 0
+        expected_result: {text: GLM-SLOT-MARKER-OK}
+        model: glm-5.2
+        logical_rounds: 1
+      - slot_index: 1
+        expected_result: {text: FLASH-HIGH-SLOT-MARKER-OK}
+        model: deepseek-v4-flash
+        logical_rounds: 1
+        initial_thinking: {kind: exact, config: {mode: adaptive, effort: high}}
+  - type: text_contains
+    needle: GLM-SLOT-MARKER-OK
+  - type: text_contains
+    needle: FLASH-HIGH-SLOT-MARKER-OK
+  - type: execution_tool_count
+    name: reflect
+    min: 0
+    max: 0

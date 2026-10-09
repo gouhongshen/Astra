@@ -13,6 +13,7 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::case::PromptCacheReuseScope;
@@ -23,50 +24,177 @@ use crate::session_capture::SessionCapture;
 
 mod work_replacement;
 
-/// One declarative success check. Serialized into YAML cases as
-/// `type: <variant>` discriminator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventJsonMatch {
+    /// Missing fields do not match, even when `equals` is JSON null.
+    pub path: String,
+    pub equals: serde_json::Value,
+    /// Require every matching event to carry a distinct, non-empty string at
+    /// this pointer (for example, a child `run_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unique_by: Option<String>,
+    /// Require the matched event's `run_id` (top-level for step events,
+    /// `metadata.run_id` for lifecycle events) to equal an identity carried
+    /// by an event of this type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_run_as: Option<SessionEventRunIdMatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventFieldMatch {
+    pub path: String,
+    pub equals: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionEventRunIdMatch {
+    pub event_type: String,
+    /// JSON pointer to the related event's run ID (for example,
+    /// `/metadata/run_id` on `agent_spawned`).
+    pub run_id_path: String,
+    /// Optional predicate on the related event. This lets a provider event
+    /// prove the exact child slot/configuration it belongs to, rather than
+    /// merely proving that some spawn with the same run ID exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_match: Option<SessionEventFieldMatch>,
+}
+
+/// Exact text and semantic JSON have distinct contracts; neither changes the
+/// raw bytes used to verify result custody.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildResultExpectation {
+    Text(String),
+    Contains(String),
+    Json(serde_json::Value),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChildThinkingExpectation {
+    Exact {
+        config: astra_turn_core::thinking_config::ThinkingConfig,
+    },
+    SameAsRoot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildExecutionExpectation {
+    #[serde(with = "serde_yaml_ng::with::singleton_map")]
+    pub expected_result: ChildResultExpectation,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_thinking: Option<ChildThinkingExpectation>,
+    #[serde(default)]
+    pub answered_question: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mutation: Option<astra_config::user_profile::WorkspaceMutationIntent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_rounds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_index: Option<u32>,
+}
+
+/// One declarative success check, serialized with `type: <variant>`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Criterion {
+    /// Prove all direct children's physical model execution and result adoption
+    /// from the Server capture, not local presentation events.
+    ExecutionChildResultsAdopted {
+        children: Vec<ChildExecutionExpectation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fanout_group: Option<String>,
+    },
+    /// Count joined tool requests/results from the complete Server transcript.
+    ExecutionToolCount {
+        name: String,
+        min: u32,
+        max: u32,
+        #[serde(default)]
+        root_only: bool,
+        #[serde(default)]
+        ok: Option<bool>,
+        #[serde(default)]
+        predicates: Vec<JournalJsonPredicate>,
+        /// Positive diagnostic text from the same typed failed/rejected call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_contains: Option<String>,
+    },
+    ExecutionToolSequence {
+        tools: Vec<String>,
+    },
+    /// Count direct children in the complete authoritative run tree.
+    ExecutionChildCount {
+        min: u32,
+        max: u32,
+    },
     /// Passes if the tool with `name` appears in the run's
     /// `tools_used` list. Cheapest possible check.
-    ToolCalled { name: String },
+    ToolCalled {
+        name: String,
+    },
 
     /// Passes when the run's exit code equals `code`. Useful for
     /// pinning expected failures.
-    ExitCode { code: i32 },
+    ExitCode {
+        code: i32,
+    },
 
     /// Passes when `astra chat --json` reports the expected terminal state.
-    FinalState { expect: String },
+    FinalState {
+        expect: String,
+    },
 
     /// Passes when the structured interruption kind matches.
-    InterruptionKind { expect: String },
+    InterruptionKind {
+        expect: String,
+    },
 
     /// Passes when a tool result class occurred within the expected count range.
-    ToolResultClassCount { class: String, min: u32, max: u32 },
+    ToolResultClassCount {
+        class: String,
+        min: u32,
+        max: u32,
+    },
 
     /// Passes when the total tool_calls_count is within the range
     /// `min..=max`. Catches runaway loops or under-tool-use.
-    ToolsCountBetween { min: u32, max: u32 },
+    ToolsCountBetween {
+        min: u32,
+        max: u32,
+    },
 
     /// Regex match against the run's stderr. Intended for
-    /// observability checks — `^\[fork-cache\]` / `^\[audit\]`.
+    /// observability checks — `^\[diagnostic\]` / `^\[audit\]`.
     /// The regex is compiled per-evaluation; test stays
     /// robust across Rust regex version bumps.
-    StderrMatches { pattern: String },
+    StderrMatches {
+        pattern: String,
+    },
 
     /// Passes when the final assistant text contains `needle`
     /// (case-sensitive substring match). For simple yes/no
     /// checks without pulling in a judger.
-    TextContains { needle: String },
+    TextContains {
+        needle: String,
+    },
 
     /// Passes when the final assistant text does not contain `needle`.
     /// Useful for deterministic stale-topic and provenance-contamination gates.
-    TextNotContains { needle: String },
+    TextNotContains {
+        needle: String,
+    },
 
     /// Passes when the assistant text, after trimming outer whitespace, is
     /// exactly `expected`.
-    TextEquals { expected: String },
+    TextEquals {
+        expected: String,
+    },
 
     /// Parses the complete assistant text as one JSON value and requires the
     /// value at the RFC 6901 JSON pointer to equal `equals`. Markdown fences
@@ -79,11 +207,17 @@ pub enum Criterion {
 
     /// Parses the complete assistant text as JSON and bounds the length of an
     /// array selected by an RFC 6901 JSON pointer.
-    TextJsonArrayCount { path: String, min: u32, max: u32 },
+    TextJsonArrayCount {
+        path: String,
+        min: u32,
+        max: u32,
+    },
 
     /// Requires that an RFC 6901 JSON pointer is absent from the complete
     /// assistant JSON value. A present `null` still counts as present.
-    TextJsonPathAbsent { path: String },
+    TextJsonPathAbsent {
+        path: String,
+    },
 
     /// Validates a generic directed acyclic graph encoded in the complete
     /// assistant JSON value. Node and edge field pointers are relative to
@@ -104,8 +238,10 @@ pub enum Criterion {
         successor_path: String,
     },
 
-    /// Passes when the session journal contains at least `min`
-    /// events with `type == event_type`. Requires session capture.
+    /// Passes when session capture contains at least `min`
+    /// events with `type == event_type`, optionally matching one exact
+    /// JSON pointer/value pair or linking a step-event `run_id` to a related
+    /// lifecycle event. Requires session capture.
     /// Use for structural checks ("at least one subagent_spawned
     /// event appears").
     ///
@@ -120,11 +256,35 @@ pub enum Criterion {
         event_type: String,
         #[serde(default = "default_event_min")]
         min: u32,
+        /// Optional upper bound; `min: 0, max: 0` proves absence.
+        #[serde(default)]
+        max: Option<u32>,
+        /// Optional exact JSON-pointer predicate against the complete event.
+        #[serde(default)]
+        json_match: Option<SessionEventJsonMatch>,
         /// When true, skip-pass when session is unavailable. Use
         /// sparingly — only for cases that are meaningful even
         /// without the journal check.
         #[serde(default)]
         optional: bool,
+    },
+
+    /// The exact completed child result reached its owning parent's model
+    /// request, followed by that parent's accepted finalization. Cases may
+    /// also accept an exact terminal get_result read by that owning parent.
+    /// Uses existing journal identities and trace hashes, not run storage.
+    SessionChildResultAdopted {
+        /// When omitted, prove the complete staged result was adopted unchanged.
+        #[serde(default)]
+        expected_result: Option<String>,
+        /// Restrict the originating spawn, e.g. to the required model or slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spawn_match: Option<SessionEventFieldMatch>,
+        /// Accept a successful foreground get_result for this same spawned
+        /// and completed child, with exact caller, agent, run and body proof.
+        /// Ordinary messages and incomplete observations never qualify.
+        #[serde(default)]
+        allow_get_result: bool,
     },
 
     /// Counts typed signal codes in durable `turn_evaluation` events.
@@ -133,13 +293,19 @@ pub enum Criterion {
     /// rendered diagnostic message. Pair an absence assertion with
     /// `SessionEventCount { event_type: "turn_evaluation", .. }` when a
     /// missing evaluation event must not be mistaken for a healthy turn.
-    JournalTurnEvaluationSignalCount { kind: String, min: u32, max: u32 },
+    JournalTurnEvaluationSignalCount {
+        kind: String,
+        min: u32,
+        max: u32,
+    },
 
     /// Requires the terminal durable turn evaluation to report the requested
     /// product-success verdict. This prevents a harness from certifying a
     /// structurally shaped run whose own runtime evaluator detected unresolved
     /// failures or incomplete work.
-    JournalTurnEvaluationSuccess { equals: bool },
+    JournalTurnEvaluationSuccess {
+        equals: bool,
+    },
 
     /// Requires complete durable session evidence and rejects asynchronous
     /// subsystem failures/degradation recorded during the case.
@@ -181,7 +347,9 @@ pub enum Criterion {
     /// surface. This proves catalog authority at the product boundary; it
     /// intentionally does not inspect child tool surfaces, where an
     /// attempt-bound tool may be valid.
-    JournalTurnToolHidden { name: String },
+    JournalTurnToolHidden {
+        name: String,
+    },
 
     /// Exact number of complete tool-call records in durable turn events.
     /// The optional document/path/equality triplet narrows the count by one
@@ -190,6 +358,9 @@ pub enum Criterion {
         name: String,
         min: u32,
         max: u32,
+        /// Limit the count to the CLI run, excluding delegated child runs.
+        #[serde(default)]
+        root_only: bool,
         /// Bind the structural predicate to this same call's typed outcome.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ok: Option<bool>,
@@ -231,6 +402,15 @@ pub enum Criterion {
         document: JournalToolDocument,
         path: String,
         equals: serde_json::Value,
+        /// Optional predicate on the same durable call as `path`.
+        #[serde(default)]
+        where_match: Option<JournalJsonPredicate>,
+        /// When `equals` is JSON null, also accept a missing pointer. This
+        /// models optional API fields whose omitted and explicit-null forms
+        /// both mean "unset" without weakening exact JSON assertions by
+        /// default.
+        #[serde(default)]
+        allow_missing: bool,
     },
 
     /// Requires a durable JSON-pointer value to be a string containing the
@@ -248,7 +428,10 @@ pub enum Criterion {
     /// advertised by an earlier producer result. This is a structural
     /// provenance assertion over complete durable records; final assistant
     /// text and physical filesystem paths are not evidence.
-    JournalArtifactConsumed { producer: String, consumer: String },
+    JournalArtifactConsumed {
+        producer: String,
+        consumer: String,
+    },
 
     /// Proves that a successful consumer used an exact scalar value emitted
     /// by a prior successful producer. JSON pointers select the producer value
@@ -290,29 +473,6 @@ pub enum Criterion {
         min_turns_after_producer: Option<u32>,
     },
 
-    /// Passes when at least one `[fork-cache]` JSON event in stderr
-    /// has its `outcome` field in `expect`. Pins the exact runtime
-    /// contract (see `ForkCacheEvent` in astra-turn-core) — outcomes
-    /// are one of `hit`, `partial_drift`, `miss`, `exceeded_expected`.
-    ///
-    /// Example:
-    /// ```yaml
-    /// - type: fork_cache_outcome
-    ///   expect: [hit]
-    /// ```
-    ///
-    /// Accepted field aliases: `outcome` (current wire name) and
-    /// `class` (earlier harness-facing name; deprecated, still read so
-    /// existing YAML doesn't silently break).
-    ForkCacheOutcome {
-        /// Accepted outcome names (snake_case — `hit`, `partial_drift`,
-        /// `miss`, `exceeded_expected`, plus any future variant added
-        /// to `astra_turn_core::fork_cache_event::ForkCacheOutcome`).
-        /// A stderr event whose `outcome` equals any of these passes.
-        #[serde(default)]
-        expect: Vec<String>,
-    },
-
     /// LLM judger — calls a scoring model with the prompt +
     /// context and expects a number in [0.0, 1.0]. Passes when
     /// score >= `threshold`. Most expensive; put last.
@@ -335,7 +495,9 @@ pub enum Criterion {
     /// LLM judger whose result is a required product assertion rather than
     /// advisory quality feedback. Use this when a remote side effect has no
     /// deterministic receipt in the chat envelope (for example a memory
-    /// purge) and a failed judgement must fail the case.
+    /// purge) and a failed judgement must fail the case. The built-in backend
+    /// asks directly whether the evidence meets this criterion at its threshold;
+    /// it returns a verdict rather than an advisory quality grade.
     HardJudger {
         question: String,
         #[serde(default = "default_judger_threshold")]
@@ -347,25 +509,35 @@ pub enum Criterion {
     /// Passes when total tokens (prompt + completion) is within range.
     /// Catches token efficiency regressions — a case that used to cost
     /// 500 tokens suddenly costing 5000 means something broke.
-    TokensBetween { min: u64, max: u64 },
+    TokensBetween {
+        min: u64,
+        max: u64,
+    },
 
     /// Passes when wall-clock duration (ms) is within range.
     /// Catches latency regressions and hung subprocesses that
     /// complete just under the timeout.
-    DurationBetween { min_ms: u64, max_ms: u64 },
+    DurationBetween {
+        min_ms: u64,
+        max_ms: u64,
+    },
 
     /// Passes when the tools_used list contains the given names
     /// as an ordered subsequence. Does NOT require exact match —
     /// extra tools between the expected ones are allowed.
     /// Example: `[read_file, str_replace]` passes for
     /// `[bash, read_file, bash, str_replace, bash]`.
-    ToolSequence { tools: Vec<String> },
+    ToolSequence {
+        tools: Vec<String>,
+    },
 
     /// Requires an ordered subsequence in complete durable journal records.
     /// Unlike [`ToolSequence`], this includes server-side and child calls that
     /// the CLI envelope can omit, so it proves lifecycle ordering rather than
     /// merely the client-visible summary.
-    JournalToolSequence { tools: Vec<String> },
+    JournalToolSequence {
+        tools: Vec<String>,
+    },
 
     /// Requires every durable invocation of `successor` to occur only after
     /// `predecessor` has appeared in the same session journal. This is a
@@ -437,7 +609,10 @@ pub enum Criterion {
     /// Passes when the number of LLM round-trips (turns) is within range.
     /// Catches inefficient multi-turn loops where the agent should have
     /// completed in fewer rounds.
-    TurnRoundsBetween { min: u32, max: u32 },
+    TurnRoundsBetween {
+        min: u32,
+        max: u32,
+    },
 
     /// Passes when the tool cache hit rate >= threshold (0.0 to 1.0).
     /// A high cache rate means the agent is efficiently reusing
@@ -520,13 +695,18 @@ pub enum Criterion {
     /// prefix against provider-reported cache reads. It only counts feedback
     /// observations with `provider-prefix-v1`; total request cache reads may
     /// include a growing or provider-evicted conversation history.
-    ProviderStablePrefixCacheCoverage { min: f64, min_observations: u32 },
+    ProviderStablePrefixCacheCoverage {
+        min: f64,
+        min_observations: u32,
+    },
 
     /// Internal hard gate injected when a case declares
     /// `required_cache_scope`. It proves the requested reuse boundary from
     /// canonical primary execution facts rather than model metadata or a soft
     /// cache-quality criterion.
-    PromptCacheReuseScope { scope: PromptCacheReuseScope },
+    PromptCacheReuseScope {
+        scope: PromptCacheReuseScope,
+    },
 
     /// Passes when the session's pipeline alerts matching `rule`
     /// occur at most `max` times.
@@ -550,13 +730,17 @@ pub enum Criterion {
     ///
     /// Use for cases with multiple acceptable high-quality behaviors, such
     /// as "called the requested tool" OR "safely refused a runaway prompt".
-    AnyOf { criteria: Vec<Criterion> },
+    AnyOf {
+        criteria: Vec<Criterion>,
+    },
 
     /// Passes when every nested deterministic criterion passes.
     ///
     /// Useful for making a set of normally-soft metric bounds a hard case
     /// requirement without changing their default severity globally.
-    AllOf { criteria: Vec<Criterion> },
+    AllOf {
+        criteria: Vec<Criterion>,
+    },
 }
 
 fn default_cache_min_calls() -> u32 {
@@ -595,11 +779,73 @@ pub enum JournalToolDocument {
 
 /// One structural predicate applied to the same durable tool call that
 /// participates in a value-flow relation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct JournalJsonPredicate {
     pub document: JournalToolDocument,
     pub path: String,
-    pub equals: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equals: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contains: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for JournalJsonPredicate {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        fn present_value<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<serde_json::Value>, D::Error> {
+            serde_json::Value::deserialize(deserializer).map(Some)
+        }
+        fn present_string<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<String>, D::Error> {
+            String::deserialize(deserializer).map(Some)
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Predicate {
+            document: JournalToolDocument,
+            path: String,
+            #[serde(default, deserialize_with = "present_value")]
+            equals: Option<serde_json::Value>,
+            #[serde(default, deserialize_with = "present_string")]
+            contains: Option<String>,
+        }
+        let predicate = Predicate::deserialize(deserializer)?;
+        let result = Self {
+            document: predicate.document,
+            path: predicate.path,
+            equals: predicate.equals,
+            contains: predicate.contains,
+        };
+        result.validate().map_err(serde::de::Error::custom)?;
+        Ok(result)
+    }
+}
+
+impl JournalJsonPredicate {
+    fn validate(&self) -> Result<(), String> {
+        if self.equals.is_some() == self.contains.is_some()
+            || self
+                .contains
+                .as_ref()
+                .is_some_and(|text| text.is_empty() || text.len() > 4096)
+        {
+            return Err(
+                "predicate requires exactly one equals or bounded nonempty contains".into(),
+            );
+        }
+        Ok(())
+    }
+    fn matches(&self, value: Option<&serde_json::Value>) -> bool {
+        match (&self.equals, &self.contains, value) {
+            (Some(expected), None, Some(actual)) => actual == expected,
+            (None, Some(needle), Some(actual)) => {
+                actual.as_str().is_some_and(|text| text.contains(needle))
+            }
+            _ => false,
+        }
+    }
 }
 
 /// How severe a criterion failure is.
@@ -669,7 +915,6 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::JournalWorkItemExecutionFromStart { .. }
         | Criterion::JournalWorkReplacementLifecycle { .. }
         | Criterion::JournalWorkGraphPatch { .. }
-        | Criterion::ForkCacheOutcome { .. }
         | Criterion::HardJudger { .. }
         | Criterion::JournalTurnEvaluationSignalCount { .. }
         | Criterion::JournalTurnEvaluationSuccess { .. }
@@ -686,6 +931,13 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::PromptCacheReuseScope { .. }
         | Criterion::AnyOf { .. }
         | Criterion::AllOf { .. } => CriterionSeverity::Hard,
+
+        Criterion::SessionChildResultAdopted { .. }
+        | Criterion::ExecutionChildResultsAdopted { .. } => CriterionSeverity::Hard,
+
+        Criterion::ExecutionToolCount { .. }
+        | Criterion::ExecutionToolSequence { .. }
+        | Criterion::ExecutionChildCount { .. } => CriterionSeverity::Hard,
 
         Criterion::SessionEventCount {
             optional: false, ..
@@ -713,18 +965,130 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
     }
 }
 
-/// Evaluate every criterion against the outcome in list order.
-/// Returns all results (not just first failure) so the report can
-/// show which specific checks passed.
-///
-/// Session-dependent criteria (`SessionEventCount`, `JournalToolCalled`)
-/// require the loaded session; pass `None` when session capture is off
-/// and they'll auto-PASS with a clear "skipped" detail line.
-///
-/// For Judger criteria the runner calls into
-/// [`crate::judger::Judger`] separately — this function is the
-/// deterministic-only pass; see [`crate::suite::SuiteRunner`] for
-/// the full orchestration.
+/// Share the same structured proof with classification, including composites.
+pub(crate) fn execution_verification_unavailable(
+    result: &CriterionResult,
+    outcome: &RunOutcome,
+) -> bool {
+    match &result.criterion {
+        Criterion::ExecutionToolCount { .. }
+        | Criterion::ExecutionToolSequence { .. }
+        | Criterion::ExecutionChildCount { .. }
+        | Criterion::ExecutionChildResultsAdopted { .. } => {
+            execution_contract_proof(&result.criterion, outcome).is_err()
+        }
+        Criterion::AnyOf { .. } | Criterion::AllOf { .. } => result
+            .full_detail
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Vec<CriterionResult>>(value).ok())
+            .is_some_and(|nested| {
+                nested.iter().any(|evaluated| {
+                    !evaluated.passed && execution_verification_unavailable(evaluated, outcome)
+                })
+            }),
+        _ => false,
+    }
+}
+
+fn execution_contract_proof(c: &Criterion, outcome: &RunOutcome) -> Result<bool, &'static str> {
+    let stream = outcome
+        .stream_capture
+        .as_ref()
+        .ok_or("execution not captured")?;
+    // Stream diagnostics mix sidecar gaps with other warnings. A presentation
+    // gap alone cannot invalidate the separately fetched Server capture;
+    // identity, owner, canonical completeness, and lifecycle checks are
+    // enforced independently.
+    if !stream.identity_verified {
+        return Err("execution identity or coverage unverified");
+    }
+    let capture = stream
+        .execution
+        .as_ref()
+        .ok_or("Server execution not captured")?;
+    let root = outcome.run_id.as_deref().ok_or("root not captured")?;
+    if let Criterion::ExecutionChildResultsAdopted {
+        children,
+        fanout_group,
+    } = c
+    {
+        return capture.proves_children(root, children, fanout_group.as_deref());
+    }
+    if let Criterion::ExecutionChildCount { min, max } = c {
+        let count = capture
+            .child_count(root)
+            .ok_or("complete tree unavailable")? as u32;
+        return Ok(count >= *min && count <= *max);
+    }
+    let calls = capture.tools(root)?;
+    match c {
+        Criterion::ExecutionToolCount {
+            name,
+            min,
+            max,
+            root_only,
+            ok,
+            predicates,
+            error_contains,
+        } => {
+            if *min == 0 && (!predicates.is_empty() || error_contains.is_some()) {
+                return Err(
+                    "negative document predicates require raw capture, not display projections",
+                );
+            }
+            for call in calls
+                .iter()
+                .filter(|call| call.name == name && (!root_only || call.run_id == root))
+            {
+                if ok.is_some() && call.ok.is_none() {
+                    return Err("requested tool outcome not captured");
+                }
+                if ok.is_some_and(|expected| call.ok != Some(expected)) {
+                    continue;
+                }
+                for predicate in predicates {
+                    let document = match predicate.document {
+                        JournalToolDocument::Arguments => call.arguments.as_ref(),
+                        JournalToolDocument::Result => call.result.as_ref(),
+                        _ => None,
+                    };
+                    if document.is_none() {
+                        return Err("required tool document unavailable or not JSON");
+                    }
+                }
+            }
+            let count = calls
+                .iter()
+                .filter(|call| {
+                    call.name == name
+                        && (!root_only || call.run_id == root)
+                        && ok.is_none_or(|expected| call.ok == Some(expected))
+                        && error_contains.as_ref().is_none_or(|needle| {
+                            call.ok == Some(false) && call.raw_result.contains(needle)
+                        })
+                        && predicates.iter().all(|predicate| {
+                            let document = match predicate.document {
+                                JournalToolDocument::Arguments => call.arguments.as_ref(),
+                                JournalToolDocument::Result => call.result.as_ref(),
+                                _ => None,
+                            };
+                            predicate
+                                .matches(document.and_then(|value| value.pointer(&predicate.path)))
+                        })
+                })
+                .count() as u32;
+            Ok(count >= *min && count <= *max)
+        }
+        Criterion::ExecutionToolSequence { tools } => {
+            let mut calls = calls.iter().filter(|call| call.run_id == root);
+            Ok(tools.iter().all(|name| calls.any(|call| call.name == name)))
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Evaluate every deterministic criterion in order. Required missing evidence
+/// fails closed; optional criteria explicitly report their skipped scope.
 pub fn evaluate_deterministic(
     criteria: &[Criterion],
     outcome: &RunOutcome,
@@ -1059,6 +1423,7 @@ pub fn requires_durable_run_binding(criteria: &[Criterion]) -> bool {
 fn criterion_requires_session_capture(c: &Criterion) -> bool {
     match c {
         Criterion::SessionEventCount { .. }
+        | Criterion::SessionChildResultAdopted { .. }
         | Criterion::JournalTurnEvaluationSignalCount { .. }
         | Criterion::JournalTurnEvaluationSuccess { .. }
         | Criterion::SessionSubsystemHealthy { .. }
@@ -1086,6 +1451,42 @@ fn criterion_requires_session_capture(c: &Criterion) -> bool {
         }
         _ => false,
     }
+}
+
+pub(crate) fn requires_execution_capture(criteria: &[Criterion]) -> bool {
+    criteria.iter().any(|criterion| match criterion {
+        Criterion::ExecutionChildResultsAdopted { .. }
+        | Criterion::ExecutionToolCount { .. }
+        | Criterion::ExecutionToolSequence { .. }
+        | Criterion::ExecutionChildCount { .. } => true,
+        Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
+            requires_execution_capture(criteria)
+        }
+        _ => false,
+    })
+}
+
+pub(crate) fn requires_execution_transcript(criteria: &[Criterion]) -> bool {
+    criteria.iter().any(|criterion| match criterion {
+        Criterion::ExecutionToolCount { .. } | Criterion::ExecutionToolSequence { .. } => true,
+        Criterion::ExecutionChildResultsAdopted { .. } => true,
+        Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
+            requires_execution_transcript(criteria)
+        }
+        _ => false,
+    })
+}
+
+pub(crate) fn requires_execution_run_events(criteria: &[Criterion]) -> bool {
+    criteria.iter().any(|criterion| match criterion {
+        Criterion::ExecutionChildResultsAdopted { children, .. } => children
+            .iter()
+            .any(|child| child.initial_thinking.is_some() || child.logical_rounds.is_some()),
+        Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
+            requires_execution_run_events(criteria)
+        }
+        _ => false,
+    })
 }
 
 fn missing_required_session(c: &Criterion, label: &str) -> CriterionResult {
@@ -1186,7 +1587,7 @@ fn call_matches_predicate(
         return true;
     };
     let document = journal_tool_document(call, predicate.document);
-    document.and_then(|value| value.pointer(&predicate.path)) == Some(&predicate.equals)
+    predicate.matches(document.and_then(|value| value.pointer(&predicate.path)))
 }
 
 fn journal_tool_document(
@@ -1199,6 +1600,22 @@ fn journal_tool_document(
         JournalToolDocument::Error => call.error.as_ref(),
         JournalToolDocument::RuntimeMetadata => Some(&call.runtime_metadata),
     }
+}
+
+fn journal_tool_missing_optional_property(value: &serde_json::Value, path: &str) -> bool {
+    let Some((parent_path, property)) = path.rsplit_once('/') else {
+        return false;
+    };
+    let parent = if parent_path.is_empty() {
+        Some(value)
+    } else {
+        value.pointer(parent_path)
+    };
+    let Some(parent) = parent.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let property = property.replace("~1", "/").replace("~0", "~");
+    !parent.contains_key(&property)
 }
 
 fn call_matches_predicates(
@@ -1371,6 +1788,462 @@ fn validate_text_json_dag(
     Ok((node_ids.len(), unique_edges.len()))
 }
 
+fn fanout_launch_set_proven(
+    session: &SessionCapture,
+    spawn: &crate::session_capture::JournalEvent,
+    calls: &[crate::session_capture::JournalToolCall],
+) -> bool {
+    fn identity(
+        slot: &serde_json::Value,
+        run: &serde_json::Value,
+        agent: &serde_json::Value,
+    ) -> Option<(u64, String, String)> {
+        Some((
+            slot.as_u64()?,
+            run.as_str().filter(|s| !s.is_empty())?.into(),
+            agent.as_str().filter(|s| !s.is_empty())?.into(),
+        ))
+    }
+    let Some(group) = spawn
+        .raw
+        .pointer("/metadata/fanout_slot/group_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return false;
+    };
+    let Some(parent) = spawn
+        .raw
+        .pointer("/metadata/parent_run_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+    else {
+        return false;
+    };
+    let mut spawned = BTreeSet::new();
+    let mut run_ids = BTreeSet::new();
+    let mut agent_ids = BTreeSet::new();
+    let mut slots = BTreeSet::new();
+    for event in &session.events {
+        if event.event_type != "agent_spawned"
+            || event
+                .raw
+                .pointer("/metadata/fanout_slot/group_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(group)
+            || event
+                .raw
+                .pointer("/metadata/parent_run_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(parent)
+        {
+            continue;
+        }
+        let metadata = &event.raw["metadata"];
+        let Some(row) = identity(
+            &metadata["fanout_slot"]["slot_index"],
+            &metadata["run_id"],
+            &metadata["agent_id"],
+        ) else {
+            return false;
+        };
+        if !slots.insert(row.0)
+            || !run_ids.insert(row.1.clone())
+            || !agent_ids.insert(row.2.clone())
+        {
+            return false;
+        }
+        spawned.insert(row);
+        if spawned.len() > 50 {
+            return false;
+        }
+    }
+    let mut receipts = calls.iter().filter(|call| {
+        call.name == "agent_fanout"
+            && call.ok == Some(true)
+            && call.run_id.as_deref() == Some(parent)
+            && call
+                .arguments
+                .as_ref()
+                .and_then(|args| args.get("action"))
+                .and_then(serde_json::Value::as_str)
+                == Some("start")
+            && call
+                .result
+                .as_ref()
+                .and_then(|result| result.get("group_id"))
+                .and_then(serde_json::Value::as_str)
+                == Some(group)
+    });
+    let Some(receipt) = receipts.next() else {
+        return false;
+    };
+    if receipts.next().is_some() {
+        return false;
+    }
+    let result = receipt.result.as_ref().unwrap();
+    if result
+        .pointer("/fanout/parent_run_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(parent)
+    {
+        return false;
+    }
+    let Some(agents) = result.get("agents").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    if agents.is_empty()
+        || agents.len() != spawned.len()
+        || receipt
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("target_count"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(agents.len() as u64)
+    {
+        return false;
+    }
+    let launched: Option<BTreeSet<_>> = agents
+        .iter()
+        .map(|agent| identity(&agent["slot_index"], &agent["run_id"], &agent["agent_id"]))
+        .collect();
+    launched.is_some_and(|launched| launched.len() == agents.len() && launched == spawned)
+}
+
+fn child_result_adoption_proven(
+    session: &SessionCapture,
+    expected_result: Option<&str>,
+    spawn_match: Option<&SessionEventFieldMatch>,
+    allow_get_result: bool,
+) -> bool {
+    let expected_hash =
+        expected_result.map(|result| format!("{:x}", Sha256::digest(result.as_bytes())));
+    let calls = session.journal_tool_calls();
+    let events = &session.events;
+    if expected_result.is_none()
+        && (spawn_match.is_none()
+            || events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "agent_spawned"
+                        && spawn_match.is_some_and(|predicate| {
+                            event.raw.pointer(&predicate.path) == Some(&predicate.equals)
+                        })
+                })
+                .count()
+                != 1)
+    {
+        return false;
+    }
+    events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| {
+            event.event_type == "agent_spawned"
+                && spawn_match.is_none_or(|predicate| {
+                    event.raw.pointer(&predicate.path) == Some(&predicate.equals)
+                })
+        })
+        .any(|(spawn_index, spawn)| {
+            if spawn
+                .raw
+                .pointer("/metadata/fanout_slot")
+                .is_some_and(|slot| !slot.is_null())
+                && !fanout_launch_set_proven(session, spawn, &calls)
+            {
+                return false;
+            }
+            let Some(child_run_id) = spawn
+                .raw
+                .pointer("/metadata/run_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            let Some(child_agent_id) = spawn
+                .raw
+                .pointer("/metadata/agent_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            let Some(parent_run_id) = spawn
+                .raw
+                .pointer("/metadata/parent_run_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            if child_run_id.is_empty() || child_agent_id.is_empty() || parent_run_id.is_empty() {
+                return false;
+            }
+            let terminated = events.iter().position(|event| {
+                event.event_type == "agent_terminated"
+                    && event
+                        .raw
+                        .pointer("/metadata/run_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(child_run_id)
+                    && event
+                        .raw
+                        .pointer("/metadata/agent_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(child_agent_id)
+                    && event
+                        .raw
+                        .pointer("/metadata/status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("completed")
+            });
+            if terminated.is_none()
+                || (expected_result.is_none()
+                    && terminated.is_none_or(|index| index <= spawn_index))
+            {
+                return false;
+            }
+            if allow_get_result && {
+                calls.iter().any(|call| {
+                    let Some(arguments) = call.arguments.as_ref() else {
+                        return false;
+                    };
+                    let Some(result) = call.result.as_ref() else {
+                        return false;
+                    };
+                    if call.ok != Some(true) || call.run_id.as_deref() != Some(parent_run_id) {
+                        return false;
+                    }
+                    let action = arguments.get("action").and_then(serde_json::Value::as_str);
+                    let result = if call.name == "agent"
+                        && action == Some("get_result")
+                        && arguments
+                            .get("agent_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(child_agent_id)
+                    {
+                        result
+                    } else if call.name == "agent_fanout" && action == Some("get_results") {
+                        let Some(group_id) = spawn
+                            .raw
+                            .pointer("/metadata/fanout_slot/group_id")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|id| !id.is_empty())
+                        else {
+                            return false;
+                        };
+                        if arguments
+                            .get("group_id")
+                            .and_then(serde_json::Value::as_str)
+                            != Some(group_id)
+                            || result.get("group_id").and_then(serde_json::Value::as_str)
+                                != Some(group_id)
+                            || result
+                                .pointer("/fanout/parent_run_id")
+                                .and_then(serde_json::Value::as_str)
+                                != Some(parent_run_id)
+                        {
+                            return false;
+                        }
+                        let Some(slot) = result
+                            .get("results")
+                            .and_then(serde_json::Value::as_array)
+                            .and_then(|slots| {
+                                slots.iter().find(|slot| {
+                                    slot.get("agent_id").and_then(serde_json::Value::as_str)
+                                        == Some(child_agent_id)
+                                        && slot.get("run_id").and_then(serde_json::Value::as_str)
+                                            == Some(child_run_id)
+                                })
+                            })
+                        else {
+                            return false;
+                        };
+                        let Some(body) = slot.get("result") else {
+                            return false;
+                        };
+                        let Some(bytes) = body
+                            .get("result")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|body| body.len() as u64)
+                        else {
+                            return false;
+                        };
+                        if slot
+                            .get("result_truncated")
+                            .and_then(serde_json::Value::as_bool)
+                            != Some(false)
+                            || slot
+                                .get("result_start_offset")
+                                .and_then(serde_json::Value::as_u64)
+                                != Some(0)
+                            || slot
+                                .get("result_end_offset")
+                                .and_then(serde_json::Value::as_u64)
+                                != Some(bytes)
+                            || slot.get("result_bytes").and_then(serde_json::Value::as_u64)
+                                != Some(bytes)
+                        {
+                            return false;
+                        }
+                        body
+                    } else {
+                        return false;
+                    };
+                    result
+                        .get("result_family")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("child_result")
+                        && result.get("status").and_then(serde_json::Value::as_str)
+                            == Some("completed")
+                        && result
+                            .get("incomplete")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(false)
+                        && result.get("agent_id").and_then(serde_json::Value::as_str)
+                            == Some(child_agent_id)
+                        && result.get("run_id").and_then(serde_json::Value::as_str)
+                            == Some(child_run_id)
+                        && result
+                            .get("result")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|result| {
+                                !result.is_empty()
+                                    && expected_result.is_none_or(|expected| result == expected)
+                            })
+                        && (expected_result.is_some()
+                            || call.round.is_some_and(|round| {
+                                events.iter().any(|event| {
+                                    event.event_type == "trace_span"
+                                        && event
+                                            .raw
+                                            .pointer("/metadata/attrs/outcome")
+                                            .and_then(serde_json::Value::as_str)
+                                            == Some("finalization_accepted")
+                                        && event
+                                            .raw
+                                            .pointer("/metadata/attrs/parent_run_id")
+                                            .and_then(serde_json::Value::as_str)
+                                            == Some(parent_run_id)
+                                        && event
+                                            .raw
+                                            .pointer("/metadata/attrs/round_index")
+                                            .and_then(serde_json::Value::as_str)
+                                            .and_then(|value| value.parse::<u32>().ok())
+                                            .is_some_and(|final_round| final_round > round)
+                                })
+                            }))
+                })
+            } {
+                return true;
+            }
+            events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| event.event_type == "trace_span")
+                .any(|(adoption_index, adoption)| {
+                    if adoption
+                        .raw
+                        .pointer("/metadata/attrs/outcome")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("results_adopted")
+                        || adoption
+                            .raw
+                            .pointer("/metadata/attrs/parent_run_id")
+                            .and_then(serde_json::Value::as_str)
+                            != Some(parent_run_id)
+                    {
+                        return false;
+                    }
+                    let children = adoption
+                        .raw
+                        .pointer("/metadata/attrs/children")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+                    let staged_hash = expected_hash.clone().or_else(|| {
+                        events[..adoption_index].iter().enumerate().rev().find_map(
+                            |(staged_index, event)| {
+                                if terminated.is_none_or(|index| index >= staged_index)
+                                    || event.event_type != "trace_span"
+                                    || event
+                                        .raw
+                                        .pointer("/metadata/attrs/outcome")
+                                        .and_then(serde_json::Value::as_str)
+                                        != Some("results_staged")
+                                    || event
+                                        .raw
+                                        .pointer("/metadata/attrs/parent_run_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        != Some(parent_run_id)
+                                {
+                                    return None;
+                                }
+                                let children: serde_json::Value = serde_json::from_str(
+                                    event.raw.pointer("/metadata/attrs/children")?.as_str()?,
+                                )
+                                .ok()?;
+                                children.as_array()?.iter().find_map(|child| {
+                                    if child.get("run_id").and_then(serde_json::Value::as_str)
+                                        != Some(child_run_id)
+                                        || child.get("agent_id").and_then(serde_json::Value::as_str)
+                                            != Some(child_agent_id)
+                                        || child.get("status").and_then(serde_json::Value::as_str)
+                                            != Some("completed")
+                                        || child
+                                            .get("result_truncated")
+                                            .and_then(serde_json::Value::as_bool)
+                                            != Some(false)
+                                    {
+                                        return None;
+                                    }
+                                    let hash = child.get("result_sha256")?.as_str()?;
+                                    (hash.len() == 64
+                                        && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                                    .then(|| hash.to_string())
+                                })
+                            },
+                        )
+                    });
+                    let Some(staged_hash) = staged_hash else {
+                        return false;
+                    };
+                    let matched_child = children
+                        .as_ref()
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|children| {
+                            children.iter().any(|child| {
+                                child.get("run_id").and_then(serde_json::Value::as_str)
+                                    == Some(child_run_id)
+                                    && child.get("agent_id").and_then(serde_json::Value::as_str)
+                                        == Some(child_agent_id)
+                                    && child.get("status").and_then(serde_json::Value::as_str)
+                                        == Some("completed")
+                                    && child
+                                        .get("result_sha256")
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some(staged_hash.as_str())
+                                    && child
+                                        .get("result_truncated")
+                                        .and_then(serde_json::Value::as_bool)
+                                        == Some(false)
+                            })
+                        });
+                    matched_child
+                        && events.iter().skip(adoption_index + 1).any(|event| {
+                            event.event_type == "trace_span"
+                                && event
+                                    .raw
+                                    .pointer("/metadata/attrs/outcome")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some("finalization_accepted")
+                                && event
+                                    .raw
+                                    .pointer("/metadata/attrs/parent_run_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some(parent_run_id)
+                        })
+                })
+        })
+}
+
 fn evaluate_one(
     c: &Criterion,
     outcome: &RunOutcome,
@@ -1513,7 +2386,7 @@ fn evaluate_one_with_primary_cache(
         Criterion::StderrMatches { pattern } => {
             // Multi-line mode so `^` / `$` anchor at line boundaries —
             // stderr is almost always a log stream, and users write
-            // patterns like `^\[fork-cache\]` expecting per-line match.
+            // patterns like `^\[diagnostic\]` expecting per-line match.
             match Regex::new(&format!("(?m){pattern}")) {
                 Ok(re) => {
                     let hit = re.is_match(&outcome.stderr);
@@ -1727,7 +2600,8 @@ fn evaluate_one_with_primary_cache(
                 } else {
                     format!("any_of failed ({detail})")
                 },
-                full_detail: None,
+                full_detail: (!passed && requires_execution_capture(criteria))
+                    .then(|| serde_json::to_string(&nested).expect("evaluated criteria serialize")),
                 score: None,
             }
         }
@@ -1769,13 +2643,16 @@ fn evaluate_one_with_primary_cache(
                 } else {
                     format!("all_of failed ({detail})")
                 },
-                full_detail: None,
+                full_detail: (!passed && requires_execution_capture(criteria))
+                    .then(|| serde_json::to_string(&nested).expect("evaluated criteria serialize")),
                 score: None,
             }
         }
         Criterion::SessionEventCount {
             event_type,
             min,
+            max,
+            json_match,
             optional,
         } => {
             let Some(sess) = session else {
@@ -1805,15 +2682,165 @@ fn evaluate_one_with_primary_cache(
                     score: if passed { Some(1.0) } else { Some(0.0) },
                 };
             };
-            let n = sess.count_events(event_type);
-            let pass = n as u32 >= *min;
+            let matching_events = sess
+                .events
+                .iter()
+                .filter(|event| event.event_type == *event_type)
+                .filter(|event| {
+                    json_match.as_ref().is_none_or(|predicate| {
+                        event.raw.pointer(&predicate.path) == Some(&predicate.equals)
+                    })
+                })
+                .filter(|event| {
+                    let Some(link) = json_match
+                        .as_ref()
+                        .and_then(|predicate| predicate.same_run_as.as_ref())
+                    else {
+                        return true;
+                    };
+                    let Some(run_id) = event
+                        .raw
+                        .get("run_id")
+                        .or_else(|| event.raw.pointer("/metadata/run_id"))
+                        .and_then(serde_json::Value::as_str)
+                    else {
+                        return false;
+                    };
+                    if run_id.trim().is_empty() {
+                        return false;
+                    }
+                    sess.events.iter().any(|related| {
+                        related.event_type == link.event_type
+                            && related
+                                .raw
+                                .pointer(&link.run_id_path)
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|related_id| {
+                                    !related_id.trim().is_empty()
+                                        && related_id == run_id
+                                        && link.related_match.as_ref().is_none_or(|predicate| {
+                                            related.raw.pointer(&predicate.path)
+                                                == Some(&predicate.equals)
+                                        })
+                                })
+                    })
+                })
+                .collect::<Vec<_>>();
+            let n = matching_events.len();
+            let unique_count = json_match
+                .as_ref()
+                .and_then(|predicate| predicate.unique_by.as_ref())
+                .map(|path| {
+                    matching_events
+                        .iter()
+                        .filter_map(|event| {
+                            event.raw.pointer(path).and_then(serde_json::Value::as_str)
+                        })
+                        .filter(|value| !value.trim().is_empty())
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                });
+            let pass = n as u32 >= *min
+                && max.is_none_or(|max| n as u32 <= max)
+                && unique_count.is_none_or(|unique_count| unique_count == n);
+            let predicate = json_match.as_ref().map_or_else(String::new, |predicate| {
+                let unique_by = predicate
+                    .unique_by
+                    .as_ref()
+                    .map_or_else(String::new, |path| {
+                        format!(
+                            ", unique_by={path} distinct={}",
+                            unique_count.unwrap_or_default()
+                        )
+                    });
+                let run_link = predicate
+                    .same_run_as
+                    .as_ref()
+                    .map_or_else(String::new, |link| {
+                        format!(", same_run_as={}", link.event_type)
+                    });
+                format!(
+                    ", {}={}{}{}",
+                    predicate.path, predicate.equals, unique_by, run_link
+                )
+            });
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed: pass,
-                detail: format!("session events type={event_type} count={n} (expected >= {min})"),
+                detail: format!(
+                    "session events type={event_type}{predicate} count={n} (expected {min}..={})",
+                    max.map_or("unbounded".to_string(), |max| max.to_string())
+                ),
                 full_detail: None,
                 score: if pass { Some(1.0) } else { Some(0.0) },
+            }
+        }
+        Criterion::ExecutionToolCount { .. }
+        | Criterion::ExecutionToolSequence { .. }
+        | Criterion::ExecutionChildCount { .. }
+        | Criterion::ExecutionChildResultsAdopted { .. } => {
+            let proof = execution_contract_proof(c, outcome);
+            CriterionResult {
+                criterion: c.clone(),
+                severity: CriterionSeverity::Hard,
+                passed: proof == Ok(true),
+                detail: match proof {
+                    Ok(passed) => format!("complete Server execution contract proven={passed}"),
+                    Err(reason) => format!("Server verification unavailable: {reason}"),
+                },
+                full_detail: None,
+                score: None,
+            }
+        }
+        Criterion::SessionChildResultAdopted {
+            expected_result,
+            spawn_match,
+            allow_get_result,
+        } => {
+            let Some(session) = session else {
+                return missing_required_session(c, "session_child_result_adopted");
+            };
+            let passed = child_result_adoption_proven(
+                session,
+                expected_result.as_deref(),
+                spawn_match.as_ref(),
+                *allow_get_result,
+            );
+            CriterionResult {
+                criterion: c.clone(),
+                severity: CriterionSeverity::Hard,
+                passed,
+                detail: if !passed
+                    && expected_result.is_some()
+                    && (1..=4096).contains(&outcome.text.len())
+                    && child_result_adoption_proven(
+                        session,
+                        Some(&outcome.text),
+                        spawn_match.as_ref(),
+                        *allow_get_result,
+                    ) {
+                    format!(
+                        "actual child result proven via parent adoption{}; expected result differs (expected_sha256={:x}, observed_sha256={:x})",
+                        if *allow_get_result {
+                            " or exact parent get_result"
+                        } else {
+                            ""
+                        },
+                        Sha256::digest(expected_result.as_deref().unwrap_or_default().as_bytes()),
+                        Sha256::digest(outcome.text.as_bytes()),
+                    )
+                } else if *allow_get_result {
+                    format!(
+                        "expected completed child result through parent adoption or exact parent get_result: {passed}"
+                    )
+                } else if passed {
+                    "same child result adopted by its parent before finalization".into()
+                } else {
+                    "expected-result adoption not proven: missing or mismatched child identity, result hash, parent adoption, or later finalization".into()
+                },
+                full_detail: None,
+                score: Some(if passed { 1.0 } else { 0.0 }),
             }
         }
         Criterion::JournalTurnEvaluationSignalCount { kind, min, max } => {
@@ -2079,6 +3106,7 @@ fn evaluate_one_with_primary_cache(
             name,
             min,
             max,
+            root_only,
             document,
             path,
             equals,
@@ -2087,10 +3115,37 @@ fn evaluate_one_with_primary_cache(
             let Some(session) = session else {
                 return missing_required_session(c, "journal_tool_call_count");
             };
-            let count = session
-                .journal_tool_calls()
+            if *root_only && outcome.run_id.is_none() {
+                return CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed: false,
+                    detail: "root_only requires a captured root run_id".to_string(),
+                    full_detail: None,
+                    score: None,
+                };
+            }
+            let calls = session.journal_tool_calls();
+            if *root_only
+                && calls
+                    .iter()
+                    .any(|call| call.name == *name && call.run_id.is_none())
+            {
+                return CriterionResult {
+                    criterion: c.clone(),
+                    severity: criterion_severity(c),
+                    passed: false,
+                    detail: format!("root-only tool {name} has a call with unknown run_id"),
+                    full_detail: None,
+                    score: None,
+                };
+            }
+            let count = calls
                 .iter()
                 .filter(|call| {
+                    if *root_only && call.run_id.as_deref() != outcome.run_id.as_deref() {
+                        return false;
+                    }
                     if call.name != *name || ok.is_some_and(|expected| call.ok != Some(expected)) {
                         return false;
                     }
@@ -2116,7 +3171,8 @@ fn evaluate_one_with_primary_cache(
                 severity: criterion_severity(c),
                 passed,
                 detail: format!(
-                    "journal tool {name}{outcome_filter}{predicate} full-call count={count}, expected {min}..={max}"
+                    "journal tool {name}{outcome_filter}{predicate}{} full-call count={count}, expected {min}..={max}",
+                    if *root_only { " root-only" } else { "" }
                 ),
                 full_detail: None,
                 score: None,
@@ -2187,6 +3243,8 @@ fn evaluate_one_with_primary_cache(
             document,
             path,
             equals,
+            where_match,
+            allow_missing,
         } => {
             let Some(session) = session else {
                 return missing_required_session(c, "journal_tool_json");
@@ -2194,16 +3252,36 @@ fn evaluate_one_with_primary_cache(
             let calls = session.journal_tool_calls();
             let passed = calls.iter().filter(|call| call.name == *name).any(|call| {
                 let value = journal_tool_document(call, *document);
-                value.and_then(|value| value.pointer(path)) == Some(equals)
+                if let Some(predicate) = where_match
+                    && !predicate.matches(
+                        journal_tool_document(call, predicate.document)
+                            .and_then(|value| value.pointer(&predicate.path)),
+                    )
+                {
+                    return false;
+                }
+                let actual = value.and_then(|value| value.pointer(path));
+                actual == Some(equals)
+                    || (*allow_missing
+                        && equals.is_null()
+                        && actual.is_none()
+                        && value.is_some_and(|value| {
+                            journal_tool_missing_optional_property(value, path)
+                        }))
             });
             CriterionResult {
                 criterion: c.clone(),
                 severity: criterion_severity(c),
                 passed,
                 detail: format!(
-                    "journal tool {name} {document:?} pointer {path:?} {} expected {}",
+                    "journal tool {name} {document:?} pointer {path:?} {} expected {}{}",
                     if passed { "matched" } else { "did not match" },
-                    equals
+                    equals,
+                    if *allow_missing && equals.is_null() {
+                        " (missing also accepted)"
+                    } else {
+                        ""
+                    },
                 ),
                 full_detail: None,
                 score: None,
@@ -3176,26 +4254,6 @@ fn evaluate_one_with_primary_cache(
                 score: None,
             }
         }
-        Criterion::ForkCacheOutcome { expect } => {
-            let hits = parse_fork_cache_outcomes(&outcome.stderr);
-            let pass = hits.iter().any(|c| expect.iter().any(|e| e == c));
-            CriterionResult {
-                criterion: c.clone(),
-                severity: criterion_severity(c),
-                passed: pass,
-                detail: if pass {
-                    format!(
-                        "fork-cache event with outcome in {expect:?} observed (all seen: {hits:?})"
-                    )
-                } else if hits.is_empty() {
-                    "no [fork-cache] events observed in stderr".to_string()
-                } else {
-                    format!("no [fork-cache] event matched {expect:?}; seen outcomes: {hits:?}")
-                },
-                full_detail: None,
-                score: None,
-            }
-        }
         Criterion::Judger { .. } | Criterion::HardJudger { .. } => CriterionResult {
             criterion: c.clone(),
             severity: criterion_severity(c),
@@ -3915,41 +4973,6 @@ fn evaluate_prompt_cache_reuse_scope(
     }
 }
 
-/// Scan stderr for `[fork-cache] {...}` JSON lines and return the
-/// `outcome` field from each. Silently skips malformed lines and
-/// lines where the outcome can't be found — a single corrupt event
-/// should not hide the valid ones.
-///
-/// Field precedence: `outcome` (current wire name as serialized by
-/// `astra_turn_core::fork_cache_event::ForkCacheEvent`) then `class`
-/// (earlier harness-facing name; kept for YAML backward-compat). No
-/// positional / first-key fallback — that was a schema-churn footgun
-/// that would misclassify a re-tagged event.
-fn parse_fork_cache_outcomes(stderr: &str) -> Vec<String> {
-    let mut outcomes = Vec::new();
-    for line in stderr.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("[fork-cache]") else {
-            continue;
-        };
-        let rest = rest.trim_start();
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(rest) else {
-            continue;
-        };
-        // Only accept the two named fields. Unknown shapes are
-        // skipped entirely — loud missing-outcome surface is
-        // preferable to a silent misclassification.
-        let name = v
-            .get("outcome")
-            .and_then(|c| c.as_str())
-            .or_else(|| v.get("class").and_then(|c| c.as_str()));
-        if let Some(s) = name {
-            outcomes.push(s.to_string());
-        }
-    }
-    outcomes
-}
-
 /// Reject a criterion whose bounds are internally inconsistent —
 /// typos in YAML (`min: 5, max: 2`, `threshold: 2.0`, empty expect
 /// list) otherwise turn into permanent-FAIL or permanent-PASS cases
@@ -3984,6 +5007,61 @@ pub fn validate_criterion(c: &Criterion) -> Result<(), String> {
 
 fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<(), String> {
     match c {
+        Criterion::ExecutionToolCount {
+            name,
+            min,
+            max,
+            predicates,
+            ok,
+            error_contains,
+            ..
+        } => {
+            if name.trim().is_empty() || name.len() > 128 || min > max || predicates.len() > 16 {
+                return Err("ExecutionToolCount requires a bounded tool, ordered count bounds and at most 16 predicates".into());
+            }
+            if *min == 0 && !predicates.is_empty() {
+                return Err("ExecutionToolCount negative document predicates require raw evidence, not a display transcript".into());
+            }
+            if error_contains.as_ref().is_some_and(|needle| {
+                needle.is_empty() || needle.len() > 4096 || *min == 0 || *ok != Some(false)
+            }) {
+                return Err("ExecutionToolCount.error_contains requires positive count, ok:false and 1..=4096 bytes".into());
+            }
+            for predicate in predicates {
+                predicate.validate()?;
+                if !matches!(
+                    predicate.document,
+                    JournalToolDocument::Arguments | JournalToolDocument::Result
+                ) {
+                    return Err(
+                        "ExecutionToolCount accepts only transcript arguments or result documents"
+                            .into(),
+                    );
+                }
+                validate_json_pointer("ExecutionToolCount predicate", &predicate.path)?;
+            }
+            Ok(())
+        }
+        Criterion::ExecutionToolSequence { tools } => {
+            if tools.is_empty()
+                || tools.len() > 64
+                || tools
+                    .iter()
+                    .any(|name| name.trim().is_empty() || name.len() > 128)
+            {
+                return Err("ExecutionToolSequence requires 1..=64 bounded tool names".into());
+            }
+            Ok(())
+        }
+        Criterion::ExecutionChildCount { min, max } => {
+            if min > max || *max > 200 {
+                return Err(
+                    "ExecutionChildCount requires ordered bounds within the captured tree limit"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
         Criterion::ToolsCountBetween { min, max } => {
             if min > max {
                 return Err(format!(
@@ -4194,15 +5272,20 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             name,
             path,
             document: _,
-            equals: _,
+            equals,
+            where_match,
+            allow_missing,
         } => {
             if name.trim().is_empty() {
                 return Err("JournalToolJson.name must not be empty".into());
             }
-            if !path.is_empty() && !path.starts_with('/') {
-                return Err(format!(
-                    "JournalToolJson.path must be an RFC 6901 JSON pointer; got {path:?}"
-                ));
+            validate_json_pointer("JournalToolJson.path", path)?;
+            if let Some(predicate) = where_match {
+                predicate.validate()?;
+                validate_json_pointer("JournalToolJson.where_match.path", &predicate.path)?;
+            }
+            if *allow_missing && !equals.is_null() {
+                return Err("JournalToolJson.allow_missing requires equals: null".into());
             }
             Ok(())
         }
@@ -4242,6 +5325,9 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             consumer_filter,
             ..
         } => {
+            for predicate in producer_filter.iter().chain(consumer_filter) {
+                predicate.validate()?;
+            }
             if producer.trim().is_empty() || consumer.trim().is_empty() {
                 return Err("JournalToolValueFlow producer and consumer must not be empty".into());
             }
@@ -4281,6 +5367,9 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             consumer_filters,
             ..
         } => {
+            for predicate in producer_filters.iter().chain(consumer_filters) {
+                predicate.validate()?;
+            }
             if producer.trim().is_empty() || consumer.trim().is_empty() {
                 return Err(
                     "JournalToolValueFlowBound producer and consumer must not be empty".into(),
@@ -4353,13 +5442,113 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             Ok(())
         }
         Criterion::SessionEventCount {
-            min, event_type, ..
+            min,
+            max,
+            event_type,
+            json_match,
+            ..
         } => {
-            if *min == 0 {
+            if let Some(predicate) = json_match {
+                validate_json_pointer("SessionEventCount.json_match.path", &predicate.path)?;
+                if let Some(path) = predicate.unique_by.as_ref() {
+                    validate_json_pointer("SessionEventCount.json_match.unique_by", path)?;
+                }
+                if let Some(link) = predicate.same_run_as.as_ref() {
+                    if link.event_type.trim().is_empty() {
+                        return Err(
+                            "SessionEventCount.same_run_as.event_type must not be empty".into()
+                        );
+                    }
+                    validate_json_pointer(
+                        "SessionEventCount.same_run_as.run_id_path",
+                        &link.run_id_path,
+                    )?;
+                    if let Some(related_match) = link.related_match.as_ref() {
+                        validate_json_pointer(
+                            "SessionEventCount.same_run_as.related_match.path",
+                            &related_match.path,
+                        )?;
+                    }
+                }
+            }
+            if *min == 0 && max.is_none() {
                 return Err(format!(
-                    "SessionEventCount.min must be >= 1 (min=0 is trivially-true for \
-                     event_type={event_type:?}; did you mean >= 1?)"
+                    "SessionEventCount with min=0 requires max for event_type={event_type:?}"
                 ));
+            }
+            if max.is_some_and(|max| max < *min) {
+                return Err("SessionEventCount.max must be >= min".into());
+            }
+            Ok(())
+        }
+        Criterion::ExecutionChildResultsAdopted {
+            children,
+            fanout_group,
+        } => {
+            if children.is_empty() || children.len() > 50 {
+                return Err("ExecutionChildResultsAdopted requires 1..=50 children".into());
+            }
+            let mut identities = std::collections::BTreeSet::new();
+            if fanout_group
+                .as_ref()
+                .is_some_and(|group| group.trim().is_empty() || group.len() > 256)
+            {
+                return Err("fanout_group must be a bounded nonempty identity".into());
+            }
+            for child in children {
+                let expected_bytes = match &child.expected_result {
+                    ChildResultExpectation::Text(text) | ChildResultExpectation::Contains(text) => {
+                        text.len()
+                    }
+                    ChildResultExpectation::Json(value) => value.to_string().len(),
+                };
+                if expected_bytes == 0
+                    || expected_bytes > 4096
+                    || child.model.trim().is_empty()
+                    || child.model.len() > 128
+                {
+                    return Err("ExecutionChildResultsAdopted requires a 1..=4096 byte result and a bounded model name".into());
+                }
+                let identity = match fanout_group {
+                    Some(_) => child
+                        .slot_index
+                        .map(|slot| slot.to_string())
+                        .ok_or("fanout children require slot_index")?,
+                    None if child.slot_index.is_none() => child.model.clone(),
+                    None => return Err("slot_index requires fanout_group".into()),
+                };
+                if !identities.insert(identity) {
+                    return Err("child expectations require distinct models or fanout slots".into());
+                }
+                if let Some(ChildThinkingExpectation::Exact { config }) = &child.initial_thinking {
+                    config.validate_output_budget(u64::MAX)?;
+                }
+            }
+            Ok(())
+        }
+        Criterion::SessionChildResultAdopted {
+            expected_result,
+            spawn_match,
+            ..
+        } => {
+            if expected_result
+                .as_ref()
+                .is_some_and(|result| result.is_empty() || result.len() > 4_096)
+            {
+                return Err(
+                    "SessionChildResultAdopted.expected_result must be 1..=4096 bytes".into(),
+                );
+            }
+            if expected_result.is_none() && spawn_match.is_none() {
+                return Err(
+                    "SessionChildResultAdopted requires expected_result or spawn_match".into(),
+                );
+            }
+            if let Some(predicate) = spawn_match {
+                validate_json_pointer(
+                    "SessionChildResultAdopted.spawn_match.path",
+                    &predicate.path,
+                )?;
             }
             Ok(())
         }
@@ -4384,15 +5573,6 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             } else {
                 Ok(())
             }
-        }
-        Criterion::ForkCacheOutcome { expect } => {
-            if expect.is_empty() {
-                return Err(
-                    "ForkCacheOutcome.expect must not be empty (no outcome would ever match)"
-                        .into(),
-                );
-            }
-            Ok(())
         }
         Criterion::StderrMatches { pattern } => {
             // Compile-check the regex at load so a bad pattern fails
@@ -4612,6 +5792,56 @@ pub fn validate_criteria(criteria: &[Criterion]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn document_predicates_preserve_null_and_only_match_string_contains() {
+        let null: super::JournalJsonPredicate =
+            serde_json::from_str(r#"{"document":"arguments","path":"/value","equals":null}"#)
+                .unwrap();
+        assert!(null.matches(Some(&serde_json::Value::Null)));
+        assert!(!null.matches(None));
+        let yaml = serde_yaml_ng::to_string(&null).unwrap();
+        assert_eq!(
+            serde_yaml_ng::from_str::<super::JournalJsonPredicate>(&yaml).unwrap(),
+            null
+        );
+        for operators in [
+            r#""#,
+            r#", "equals":null,"contains":"x""#,
+            r#", "contains":"""#,
+            r#", "contains":42"#,
+            r#", "equals":null,"contains":null"#,
+            r#", "contains":"x","contains":"y""#,
+            r#", "equals":null,"other":true"#,
+        ] {
+            assert!(
+                serde_json::from_str::<super::JournalJsonPredicate>(&format!(
+                    r#"{{"document":"arguments","path":"/value"{operators}}}"#
+                ))
+                .is_err(),
+                "{operators}"
+            );
+        }
+        let contains: super::JournalJsonPredicate = serde_json::from_value(serde_json::json!({
+            "document":"arguments", "path":"/value", "contains":"MARKER"
+        }))
+        .unwrap();
+        assert!(contains.matches(Some(&serde_json::json!("prefix MARKER suffix"))));
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!(["MARKER"]),
+            serde_json::json!("marker"),
+        ] {
+            assert!(!contains.matches(Some(&value)));
+        }
+        assert!(!contains.matches(None));
+        assert!(
+            serde_json::from_value::<super::JournalJsonPredicate>(serde_json::json!({
+                "document":"arguments", "path":"/value", "contains":"x".repeat(4097)
+            }))
+            .is_err()
+        );
+    }
     use super::*;
     use crate::runner::RunOutcome;
 
@@ -4629,6 +5859,7 @@ mod tests {
             prompt_tokens: 0,
             cached_input_tokens: 0,
             cache_creation_tokens: 0,
+            token_usage_coverage: None,
             duration_ms: 0,
             turn_rounds: 0,
             cache_hits: 0,
@@ -4638,7 +5869,821 @@ mod tests {
             interruption_kind: None,
             error_kind: None,
             explain_capture: None,
+            stream_capture: None,
             tool_result_class_counts: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn failed_tool_diagnostic_is_bound_to_its_typed_call() {
+        let criterion = Criterion::ExecutionToolCount {
+            name: "agent".into(),
+            min: 1,
+            max: 1,
+            root_only: true,
+            ok: Some(false),
+            predicates: vec![],
+            error_contains: Some("diagnostic marker".into()),
+        };
+        for (fault, status, body, passed, unavailable) in [
+            ("plain", "failed", "diagnostic marker", true, false),
+            (
+                "json",
+                "rejected",
+                "{\"error\":\"diagnostic marker\"}",
+                true,
+                false,
+            ),
+            ("success", "completed", "diagnostic marker", false, false),
+            ("arguments", "failed", "ordinary error", false, false),
+            ("advisory", "failed", "ordinary error", false, false),
+            ("other-call", "failed", "ordinary error", false, false),
+            ("unknown", "reused", "diagnostic marker", false, true),
+        ] {
+            let mut capture = crate::execution_capture::tests::tool_capture();
+            let page = capture.transcript.as_mut().unwrap();
+            page.items[1].content = body.into();
+            page.items[1].tool_result.as_mut().unwrap().status = Some(status.into());
+            match fault {
+                "arguments" => {
+                    page.items[0].tool_calls[0].arguments =
+                        "{\"prompt\":\"diagnostic marker\"}".into()
+                }
+                "advisory" => {
+                    page.items[1]
+                        .tool_result
+                        .as_mut()
+                        .unwrap()
+                        .runtime_advisories = vec!["diagnostic marker".into()]
+                }
+                "other-call" => {
+                    let mut request = page.items[0].clone();
+                    request.item_seq = 4;
+                    request.run_id = Some("child".into());
+                    let mut response = page.items[1].clone();
+                    response.item_seq = 5;
+                    response.run_id = Some("child".into());
+                    response.content = "diagnostic marker".into();
+                    page.items.extend([request, response]);
+                    capture.run_tree.runs[1].total_tool_calls = 1;
+                }
+                _ => {}
+            }
+            let mut outcome = outcome_with_tools(&[]);
+            outcome.run_id = Some("root".into());
+            let mut stream = crate::runner::StreamCapture::default();
+            stream.identity_verified = true;
+            stream.execution = Some(capture);
+            outcome.stream_capture = Some(stream);
+            let evaluated = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
+            assert_eq!(evaluated[0].passed, passed, "{fault}");
+            assert_eq!(
+                execution_verification_unavailable(&evaluated[0], &outcome),
+                unavailable,
+                "{fault}"
+            );
+        }
+        for (min, ok, needle) in [
+            (0, Some(false), "marker"),
+            (1, Some(true), "marker"),
+            (1, None, "marker"),
+            (1, Some(false), ""),
+        ] {
+            let mut invalid = criterion.clone();
+            if let Criterion::ExecutionToolCount {
+                min: actual_min,
+                ok: actual_ok,
+                error_contains,
+                ..
+            } = &mut invalid
+            {
+                *actual_min = min;
+                *actual_ok = ok;
+                *error_contains = Some(needle.into());
+            }
+            assert!(validate_criteria(&[invalid]).is_err());
+        }
+    }
+
+    #[test]
+    fn child_admission_thinking_requires_exact_positive_custody() {
+        use astra_turn_core::thinking_config::{ThinkingConfig, ThinkingEffort};
+        let criterion = Criterion::ExecutionChildResultsAdopted {
+            children: vec![ChildExecutionExpectation {
+                expected_result: ChildResultExpectation::Text("observed-value".into()),
+                model: "test-model".into(),
+                initial_thinking: Some(ChildThinkingExpectation::Exact {
+                    config: ThinkingConfig::Adaptive {
+                        effort: ThinkingEffort::Medium,
+                    },
+                }),
+                answered_question: false,
+                workspace_mutation: None,
+                logical_rounds: None,
+                slot_index: None,
+            }],
+            fanout_group: None,
+        };
+        assert!(requires_execution_run_events(&[Criterion::AllOf {
+            criteria: vec![criterion.clone()]
+        }]));
+        for (fault, passes, unavailable) in [
+            ("none", true, false),
+            ("high", false, false),
+            ("missing", false, true),
+            ("foreign", false, true),
+            ("duplicate", false, true),
+            ("foreign-start", false, true),
+            ("duplicate-start", false, true),
+            ("incomplete", false, true),
+            ("missing-index", false, true),
+            ("late-index", false, true),
+            ("invalid-watermark", false, true),
+            ("wrong-result", false, false),
+        ] {
+            let mut capture = crate::execution_capture::tests::capture();
+            let mut projection = serde_json::json!({
+                "run_id":"child", "session_id":"session", "run_event_high_watermark":1,
+                "recent_events":[{"type":"run_started", "index":0, "run_id":"child",
+                    "generation_controls":{"thinking":{"mode":"adaptive","effort":"medium"}}}],
+            });
+            match fault {
+                "high" => {
+                    projection["recent_events"][0]["generation_controls"]["thinking"]["effort"] =
+                        "high".into()
+                }
+                "missing" => projection["recent_events"] = serde_json::json!([]),
+                "foreign" => projection["session_id"] = "foreign".into(),
+                "missing-index" => {
+                    projection["recent_events"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("index");
+                }
+                "late-index" => projection["recent_events"][0]["index"] = 99.into(),
+                "invalid-watermark" => projection["run_event_high_watermark"] = (-1).into(),
+                "foreign-start" => projection["recent_events"][0]["run_id"] = "foreign".into(),
+                "duplicate-start" => {
+                    let start = projection["recent_events"][0].clone();
+                    projection["recent_events"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(start);
+                }
+                "incomplete" => {
+                    projection["recent_events"][0]["generation_controls"]["thinking"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("effort");
+                }
+                _ => {}
+            }
+            capture.run_projections = Some(if fault == "duplicate" {
+                vec![projection.clone(), projection]
+            } else {
+                vec![projection]
+            });
+            let mut outcome = outcome_with_tools(&[]);
+            outcome.run_id = Some("root".into());
+            let mut stream = crate::runner::StreamCapture::default();
+            stream.identity_verified = true;
+            stream.execution = Some(capture);
+            outcome.stream_capture = Some(stream);
+            let mut requested = criterion.clone();
+            if fault == "wrong-result" {
+                if let Criterion::ExecutionChildResultsAdopted { children, .. } = &mut requested {
+                    children[0].expected_result =
+                        ChildResultExpectation::Text("not-delivered".into());
+                }
+                outcome
+                    .stream_capture
+                    .as_mut()
+                    .unwrap()
+                    .execution
+                    .as_mut()
+                    .unwrap()
+                    .run_projections = None;
+            }
+            let evaluated = evaluate_deterministic(&[requested], &outcome);
+            assert_eq!(evaluated[0].passed, passes, "{fault}");
+            assert_eq!(
+                execution_verification_unavailable(&evaluated[0], &outcome),
+                unavailable,
+                "{fault}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_child_adoption_checks_original_bytes_before_semantic_value() {
+        let criterion = Criterion::ExecutionChildResultsAdopted {
+            children: vec![ChildExecutionExpectation {
+                expected_result: ChildResultExpectation::Json(serde_json::json!({"value":42})),
+                model: "test-model".into(),
+                initial_thinking: None,
+                answered_question: false,
+                workspace_mutation: None,
+                logical_rounds: None,
+                slot_index: None,
+            }],
+            fanout_group: None,
+        };
+        for expected_result in [
+            ChildResultExpectation::Text("literal".into()),
+            ChildResultExpectation::Json(serde_json::json!({"value":42})),
+        ] {
+            let typed = Criterion::ExecutionChildResultsAdopted {
+                children: vec![ChildExecutionExpectation {
+                    expected_result,
+                    model: "test-model".into(),
+                    initial_thinking: None,
+                    answered_question: false,
+                    workspace_mutation: None,
+                    logical_rounds: None,
+                    slot_index: None,
+                }],
+                fanout_group: None,
+            };
+            assert!(requires_execution_transcript(std::slice::from_ref(&typed)));
+            let yaml = serde_yaml_ng::to_string(&typed).unwrap();
+            let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert!(
+                matches!(&document["children"][0]["expected_result"], serde_yaml_ng::Value::Mapping(map) if map.len() == 1)
+            );
+            let round_trip: Criterion = serde_yaml_ng::from_str(&yaml).unwrap();
+            let json = serde_json::to_value(&typed).unwrap();
+            assert_eq!(
+                json["children"][0]["expected_result"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(serde_json::to_value(&round_trip).unwrap(), json);
+        }
+        assert!(requires_execution_transcript(std::slice::from_ref(
+            &criterion
+        )));
+        for (raw, expected_pass) in [
+            (r#"{"value":42}"#, true),
+            (r#"{"value": 42}"#, true),
+            (r#"{"value":42,"extra":true}"#, false),
+            ("not JSON", false),
+        ] {
+            let mut capture = crate::execution_capture::tests::tool_capture();
+            let mut terminal = capture.transcript.as_ref().unwrap().items[0].clone();
+            terminal.item_seq = 3;
+            terminal.run_id = Some("child".into());
+            terminal.tool_calls.clear();
+            terminal.content = raw.into();
+            terminal.source_event_id = Some("child-terminal".into());
+            capture.transcript.as_mut().unwrap().items[2] = terminal;
+            capture.reflection.graph_slice.nodes[0]
+                .metadata
+                .as_mut()
+                .unwrap()["execution_spine"]["facts"][1]["children"][0]["result_sha256"] =
+                serde_json::json!(format!("{:x}", Sha256::digest(raw.as_bytes())));
+            let mut outcome = outcome_with_tools(&[]);
+            outcome.run_id = Some("root".into());
+            let mut stream = crate::runner::StreamCapture::default();
+            stream.identity_verified = true;
+            stream.execution = Some(capture);
+            outcome.stream_capture = Some(stream);
+            let result = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
+            assert_eq!(result[0].passed, expected_pass, "{raw}");
+            assert!(!execution_verification_unavailable(&result[0], &outcome));
+            if !expected_pass {
+                assert_eq!(
+                    crate::classify::classify(&outcome, &result),
+                    crate::classify::FailureClass::BehaviorContractViolation
+                );
+            }
+            if raw == r#"{"value":42}"# {
+                for tree_change in ["zero", "multiple", "paused"] {
+                    let mut known = outcome.clone();
+                    let tree = &mut known
+                        .stream_capture
+                        .as_mut()
+                        .unwrap()
+                        .execution
+                        .as_mut()
+                        .unwrap()
+                        .run_tree;
+                    match tree_change {
+                        "zero" => tree.runs.retain(|run| run.run_id == "root"),
+                        "multiple" => {
+                            let mut second = tree.runs[1].clone();
+                            second.run_id = "second-child".into();
+                            tree.runs.push(second);
+                        }
+                        "paused" => {
+                            tree.runs[1].status =
+                                astra_server_types::SessionRunLifecycleStatus::Paused
+                        }
+                        _ => unreachable!(),
+                    }
+                    let rejected = evaluate_deterministic(std::slice::from_ref(&criterion), &known);
+                    assert!(!rejected[0].passed, "{tree_change}");
+                    assert_eq!(
+                        crate::classify::classify(&known, &rejected),
+                        crate::classify::FailureClass::BehaviorContractViolation,
+                        "{tree_change}"
+                    );
+                }
+            }
+            outcome.text = raw.into();
+            let parent = Criterion::TextJsonValue {
+                path: "".into(),
+                equals: serde_json::json!({"value":42}),
+            };
+            assert_eq!(
+                evaluate_deterministic(&[parent], &outcome)[0].passed,
+                expected_pass
+            );
+            let capture = outcome
+                .stream_capture
+                .as_mut()
+                .unwrap()
+                .execution
+                .as_mut()
+                .unwrap();
+            capture.reflection.graph_slice.nodes[0]
+                .metadata
+                .as_mut()
+                .unwrap()["execution_spine"]["facts"][1]["children"][0]["result_sha256"] =
+                serde_json::json!("wrong");
+            assert!(!evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed);
+            outcome
+                .stream_capture
+                .as_mut()
+                .unwrap()
+                .execution
+                .as_mut()
+                .unwrap()
+                .transcript = None;
+            let unavailable = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
+            assert!(execution_verification_unavailable(
+                &unavailable[0],
+                &outcome
+            ));
+            assert_eq!(
+                crate::classify::classify(&outcome, &unavailable),
+                crate::classify::FailureClass::InfraVerificationUnavailable
+            );
+        }
+        for expected in [
+            serde_json::json!("old scalar"),
+            serde_json::json!({"text":"x","json":{"value":42}}),
+        ] {
+            let document = serde_json::json!({
+                "type":"execution_child_results_adopted", "children":[{"expected_result":expected, "model":"test-model"}]
+            });
+            assert!(serde_json::from_value::<Criterion>(document.clone()).is_err());
+            assert!(
+                serde_yaml_ng::from_str::<Criterion>(&serde_yaml_ng::to_string(&document).unwrap())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_brief_predicates_must_match_the_same_successful_spawn() {
+        let mut capture = crate::execution_capture::tests::tool_capture();
+        capture.transcript.as_mut().unwrap().items[0].tool_calls[0].arguments =
+            r#"{"action":"spawn","prompt":"MARKER-A and MARKER-B"}"#.into();
+        let criterion: Criterion = serde_json::from_value(serde_json::json!({
+            "type":"execution_tool_count","name":"agent","root_only":true,
+            "ok":true,"min":1,"max":1,"predicates":[
+                {"document":"arguments","path":"/action","equals":"spawn"},
+                {"document":"arguments","path":"/prompt","contains":"MARKER-A"},
+                {"document":"arguments","path":"/prompt","contains":"MARKER-B"}
+            ]
+        }))
+        .unwrap();
+        let mut outcome = outcome_with_tools(&[]);
+        outcome.run_id = Some("root".into());
+        outcome.session_id = Some("session".into());
+        let mut stream = crate::runner::StreamCapture::default();
+        stream.identity_verified = true;
+        stream.execution = Some(capture.clone());
+        outcome.stream_capture = Some(stream);
+        assert!(evaluate_deterministic(std::slice::from_ref(&criterion), &outcome)[0].passed);
+        capture.run_tree.runs[0].total_tool_calls = 2;
+        let page = capture.transcript.as_mut().unwrap();
+        let mut second_request = page.items[0].clone();
+        second_request.item_seq = 4;
+        second_request.source_event_id = Some("second-request".into());
+        second_request.tool_calls[0].tool_use_id = "second".into();
+        second_request.tool_calls[0].arguments = r#"{"action":"spawn","prompt":"MARKER-B"}"#.into();
+        let mut second_result = page.items[1].clone();
+        second_result.item_seq = 5;
+        second_result.source_event_id = Some("second-result".into());
+        second_result.tool_result.as_mut().unwrap().tool_use_id = "second".into();
+        page.items[0].tool_calls[0].arguments = r#"{"action":"spawn","prompt":"MARKER-A"}"#.into();
+        page.items.extend([second_request, second_result]);
+        outcome.stream_capture.as_mut().unwrap().execution = Some(capture);
+        let results = evaluate_deterministic(std::slice::from_ref(&criterion), &outcome);
+        assert!(!results[0].passed);
+        assert_eq!(
+            crate::classify::classify(&outcome, &results),
+            crate::classify::FailureClass::BehaviorContractViolation
+        );
+    }
+
+    #[test]
+    fn execution_tool_absence_requires_complete_canonical_evidence() {
+        let mut outcome = outcome_with_tools(&[]);
+        outcome.run_id = Some("root".into());
+        let absence = Criterion::ExecutionToolCount {
+            name: "bash".into(),
+            min: 0,
+            max: 0,
+            root_only: false,
+            ok: None,
+            predicates: vec![],
+            error_contains: None,
+        };
+        let check = |outcome: &RunOutcome, criterion: &Criterion| {
+            evaluate_deterministic(std::slice::from_ref(criterion), outcome)[0].passed
+        };
+        assert!(
+            !check(&outcome, &absence),
+            "empty local journal is not proof of absence"
+        );
+        let mut stream = crate::runner::StreamCapture::default();
+        stream.identity_verified = true;
+        stream.execution = Some(crate::execution_capture::tests::tool_capture());
+        outcome.stream_capture = Some(stream);
+        assert!(check(&outcome, &absence));
+        let stream = outcome.stream_capture.as_mut().unwrap();
+        stream.diagnostics = vec!["agent_live_gap".into(), "capture_truncated".into()];
+        assert!(
+            check(&outcome, &absence),
+            "presentation capture loss must not invalidate the separate canonical Server capture"
+        );
+        let requested = Criterion::ExecutionToolCount {
+            name: "agent".into(),
+            min: 1,
+            max: 1,
+            root_only: true,
+            ok: Some(true),
+            predicates: vec![JournalJsonPredicate {
+                document: JournalToolDocument::Arguments,
+                path: "/action".into(),
+                equals: Some(serde_json::json!("spawn")),
+                contains: None,
+            }],
+            error_contains: None,
+        };
+        assert!(check(&outcome, &requested));
+        assert!(check(
+            &outcome,
+            &Criterion::ExecutionToolSequence {
+                tools: vec!["agent".into()]
+            }
+        ));
+        assert!(!check(
+            &outcome,
+            &Criterion::ExecutionChildCount { min: 0, max: 0 }
+        ));
+        let mut malformed = outcome.clone();
+        malformed
+            .stream_capture
+            .as_mut()
+            .unwrap()
+            .execution
+            .as_mut()
+            .unwrap()
+            .transcript
+            .as_mut()
+            .unwrap()
+            .items[0]
+            .tool_calls[0]
+            .arguments = "display preview…".into();
+        let mut negative_predicate = requested.clone();
+        if let Criterion::ExecutionToolCount { min, max, .. } = &mut negative_predicate {
+            *min = 0;
+            *max = 0;
+        }
+        let unavailable =
+            evaluate_deterministic(std::slice::from_ref(&negative_predicate), &malformed);
+        assert!(!unavailable[0].passed);
+        assert!(execution_verification_unavailable(
+            &unavailable[0],
+            &malformed
+        ));
+        assert_eq!(
+            crate::classify::classify(&malformed, &unavailable),
+            crate::classify::FailureClass::InfraVerificationUnavailable
+        );
+        let result = Criterion::ExecutionToolCount {
+            name: "agent".into(),
+            min: 1,
+            max: 1,
+            root_only: true,
+            ok: Some(true),
+            predicates: vec![JournalJsonPredicate {
+                document: JournalToolDocument::Result,
+                path: "/value".into(),
+                equals: Some(serde_json::json!(42)),
+                contains: None,
+            }],
+            error_contains: None,
+        };
+        assert!(check(&outcome, &requested));
+        let evaluated = evaluate_deterministic(std::slice::from_ref(&requested), &outcome);
+        assert!(!execution_verification_unavailable(&evaluated[0], &outcome));
+        let mut unverified = outcome.clone();
+        unverified
+            .stream_capture
+            .as_mut()
+            .unwrap()
+            .identity_verified = false;
+        let unavailable = evaluate_deterministic(std::slice::from_ref(&requested), &unverified);
+        assert!(!unavailable[0].passed);
+        assert!(execution_verification_unavailable(
+            &unavailable[0],
+            &unverified
+        ));
+        assert!(check(&outcome, &result));
+        let mut mixed = outcome.clone();
+        let capture = mixed
+            .stream_capture
+            .as_mut()
+            .unwrap()
+            .execution
+            .as_mut()
+            .unwrap();
+        capture.run_tree.runs[0].total_tool_calls = 2;
+        let items = &mut capture.transcript.as_mut().unwrap().items;
+        let mut rejected_request = items[0].clone();
+        rejected_request.item_seq = 4;
+        rejected_request.source_event_id = Some("rejected-request".into());
+        rejected_request.tool_calls[0].tool_use_id = "rejected-call".into();
+        let mut rejected_result = items[1].clone();
+        rejected_result.item_seq = 5;
+        rejected_result.source_event_id = Some("rejected-result".into());
+        rejected_result.content = "Rejected arguments, not a JSON result.".into();
+        rejected_result.tool_result.as_mut().unwrap().tool_use_id = "rejected-call".into();
+        items.extend([rejected_request, rejected_result]);
+        for (status, available) in [("rejected", true), ("completed", false), ("reused", false)] {
+            mixed
+                .stream_capture
+                .as_mut()
+                .unwrap()
+                .execution
+                .as_mut()
+                .unwrap()
+                .transcript
+                .as_mut()
+                .unwrap()
+                .items[4]
+                .tool_result
+                .as_mut()
+                .unwrap()
+                .status = Some(status.into());
+            let evaluated = evaluate_deterministic(std::slice::from_ref(&result), &mixed);
+            assert_eq!(evaluated[0].passed, available, "{status}");
+            if !available {
+                assert!(execution_verification_unavailable(&evaluated[0], &mixed));
+            }
+        }
+        malformed = outcome.clone();
+        malformed
+            .stream_capture
+            .as_mut()
+            .unwrap()
+            .execution
+            .as_mut()
+            .unwrap()
+            .transcript
+            .as_mut()
+            .unwrap()
+            .items[1]
+            .content = "{\"value\":42}\ndisplay advisory".into();
+        let unavailable = evaluate_deterministic(std::slice::from_ref(&result), &malformed);
+        assert!(
+            !unavailable[0].passed
+                && execution_verification_unavailable(&unavailable[0], &malformed)
+        );
+        outcome
+            .stream_capture
+            .as_mut()
+            .unwrap()
+            .execution
+            .as_mut()
+            .unwrap()
+            .transcript = None;
+        assert!(!check(&outcome, &absence));
+        for composite in [
+            Criterion::AllOf {
+                criteria: vec![absence.clone()],
+            },
+            Criterion::AnyOf {
+                criteria: vec![absence.clone()],
+            },
+        ] {
+            let results = evaluate_deterministic(std::slice::from_ref(&composite), &outcome);
+            assert!(!results[0].passed);
+            assert_eq!(
+                crate::classify::classify(&outcome, &results),
+                crate::classify::FailureClass::InfraVerificationUnavailable
+            );
+        }
+        outcome.stream_capture.as_mut().unwrap().execution =
+            Some(crate::execution_capture::tests::tool_capture());
+        let contradiction = Criterion::AllOf {
+            criteria: vec![Criterion::ExecutionToolCount {
+                name: "agent".into(),
+                min: 2,
+                max: 2,
+                root_only: true,
+                ok: None,
+                predicates: vec![],
+                error_contains: None,
+            }],
+        };
+        let results = evaluate_deterministic(std::slice::from_ref(&contradiction), &outcome);
+        assert!(!results[0].passed);
+        assert_eq!(
+            crate::classify::classify(&outcome, &results),
+            crate::classify::FailureClass::BehaviorContractViolation
+        );
+        outcome
+            .stream_capture
+            .as_mut()
+            .unwrap()
+            .execution
+            .as_mut()
+            .unwrap()
+            .transcript = None;
+        let evaluated = vec![Criterion::ExecutionChildCount { min: 0, max: 0 }, absence];
+        for (composite, expected) in [
+            (
+                Criterion::AllOf {
+                    criteria: evaluated.clone(),
+                },
+                crate::classify::FailureClass::BehaviorContractViolation,
+            ),
+            (
+                Criterion::AnyOf {
+                    criteria: evaluated,
+                },
+                crate::classify::FailureClass::InfraVerificationUnavailable,
+            ),
+        ] {
+            let results = evaluate_deterministic(std::slice::from_ref(&composite), &outcome);
+            assert!(!results[0].passed);
+            assert_eq!(crate::classify::classify(&outcome, &results), expected);
+        }
+    }
+
+    #[test]
+    fn shipped_rejection_cases_reject_extra_attempts_with_different_outcomes() {
+        for name in [
+            "flash_missing_child_model_fail_closed",
+            "flash_near_version_must_not_substitute",
+            "flash_rejected_delegation_preserves_parent_tools",
+        ] {
+            let case = crate::case::Case::from_path(
+                &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("cases/subagent_model_selection/{name}.yaml")),
+            )
+            .unwrap();
+            let criteria: Vec<_> = case
+                .criteria
+                .into_iter()
+                .filter(|criterion| {
+                    matches!(
+                        criterion,
+                        Criterion::ExecutionToolCount { .. }
+                            | Criterion::ExecutionToolSequence { .. }
+                            | Criterion::ExecutionChildCount { .. }
+                    )
+                })
+                .collect();
+            let mut capture = crate::execution_capture::tests::tool_capture();
+            capture.run_tree.runs.truncate(1);
+            let page = capture.transcript.as_mut().unwrap();
+            page.items[1].tool_result.as_mut().unwrap().status = Some("rejected".into());
+            page.items[1].content = r#"{"error_kind":"invalid_request","status":"failed"}"#.into();
+            let append = |capture: &mut crate::execution_capture::SessionExecutionCapture,
+                          name: &str,
+                          args: &str,
+                          result: &str,
+                          status: &str| {
+                let page = capture.transcript.as_mut().unwrap();
+                let mut request = page.items[0].clone();
+                let mut response = page.items[1].clone();
+                let seq = page.items.len() as i64 + 1;
+                let id = format!("call-{seq}");
+                request.item_seq = seq;
+                request.source_event_id = Some(format!("source-{seq}"));
+                request.tool_calls[0].tool_use_id = id.clone();
+                request.tool_calls[0].name = name.into();
+                request.tool_calls[0].arguments = args.into();
+                response.item_seq = seq + 1;
+                response.source_event_id = Some(format!("source-{}", seq + 1));
+                response.content = result.into();
+                let receipt = response.tool_result.as_mut().unwrap();
+                receipt.tool_use_id = id;
+                receipt.name = Some(name.into());
+                receipt.status = Some(status.into());
+                page.items.extend([request, response]);
+                capture.run_tree.runs[0].total_tool_calls = (page.items.len() / 2) as u32;
+            };
+            let before_catalog = capture.clone();
+            if name == "flash_rejected_delegation_preserves_parent_tools" {
+                append(
+                    &mut capture,
+                    "model_catalog",
+                    "{}",
+                    r#"{"purpose":"chat"}"#,
+                    "completed",
+                );
+            }
+            let baseline = capture.clone();
+            let mut outcome = outcome_with_tools(&[]);
+            outcome.run_id = Some("root".into());
+            let mut stream = crate::runner::StreamCapture::default();
+            stream.identity_verified = true;
+            stream.execution = Some(capture);
+            outcome.stream_capture = Some(stream);
+            assert!(
+                evaluate_deterministic(&criteria, &outcome)
+                    .iter()
+                    .all(|result| result.passed),
+                "{name}"
+            );
+            for (extra_name, arguments) in [
+                ("agent", r#"{"action":"spawn"}"#),
+                ("agent", r#"{"action":"get_status"}"#),
+                ("model_catalog", "{}"),
+            ] {
+                if extra_name == "model_catalog"
+                    && name != "flash_rejected_delegation_preserves_parent_tools"
+                {
+                    continue;
+                }
+                let mut extra = if extra_name == "model_catalog" {
+                    before_catalog.clone()
+                } else {
+                    baseline.clone()
+                };
+                append(
+                    &mut extra,
+                    extra_name,
+                    arguments,
+                    if extra_name == "model_catalog" {
+                        "Invalid arguments."
+                    } else {
+                        r#"{"error_kind":"different_failure","status":"failed"}"#
+                    },
+                    "rejected",
+                );
+                if extra_name == "model_catalog" {
+                    append(
+                        &mut extra,
+                        "model_catalog",
+                        "{}",
+                        r#"{"purpose":"chat"}"#,
+                        "completed",
+                    );
+                }
+                outcome.stream_capture.as_mut().unwrap().execution = Some(extra);
+                let results = evaluate_deterministic(&criteria, &outcome);
+                if extra_name == "model_catalog" {
+                    assert!(
+                        results.iter().all(|result| result.passed),
+                        "recovered discovery: {results:?}"
+                    );
+                    let calls = outcome
+                        .stream_capture
+                        .as_ref()
+                        .unwrap()
+                        .execution
+                        .as_ref()
+                        .unwrap()
+                        .tools("root")
+                        .unwrap();
+                    assert_eq!(
+                        calls
+                            .iter()
+                            .filter(|call| call.name == "model_catalog")
+                            .count(),
+                        2
+                    );
+                    continue;
+                }
+                assert!(
+                    results.iter().any(|result| !result.passed),
+                    "{name}: {extra_name}"
+                );
+                assert_eq!(
+                    crate::classify::classify(&outcome, &results),
+                    crate::classify::FailureClass::BehaviorContractViolation
+                );
+            }
         }
     }
 
@@ -4987,10 +7032,10 @@ mod tests {
     #[test]
     fn stderr_matches_uses_regex() {
         let mut out = outcome_with_tools(&[]);
-        out.stderr = "some noise\n[fork-cache] {...}\nmore noise".into();
+        out.stderr = "some noise\n[diagnostic] {...}\nmore noise".into();
         let r = evaluate_deterministic(
             &[Criterion::StderrMatches {
-                pattern: r"^\[fork-cache\]".into(),
+                pattern: r"^\[diagnostic\]".into(),
             }],
             &out,
         );
@@ -5139,6 +7184,55 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn root_only_tool_count_excludes_child_calls_and_requires_root_identity() {
+        let criterion = Criterion::JournalToolCallCount {
+            name: "bash".into(),
+            min: 0,
+            max: 0,
+            root_only: true,
+            ok: None,
+            document: None,
+            path: None,
+            equals: None,
+        };
+        let session = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "run_id": "child-run",
+                "tool_calls": [{"tool_call_id":"child-bash","name":"bash"}]
+            }),
+        )]);
+        let mut outcome = outcome_with_tools(&["agent"]);
+        outcome.run_id = Some("root-run".into());
+        assert!(
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&session)
+            )[0]
+            .passed
+        );
+        let unknown = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [{"tool_call_id":"unknown-bash","name":"bash"}]
+            }),
+        )]);
+        assert!(
+            !evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&unknown)
+            )[0]
+            .passed
+        );
+        outcome.run_id = None;
+        assert!(
+            !evaluate_deterministic_with_session(&[criterion], &outcome, Some(&session))[0].passed
+        );
     }
 
     #[test]
@@ -5322,6 +7416,8 @@ mod tests {
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                max: None,
+                json_match: None,
                 optional: false,
             }],
             &out,
@@ -5329,6 +7425,816 @@ mod tests {
         );
         assert!(r[0].passed);
         assert_eq!(r[0].severity, CriterionSeverity::Hard);
+    }
+
+    #[test]
+    fn variable_child_result_requires_unique_slot_and_complete_ordered_handoff() {
+        let hash = format!("{:x}", Sha256::digest(b"variable review findings"));
+        let children = serde_json::json!([{
+            "agent_id": "child-agent", "run_id": "child-run", "status": "completed",
+            "result_sha256": hash, "result_truncated": false
+        }])
+        .to_string();
+        let mut session = mk_session(&[
+            (
+                "agent_spawned",
+                serde_json::json!({"metadata": {
+                    "run_id": "child-run", "agent_id": "child-agent", "parent_run_id": "parent-run",
+                    "fanout_slot": {"slot_index": 0, "group_id": "review-group"}
+                }}),
+            ),
+            (
+                "agent_terminated",
+                serde_json::json!({"metadata": {
+                    "run_id": "child-run", "agent_id": "child-agent", "status": "completed"
+                }}),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata": {"attrs": {
+                    "parent_run_id": "parent-run", "outcome": "results_staged", "children": children
+                }}}),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata": {"attrs": {
+                    "parent_run_id": "parent-run", "outcome": "results_adopted", "children": children
+                }}}),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata": {"attrs": {
+                    "parent_run_id": "parent-run", "outcome": "finalization_accepted"
+                }}}),
+            ),
+        ]);
+        let launch = mk_session(&[(
+            "llm_round",
+            serde_json::json!({
+                "turn":1, "round":1, "producer_scope":{"run_id":"parent-run"}, "tool_calls":[{
+                    "name":"agent_fanout", "tool_call_id":"launch", "ok":true,
+                    "args_full":serde_json::json!({"action":"start", "target_count":1}).to_string(),
+                    "result_full":serde_json::json!({"group_id":"review-group", "fanout":{"parent_run_id":"parent-run"},
+                        "agents":[{"slot_index":0,"run_id":"child-run","agent_id":"child-agent"}]}).to_string()
+                }]
+            }),
+        )]);
+        session.events.extend(launch.events.clone());
+        let shipped: crate::case::Case =
+            serde_yaml_ng::from_str(include_str!("../cases/parallel_synthesized_review.yaml"))
+                .unwrap();
+        let criterion = shipped
+            .criteria
+            .iter()
+            .find(|criterion| {
+                matches!(criterion,
+                    Criterion::SessionChildResultAdopted { spawn_match: Some(predicate), .. }
+                        if predicate.equals == serde_json::json!(0)
+                )
+            })
+            .unwrap()
+            .clone();
+        validate_criterion(&criterion).unwrap();
+        let check = |capture: &SessionCapture| {
+            evaluate_one(&criterion, &outcome_with_tools(&[]), Some(capture)).passed
+        };
+        assert!(check(&session));
+        for (path, value) in [
+            ("/agents/0/run_id", serde_json::json!("wrong-run")),
+            ("/agents/0/agent_id", serde_json::json!("wrong-agent")),
+            ("/agents/0/slot_index", serde_json::json!(1)),
+            ("/fanout/parent_run_id", serde_json::json!("wrong-parent")),
+            ("/group_id", serde_json::json!("wrong-group")),
+        ] {
+            let mut wrong = session.clone();
+            let call = &mut wrong.events[5].raw["tool_calls"][0];
+            let mut receipt: serde_json::Value =
+                serde_json::from_str(call["result_full"].as_str().unwrap()).unwrap();
+            *receipt.pointer_mut(path).unwrap() = value;
+            call["result_full"] = serde_json::json!(receipt.to_string());
+            assert!(!check(&wrong), "launch receipt mismatch {path}");
+        }
+        let mut duplicate = session.clone();
+        let call = &mut duplicate.events[5].raw["tool_calls"][0];
+        let mut receipt: serde_json::Value =
+            serde_json::from_str(call["result_full"].as_str().unwrap()).unwrap();
+        let row = receipt["agents"][0].clone();
+        receipt["agents"].as_array_mut().unwrap().push(row);
+        call["result_full"] = serde_json::json!(receipt.to_string());
+        assert!(!check(&duplicate), "duplicate launch identity");
+        let mut independent = session.clone();
+        let mut other = session.events[0].clone();
+        other.raw["metadata"]["parent_run_id"] = serde_json::json!("another-parent");
+        other.raw["metadata"]["run_id"] = serde_json::json!("independent-child-run");
+        other.raw["metadata"]["agent_id"] = serde_json::json!("independent-child-agent");
+        other.raw["metadata"]["fanout_slot"]["slot_index"] = serde_json::json!(1);
+        independent.events.push(other);
+        assert!(
+            check(&independent),
+            "other parents do not pollute this launch set"
+        );
+        let mut wrong = session.clone();
+        wrong.events.remove(2);
+        assert!(!check(&wrong), "adoption alone is insufficient");
+        let mut wrong = session.clone();
+        wrong.events.push(wrong.events[0].clone());
+        assert!(!check(&wrong), "duplicate slot identity is ambiguous");
+        for index in [2, 3] {
+            for (field, value) in [
+                ("result_sha256", serde_json::json!("wrong")),
+                ("result_truncated", serde_json::json!(true)),
+                ("run_id", serde_json::json!("other-child")),
+                ("agent_id", serde_json::json!("other-agent")),
+            ] {
+                let mut wrong = session.clone();
+                let mut children: serde_json::Value = serde_json::from_str(
+                    wrong.events[index].raw["metadata"]["attrs"]["children"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                children[0][field] = value;
+                wrong.events[index].raw["metadata"]["attrs"]["children"] =
+                    serde_json::json!(children.to_string());
+                assert!(!check(&wrong), "{index} {field}");
+            }
+            let mut wrong = session.clone();
+            wrong.events[index].raw["metadata"]["attrs"]["parent_run_id"] =
+                serde_json::json!("other-parent");
+            assert!(!check(&wrong));
+        }
+        let retrieved: Criterion = serde_yaml_ng::from_str(
+            "type: session_child_result_adopted\nallow_get_result: true\nspawn_match:\n  path: /metadata/fanout_slot/slot_index\n  equals: 0\n"
+        ).unwrap();
+        let mut foreground = mk_session(&[
+            ("agent_spawned", session.events[0].raw.clone()),
+            ("agent_terminated", session.events[1].raw.clone()),
+            (
+                "llm_round",
+                serde_json::json!({
+                    "turn": 1, "round": 2, "producer_scope": {"run_id": "parent-run"}, "tool_calls": [{
+                        "name": "agent", "tool_call_id": "read-full-child", "ok": true, "round": 2,
+                        "args_full": serde_json::json!({"action":"get_result", "agent_id":"child-agent"}).to_string(),
+                        "result_full": serde_json::json!({"result_family":"child_result", "status":"completed", "incomplete":false,
+                            "agent_id":"child-agent", "run_id":"child-run", "result":"complete variable findings"}).to_string()
+                    }]
+                }),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata":{"attrs":{
+                    "parent_run_id":"parent-run", "outcome":"finalization_accepted", "round_index":"3"
+                }}}),
+            ),
+        ]);
+        let check_retrieved = |capture: &SessionCapture| {
+            evaluate_one(&retrieved, &outcome_with_tools(&[]), Some(capture)).passed
+        };
+        foreground.events.extend(launch.events.clone());
+        assert!(check_retrieved(&foreground));
+        let mut aggregate = foreground.clone();
+        aggregate.events[0].raw["metadata"]["fanout_slot"]["group_id"] =
+            serde_json::json!("review-group");
+        let call = &mut aggregate.events[2].raw["tool_calls"][0];
+        let body: serde_json::Value =
+            serde_json::from_str(call["result_full"].as_str().unwrap()).unwrap();
+        let bytes = body["result"].as_str().unwrap().len();
+        let slot = serde_json::json!({"agent_id":"child-agent", "run_id":"child-run", "result":body,
+            "result_start_offset":0, "result_end_offset":bytes, "result_bytes":bytes, "result_truncated":false});
+        call["name"] = serde_json::json!("agent_fanout");
+        call["args_full"] = serde_json::json!(
+            serde_json::json!({"action":"get_results", "group_id":"review-group"}).to_string()
+        );
+        let response = serde_json::json!({"group_id":"review-group", "fanout":{"parent_run_id":"parent-run"}, "results":[slot]});
+        call["result_full"] = serde_json::json!(response.to_string());
+        assert!(check_retrieved(&aggregate));
+        for (field, value) in [
+            ("result_truncated", serde_json::json!(true)),
+            ("result_start_offset", serde_json::json!(1)),
+            ("result_end_offset", serde_json::json!(bytes - 1)),
+            ("run_id", serde_json::json!("other-child")),
+        ] {
+            let mut wrong = aggregate.clone();
+            let mut response = response.clone();
+            response["results"][0][field] = value;
+            wrong.events[2].raw["tool_calls"][0]["result_full"] =
+                serde_json::json!(response.to_string());
+            assert!(!check_retrieved(&wrong), "partial or wrong slot {field}");
+        }
+
+        foreground.events[3].raw["metadata"]["attrs"]["round_index"] = serde_json::json!("2");
+        assert!(
+            !check_retrieved(&foreground),
+            "retrieval must precede parent finalization"
+        );
+        foreground.events.remove(3);
+        assert!(
+            !check_retrieved(&foreground),
+            "retrieval alone cannot authorize parent completion"
+        );
+        for pair in [(0, 1), (1, 2), (2, 3), (3, 4)] {
+            let mut wrong = session.clone();
+            wrong.events.swap(pair.0, pair.1);
+            assert!(!check(&wrong), "handoff order {pair:?}");
+        }
+    }
+
+    #[test]
+    fn adopted_child_result_requires_exact_child_parent_hash_and_order() {
+        let result = "ASTRA-CHILD-ANSWERED-JSON";
+        let hash = format!("{:x}", Sha256::digest(result.as_bytes()));
+        let children = serde_json::json!([{
+            "agent_id": "child-agent", "run_id": "child-run", "status": "completed",
+            "result_sha256": hash, "result_truncated": false
+        }])
+        .to_string();
+        let session = mk_session(&[
+            (
+                "agent_spawned",
+                serde_json::json!({"metadata": {
+                    "run_id": "child-run", "agent_id": "child-agent", "parent_run_id": "parent-run",
+                    "model_configuration": {"prepared_selection": {"model_name": "glm-5.2"}},
+                    "fanout_slot": null
+                }}),
+            ),
+            (
+                "agent_terminated",
+                serde_json::json!({"metadata": {
+                    "run_id": "child-run", "agent_id": "child-agent", "status": "completed"
+                }}),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata": {
+                    "end_us": 20, "attrs": {"parent_run_id": "parent-run", "outcome": "results_adopted", "children": children}
+                }}),
+            ),
+            (
+                "trace_span",
+                serde_json::json!({"metadata": {
+                    "start_us": 21, "attrs": {"parent_run_id": "parent-run", "outcome": "finalization_accepted"}
+                }}),
+            ),
+        ]);
+        let criterion = Criterion::SessionChildResultAdopted {
+            expected_result: Some(result.into()),
+            spawn_match: None,
+            allow_get_result: false,
+        };
+        let outcome = outcome_with_tools(&[]);
+        let check = |capture: &SessionCapture| {
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(capture),
+            )[0]
+            .passed
+        };
+        assert!(check(&session));
+        assert!(!check(&mk_session(&[])));
+        assert!(
+            !evaluate_deterministic_with_session(std::slice::from_ref(&criterion), &outcome, None)
+                [0]
+            .passed
+        );
+        assert!(!child_result_adoption_proven(
+            &session,
+            Some("OTHER-RESULT"),
+            None,
+            false
+        ));
+        let mismatch = Criterion::SessionChildResultAdopted {
+            expected_result: Some("OTHER-RESULT".into()),
+            spawn_match: None,
+            allow_get_result: false,
+        };
+        let mut observed = outcome.clone();
+        observed.text = result.into();
+        let mismatched = evaluate_one(&mismatch, &observed, Some(&session));
+        assert!(!mismatched.passed);
+        assert!(mismatched.detail.contains("actual child result proven"));
+        let unproven = evaluate_one(&mismatch, &observed, Some(&mk_session(&[])));
+        assert!(!unproven.passed);
+        assert!(!unproven.detail.contains("actual child result proven"));
+        let model_match = SessionEventFieldMatch {
+            path: "/metadata/model_configuration/prepared_selection/model_name".into(),
+            equals: serde_json::json!("required-model"),
+        };
+        assert!(!child_result_adoption_proven(
+            &session,
+            Some(result),
+            Some(&model_match),
+            false
+        ));
+        let mut model_bound = session.clone();
+        model_bound.events[0].raw["metadata"]["model_configuration"] = serde_json::json!({
+            "prepared_selection": {"model_name": "required-model"}
+        });
+        assert!(child_result_adoption_proven(
+            &model_bound,
+            Some(result),
+            Some(&model_match),
+            false
+        ));
+        model_bound.events[0].raw["metadata"]["model_configuration"]["prepared_selection"]["model_name"] =
+            serde_json::json!("other-model");
+        assert!(!child_result_adoption_proven(
+            &model_bound,
+            Some(result),
+            Some(&model_match),
+            false
+        ));
+
+        let mut wrong = session.clone();
+        wrong.events[1].raw["metadata"]["run_id"] = serde_json::json!("other-child");
+        assert!(!check(&wrong));
+        let mut wrong = session.clone();
+        wrong.events[2].raw["metadata"]["attrs"]["parent_run_id"] =
+            serde_json::json!("other-parent");
+        assert!(!check(&wrong));
+        let mut wrong = session.clone();
+        wrong.events[2].raw["metadata"]["attrs"]["children"] = serde_json::json!("[]");
+        assert!(!check(&wrong));
+        let mut wrong = session.clone();
+        let mut truncated: serde_json::Value = serde_json::from_str(
+            wrong.events[2].raw["metadata"]["attrs"]["children"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        truncated[0]["result_truncated"] = serde_json::json!(true);
+        wrong.events[2].raw["metadata"]["attrs"]["children"] =
+            serde_json::json!(truncated.to_string());
+        assert!(!check(&wrong));
+        let mut clock_shifted = session.clone();
+        clock_shifted.events[3].raw["metadata"]["start_us"] = serde_json::json!(19);
+        assert!(
+            check(&clock_shifted),
+            "journal order survives wall-clock changes"
+        );
+        let mut wrong = session.clone();
+        wrong.events.swap(2, 3);
+        assert!(!check(&wrong));
+        let mut wrong = session.clone();
+        wrong.events[3].raw["metadata"]["attrs"]["outcome"] =
+            serde_json::json!("finalization_incomplete");
+        assert!(!check(&wrong));
+
+        let handoff = &Criterion::SessionChildResultAdopted {
+            expected_result: Some(result.into()),
+            spawn_match: Some(SessionEventFieldMatch {
+                path: "/metadata/model_configuration/prepared_selection/model_name".into(),
+                equals: serde_json::json!("glm-5.2"),
+            }),
+            allow_get_result: true,
+        };
+        validate_criterion(handoff).expect("valid shipped handoff");
+        let handoff_check = |capture: &SessionCapture| {
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(handoff),
+                &outcome,
+                Some(capture),
+            )[0]
+            .passed
+        };
+        assert!(handoff_check(&session), "canonical adoption remains valid");
+
+        let tool_turn =
+            |caller: &str, arguments: serde_json::Value, body: serde_json::Value, ok: bool| {
+                let call = astra_services::session_journal::ToolCallRecord {
+                    tool_call_id: Some("handoff-call".into()),
+                    name: "agent".into(),
+                    ok,
+                    args_full: Some(arguments.to_string()),
+                    result_full: Some(body.to_string()),
+                    ..Default::default()
+                };
+                let event = astra_services::session_journal::JournalEvent::turn(
+                    Some("s"),
+                    1,
+                    None,
+                    "fixture",
+                    "done",
+                    1,
+                    0,
+                    0,
+                    1,
+                )
+                .with_producer_scope(Some(caller))
+                .with_tool_calls(vec![call]);
+                mk_session(&[("turn", serde_json::to_value(event).unwrap())])
+                    .events
+                    .into_iter()
+                    .next()
+                    .unwrap()
+            };
+        for caller in ["parent-run", "child-run"] {
+            for ok in [true, false] {
+                let mut wrong = session.clone();
+                let mut children: serde_json::Value = serde_json::from_str(
+                    wrong.events[2].raw["metadata"]["attrs"]["children"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                children[0]["result_sha256"] =
+                    serde_json::json!(format!("{:x}", Sha256::digest(b"WRONG-RESULT")));
+                wrong.events[2].raw["metadata"]["attrs"]["children"] =
+                    serde_json::json!(children.to_string());
+                wrong.events.push(tool_turn(
+                    caller,
+                    serde_json::json!({"action": "send_message", "message_type": "text", "message": result}),
+                    serde_json::json!({"result_family": "control_receipt", "status": "queued", "success": true}),
+                    ok,
+                ));
+                assert!(
+                    !handoff_check(&wrong),
+                    "ordinary marker from {caller}, ok={ok}, cannot replace the wrong terminal body"
+                );
+            }
+        }
+
+        let arguments = serde_json::json!({"action": "get_result", "agent_id": "child-agent"});
+        // Use the real completed-result renderer, then the run_id enrichment
+        // performed by the production get_result owner.
+        let mut body: serde_json::Value = serde_json::from_str(
+            &astra_turn_core::orchestration::agent_result_wire::render_completed_agent_result(
+                "child-agent",
+                result,
+                None,
+            ),
+        )
+        .unwrap();
+        body["run_id"] = serde_json::json!("child-run");
+        let foreground =
+            |caller: &str, arguments: serde_json::Value, body: serde_json::Value, ok: bool| {
+                let mut capture = session.clone();
+                capture.events.truncate(2);
+                capture.events.push(tool_turn(caller, arguments, body, ok));
+                capture
+            };
+        let healthy = foreground("parent-run", arguments.clone(), body.clone(), true);
+        assert!(
+            handoff_check(&healthy),
+            "healthy foreground retrieval does not need background adoption"
+        );
+        assert!(!check(&healthy), "adoption-only default remains strict");
+        let foreground_mismatch = Criterion::SessionChildResultAdopted {
+            expected_result: Some("OTHER-RESULT".into()),
+            spawn_match: None,
+            allow_get_result: true,
+        };
+        let retrieved = evaluate_one(&foreground_mismatch, &observed, Some(&healthy));
+        assert!(!retrieved.passed);
+        assert!(retrieved.detail.contains("actual child result proven"));
+        assert!(retrieved.detail.contains("exact parent get_result"));
+        assert!(!handoff_check(&foreground(
+            "other-parent",
+            arguments.clone(),
+            body.clone(),
+            true
+        )));
+        assert!(!handoff_check(&foreground(
+            "parent-run",
+            arguments.clone(),
+            body.clone(),
+            false
+        )));
+        let mut wrong_arguments = arguments.clone();
+        wrong_arguments["agent_id"] = serde_json::json!("other-agent");
+        assert!(!handoff_check(&foreground(
+            "parent-run",
+            wrong_arguments,
+            body.clone(),
+            true
+        )));
+        for (field, value) in [
+            ("agent_id", serde_json::json!("other-agent")),
+            ("run_id", serde_json::json!("other-run")),
+            ("result", serde_json::json!("WRONG-RESULT")),
+            ("status", serde_json::json!("still_running")),
+            ("incomplete", serde_json::json!(true)),
+            ("result_family", serde_json::json!("control_receipt")),
+        ] {
+            let mut wrong_body = body.clone();
+            wrong_body[field] = value;
+            assert!(
+                !handoff_check(&foreground(
+                    "parent-run",
+                    arguments.clone(),
+                    wrong_body,
+                    true
+                )),
+                "wrong returned {field} must fail"
+            );
+        }
+        let mut wrong = healthy.clone();
+        wrong.events[1].raw["metadata"]["status"] = serde_json::json!("failed");
+        assert!(
+            !handoff_check(&wrong),
+            "terminal receipt cannot override failed child"
+        );
+        let mut wrong = healthy;
+        wrong.events[0].raw["metadata"]["model_configuration"]["prepared_selection"]["model_name"] =
+            serde_json::json!("deepseek-v4-flash");
+        assert!(
+            !handoff_check(&wrong),
+            "wrong model cannot supply the handoff"
+        );
+
+        for name in [
+            "flash_semantic_model_reference_glm",
+            "flash_discover_then_delegate_glm",
+        ] {
+            let case = crate::case::Case::from_path(
+                &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("cases/subagent_model_selection/{name}.yaml")),
+            )
+            .expect("load shipped GLM journey");
+            let witness = case
+                .criteria
+                .iter()
+                .find(|criterion| {
+                    matches!(criterion, Criterion::ExecutionChildResultsAdopted { .. })
+                })
+                .expect("GLM journey must prove its actual child result");
+            let Criterion::ExecutionChildResultsAdopted { children, .. } = witness else {
+                unreachable!()
+            };
+            let ChildExecutionExpectation {
+                expected_result,
+                model,
+                ..
+            } = &children[0];
+            let ChildResultExpectation::Text(expected_result) = expected_result else {
+                panic!("literal marker journey must have a text expectation");
+            };
+            let mut parent_marker = outcome.clone();
+            parent_marker.text = expected_result.clone();
+            parent_marker.run_id = Some("root".into());
+            assert!(
+                !evaluate_deterministic(std::slice::from_ref(witness), &parent_marker)[0].passed,
+                "parent-only marker must fail"
+            );
+            let mut capture = crate::execution_capture::tests::capture();
+            capture.run_tree.runs[1].runtime.model_name = Some(model.clone());
+            capture
+                .reflection
+                .model_requests
+                .terminal
+                .as_mut()
+                .unwrap()
+                .groups[0]
+                .model = model.clone();
+            let mut stream = crate::runner::StreamCapture::default();
+            stream.identity_verified = true;
+            stream.execution = Some(capture.clone());
+            parent_marker.stream_capture = Some(stream);
+            assert!(
+                !evaluate_deterministic(std::slice::from_ref(witness), &parent_marker)[0].passed,
+                "wrong actual child body must fail"
+            );
+            capture.reflection.graph_slice.nodes[0]
+                .metadata
+                .as_mut()
+                .unwrap()["execution_spine"]["facts"][1]["children"][0]["result_sha256"] =
+                serde_json::json!(format!("{:x}", Sha256::digest(expected_result.as_bytes())));
+            capture.transcript.as_mut().unwrap().items[0].content = expected_result.clone();
+            parent_marker.stream_capture.as_mut().unwrap().execution = Some(capture);
+            assert!(
+                evaluate_deterministic(std::slice::from_ref(witness), &parent_marker)[0].passed,
+                "exact canonical child adoption remains valid"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_child_question_uses_canonical_custody_and_answer_observation() {
+        let case = crate::case::Case::from_path(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("cases/subagent_model_selection/flash_child_question_parent_answer.yaml"),
+        )
+        .unwrap();
+        assert!(case.criteria.iter().any(|criterion| matches!(criterion,
+            Criterion::ExecutionChildResultsAdopted { children, .. }
+                if children.len() == 1 && children[0].answered_question
+                    && children[0].workspace_mutation == Some(astra_config::user_profile::WorkspaceMutationIntent::ReadOnly))));
+        assert!(!case.criteria.iter().any(|criterion| matches!(
+            criterion,
+            Criterion::AnyOf { .. } | Criterion::SessionChildResultAdopted { .. }
+        )));
+    }
+
+    #[test]
+    fn session_event_json_match_preserves_yaml_null() {
+        let parsed: Criterion = serde_yaml_ng::from_str(
+            "type: session_event_count\nevent_type: agent_spawned\nmin: 1\njson_match:\n  path: /metadata/model\n  equals: null\n",
+        )
+        .expect("YAML preserves explicit null in the nested matcher");
+        let Criterion::SessionEventCount {
+            json_match: Some(predicate),
+            ..
+        } = &parsed
+        else {
+            panic!("expected a session event matcher");
+        };
+        assert!(predicate.equals.is_null());
+        validate_criterion(&parsed).expect("parsed null predicate is valid");
+        let session = mk_session(&[(
+            "agent_spawned",
+            serde_json::json!({"metadata": {"model": null}}),
+        )]);
+        let evaluated = evaluate_deterministic_with_session(
+            std::slice::from_ref(&parsed),
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(evaluated[0].passed, "{}", evaluated[0].detail);
+    }
+
+    #[test]
+    fn session_event_count_can_bind_completed_model_call_to_spawned_child_run() {
+        let criterion = Criterion::SessionEventCount {
+            event_type: "LlmRoundCompleted".into(),
+            min: 1,
+            max: None,
+            json_match: Some(SessionEventJsonMatch {
+                path: "/payload/model".into(),
+                equals: serde_json::json!("glm-5.2"),
+                unique_by: None,
+                same_run_as: Some(SessionEventRunIdMatch {
+                    event_type: "agent_spawned".into(),
+                    run_id_path: "/metadata/run_id".into(),
+                    related_match: None,
+                }),
+            }),
+            optional: false,
+        };
+        validate_criterion(&criterion).expect("related run identity path is valid");
+
+        let linked = mk_session(&[
+            (
+                "agent_spawned",
+                serde_json::json!({"metadata": {"run_id": "child-run"}}),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "child-run",
+                    "payload": {"model": "glm-5.2"}
+                }),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "parent-run",
+                    "payload": {"model": "glm-5.2"}
+                }),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "other-child",
+                    "payload": {"model": "other-model"}
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&linked),
+        );
+        assert!(result[0].passed, "{}", result[0].detail);
+        assert!(result[0].detail.contains("count=1"));
+
+        let unlinked = mk_session(&[(
+            "LlmRoundCompleted",
+            serde_json::json!({
+                "run_id": "parent-run",
+                "payload": {"model": "glm-5.2"}
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&unlinked),
+        );
+        assert!(
+            !result[0].passed,
+            "a parent call must not satisfy child evidence"
+        );
+    }
+
+    #[test]
+    fn session_event_count_binds_lifecycle_metadata_run_without_spoofing_step_run() {
+        let criterion = Criterion::SessionEventCount {
+            event_type: "agent_terminated".into(),
+            min: 1,
+            max: Some(1),
+            json_match: Some(SessionEventJsonMatch {
+                path: "/metadata/status".into(),
+                equals: serde_json::json!("completed"),
+                unique_by: None,
+                same_run_as: Some(SessionEventRunIdMatch {
+                    event_type: "agent_spawned".into(),
+                    run_id_path: "/metadata/run_id".into(),
+                    related_match: None,
+                }),
+            }),
+            optional: false,
+        };
+        let check = |termination: serde_json::Value| {
+            let session = mk_session(&[
+                (
+                    "agent_spawned",
+                    serde_json::json!({"metadata": {"run_id": "child-run"}}),
+                ),
+                ("agent_terminated", termination),
+            ]);
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome_with_tools(&[]),
+                Some(&session),
+            )[0]
+            .passed
+        };
+        assert!(check(serde_json::json!({"metadata": {
+            "run_id": "child-run", "status": "completed"
+        }})));
+        assert!(!check(serde_json::json!({"metadata": {
+            "run_id": "other-run", "status": "completed"
+        }})));
+        assert!(!check(serde_json::json!({
+            "run_id": "other-run",
+            "metadata": {"run_id": "child-run", "status": "completed"}
+        })));
+    }
+
+    #[test]
+    fn session_event_count_can_bind_provider_call_to_a_specific_spawn_configuration() {
+        let criterion = Criterion::SessionEventCount {
+            event_type: "LlmRoundCompleted".into(),
+            min: 1,
+            max: Some(1),
+            json_match: Some(SessionEventJsonMatch {
+                path: "/payload/model".into(),
+                equals: serde_json::json!("glm-5.2"),
+                unique_by: None,
+                same_run_as: Some(SessionEventRunIdMatch {
+                    event_type: "agent_spawned".into(),
+                    run_id_path: "/metadata/run_id".into(),
+                    related_match: Some(SessionEventFieldMatch {
+                        path: "/metadata/fanout_slot/slot_index".into(),
+                        equals: serde_json::json!(1),
+                    }),
+                }),
+            }),
+            optional: false,
+        };
+        validate_criterion(&criterion).expect("specific related event predicate is valid");
+
+        let session = mk_session(&[
+            (
+                "agent_spawned",
+                serde_json::json!({
+                    "metadata": {
+                        "run_id": "plan-run",
+                        "fanout_slot": {"slot_index": 0}
+                    }
+                }),
+            ),
+            (
+                "agent_spawned",
+                serde_json::json!({
+                    "metadata": {
+                        "run_id": "review-run",
+                        "fanout_slot": {"slot_index": 1}
+                    }
+                }),
+            ),
+            (
+                "LlmRoundCompleted",
+                serde_json::json!({
+                    "run_id": "review-run",
+                    "payload": {"model": "glm-5.2"}
+                }),
+            ),
+        ]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(result[0].passed, "{}", result[0].detail);
+
+        let mut wrong_slot = session.clone();
+        wrong_slot.events[1].raw["metadata"]["fanout_slot"]["slot_index"] = serde_json::json!(0);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&wrong_slot),
+        );
+        assert!(!result[0].passed, "wrong slot must not satisfy the link");
     }
 
     #[test]
@@ -5341,6 +8247,8 @@ mod tests {
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                max: None,
+                json_match: None,
                 optional: false,
             }],
             &out,
@@ -5357,6 +8265,8 @@ mod tests {
             &[Criterion::SessionEventCount {
                 event_type: "llm_round".into(),
                 min: 2,
+                max: None,
+                json_match: None,
                 optional: true,
             }],
             &out,
@@ -5650,9 +8560,9 @@ mod tests {
                     "result_full": r#"{"fanout":{"terminal":3},"provenance":{"all_slots_delivered":true}}"#
                 }, {
                     "tool_call_id": "schema-rejected-call",
-                    "name": "submit_task_resolution",
+                    "name": "write_file",
                     "ok": false,
-                    "args_full": r#"{"remaining_gaps":["invalid"]}"#,
+                    "args_full": r#"{"path":42}"#,
                     "result_full": r#"{"error_kind":"tool_invalid_args"}"#,
                     "error_kind": "tool_invalid_args",
                     "disposition": "rejected",
@@ -5666,6 +8576,7 @@ mod tests {
                 name: "agent_fanout".into(),
                 min: 1,
                 max: 1,
+                root_only: false,
                 document: Some(JournalToolDocument::Arguments),
                 path: Some("/action".into()),
                 equals: Some(serde_json::json!("start")),
@@ -5675,18 +8586,24 @@ mod tests {
                 document: JournalToolDocument::Arguments,
                 path: "/target_count".into(),
                 equals: serde_json::json!(3),
+                where_match: None,
+                allow_missing: false,
             },
             Criterion::JournalToolJson {
                 name: "agent_fanout".into(),
                 document: JournalToolDocument::Result,
                 path: "/provenance/all_slots_delivered".into(),
                 equals: serde_json::json!(true),
+                where_match: None,
+                allow_missing: false,
             },
             Criterion::JournalToolJson {
-                name: "submit_task_resolution".into(),
+                name: "write_file".into(),
                 document: JournalToolDocument::RuntimeMetadata,
                 path: "/pre_dispatch_rejection".into(),
                 equals: serde_json::json!("provider_schema_validation"),
+                where_match: None,
+                allow_missing: false,
             },
         ];
         let results =
@@ -5704,6 +8621,8 @@ mod tests {
                 document: JournalToolDocument::Result,
                 path: "/fanout/terminal".into(),
                 equals: serde_json::json!(2),
+                where_match: None,
+                allow_missing: false,
             }],
             &outcome_with_tools(&[]),
             Some(&sess),
@@ -5712,10 +8631,12 @@ mod tests {
 
         let wrong_stage = evaluate_deterministic_with_session(
             &[Criterion::JournalToolJson {
-                name: "submit_task_resolution".into(),
+                name: "write_file".into(),
                 document: JournalToolDocument::RuntimeMetadata,
                 path: "/pre_dispatch_rejection".into(),
                 equals: serde_json::json!("handler_error"),
+                where_match: None,
+                allow_missing: false,
             }],
             &outcome_with_tools(&[]),
             Some(&sess),
@@ -5723,6 +8644,184 @@ mod tests {
         assert!(
             !wrong_stage[0].passed,
             "another rejection stage must not match"
+        );
+
+        let case: crate::case::Case =
+            serde_yaml_ng::from_str(include_str!("../cases/fanout_completion_truth.yaml")).unwrap();
+        let no_extra_spawn = case.criteria.iter().find(|criterion| {
+            matches!(criterion, Criterion::JournalToolCallCount { name, .. } if name == "agent")
+        }).unwrap();
+        for (action, allowed) in [("wait", true), ("spawn", false)] {
+            let session = mk_session(&[(
+                "turn",
+                serde_json::json!({
+                    "tool_calls": [{
+                        "tool_call_id": "parent-control", "name": "agent", "ok": true,
+                        "args_full": serde_json::json!({"action": action}).to_string(),
+                        "result_full": "{}"
+                    }]
+                }),
+            )]);
+            let result = evaluate_deterministic_with_session(
+                std::slice::from_ref(no_extra_spawn),
+                &outcome_with_tools(&[]),
+                Some(&session),
+            );
+            assert_eq!(result[0].passed, allowed, "{action}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn durable_tool_json_can_assert_optional_field_is_unset() {
+        let session_with_args = |args: &str| {
+            mk_session(&[(
+                "turn",
+                serde_json::json!({
+                    "tool_calls": [{
+                        "tool_call_id": "spawn-call",
+                        "name": "agent",
+                        "ok": true,
+                        "args_full": args,
+                        "result_full": "{}"
+                    }]
+                }),
+            )])
+        };
+        let criterion = Criterion::JournalToolJson {
+            name: "agent".into(),
+            document: JournalToolDocument::Arguments,
+            path: "/requested_model_policy".into(),
+            equals: serde_json::Value::Null,
+            where_match: Some(JournalJsonPredicate {
+                document: JournalToolDocument::Arguments,
+                path: "/action".into(),
+                equals: Some(serde_json::json!("spawn")),
+                contains: None,
+            }),
+            allow_missing: true,
+        };
+        let outcome = outcome_with_tools(&[]);
+
+        for args in [
+            r#"{"action":"spawn"}"#,
+            r#"{"action":"spawn","requested_model_policy":null}"#,
+        ] {
+            let session = session_with_args(args);
+            let result = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&session),
+            );
+            assert!(result[0].passed, "unset selector should match: {result:?}");
+        }
+
+        let selected =
+            session_with_args(r#"{"action":"spawn","requested_model_policy":{"mode":"fixed"}}"#);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome,
+            Some(&selected),
+        );
+        assert!(!result[0].passed, "a non-null selection must not match");
+
+        let selected_then_retrieved = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [
+                    {"tool_call_id":"spawn-call", "name":"agent", "ok":true,
+                     "args_full":r#"{"action":"spawn","requested_model_policy":{"mode":"fixed"}}"#,
+                     "result_full":"{}"},
+                    {"tool_call_id":"get-call", "name":"agent", "ok":true,
+                     "args_full":r#"{"action":"get_result","agent_id":"child"}"#,
+                     "result_full":"{}"}
+                ]
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome,
+            Some(&selected_then_retrieved),
+        );
+        assert!(
+            !result[0].passed,
+            "get_result must not supply the spawn's absent selector"
+        );
+
+        let null_filter: Criterion = serde_json::from_value(serde_json::json!({
+            "type":"journal_tool_json", "name":"agent", "document":"arguments",
+            "path":"/requested_model_policy", "equals":null,
+            "allow_missing":true,
+            "where_match":{"document":"arguments","path":"/action","equals":null}
+        }))
+        .unwrap();
+        assert!(matches!(
+            &null_filter,
+            Criterion::JournalToolJson { where_match: Some(predicate), .. }
+                if predicate.equals.as_ref().is_some_and(serde_json::Value::is_null)
+        ));
+        let explicit_null = session_with_args(r#"{"action":null,"requested_model_policy":null}"#);
+        assert!(
+            evaluate_deterministic_with_session(
+                std::slice::from_ref(&null_filter),
+                &outcome,
+                Some(&explicit_null)
+            )[0]
+            .passed
+        );
+        let missing_action = session_with_args(r#"{"requested_model_policy":null}"#);
+        assert!(
+            !evaluate_deterministic_with_session(&[null_filter], &outcome, Some(&missing_action))
+                [0]
+            .passed
+        );
+
+        let strict = Criterion::JournalToolJson {
+            name: "agent".into(),
+            document: JournalToolDocument::Arguments,
+            path: "/requested_model_policy".into(),
+            equals: serde_json::Value::Null,
+            where_match: None,
+            allow_missing: false,
+        };
+        let missing = session_with_args(r#"{"action":"spawn"}"#);
+        let result = evaluate_deterministic_with_session(&[strict], &outcome, Some(&missing));
+        assert!(
+            !result[0].passed,
+            "exact null assertion must continue distinguishing a missing key"
+        );
+
+        for unusable in ["not-json", "[]", "null"] {
+            let session = session_with_args(unusable);
+            let result = evaluate_deterministic_with_session(
+                std::slice::from_ref(&criterion),
+                &outcome,
+                Some(&session),
+            );
+            assert!(
+                !result[0].passed,
+                "unusable/non-object arguments must not count as an omitted property: {unusable}"
+            );
+        }
+
+        let missing_document = mk_session(&[(
+            "turn",
+            serde_json::json!({
+                "tool_calls": [{
+                    "tool_call_id": "spawn-call",
+                    "name": "agent",
+                    "ok": true,
+                    "result_full": "{}"
+                }]
+            }),
+        )]);
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome,
+            Some(&missing_document),
+        );
+        assert!(
+            !result[0].passed,
+            "missing arguments evidence must not count as an omitted property"
         );
     }
 
@@ -6068,7 +9167,8 @@ mod tests {
             producer_filter: Some(JournalJsonPredicate {
                 document: JournalToolDocument::Arguments,
                 path: "/action".into(),
-                equals: serde_json::json!("remember"),
+                equals: Some(serde_json::json!("remember")),
+                contains: None,
             }),
             consumer: "memory".into(),
             consumer_document: JournalToolDocument::Arguments,
@@ -6080,7 +9180,8 @@ mod tests {
             consumer_filter: Some(JournalJsonPredicate {
                 document: JournalToolDocument::Arguments,
                 path: "/action".into(),
-                equals: serde_json::json!("forget"),
+                equals: Some(serde_json::json!("forget")),
+                contains: None,
             }),
         };
         let mut empty_destination = criterion.clone();
@@ -6252,12 +9353,14 @@ mod tests {
                 JournalJsonPredicate {
                     document: JournalToolDocument::Arguments,
                     path: "/action".into(),
-                    equals: serde_json::json!("remember"),
+                    equals: Some(serde_json::json!("remember")),
+                    contains: None,
                 },
                 JournalJsonPredicate {
                     document: JournalToolDocument::Arguments,
                     path: "/memory_type".into(),
-                    equals: serde_json::json!("working"),
+                    equals: Some(serde_json::json!("working")),
+                    contains: None,
                 },
             ],
             consumer: "memory".into(),
@@ -6267,12 +9370,14 @@ mod tests {
                 JournalJsonPredicate {
                     document: JournalToolDocument::Arguments,
                     path: "/action".into(),
-                    equals: serde_json::json!("recall"),
+                    equals: Some(serde_json::json!("recall")),
+                    contains: None,
                 },
                 JournalJsonPredicate {
                     document: JournalToolDocument::Arguments,
                     path: "/scope".into(),
-                    equals: serde_json::json!("session"),
+                    equals: Some(serde_json::json!("session")),
+                    contains: None,
                 },
             ],
             min_turns_after_producer: None,
@@ -6367,12 +9472,14 @@ mod tests {
                 JournalJsonPredicate {
                     document: JournalToolDocument::Arguments,
                     path: "/action".into(),
-                    equals: serde_json::json!("remember"),
+                    equals: Some(serde_json::json!("remember")),
+                    contains: None,
                 },
                 JournalJsonPredicate {
                     document: JournalToolDocument::Arguments,
                     path: "/memory_type".into(),
-                    equals: serde_json::json!("working"),
+                    equals: Some(serde_json::json!("working")),
+                    contains: None,
                 },
             ],
             consumer: "memory".into(),
@@ -6382,12 +9489,14 @@ mod tests {
                 JournalJsonPredicate {
                     document: JournalToolDocument::Arguments,
                     path: "/action".into(),
-                    equals: serde_json::json!("recall"),
+                    equals: Some(serde_json::json!("recall")),
+                    contains: None,
                 },
                 JournalJsonPredicate {
                     document: JournalToolDocument::Arguments,
                     path: "/scope".into(),
-                    equals: serde_json::json!("session"),
+                    equals: Some(serde_json::json!("session")),
+                    contains: None,
                 },
             ],
             min_turns_after_producer: Some(1),
@@ -6612,6 +9721,35 @@ mod tests {
 
         assert!(!result[0].passed);
         assert!(result[0].detail.contains("observations=1"));
+    }
+
+    #[test]
+    fn stable_prefix_observation_gate_requires_data_but_does_not_claim_reuse() {
+        let criterion = Criterion::ProviderStablePrefixCacheCoverage {
+            min: 0.0,
+            min_observations: 1,
+        };
+        let no_observation = mk_session(&[]);
+        let zero_reuse = mk_session(&[(
+            "pipeline_feedback",
+            provider_prefix_cache_event(1, 9_000, 0, 9_000),
+        )]);
+
+        let missing = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&no_observation),
+        );
+        assert!(!missing[0].passed);
+        assert!(missing[0].detail.contains("provider-prefix observations=0"));
+
+        let observed = evaluate_deterministic_with_session(
+            &[criterion],
+            &outcome_with_tools(&[]),
+            Some(&zero_reuse),
+        );
+        assert!(observed[0].passed, "this is an observation-presence gate");
+        assert!(observed[0].detail.contains("read=0"));
     }
 
     #[test]
@@ -7277,6 +10415,28 @@ mod tests {
     }
 
     #[test]
+    fn deferred_work_creation_case_requires_cache_observation_presence() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("cases/work_auto_decomposition_journey.yaml");
+        let case = crate::case::Case::from_path(&path).expect("load shipped Work case");
+        let gate = case
+            .criteria
+            .iter()
+            .find(|criterion| {
+                matches!(criterion, Criterion::AllOf { criteria }
+                if criteria.iter().any(|inner| {
+                    matches!(inner, Criterion::ProviderStablePrefixCacheCoverage { .. })
+                }))
+            })
+            .expect("stable-prefix observation is a required case contract");
+        assert_eq!(criterion_severity(gate), CriterionSeverity::Hard);
+        assert!(matches!(gate, Criterion::AllOf { criteria }
+            if criteria.iter().any(|inner| matches!(inner,
+                Criterion::ProviderStablePrefixCacheCoverage { min, min_observations: 1 }
+                if *min == 0.0))));
+    }
+
+    #[test]
     fn shipped_multi_turn_cache_case_gates_reads_without_exact_creation_usage() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("cases/pipeline_cache_hit_multi_turn.yaml");
@@ -7601,21 +10761,42 @@ mod tests {
     }
 
     #[test]
-    fn validate_session_event_count_rejects_min_zero() {
+    fn validate_session_event_count_rejects_unbounded_min_zero() {
         let err = validate_criterion(&Criterion::SessionEventCount {
             event_type: "llm_round".into(),
             min: 0,
+            max: None,
+            json_match: None,
             optional: false,
         })
         .expect_err("min=0 is trivially-true — should reject");
-        assert!(err.contains("min must be >= 1"));
+        assert!(err.contains("min=0 requires max"));
     }
 
     #[test]
-    fn validate_fork_cache_outcome_rejects_empty_expect() {
-        let err = validate_criterion(&Criterion::ForkCacheOutcome { expect: vec![] })
-            .expect_err("empty expect should fail");
-        assert!(err.contains("must not be empty"));
+    fn session_event_count_can_prove_no_child_start() {
+        let session = mk_session(&[("llm_round", serde_json::json!({}))]);
+        let criterion = Criterion::SessionEventCount {
+            event_type: "agent_spawned".into(),
+            min: 0,
+            max: Some(0),
+            json_match: None,
+            optional: false,
+        };
+        validate_criterion(&criterion).expect("bounded absence check");
+        let result = evaluate_deterministic_with_session(
+            std::slice::from_ref(&criterion),
+            &outcome_with_tools(&[]),
+            Some(&session),
+        );
+        assert!(result[0].passed, "{}", result[0].detail);
+        let started = mk_session(&[("agent_spawned", serde_json::json!({}))]);
+        let result = evaluate_deterministic_with_session(
+            &[criterion],
+            &outcome_with_tools(&[]),
+            Some(&started),
+        );
+        assert!(!result[0].passed, "{}", result[0].detail);
     }
 
     #[test]
@@ -7634,6 +10815,7 @@ mod tests {
             name: "agent_fanout".into(),
             min: 1,
             max: 1,
+            root_only: false,
             document: Some(JournalToolDocument::Arguments),
             path: Some("/action".into()),
             equals: None,
@@ -7649,6 +10831,7 @@ mod tests {
             name: "agent_fanout".into(),
             min: 1,
             max: 1,
+            root_only: false,
             document: Some(JournalToolDocument::Arguments),
             path: Some("action".into()),
             equals: Some(serde_json::json!("start")),
@@ -7748,124 +10931,6 @@ mod tests {
         let err = validate_criteria(&criteria).expect_err("second criterion is bad");
         assert!(err.contains("criteria[2]"), "1-based index expected: {err}");
         assert!(err.contains("min (5) > max (2)"));
-    }
-
-    // ── ForkCacheOutcome tests ──
-
-    fn outcome_with_stderr(stderr: &str) -> RunOutcome {
-        let mut out = outcome_with_tools(&[]);
-        out.stderr = stderr.to_string();
-        out
-    }
-
-    #[test]
-    fn fork_cache_outcome_passes_on_real_wire_shape() {
-        // Real wire shape emitted by
-        // `astra_turn_core::fork_cache_event::StderrForkCacheSink`.
-        // The field is `outcome`, rename_all = snake_case.
-        let out = outcome_with_stderr(
-            "[fork-cache] {\"prefix_id\":\"pfx-1\",\"outcome\":\"hit\",\"ratio\":0.9}",
-        );
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into()],
-            }],
-            &out,
-        );
-        assert!(r[0].passed);
-    }
-
-    #[test]
-    fn fork_cache_outcome_accepts_legacy_class_alias() {
-        // Back-compat: older harness tooling + a brief YAML window
-        // used `class` as the field name. The parser still accepts
-        // it so a rename on the consumer side doesn't silently
-        // break cases that predate the rename.
-        let out = outcome_with_stderr("[fork-cache] {\"class\":\"hit\"}");
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into()],
-            }],
-            &out,
-        );
-        assert!(r[0].passed);
-    }
-
-    #[test]
-    fn fork_cache_outcome_rejects_unknown_shape_instead_of_guessing() {
-        // Regression: the previous implementation fell back to "first
-        // object key" for events it couldn't parse, which silently
-        // misclassified `{"metadata":{...}}` or similar as a valid
-        // class. Now: unknown shapes produce NO outcome, and the
-        // criterion reports zero events seen rather than guessing.
-        let out = outcome_with_stderr("[fork-cache] {\"prefix_id\":\"x\",\"metadata\":{}}");
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into(), "partial_drift".into()],
-            }],
-            &out,
-        );
-        assert!(!r[0].passed);
-        assert!(
-            r[0].detail.contains("no [fork-cache]"),
-            "unknown-shape events must not be fabricated into outcomes; detail = {:?}",
-            r[0].detail
-        );
-    }
-
-    #[test]
-    fn fork_cache_outcome_fails_when_only_other_outcomes_seen() {
-        let out = outcome_with_stderr("[fork-cache] {\"outcome\":\"miss\"}");
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into()],
-            }],
-            &out,
-        );
-        assert!(!r[0].passed);
-        assert!(r[0].detail.contains("miss"));
-    }
-
-    #[test]
-    fn fork_cache_outcome_fails_when_no_events_seen() {
-        let out = outcome_with_stderr("unrelated noise");
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into()],
-            }],
-            &out,
-        );
-        assert!(!r[0].passed);
-        assert!(r[0].detail.contains("no [fork-cache]"));
-    }
-
-    #[test]
-    fn fork_cache_outcome_ignores_malformed_event_and_uses_good_ones() {
-        let out = outcome_with_stderr(
-            "[fork-cache] this is not json\n[fork-cache] {\"outcome\":\"hit\"}\n",
-        );
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into()],
-            }],
-            &out,
-        );
-        assert!(
-            r[0].passed,
-            "one malformed event must not mask a later valid hit"
-        );
-    }
-
-    #[test]
-    fn fork_cache_outcome_accepts_any_of_multiple_expected_values() {
-        let out = outcome_with_stderr("[fork-cache] {\"outcome\":\"partial_drift\"}");
-        let r = evaluate_deterministic(
-            &[Criterion::ForkCacheOutcome {
-                expect: vec!["hit".into(), "partial_drift".into()],
-            }],
-            &out,
-        );
-        assert!(r[0].passed);
     }
 
     #[test]

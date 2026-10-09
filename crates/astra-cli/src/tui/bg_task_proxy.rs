@@ -65,7 +65,11 @@ pub(crate) fn safe_output_window(
     max_bytes: usize,
 ) -> (String, u64, u64, u64) {
     let (output, end, total_bytes, total_lines) =
-        astra_tools::credential_redaction::redacted_output_window(raw, offset as usize, max_bytes);
+        astra_text_utils::credential_redaction::redacted_output_window(
+            raw,
+            offset as usize,
+            max_bytes,
+        );
     (output, end as u64, total_bytes as u64, total_lines as u64)
 }
 
@@ -89,6 +93,11 @@ pub(crate) fn local_agent_status_projection(
         AgentStatus::Waiting { reason } => (
             "waiting_for_input",
             Some(format!("Agent is waiting: {reason}")),
+            None,
+        ),
+        AgentStatus::Paused { reason } => (
+            "waiting_for_input",
+            Some(format!("Agent is paused: {reason}")),
             None,
         ),
         AgentStatus::Completed {
@@ -134,7 +143,7 @@ pub(crate) fn local_agent_output_tail(output: Option<String>) -> Option<String> 
             return None;
         }
         Some(
-            astra_tools::credential_redaction::redacted_output_tail_chars(
+            astra_text_utils::credential_redaction::redacted_output_tail_chars(
                 &output,
                 LOCAL_AGENT_OUTPUT_TAIL_CHARS,
             ),
@@ -146,10 +155,6 @@ pub(crate) fn background_local_agent_projection_from_info(
     agent: &astra_turn_core::orchestration_types::SpawnedAgentInfo,
     fanout_title: Option<&str>,
 ) -> Option<astra_services::session_workspace::BackgroundLocalAgentTaskProjection> {
-    if !agent.run_in_background {
-        return None;
-    }
-
     let (status, output, terminal_reason) = local_agent_status_projection(&agent.status);
     let started_at_ms = agent
         .started_at
@@ -580,7 +585,7 @@ pub(crate) fn background_task_output_snapshot_for_local_agent(
             crate::edge_tools::BgTaskOutputStatus::WaitingForInput,
             "Agent is waiting for input.".to_string(),
         ),
-        AgentStatus::Waiting { reason } => (
+        AgentStatus::Waiting { reason } | AgentStatus::Paused { reason } => (
             crate::edge_tools::BgTaskOutputStatus::WaitingForInput,
             format!("Agent is waiting: {reason}"),
         ),

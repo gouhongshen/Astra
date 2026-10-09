@@ -3,13 +3,14 @@ use std::path::{Path, PathBuf};
 
 use super::{
     AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, SANDBOX_DENIED_PREFIX, ToolExecutor, code_intel,
-    fuzzy_replacer, tool_output_limit, truncate_output,
+    tool_output_limit, truncate_output,
 };
 use astra_runtime::tool_sandbox::validate_path;
 use astra_tools::fs_ops::{
-    check_anchor_vs_replacement_size, normalize_read_file_line_range, read_to_string_lossy,
-    str_replace_fail, validate_read_file_args,
+    PreparedWriteFile, normalize_read_file_line_range, read_to_string_lossy, unified_diff_raw,
+    validate_read_file_args,
 };
+use astra_turn_core::file_edit_journal::EditType;
 use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
 use serde_json::{Value, json};
 
@@ -72,13 +73,14 @@ fn edit_type_label(edit_type: astra_turn_core::file_edit_journal::EditType) -> &
 }
 
 #[derive(Debug)]
-enum FsLeafError {
+pub(super) enum FsLeafError {
     SandboxDenied(String),
     NoEffect {
         output: String,
         evidence: astra_core::ToolFailureEvidence,
     },
     Other(String),
+    Shared(astra_tools::ToolResult),
 }
 
 impl FsLeafError {
@@ -122,14 +124,16 @@ impl FsLeafError {
                 .with_failure_evidence(evidence)
                 .with_workspace_mutation_not_applied(),
             Self::Other(output) => astra_tools::ToolResult::error(output),
+            Self::Shared(result) => result,
         }
     }
 
-    fn into_string_output(self) -> String {
+    pub(super) fn into_string_output(self) -> String {
         match self {
             Self::SandboxDenied(message) => format!("{SANDBOX_DENIED_PREFIX}{message}"),
             Self::NoEffect { output, .. } => output,
             Self::Other(output) => output,
+            Self::Shared(result) => result.output,
         }
     }
 }
@@ -140,40 +144,8 @@ impl From<String> for FsLeafError {
     }
 }
 
-// NOTE on removed `is_dangerous_write_target`:
-//
-// An earlier version of this file maintained a hard-block list of
-// "dangerous" filenames (`.env`, `.bashrc`, `.aws/credentials`, …) and
-// refused write_file/str_replace/notebook_edit to any matching path,
-// telling the model "use bash to bypass". That guard was deleted on
-// 2026-05-15 because:
-//
-//   1. It's bypassable in one tool-call. The model just routes through
-//      bash. The error message even told it how. So it stops zero
-//      malicious or buggy paths.
-//   2. It has a high false-positive rate. `.env.example` (a public
-//      template, the opposite of a secret) was flagged identically to
-//      `.env`, refusing the standard `cp .env.example .env` workflow.
-//   3. It's filename-based, never content-based. It cannot detect a
-//      secret pasted into `notes.txt` and it wrongly flags an empty
-//      `.env`.
-//   4. The real protections are elsewhere and still in force:
-//        - `validate_path` (sandbox) blocks paths outside the project.
-//        - `permission_redact::matches_sensitive_path` redacts secret
-//          *display* in approval cards.
-//        - `safety_middleware::redact_credentials_in_text` runs on
-//          tool *output* before it reaches the LLM, masking real
-//          API keys / tokens / PEMs by content pattern.
-//
-// reference-agent follows the same philosophy (`tools/FileWriteTool` has
-// no filename-based block; the only content guard is
-// `checkTeamMemSecrets`, which is path-and-content-scoped to a
-// shared team-memory directory we don't have).
-//
-// If a content-based scan ever lands here, it should match
-// the reference agent's shape: scan content, not name; warn or redact, not
-// hard-block; and only when writing to a path that's actually
-// shared/synced.
+// Path access belongs to sandbox authorization. Approval display and tool-output
+// redaction protect secrets without adding a parallel filename-based write policy.
 
 impl ToolExecutor {
     fn read_file_model_output_limit(&self) -> usize {
@@ -269,11 +241,107 @@ impl ToolExecutor {
             .map_err(FsLeafError::into_string_output)
     }
 
+    /// Bind the already-authorized spelling to its actual publication target.
+    /// Atomic rename must replace the referent, not a symlink directory entry.
+    pub(super) fn bind_file_mutation_target(&self, path: &Path) -> Result<PathBuf, FsLeafError> {
+        let target = match path.canonicalize() {
+            Ok(target) => target,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_symlink()) {
+                    return Err(
+                        format!("Error: Cannot bind dangling symlink {}", path.display()).into(),
+                    );
+                }
+                astra_sandbox::canonicalize_parent_and_append(path)
+                    .map_err(|error| format!("Error: Cannot bind file target: {error}"))?
+            }
+            Err(error) => {
+                return Err(
+                    format!("Error: Cannot bind file target {}: {error}", path.display()).into(),
+                );
+            }
+        };
+        if !self.is_within_sandbox_boundary(&target) {
+            return Err(FsLeafError::sandbox_denied(format!(
+                "Path '{}' resolves outside the approved sandbox boundary",
+                path.display()
+            )));
+        }
+        Ok(target)
+    }
+
+    pub(super) fn verify_file_mutation_binding(
+        &self,
+        path: &Path,
+        target: &Path,
+    ) -> Result<(), FsLeafError> {
+        if self.bind_file_mutation_target(path)? != target {
+            return Err(format!(
+                "Error: File target binding changed for {}; re-read the file before editing",
+                path.display()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn record_committed_file_edit(
+        &self,
+        path: &Path,
+        call_id: &str,
+        before: Option<&[u8]>,
+        after: &[u8],
+        edit_type: EditType,
+    ) {
+        let turn = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.file_journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record_committed(path, call_id, turn, before, after, edit_type);
+        self.record_write_with_content(
+            path,
+            std::str::from_utf8(after).expect("prepared text publication is UTF-8"),
+        );
+    }
+
+    pub(super) fn apply_prepared_file_edit(
+        &self,
+        prepared: &PreparedWriteFile,
+        call_id: &str,
+        edit_type: EditType,
+    ) -> astra_tools::ToolResult {
+        let result = prepared.apply();
+        if !result.is_error && !prepared.is_already_desired() {
+            self.record_committed_file_edit(
+                prepared.path(),
+                call_id,
+                prepared.original_content_bytes(),
+                prepared.content_bytes(),
+                if prepared.original_content_bytes().is_none() {
+                    EditType::Create
+                } else {
+                    edit_type
+                },
+            );
+        }
+        result
+    }
+
     pub(crate) fn read_file(&self, args: &Value) -> String {
         self.read_file_with_metadata(args).output
     }
 
     pub(crate) fn read_file_with_metadata(&self, args: &Value) -> astra_tools::ToolResult {
+        if let Err(error) = validate_read_file_args(args) {
+            return FsLeafError::caller_correctable_no_effect(
+                error,
+                vec![astra_core::ToolRecoveryAction::CorrectArguments],
+            )
+            .into_tool_result()
+            .with_execution_not_started();
+        }
         match self.read_file_impl(args) {
             Ok(output) => astra_tools::ToolResult::text(output),
             Err(error) => error.into_tool_result(),
@@ -281,7 +349,6 @@ impl ToolExecutor {
     }
 
     fn read_file_impl(&self, args: &Value) -> Result<String, FsLeafError> {
-        validate_read_file_args(args)?;
         let path_str = match args.get("path").and_then(Value::as_str) {
             Some(p) => p,
             None => {
@@ -365,57 +432,26 @@ impl ToolExecutor {
             let size = meta.len() as usize;
             let limit = self.scaled_output_limit();
             if size > limit {
-                // Cap the read at 2× the output limit to avoid OOM on
-                // multi-GB files. We only need enough to generate an
-                // outline — symbols are typically in the first portion.
-                // `total_lines` is estimated from the capped read + the
-                // remaining unread bytes (assuming ~40 chars/line).
+                // Capture a bounded prefix for a partial outline; it is not
+                // evidence of definitions or line counts in the unread suffix.
                 let cap = limit.saturating_mul(2).min(size);
                 let content = read_capped_to_string_lossy(&path, cap)
                     .map_err(|e| format!("Error reading file: {e}"))?;
                 let lines_in_cap = content.lines().count();
-                // Extrapolate total line count from the sampled portion
-                // rather than assuming a fixed 40 chars/line (which was
-                // wildly wrong for minified JS/CSS and near-binary files).
-                // Falls back to the old estimate only if the sample is
-                // empty (avoid div-by-zero).
-                let total_lines = if cap < size {
-                    if lines_in_cap > 0 && cap > 0 {
-                        // Scale: lines_in_cap * (size / cap), using
-                        // u128 to avoid overflow on huge files.
-                        let scaled = (lines_in_cap as u128 * size as u128 / cap as u128) as usize;
-                        scaled.max(lines_in_cap)
-                    } else {
-                        lines_in_cap + (size - cap) / 40
-                    }
+                let safe_outline_text =
+                    astra_tools::fs_ops::render_outline(&path, &content, lines_in_cap)
+                        .unwrap_or_else(|| {
+                            format!("(no definitions found in {lines_in_cap}-line sample)")
+                        });
+                let coverage = if cap < size {
+                    format!("partial content: sampled first {cap} bytes")
                 } else {
-                    lines_in_cap
+                    format!("{lines_in_cap} lines")
                 };
-
-                let outline_text = if let Some(lang) = code_intel::detect_language(&path) {
-                    let generated = code_intel::generate_outline(&content, lang);
-                    if generated.trim().is_empty() {
-                        format!(
-                            "(outline generation returned empty for this file — \
-                                 {total_lines} total lines)"
-                        )
-                    } else {
-                        generated
-                    }
-                } else {
-                    format!(
-                        "(no symbol outline available for this file type — \
-                             {total_lines} total lines)"
-                    )
-                };
-                let (safe_outline_text, _) =
-                    astra_tools::credential_redaction::redact_credentials_for_display(
-                        &outline_text,
-                    );
 
                 return Ok(format!(
-                    "File is large ({size} bytes, {total_lines} lines). \
-                     Auto-generated outline below.\n\n\
+                    "File is large ({size} bytes, {coverage}). \
+                     Outline of the captured content below.\n\n\
                      {safe_outline_text}\n\n\
                      To read specific sections, use:\n\
                      • read_file(path=\"{path_str}\", start_line=1, end_line=100) — first 100 lines\n\
@@ -447,47 +483,19 @@ impl ToolExecutor {
                             };
                         let total_lines = content_for_outline.lines().count();
                         let (safe_content_for_outline, _) =
-                            astra_tools::credential_redaction::redact_credentials_in_text(
+                            astra_text_utils::credential_redaction::redact_credentials_in_text(
                                 &content_for_outline,
                             );
                         self.record_read_cached(&path, true, content_for_outline.clone());
 
-                        if let Some(ts_lang) = code_intel::detect_language(&path) {
-                            let outline =
-                                code_intel::generate_outline(&content_for_outline, ts_lang);
-                            if !outline.is_empty() {
-                                let def_count = outline.lines().count();
-                                let (safe_outline, _) =
-                                    astra_tools::credential_redaction::redact_credentials_for_display(
-                                        &outline,
-                                    );
-                                return Ok(format!(
-                                    "[Auto-downgraded to outline — aggregate output budget is high \
-                                     ({agg} bytes used). Use start_line/end_line to read specific sections.]\n\
-                                     # Outline ({total_lines} lines, {def_count} symbols)\n{safe_outline}"
-                                ));
-                            }
-                        }
-
-                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                        let lang = detect_language(ext);
-                        let outline = extract_outline(&content_for_outline, lang);
-                        if !outline.is_empty() {
-                            let rendered_outline = outline
-                                .iter()
-                                .map(|(line_no, sig)| format!("{line_no}: {sig}"))
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            let (safe_outline, _) =
-                                astra_tools::credential_redaction::redact_credentials_for_display(
-                                    &rendered_outline,
-                                );
+                        if let Some(outline) = astra_tools::fs_ops::render_outline(
+                            &path,
+                            &content_for_outline,
+                            total_lines,
+                        ) {
                             return Ok(format!(
                                 "[Auto-downgraded to outline — aggregate output budget is high \
-                                 ({agg} bytes used). Use start_line/end_line to read specific sections.]\n\
-                                 # Outline ({total_lines} lines, {} definitions)\n{}",
-                                outline.len(),
-                                safe_outline
+                                 ({agg} bytes used). Use start_line/end_line to read specific sections.]\n{outline}"
                             ));
                         }
 
@@ -553,47 +561,19 @@ impl ToolExecutor {
         // partial secret.  Keep `raw_content` for AST parsing, line-range
         // accounting, and the staleness cache.
         let (safe_content, _) =
-            astra_tools::credential_redaction::redact_credentials_in_text(&raw_content);
+            astra_text_utils::credential_redaction::redact_credentials_in_text(&raw_content);
 
         // Outline isolation: return only definition signatures with line numbers
         if has_outline {
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let total_lines = raw_content.lines().count();
-
-            // Record as partial read (outline), caching full content
+            // An outline does not authorize a full overwrite, even when cached.
             self.record_read_cached(&path, true, raw_content.clone());
-
-            // Try tree-sitter first for accurate AST-based extraction
-            if let Some(ts_lang) = code_intel::detect_language(&path) {
-                let outline = code_intel::generate_outline(&raw_content, ts_lang);
-                if !outline.is_empty() {
-                    let def_count = outline.lines().count();
-                    return Ok(format!(
-                        "# Outline ({total_lines} lines, {def_count} symbols)\n{}",
-                        astra_tools::credential_redaction::redact_credentials_for_display(&outline)
-                            .0
-                    ));
-                }
-            }
-
-            // Fall back to regex-based detection
-            let lang = detect_language(ext);
-            let outline = extract_outline(&raw_content, lang);
-            if outline.is_empty() {
-                return Ok(format!("(no definitions found in {total_lines}-line file)"));
-            }
-            return Ok(format!(
-                "# Outline ({total_lines} lines total, {} definitions)\n{}",
-                outline.len(),
-                astra_tools::credential_redaction::redact_credentials_for_display(
-                    &outline
-                        .iter()
-                        .map(|(line_no, sig)| format!("{line_no}: {sig}"))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                )
-                .0
-            ));
+            return Ok(
+                astra_tools::fs_ops::render_outline(&path, &raw_content, total_lines)
+                    .unwrap_or_else(|| {
+                        format!("(no definitions found in {total_lines}-line file)")
+                    }),
+            );
         }
 
         let is_ranged = has_range;
@@ -620,7 +600,7 @@ impl ToolExecutor {
                 && raw_content.len() <= AUTO_EXPAND_MAX_BYTES
             {
                 let total_lines = raw_content.lines().count();
-                let expanded_content = astra_tools::credential_redaction::redact_line_window(
+                let expanded_content = astra_text_utils::credential_redaction::redact_line_window(
                     &raw_content,
                     1,
                     total_lines,
@@ -732,7 +712,7 @@ impl ToolExecutor {
             ));
         }
         let actual_start_line = s + 1; // 1-indexed
-        let safe_range = astra_tools::credential_redaction::redact_line_window(
+        let safe_range = astra_text_utils::credential_redaction::redact_line_window(
             &raw_content,
             actual_start_line,
             e,
@@ -843,14 +823,28 @@ impl ToolExecutor {
             Err(e) => return json!({ "success": false, "error": e }).to_string(),
         };
         let content = match args.get("content").and_then(Value::as_str) {
-            // Normalize from the caller's logical path spelling.  The path
-            // has already been resolved and sandbox-authorized above; using
-            // that resolved path here would make the owner outcome diverge
-            // from the shared convergence contract for explicitly allowed
-            // absolute paths or symlink aliases.
-            Some(c) => astra_tools::fs_ops::normalize_content_before_write(Path::new(path_arg), c),
+            Some(c) => c,
             None => return json!({ "success": false, "error": "missing 'content'" }).to_string(),
         };
+
+        let target = match self.bind_file_mutation_target(&path) {
+            Ok(target) => target,
+            Err(error) => {
+                return json!({"success": false, "error": error.into_string_output()}).to_string();
+            }
+        };
+        let prior_bytes = match fs::read(&target) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return json!({"success": false, "error": format!("Error reading file: {error}")})
+                    .to_string();
+            }
+        };
+        let prepared =
+            PreparedWriteFile::from_authorized_preimage(target, path_arg, content, prior_bytes);
+        let content = std::str::from_utf8(prepared.content_bytes())
+            .expect("prepared text publication is UTF-8");
 
         // Content size guard — prevent writing extremely large files that
         // could exhaust disk space.  10 MB is generous for source files.
@@ -865,37 +859,33 @@ impl ToolExecutor {
             }).to_string();
         }
 
-        // Exact full-state convergence is safe to establish before the
-        // read-before-overwrite policy: it performs no overwrite. The outer
-        // executor holds the exclusive bound-workspace lease; repeat the read
-        // and binding check immediately before returning so an uncoordinated
-        // external writer cannot lend us a stale equality result.
-        let mut prior_bytes = if path.exists() {
-            fs::read(&path).ok()
-        } else {
-            None
-        };
-        if prior_bytes.as_deref() == Some(content.as_bytes()) {
-            let binding_safe = path
-                .canonicalize()
-                .ok()
-                .is_some_and(|canonical| self.is_within_sandbox_boundary(&canonical));
-            let confirmed = binding_safe.then(|| fs::read(&path).ok()).flatten();
-            if confirmed.as_deref() == Some(content.as_bytes()) {
-                *already_desired = true;
-                return json!({
-                    "success": true,
-                    "state": "already_desired",
-                    "bytes_written": 0,
-                    "path": path.to_string_lossy().to_string(),
-                })
-                .to_string();
+        // The shared owner verifies the captured preimage even for an exact
+        // no-op, before any journal entry or read-before-overwrite requirement.
+        if prepared.is_already_desired() {
+            if let Err(error) = self.verify_file_mutation_binding(&path, prepared.path()) {
+                return json!({"success": false, "error": error.into_string_output()}).to_string();
             }
-            prior_bytes = confirmed;
+            let mut result = prepared.apply();
+            // This display adapter returns only the no-op fact. The outer
+            // execution boundary mints its own invocation-bound marker.
+            if let Some(fields) = result.metadata.as_mut() {
+                astra_tools::workspace_observation::discard_workspace_desired_state_convergence_marker(fields);
+            }
+            if result.is_error {
+                return json!({"success": false, "error": result.output}).to_string();
+            }
+            *already_desired = true;
+            return json!({
+                "success": true,
+                "state": "already_desired",
+                "bytes_written": 0,
+                "path": path.to_string_lossy().to_string(),
+            })
+            .to_string();
         }
 
         // Staleness check: if file exists, it must have been read first and not modified since
-        if path.exists() {
+        if prepared.original_content_bytes().is_some() {
             if let Err(e) = self.check_staleness(&path) {
                 return json!({ "success": false, "error": e }).to_string();
             }
@@ -913,77 +903,34 @@ impl ToolExecutor {
             }
         }
 
-        if let Some(parent) = path.parent()
-            && let Err(e) = fs::create_dir_all(parent)
-        {
-            return json!({
-                "success": false,
-                "error": format!("failed to create parent directory {}: {e}", parent.display())
-            })
-            .to_string();
-        }
-        let prior_for_diff = prior_bytes
-            .as_deref()
+        let prior_for_diff = prepared
+            .original_content_bytes()
             .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
 
-        // Defense-in-depth: re-check staleness right before writing to catch
-        // race conditions between the initial validation and the actual write
-        // (e.g. a linter or user modified the file in between).
-        if path.exists() {
-            if let Err(e) = self.check_staleness(&path) {
-                return json!({ "success": false, "error": format!("Pre-write staleness check failed: {e}") }).to_string();
-            }
+        if let Err(error) = self.verify_file_mutation_binding(&path, prepared.path()) {
+            return json!({"success": false, "error": error.into_string_output()}).to_string();
         }
 
-        // Defense-in-depth: re-canonicalize immediately before write to detect
-        // symlink swaps (TOCTOU) between the initial resolve_checked and now.
-        if path.exists() {
-            if let Ok(canonical) = path.canonicalize() {
-                if !self.is_within_sandbox_boundary(&canonical) {
-                    return json!({
-                        "success": false,
-                        "error": format!(
-                            "Security: path '{}' was replaced with a symlink pointing outside the approved sandbox boundary",
-                            path.display()
-                        )
-                    }).to_string();
-                }
-            }
-        }
-
-        // Journal: snapshot before-state for undo
-        let turn_idx = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
         let journal_call_id = format!("write_file:{}", path.display());
-        if let Ok(mut journal) = self.file_journal.lock() {
-            journal.record_before(&path, &journal_call_id, turn_idx);
-        }
-
-        match fs::write(&path, &content) {
-            Ok(_) => {
-                *applied = prior_bytes.as_deref() != Some(content.as_bytes());
-                // Record write state so subsequent reads/edits know the mtime
-                self.record_write_with_content(&path, &content);
-                // Journal: record after-state
-                if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_after(&path, &journal_call_id, content.as_bytes());
-                }
-                let old_slice = prior_for_diff.as_deref().unwrap_or("");
-                let cli_diff = cap_cli_unified_diff(unified_diff_raw(old_slice, &content, &path));
-                let lsp_diag = self.inline_lsp_diagnostics(&path);
-                let mut obj = json!({
-                    "success": true,
-                    "bytes_written": content.len(),
-                    "path": path.to_string_lossy().to_string(),
-                    "_cli_unified_diff": cli_diff,
-                });
-                if let Some(diag) = lsp_diag {
-                    obj["lsp_diagnostics"] = Value::String(diag);
-                }
-                obj.to_string()
+        let publication =
+            self.apply_prepared_file_edit(&prepared, &journal_call_id, EditType::Overwrite);
+        if !publication.is_error {
+            *applied = true;
+            let old_slice = prior_for_diff.as_deref().unwrap_or("");
+            let cli_diff = cap_cli_unified_diff(unified_diff_raw(old_slice, content, &path));
+            let lsp_diag = self.inline_lsp_diagnostics(&path);
+            let mut obj = json!({
+                "success": true,
+                "bytes_written": content.len(),
+                "path": path.to_string_lossy().to_string(),
+                "_cli_unified_diff": cli_diff,
+            });
+            if let Some(diag) = lsp_diag {
+                obj["lsp_diagnostics"] = Value::String(diag);
             }
-            Err(e) => json!({ "success": false, "error": e.to_string() }).to_string(),
+            obj.to_string()
+        } else {
+            json!({ "success": false, "error": publication.output }).to_string()
         }
     }
 
@@ -1002,29 +949,12 @@ impl ToolExecutor {
     }
 
     fn str_replace_impl(&self, args: &Value, applied: &mut bool) -> Result<String, FsLeafError> {
-        let path = match args.get("path").and_then(Value::as_str) {
-            Some(p) => self.resolve_checked_result(p)?,
+        let path_arg = match args.get("path").and_then(Value::as_str) {
+            Some(p) => p,
             None => return Err("Error: missing 'path'".to_string().into()),
         };
-        let old_str = match args.get("old_str").and_then(Value::as_str) {
-            Some(s) => s,
-            None => return Err("Error: missing 'old_str'".to_string().into()),
-        };
-        let new_str = match args.get("new_str").and_then(Value::as_str) {
-            Some(s) => s,
-            None => return Err("Error: missing 'new_str'".to_string().into()),
-        };
-        astra_tools::credential_redaction::reject_redaction_markers_in_replacement(new_str)?;
-        if old_str == new_str {
-            return Err(FsLeafError::caller_correctable_no_effect(
-                str_replace_fail(
-                    "old_str and new_str are identical — no change needed.",
-                    "The replacement is a no-op; the file would be unchanged.",
-                    "Provide a new_str that actually differs from old_str, or skip the edit.",
-                ),
-                vec![astra_core::ToolRecoveryAction::CorrectArguments],
-            ));
-        }
+        let path = self.resolve_checked_result(path_arg)?;
+        astra_tools::fs_ops::validate_str_replace_args(args).map_err(FsLeafError::Shared)?;
         let dry_run = args
             .get("dry_run")
             .and_then(Value::as_bool)
@@ -1034,316 +964,127 @@ impl ToolExecutor {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        if let Some(err) =
-            check_anchor_vs_replacement_size("str_replace", old_str, new_str, replace_all)
-        {
-            return Err(err.into());
-        }
-
-        let content =
-            read_to_string_lossy(&path).map_err(|e| format!("Error reading file: {e}"))?;
-        let redaction_reference = astra_tools::credential_redaction::resolve_redacted_anchor(
-            &content,
-            old_str,
-            replace_all,
-        )?;
-        let old_str = redaction_reference.as_deref().unwrap_or(old_str);
-        // A redaction marker is resolved against the source-owned bytes at
-        // execution time.  The resolved value can therefore equal new_str
-        // even when the opaque marker text differed from it (for example a
-        // model re-submits the placeholder it just read).  Treat that as a
-        // real no-op: do not journal, bump generation, or emit the mutation
-        // success sentinel.
-        if old_str == new_str {
-            return Err(FsLeafError::caller_correctable_no_effect(
-                str_replace_fail(
-                    "the resolved old_str already equals new_str — no change needed.",
-                    "The anchor resolved successfully, but the file already contains the requested replacement.",
-                    "Choose a different new_str or skip this edit; no bytes were changed.",
-                ),
-                vec![astra_core::ToolRecoveryAction::CorrectArguments],
-            ));
-        }
-        let count = content.matches(old_str).count();
-        if count == 0 {
-            let norm_count = fuzzy_replacer::quote_normalized_match_count(&content, old_str);
-            if norm_count > 1 && !replace_all {
-                self.record_fuzzy_match_event(
-                    &path,
-                    astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
-                    astra_runtime::observability::FuzzyMatchOutcome::Ambiguous,
-                );
-                return Err(FsLeafError::caller_correctable_no_effect(
-                    str_replace_fail(
-                        &format!(
-                            "old_str found {norm_count} times (after normalizing curly quotes) — must be unique."
-                        ),
-                        "Multiple curly-quote-normalized occurrences match; cannot pick one safely.",
-                        "Add more surrounding context to old_str to make it unique, or set replace_all=true.",
-                    ),
-                    vec![astra_core::ToolRecoveryAction::CorrectArguments],
-                ));
-            }
-
-            // Fuzzy cascade: try progressively looser matching strategies
-            if let Some(fuzzy_match) =
-                fuzzy_replacer::fuzzy_find_replacement(&content, old_str, replace_all)
-            {
-                let replacement = if fuzzy_match.is_quote_normalized() {
-                    fuzzy_replacer::preserve_quote_style(old_str, fuzzy_match.actual, new_str)
-                } else {
-                    new_str.to_string()
-                };
-                let actual: &str = &fuzzy_match.actual;
-                let new_content = if replace_all {
-                    content.replace(actual, &replacement)
-                } else {
-                    content.replacen(actual, &replacement, 1)
-                };
-                if new_content == content {
-                    return Err(FsLeafError::caller_correctable_no_effect(
-                        str_replace_fail(
-                            "the resolved replacement would not change the file.",
-                            "The anchor matched, but the resulting file bytes are identical to the current content.",
-                            "Choose a different new_str or skip this edit; no bytes were changed.",
-                        ),
-                        vec![astra_core::ToolRecoveryAction::CorrectArguments],
-                    ));
-                }
-                // The matched anchor self-authorizes this localized edit.
-                // Keep the snapshot partial: the model did not receive the
-                // complete file, and a failed/ambiguous replace must not
-                // unlock a later full-file overwrite.
-                self.record_read_cached(&path, true, content.clone());
-                if dry_run {
-                    self.record_fuzzy_match_event(
-                        &path,
-                        fuzzy_match.strategy,
-                        astra_runtime::observability::FuzzyMatchOutcome::Matched,
-                    );
-                    return Ok(unified_diff(&content, &new_content, &path));
-                }
-                self.check_staleness(&path)
-                    .map_err(|e| format!("Error: Pre-write staleness check failed: {e}"))?;
-                // Journal: snapshot before-state for undo
-                let turn_idx = self
-                    .journal_turn_index
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let journal_call_id = if fuzzy_match.is_quote_normalized() {
-                    format!("str_replace_quote_norm:{}", path.display())
-                } else {
-                    format!("str_replace_fuzzy:{}", path.display())
-                };
-                if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_before_patch(&path, &journal_call_id, turn_idx);
-                }
-                match fs::write(&path, &new_content) {
-                    Ok(_) => {
-                        *applied = true;
-                        self.record_write_with_content(&path, &new_content);
-                        // Journal: record after-state
-                        if let Ok(mut journal) = self.file_journal.lock() {
-                            journal.record_after(&path, &journal_call_id, new_content.as_bytes());
-                        }
-                        let format_result = auto_format_file(&path, &self.project_root);
-                        if format_result.is_some() {
-                            self.record_write(&path);
-                        }
-                        let mut result = if fuzzy_match.is_quote_normalized() {
-                            String::from(
-                                "Replaced successfully (matched after normalizing curly quotes → ASCII)\n",
-                            )
-                        } else {
-                            format!(
-                                "Replaced successfully (matched via {})\n",
-                                fuzzy_match.strategy
-                            )
-                        };
-                        let old_lines: Vec<&str> = fuzzy_match.actual.lines().collect();
-                        let new_lines: Vec<&str> = replacement.lines().collect();
-                        if old_lines.len().max(new_lines.len()) <= 10 {
-                            for l in &old_lines {
-                                result.push_str(&format!("- {l}\n"));
-                            }
-                            for l in &new_lines {
-                                result.push_str(&format!("+ {l}\n"));
-                            }
-                        }
-                        if let Some(fmt_note) = format_result {
-                            result.push_str(&format!("\n{fmt_note}"));
-                        }
-                        append_str_replace_cli_unified_diff(
-                            &mut result,
-                            &content,
-                            &new_content,
-                            &path,
-                        );
-                        if let Some(diag) = self.inline_lsp_diagnostics(&path) {
-                            result.push_str(&diag);
-                        }
-                        self.record_fuzzy_match_event(
-                            &path,
-                            fuzzy_match.strategy,
-                            astra_runtime::observability::FuzzyMatchOutcome::Matched,
-                        );
-                        return Ok(result);
+        let target = self.bind_file_mutation_target(&path)?;
+        let original_bytes = fs::read(&target).map_err(|e| format!("Error reading file: {e}"))?;
+        let content = std::str::from_utf8(&original_bytes)
+            .map_err(|_| {
+                "Error: File is not valid UTF-8; text edits cannot preserve its bytes".to_owned()
+            })?
+            .to_owned();
+        let candidate = astra_tools::fs_ops::PreparedStrReplace::from_authorized_preimage(
+            target.clone(),
+            content.clone(),
+            args,
+        )
+        .map_err(|error| {
+            if let Some(metadata) = &error.metadata {
+                let outcome = match metadata
+                    .get("replacement_match_outcome")
+                    .and_then(Value::as_str)
+                {
+                    Some("ambiguous") => {
+                        Some(astra_runtime::observability::FuzzyMatchOutcome::Ambiguous)
                     }
-                    Err(e) => return Err(format!("Error writing file: {e}").into()),
+                    Some("not_found") => {
+                        Some(astra_runtime::observability::FuzzyMatchOutcome::NotFound)
+                    }
+                    _ => None,
+                };
+                if let (Some(strategy), Some(outcome)) = (
+                    metadata
+                        .get("replacement_match_strategy")
+                        .and_then(Value::as_str),
+                    outcome,
+                ) {
+                    self.record_fuzzy_match_event(&path, strategy, outcome);
                 }
             }
-            if replace_all && norm_count > 1 {
-                self.record_fuzzy_match_event(
-                    &path,
-                    astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED,
-                    astra_runtime::observability::FuzzyMatchOutcome::Ambiguous,
-                );
-                return Err(FsLeafError::caller_correctable_no_effect(
-                    str_replace_fail(
-                        &format!(
-                            "old_str matches {norm_count} occurrences after normalizing curly quotes."
-                        ),
-                        "The file contains mixed curly quote forms; replace_all cannot safely apply with inconsistent quoting styles.",
-                        "Normalize the file's quote style first, or pass an old_str that matches the exact bytes you want to replace.",
-                    ),
-                    vec![astra_core::ToolRecoveryAction::CorrectArguments],
-                ));
-            }
-            self.record_fuzzy_match_event(
-                &path,
-                "none",
-                astra_runtime::observability::FuzzyMatchOutcome::NotFound,
-            );
-            return Err(FsLeafError::caller_correctable_no_effect(
-                str_replace_not_found_hint(&content, old_str),
-                vec![astra_core::ToolRecoveryAction::ReadTargetedRange],
-            ));
-        }
-        if count > 1 && !replace_all {
-            self.record_fuzzy_match_event(
-                &path,
-                "exact",
-                astra_runtime::observability::FuzzyMatchOutcome::Ambiguous,
-            );
-            return Err(FsLeafError::caller_correctable_no_effect(
-                str_replace_ambiguous_hint(&content, old_str, count),
-                vec![astra_core::ToolRecoveryAction::CorrectArguments],
-            ));
-        }
+            FsLeafError::Shared(error)
+        })?;
+        let actual = candidate.matched_text();
+        let replacement = candidate.replacement();
+        let strategy = candidate.match_strategy().unwrap_or("exact");
+        let count = candidate.occurrence_count();
+        let prepared = candidate.publication();
+        let new_content = std::str::from_utf8(prepared.content_bytes())
+            .expect("prepared text publication is UTF-8");
 
-        let new_content = if replace_all {
-            content.replace(old_str, new_str)
-        } else {
-            content.replacen(old_str, new_str, 1)
-        };
-        if new_content == content {
-            return Err(FsLeafError::caller_correctable_no_effect(
-                str_replace_fail(
-                    "the resolved replacement would not change the file.",
-                    "The anchor matched, but the resulting file bytes are identical to the current content.",
-                    "Choose a different new_str or skip this edit; no bytes were changed.",
-                ),
-                vec![astra_core::ToolRecoveryAction::CorrectArguments],
-            ));
-        }
-
-        // `old_str` is an optimistic-concurrency precondition, and this tool
-        // has just matched it against the complete current file. Snapshot the
-        // exact bytes for the pre-write hash check without claiming that the
-        // model received a full-file read.
-        self.record_read_cached(&path, true, content.clone());
-
-        // Dry run: show unified diff without writing
+        // A matched anchor authorizes this localized edit, not a full-file read.
+        self.record_read_cached(prepared.path(), true, content.clone());
         if dry_run {
             self.record_fuzzy_match_event(
                 &path,
-                "exact",
+                strategy,
                 astra_runtime::observability::FuzzyMatchOutcome::Matched,
             );
-            return Ok(unified_diff(&content, &new_content, &path));
+            return Ok(unified_diff(&content, new_content, &path));
         }
-
-        // Defense-in-depth: re-check staleness right before writing.
         self.check_staleness(&path)
             .map_err(|e| format!("Error: Pre-write staleness check failed: {e}"))?;
-
-        // Journal: snapshot before-state for undo
-        let turn_idx = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let journal_call_id = format!("str_replace:{}", path.display());
-        if let Ok(mut journal) = self.file_journal.lock() {
-            journal.record_before_patch(&path, &journal_call_id, turn_idx);
+        self.verify_file_mutation_binding(&path, prepared.path())?;
+        let journal_prefix = if strategy == "exact" {
+            "str_replace"
+        } else if strategy == astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED {
+            "str_replace_quote_norm"
+        } else {
+            "str_replace_fuzzy"
+        };
+        let journal_call_id = format!("{journal_prefix}:{}", path.display());
+        let publication =
+            self.apply_prepared_file_edit(prepared, &journal_call_id, EditType::Patch);
+        if publication.is_error {
+            return Err(publication.output.into());
         }
-
-        match fs::write(&path, &new_content) {
-            Ok(_) => {
-                *applied = true;
-                // Record write state for staleness tracking
-                self.record_write_with_content(&path, &new_content);
-                // Journal: record after-state
-                if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_after(&path, &journal_call_id, new_content.as_bytes());
-                }
-
-                // Auto-format if formatter is available
-                let format_result = auto_format_file(&path, &self.project_root);
-                // Re-record after format (mtime may have changed)
-                if format_result.is_some() {
-                    self.record_write(&path);
-                }
-
-                // Build a compact diff preview for the LLM and user
-                let old_lines: Vec<&str> = old_str.lines().collect();
-                let new_lines: Vec<&str> = new_str.lines().collect();
-                let diff_lines = old_lines.len().max(new_lines.len());
-                let mut result = if diff_lines <= 10 {
-                    let mut diff = String::from("Replaced successfully\n");
-                    for l in &old_lines {
-                        diff.push_str(&format!("- {l}\n"));
-                    }
-                    for l in &new_lines {
-                        diff.push_str(&format!("+ {l}\n"));
-                    }
-                    diff
-                } else {
-                    format!(
-                        "Replaced successfully ({} lines → {} lines)",
-                        old_lines.len(),
-                        new_lines.len()
-                    )
-                };
-                if let Some(fmt_note) = format_result {
-                    result.push_str(&format!("\n{fmt_note}"));
-                }
-                if replace_all && count > 1 {
-                    result = format!("Replaced {count} occurrences\n{result}");
-                }
-
-                // Scope context: show where in the code structure this edit landed
-                if let Some(lang) = code_intel::detect_language(&path) {
-                    let edit_line = content[..content.find(old_str).unwrap_or(0)]
-                        .matches('\n')
-                        .count()
-                        + 1;
-                    let scope = code_intel::scope_at_line(&new_content, lang, edit_line);
-                    if !scope.breadcrumbs.is_empty() {
-                        result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
-                    }
-                }
-
-                append_str_replace_cli_unified_diff(&mut result, &content, &new_content, &path);
-                if let Some(diag) = self.inline_lsp_diagnostics(&path) {
-                    result.push_str(&diag);
-                }
-                self.record_fuzzy_match_event(
-                    &path,
-                    "exact",
-                    astra_runtime::observability::FuzzyMatchOutcome::Matched,
-                );
-                Ok(result)
+        *applied = true;
+        let old_lines: Vec<&str> = actual.lines().collect();
+        let new_lines: Vec<&str> = replacement.lines().collect();
+        let small_edit = old_lines.len().max(new_lines.len()) <= 10;
+        let mut result = if strategy == astra_tools::fuzzy_replacer::STRATEGY_QUOTE_NORMALIZED {
+            "Replaced successfully (matched after normalizing curly quotes → ASCII)\n".to_string()
+        } else if strategy != "exact" {
+            format!("Replaced successfully (matched via {strategy})\n")
+        } else if small_edit {
+            "Replaced successfully\n".to_string()
+        } else {
+            format!(
+                "Replaced successfully ({} lines → {} lines)",
+                old_lines.len(),
+                new_lines.len()
+            )
+        };
+        if small_edit {
+            for line in old_lines {
+                result.push_str(&format!("- {line}\n"));
             }
-            Err(e) => Err(format!("Error writing file: {e}").into()),
+            for line in new_lines {
+                result.push_str(&format!("+ {line}\n"));
+            }
         }
+        if strategy == "exact" {
+            if replace_all && count > 1 {
+                result = format!("Replaced {count} occurrences\n{result}");
+            }
+            if let Some(lang) = code_intel::detect_language(&path) {
+                let edit_line = content[..candidate.first_edit_start()]
+                    .matches('\n')
+                    .count()
+                    + 1;
+                let scope = code_intel::scope_at_line(new_content, lang, edit_line);
+                if !scope.breadcrumbs.is_empty() {
+                    result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
+                }
+            }
+        }
+        append_str_replace_cli_unified_diff(&mut result, &content, new_content, &path);
+        if let Some(diag) = self.inline_lsp_diagnostics(&path) {
+            result.push_str(&diag);
+        }
+        self.record_fuzzy_match_event(
+            &path,
+            strategy,
+            astra_runtime::observability::FuzzyMatchOutcome::Matched,
+        );
+        Ok(result)
     }
 
     pub(crate) fn delete_file(&self, args: &Value) -> String {
@@ -2036,10 +1777,8 @@ impl ToolExecutor {
         }
     }
 
-    /// Execute a multi-file replacement while preserving the structured
-    /// owner result.  The string-only wrapper below is kept for the older
-    /// in-process tests/callers, but the live edge dispatch must carry partial
-    /// commit metadata into the headless ledger.
+    /// Project each committed file into CLI undo/cache state, including the
+    /// committed prefix when a later file fails publication.
     pub(crate) fn str_replace_batch_result(&self, args: &Value) -> astra_tools::ToolResult {
         let top_path = args.get("path").and_then(Value::as_str);
         let edits = match args.get("edits").and_then(Value::as_array) {
@@ -2069,40 +1808,72 @@ impl ToolExecutor {
             Err(e) => return astra_tools::ToolResult::error(e),
         };
 
-        // Sandbox-validate every path BEFORE touching disk.
-        // The core two-phase commit in multi_path_edit guarantees atomicity:
-        // all files are staged first, then rename() commits them atomically.
-        // No journal checkpoint, no preimage capture, no dual rollback.
-        for (path, _) in &groups {
-            if let Err(error) = self.resolve_checked_result(path) {
+        let mut bound_groups = Vec::with_capacity(groups.len());
+        for (spelling, edits) in groups {
+            let path = match self.resolve_checked_result(&spelling) {
+                Ok(path) => path,
+                Err(error) => return error.into_tool_result(),
+            };
+            let target = match self.bind_file_mutation_target(&path) {
+                Ok(target) => target,
+                Err(error) => return error.into_tool_result(),
+            };
+            bound_groups.push((spelling, path, target, edits));
+        }
+        let mut candidates = Vec::with_capacity(bound_groups.len());
+        for (spelling, _, target, edits) in &bound_groups {
+            let content = match fs::read_to_string(target) {
+                Ok(content) => content,
+                Err(error) => {
+                    return astra_tools::ToolResult::error(format!(
+                        "Error reading batch target: {error}"
+                    ))
+                    .with_workspace_mutation_not_applied();
+                }
+            };
+            let scoped = json!({
+                "path": spelling, "edits": edits,
+                "dry_run": args.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
+                "allow_structural_change": args.get("allow_structural_change").and_then(Value::as_bool).unwrap_or(false),
+            });
+            let candidate = match astra_tools::fs_ops::PreparedMultiEdit::from_authorized_preimage(
+                target.clone(),
+                content,
+                &scoped,
+            ) {
+                Ok(candidate) => candidate,
+                Err(error) => return error,
+            };
+            candidates.push(candidate);
+        }
+        // Candidate construction for the complete group precedes binding
+        // revalidation; preparation of a later file cannot hide alias changes.
+        for ((spelling, _, _, _), candidate) in bound_groups.iter().zip(&candidates) {
+            let path = match self.resolve_checked_result(spelling) {
+                Ok(path) => path,
+                Err(error) => return error.into_tool_result(),
+            };
+            if let Err(error) = self.check_staleness(&path) {
+                return astra_tools::ToolResult::error(error);
+            }
+            if let Err(error) = self.verify_file_mutation_binding(&path, candidate.path()) {
                 return error.into_tool_result();
             }
         }
-
-        // Build the delegated args: top-level dry_run + per-edit paths.
-        // The core's str_replace routes to multi_path_edit for multi-file batches.
-        let dry_run = args
-            .get("dry_run")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-
-        let mut delegated = serde_json::Map::new();
-        delegated.insert(
-            "edits".to_string(),
-            args.get("edits").cloned().unwrap_or(Value::Null),
-        );
-        if dry_run {
-            delegated.insert("dry_run".to_string(), Value::Bool(true));
-        }
-        if let Some(allow) = args.get("allow_structural_change") {
-            delegated.insert("allow_structural_change".to_string(), allow.clone());
-        }
-
-        astra_tools::fs_ops::str_replace(&self.project_root, &Value::Object(delegated))
-    }
-
-    pub(crate) fn str_replace_batch(&self, args: &Value) -> String {
-        self.str_replace_batch_result(args).output
+        let prepared =
+            match astra_tools::fs_ops::PreparedMultiPathEdit::from_authorized_edits(candidates) {
+                Ok(prepared) => prepared,
+                Err(error) => return error,
+            };
+        prepared.apply_with_committed(|edit| {
+            self.record_committed_file_edit(
+                edit.path(),
+                &format!("batch_edit:{}", edit.path().display()),
+                Some(edit.original_content_bytes()),
+                edit.new_content_bytes(),
+                EditType::Patch,
+            );
+        })
     }
 
     pub(crate) fn multi_edit(&self, args: &Value) -> String {
@@ -2119,10 +1890,11 @@ impl ToolExecutor {
     }
 
     fn multi_edit_impl(&self, args: &Value, applied: &mut bool) -> Result<String, FsLeafError> {
-        let path = match args.get("path").and_then(Value::as_str) {
-            Some(p) => self.resolve_checked_result(p)?,
+        let path_arg = match args.get("path").and_then(Value::as_str) {
+            Some(p) => p,
             None => return Err("Error: missing 'path'".to_string().into()),
         };
+        let path = self.resolve_checked_result(path_arg)?;
         let edits = match args.get("edits").and_then(Value::as_array) {
             Some(e) => e,
             None => return Err("Error: missing 'edits' array".to_string().into()),
@@ -2135,220 +1907,74 @@ impl ToolExecutor {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        // Staleness check
+        let target = self.bind_file_mutation_target(&path)?;
+        let original_bytes = fs::read(&target).map_err(|e| format!("Error reading file: {e}"))?;
+        let content = std::str::from_utf8(&original_bytes)
+            .map_err(|_| {
+                "Error: File is not valid UTF-8; text edits cannot preserve its bytes".to_owned()
+            })?
+            .to_owned();
+
         self.check_staleness(&path)
             .map_err(|e| format!("Error: {e}"))?;
 
-        let content =
-            read_to_string_lossy(&path).map_err(|e| format!("Error reading file: {e}"))?;
+        let candidate = astra_tools::fs_ops::PreparedMultiEdit::from_authorized_preimage(
+            target.clone(),
+            content.clone(),
+            args,
+        )
+        .map_err(FsLeafError::Shared)?;
+        let fuzzy_applications = candidate.fuzzy_applications();
+        let first_edit_start_byte = candidate.first_edit_start();
 
-        // Validate + apply all edits atomically (all or nothing).
-        //
-        // Exact-match first. When a given edit's old_str doesn't
-        // match verbatim, fall back to the same fuzzy cascade that
-        // single-edit `str_replace` uses — whitespace-normalized,
-        // indentation-flexible, etc. — so the common "LLM got the
-        // indent off by 4 spaces" case auto-succeeds instead of
-        // aborting the whole batch. Ambiguous fuzzy matches (more
-        // than one candidate) still bail out safely.
-        //
-        // We collect `(strategy_name, edit_index)` pairs for any
-        // fuzzy applications so the caller sees which edits
-        // deviated from a verbatim match and can re-inspect.
-        let mut working = content.clone();
-        let mut fuzzy_applications: Vec<(usize, &'static str)> = Vec::new();
-        let mut first_edit_start_byte: Option<usize> = None;
-        // Track byte-ranges modified by prior fuzzy edits so a later
-        // fuzzy edit can't silently land on the same span. Exact
-        // `working.matches(old_str)` already self-disambiguates via
-        // the count==0/count>1 checks, but two fuzzy edits whose
-        // normalized-whitespace candidates collapse to the same
-        // region would each succeed with `replace_all=false` and
-        // clobber each other. Abort with a dedup hint instead.
-        let mut fuzzy_spans: Vec<(usize, usize)> = Vec::new();
-        for (i, edit) in edits.iter().enumerate() {
-            let old_str = match edit.get("old_str").and_then(Value::as_str) {
-                Some(s) => s,
-                None => return Err(format!("Error: edit[{i}] missing 'old_str'").into()),
-            };
-            let new_str = match edit.get("new_str").and_then(Value::as_str) {
-                Some(s) => s,
-                None => return Err(format!("Error: edit[{i}] missing 'new_str'").into()),
-            };
-            astra_tools::credential_redaction::reject_redaction_markers_in_replacement(new_str)?;
-            let redaction_reference = astra_tools::credential_redaction::resolve_redacted_anchor(
-                &working, old_str, false,
-            )?;
-            let old_str = redaction_reference.as_deref().unwrap_or(old_str);
-            if old_str == new_str {
-                return Err(FsLeafError::caller_correctable_no_effect(
-                    str_replace_fail(
-                        &format!("edit[{i}] old_str and new_str are identical — no change needed."),
-                        "The replacement is a no-op; the file would be unchanged. Aborting all edits.",
-                        "Provide a new_str that actually differs from old_str, or remove the edit from the batch.",
-                    ),
-                    vec![astra_core::ToolRecoveryAction::CorrectArguments],
-                ));
-            }
-            if let Some(err) =
-                check_anchor_vs_replacement_size(&format!("edit[{i}]"), old_str, new_str, false)
-            {
-                return Err(err.into());
-            }
-            let count = working.matches(old_str).count();
-            if count == 0 {
-                // Try the fuzzy cascade. If it returns a unique
-                // match, apply it at that location using the
-                // caller's new_str; record which strategy matched.
-                match fuzzy_replacer::fuzzy_find_replacement(
-                    &working, old_str, /* replace_all */ false,
-                ) {
-                    Some(fuzzy_match) => {
-                        let actual = fuzzy_match.actual.to_string();
-                        let match_start = match working.find(&actual) {
-                            Some(s) => s,
-                            None => {
-                                return Err(format!(
-                                    "Error: edit[{i}] fuzzy match returned a span not present in working buffer (internal invariant violated). Aborting all edits."
-                                )
-                                .into());
-                            }
-                        };
-                        let match_end = match_start + actual.len();
-                        // Reject if this fuzzy span overlaps a span
-                        // already consumed by an earlier fuzzy edit —
-                        // otherwise two fuzzy edits could silently
-                        // clobber the same region. Exact edits remain
-                        // immune because `working.matches(old_str)`
-                        // already self-disambiguates.
-                        if let Some((prev_i, _)) =
-                            fuzzy_spans.iter().enumerate().find(|(_, (ps, pe))| {
-                                // Overlap: [ps,pe) ∩ [match_start,match_end) non-empty
-                                match_start < *pe && *ps < match_end
-                            })
-                        {
-                            let (orig_idx, _) = fuzzy_applications[prev_i];
-                            return Err(FsLeafError::caller_correctable_no_effect(
-                                str_replace_fail(
-                                    &format!(
-                                        "edit[{i}] fuzzy-matched the same region as edit[{orig_idx}]. Aborting all edits."
-                                    ),
-                                    "Both edits resolved to overlapping spans via whitespace-normalized matching, so applying them separately would clobber the same file region.",
-                                    "Merge those edits into one replacement for that region, or provide distinct exact old_str values copied from a fresh read_file result.",
-                                ),
-                                vec![astra_core::ToolRecoveryAction::CorrectArguments],
-                            ));
-                        }
-                        if i == 0 {
-                            first_edit_start_byte = Some(match_start);
-                        }
-                        fuzzy_applications.push((i, fuzzy_match.strategy));
-                        fuzzy_spans.push((match_start, match_end));
-                        working = working.replacen(&actual, new_str, 1);
-                        continue;
-                    }
-                    None => {
-                        let mut out = str_replace_fail(
-                            &format!("edit[{i}] old_str not found. Aborting all edits."),
-                            "The exact byte sequence does not appear in the current file content (after applying prior edits in this batch).",
-                            "Re-read the target region with read_file, copy the actual bytes into old_str (including indentation), then retry. Diagnostic hints below:",
-                        );
-                        out.push('\n');
-                        out.push_str(&str_replace_not_found_hint(&working, old_str));
-                        return Err(FsLeafError::caller_correctable_no_effect(
-                            out,
-                            vec![astra_core::ToolRecoveryAction::ReadTargetedRange],
-                        ));
-                    }
-                }
-            }
-            if count > 1 {
-                let mut out = str_replace_fail(
-                    &format!(
-                        "edit[{i}] old_str matches {count} times (must be unique). Aborting all edits."
-                    ),
-                    "Multiple exact occurrences match; the edit is ambiguous and cannot apply safely.",
-                    "Add more surrounding context to old_str to make it unique, or split the edit. Diagnostic hints below:",
-                );
-                out.push('\n');
-                out.push_str(&str_replace_ambiguous_hint(&working, old_str, count));
-                return Err(FsLeafError::caller_correctable_no_effect(
-                    out,
-                    vec![astra_core::ToolRecoveryAction::CorrectArguments],
-                ));
-            }
-            if i == 0 {
-                first_edit_start_byte = working.find(old_str);
-            }
-            working = working.replacen(old_str, new_str, 1);
-        }
+        let prepared = candidate.publication();
+        let working = std::str::from_utf8(prepared.content_bytes())
+            .expect("prepared text publication is UTF-8");
 
-        // Dry run: show diff
+        // Dry run: show the same normalized candidate used by publication.
         if dry_run {
-            return Ok(unified_diff(&content, &working, &path));
+            return Ok(unified_diff(&content, working, &path));
         }
 
-        // Defense-in-depth: re-check staleness right before writing.
-        self.check_staleness(&path)
-            .map_err(|e| format!("Error: Pre-write staleness check failed: {e}"))?;
+        self.verify_file_mutation_binding(&path, prepared.path())?;
 
-        // Journal: snapshot before-state for undo
-        let turn_idx = self
-            .journal_turn_index
-            .load(std::sync::atomic::Ordering::Relaxed);
         let journal_call_id = format!("batch_edit:{}", path.display());
-        if let Ok(mut journal) = self.file_journal.lock() {
-            journal.record_before_patch(&path, &journal_call_id, turn_idx);
-        }
-
-        // Apply
-        match fs::write(&path, &working) {
-            Ok(_) => {
-                // Owner-side commit boundary. This exact write succeeded with
-                // a buffer that validation proved differs from the preimage;
-                // transport must not reconstruct that fact from prose or a
-                // bounded whole-workspace fingerprint.
-                *applied = true;
-                self.record_write_with_content(&path, &working);
-                // Journal: record after-state
-                if let Ok(mut journal) = self.file_journal.lock() {
-                    journal.record_after(&path, &journal_call_id, working.as_bytes());
+        let publication =
+            self.apply_prepared_file_edit(prepared, &journal_call_id, EditType::Patch);
+        if !publication.is_error {
+            // Owner-side commit boundary. This exact write succeeded with
+            // a buffer that validation proved differs from the preimage;
+            // transport must not reconstruct that fact from prose or a
+            // bounded whole-workspace fingerprint.
+            *applied = true;
+            let mut result = format!("Applied {} edit(s) successfully", edits.len());
+            // Disclose any edits that required fuzzy matching so
+            // the caller sees the old_str wasn't byte-exact.
+            // Format: one bullet per fuzzy edit, tagged with the
+            // strategy name (whitespace-normalized, line-trimmed,
+            // etc.) and the 1-based edit index.
+            if !fuzzy_applications.is_empty() {
+                result.push_str("\n⚠ fuzzy match used (old_str did not match byte-exactly):");
+                for (idx, strategy) in fuzzy_applications {
+                    result.push_str(&format!("\n  edit[{idx}]: {strategy}"));
                 }
-                let format_result = auto_format_file(&path, &self.project_root);
-                if format_result.is_some() {
-                    self.record_write(&path);
-                }
-                let mut result = format!("Applied {} edit(s) successfully", edits.len());
-                if let Some(fmt_note) = format_result {
-                    result.push_str(&format!("\n{fmt_note}"));
-                }
-                // Disclose any edits that required fuzzy matching so
-                // the caller sees the old_str wasn't byte-exact.
-                // Format: one bullet per fuzzy edit, tagged with the
-                // strategy name (whitespace-normalized, line-trimmed,
-                // etc.) and the 1-based edit index.
-                if !fuzzy_applications.is_empty() {
-                    result.push_str("\n⚠ fuzzy match used (old_str did not match byte-exactly):");
-                    for (idx, strategy) in &fuzzy_applications {
-                        result.push_str(&format!("\n  edit[{idx}]: {strategy}"));
-                    }
-                }
-
-                // Scope context for the first edit location
-                if let Some(lang) = code_intel::detect_language(&path)
-                    && let Some(first_edit_start) = first_edit_start_byte
-                {
-                    let edit_line = content[..first_edit_start].matches('\n').count() + 1;
-                    let scope = code_intel::scope_at_line(&working, lang, edit_line);
-                    if !scope.breadcrumbs.is_empty() {
-                        result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
-                    }
-                }
-
-                append_str_replace_cli_unified_diff(&mut result, &content, &working, &path);
-                Ok(result)
             }
-            Err(e) => Err(format!("Error writing file: {e}").into()),
+
+            // Scope context for the first edit location
+            if let Some(lang) = code_intel::detect_language(&path)
+                && let Some(first_edit_start) = first_edit_start_byte
+            {
+                let edit_line = content[..first_edit_start].matches('\n').count() + 1;
+                let scope = code_intel::scope_at_line(working, lang, edit_line);
+                if !scope.breadcrumbs.is_empty() {
+                    result.push_str(&format!("\n📍 {}", scope.breadcrumbs.join(" > ")));
+                }
+            }
+
+            append_str_replace_cli_unified_diff(&mut result, &content, working, &path);
+            Ok(result)
+        } else {
+            Err(publication.output.into())
         }
     }
 
@@ -2681,253 +2307,6 @@ fn similarity_score(target: &str, candidate: &str) -> usize {
     score
 }
 
-// ─── File outline extraction ────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Language {
-    Rust,
-    Python,
-    TypeScript,
-    Go,
-    Java,
-    CppLike,
-    Unknown,
-}
-
-fn detect_language(ext: &str) -> Language {
-    match ext {
-        "rs" => Language::Rust,
-        "py" | "pyi" => Language::Python,
-        "ts" | "tsx" | "js" | "jsx" | "mjs" | "mts" => Language::TypeScript,
-        "go" => Language::Go,
-        "java" | "kt" | "scala" => Language::Java,
-        "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "cs" => Language::CppLike,
-        _ => Language::Unknown,
-    }
-}
-
-/// Extract definition signatures from source code.
-/// Returns Vec<(line_number, signature_text)>.
-fn extract_outline(content: &str, lang: Language) -> Vec<(usize, String)> {
-    let lines: Vec<&str> = content.lines().collect();
-    let mut defs = Vec::new();
-
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with("//")
-            || trimmed.starts_with('#') && lang != Language::Python
-        {
-            continue;
-        }
-        if is_definition(trimmed, line, lang) {
-            // Trim trailing `{` and whitespace for cleaner output
-            let sig = trimmed.trim_end_matches('{').trim_end();
-            defs.push((i + 1, sig.to_string()));
-        }
-    }
-    defs
-}
-
-fn is_definition(trimmed: &str, _original: &str, lang: Language) -> bool {
-    match lang {
-        Language::Rust => is_rust_def(trimmed),
-        Language::Python => is_python_def(trimmed),
-        Language::TypeScript => is_typescript_def(trimmed),
-        Language::Go => is_go_def(trimmed),
-        Language::Java => is_java_def(trimmed),
-        Language::CppLike => is_cpp_def(trimmed),
-        Language::Unknown => is_generic_def(trimmed),
-    }
-}
-
-fn is_rust_def(line: &str) -> bool {
-    // Strip visibility/attribute prefixes
-    let s = strip_rust_vis(line);
-    s.starts_with("fn ")
-        || s.starts_with("async fn ")
-        || s.starts_with("unsafe fn ")
-        || s.starts_with("const fn ")
-        || s.starts_with("struct ")
-        || s.starts_with("enum ")
-        || s.starts_with("trait ")
-        || s.starts_with("impl ")
-        || s.starts_with("impl<")
-        || s.starts_with("mod ")
-        || s.starts_with("type ")
-        || s.starts_with("const ")
-        || s.starts_with("static ")
-        || s.starts_with("macro_rules!")
-        || s.starts_with("use ")
-}
-
-fn strip_rust_vis(line: &str) -> &str {
-    let s = line.strip_prefix("pub(crate) ").unwrap_or(line);
-    let s = s.strip_prefix("pub(super) ").unwrap_or(s);
-
-    (s.strip_prefix("pub ").unwrap_or(s)) as _
-}
-
-fn is_python_def(line: &str) -> bool {
-    line.starts_with("def ")
-        || line.starts_with("async def ")
-        || line.starts_with("class ")
-        // Module-level assignments
-        || (line.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false)
-            && line.contains(" = "))
-        // Decorators (include for context)
-        || line.starts_with("@")
-}
-
-fn is_typescript_def(line: &str) -> bool {
-    let s = line.strip_prefix("export ").unwrap_or(line);
-    let s = s.strip_prefix("default ").unwrap_or(s);
-    let s = s.strip_prefix("declare ").unwrap_or(s);
-    let s = s.strip_prefix("abstract ").unwrap_or(s);
-    let s = s.strip_prefix("async ").unwrap_or(s);
-    s.starts_with("function ")
-        || s.starts_with("function*(")
-        || s.starts_with("class ")
-        || s.starts_with("interface ")
-        || s.starts_with("type ")
-        || s.starts_with("enum ")
-        || s.starts_with("const ")
-        || s.starts_with("let ")
-        || s.starts_with("var ")
-        // Method-like at class level (indent)
-        || (line.starts_with("  ") && (s.contains("(") && !s.starts_with("if ") && !s.starts_with("for ") && !s.starts_with("while ")))
-}
-
-fn is_go_def(line: &str) -> bool {
-    line.starts_with("func ")
-        || line.starts_with("type ")
-        || line.starts_with("var ")
-        || (line.starts_with("const ") && !line.starts_with("const ("))
-        || line == "const ("
-        || line == "var ("
-}
-
-fn is_java_def(line: &str) -> bool {
-    // Strip annotations (common above defs but on same logical line when collapsed)
-    let s = line.strip_prefix("@").map(|_| line).unwrap_or(line);
-    let stripped = strip_java_mods(s);
-    stripped.starts_with("class ")
-        || stripped.starts_with("interface ")
-        || stripped.starts_with("enum ")
-        || stripped.starts_with("record ")
-        // Method declarations: have ( and either { or ;
-        || (stripped.contains('(') && !stripped.starts_with("if ") && !stripped.starts_with("for ") && !stripped.starts_with("while ")
-            && !stripped.starts_with("//") && !stripped.starts_with("*")
-            && (stripped.ends_with('{') || stripped.ends_with(") {")))
-        || s.starts_with("@")
-}
-
-fn strip_java_mods(line: &str) -> &str {
-    let mut s = line;
-    for m in &[
-        "public ",
-        "private ",
-        "protected ",
-        "static ",
-        "final ",
-        "abstract ",
-        "synchronized ",
-        "native ",
-    ] {
-        s = s.strip_prefix(m).unwrap_or(s);
-    }
-    s
-}
-
-fn is_cpp_def(line: &str) -> bool {
-    // Minimal: detect function signatures, class/struct, namespace
-    line.starts_with("class ")
-        || line.starts_with("struct ")
-        || line.starts_with("namespace ")
-        || line.starts_with("enum ")
-        || line.starts_with("typedef ")
-        || line.starts_with("#define ")
-        || line.starts_with("template")
-        // Function-like: type name( with no leading spaces (top-level)
-        || (!line.starts_with(' ') && !line.starts_with('\t') && line.contains('(')
-            && !line.starts_with("//") && !line.starts_with("/*") && !line.starts_with("#")
-            && !line.starts_with("if ") && !line.starts_with("for ") && !line.starts_with("while "))
-}
-
-fn is_generic_def(line: &str) -> bool {
-    // Catch common patterns across languages
-    line.starts_with("function ")
-        || line.starts_with("def ")
-        || line.starts_with("class ")
-        || line.starts_with("struct ")
-        || line.starts_with("pub fn ")
-        || line.starts_with("fn ")
-        || line.starts_with("impl ")
-        || line.starts_with("trait ")
-        || line.starts_with("type ")
-        || line.starts_with("export ")
-        || line.starts_with("module ")
-        || line.starts_with("func ")
-}
-
-// ─── Auto-format after edit ────────────────────────────────────────────────
-
-/// Detect project formatter and run it on the edited file.
-/// Returns Some(note) if formatter ran, None otherwise.
-fn auto_format_file(file_path: &Path, project_root: &Path) -> Option<String> {
-    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-    let (cmd, args): (&str, Vec<&str>) = match ext {
-        "rs" => {
-            // Only format if Cargo.toml exists (we're in a Rust project)
-            if !project_root.join("Cargo.toml").exists()
-                && !project_root.join("Cargo.toml").exists()
-            {
-                return None;
-            }
-            ("rustfmt", vec!["--edition", "2021"])
-        }
-        "py" => {
-            // Only if pyproject.toml or .black config exists
-            if !project_root.join("pyproject.toml").exists()
-                && !project_root.join("setup.cfg").exists()
-            {
-                return None;
-            }
-            ("black", vec!["--quiet"])
-        }
-        "go" => ("gofmt", vec!["-w"]),
-        "ts" | "tsx" | "js" | "jsx" | "json" | "css" | "scss" | "html" | "md" | "yaml" | "yml" => {
-            // Only if prettier config or package.json exists
-            if !project_root.join("package.json").exists()
-                && !project_root.join(".prettierrc").exists()
-                && !project_root.join(".prettierrc.json").exists()
-            {
-                return None;
-            }
-            ("npx", vec!["prettier", "--write"])
-        }
-        _ => return None,
-    };
-
-    let file_str = file_path.to_string_lossy();
-    let mut full_args: Vec<&str> = args;
-    full_args.push(&file_str);
-
-    let result = std::process::Command::new(cmd)
-        .args(&full_args)
-        .current_dir(project_root)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output();
-
-    match result {
-        Ok(out) if out.status.success() => Some(format!("✓ Auto-formatted with {cmd}")),
-        Ok(_) => None,  // Formatter failed silently — don't report
-        Err(_) => None, // Formatter not available — don't report
-    }
-}
-
 // ─── unified diff generation ────────────────────────────────────────────────
 
 const CLI_UNIFIED_DIFF_MAX_LINES: usize = 400;
@@ -2944,75 +2323,6 @@ fn cap_cli_unified_diff(s: String) -> String {
         + "\n... (_cli_unified_diff truncated)\n"
 }
 
-/// Unified diff body (no dry-run banner) for CLI previews and `_cli_unified_diff`.
-fn unified_diff_raw(old_content: &str, new_content: &str, path: &std::path::Path) -> String {
-    let fname = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
-
-    let old_lines: Vec<&str> = old_content.lines().collect();
-    let new_lines: Vec<&str> = new_content.lines().collect();
-
-    let mut out = format!("--- a/{fname}\n+++ b/{fname}\n");
-
-    // Find first and last differing line
-    let max_len = old_lines.len().max(new_lines.len());
-    let mut first_diff = max_len;
-    let mut last_diff = 0;
-    for i in 0..max_len {
-        let old_line = old_lines.get(i).copied().unwrap_or("");
-        let new_line = new_lines.get(i).copied().unwrap_or("");
-        if old_line != new_line {
-            if i < first_diff {
-                first_diff = i;
-            }
-            last_diff = i;
-        }
-    }
-
-    if first_diff > last_diff {
-        out.push_str("(no changes)\n");
-        return out;
-    }
-
-    // Show context around the diff (3 lines before/after)
-    let ctx = 3;
-    let start = first_diff.saturating_sub(ctx);
-    let end = (last_diff + ctx + 1).min(max_len);
-
-    out.push_str(&format!(
-        "@@ -{},{} +{},{} @@\n",
-        start + 1,
-        end.min(old_lines.len()).saturating_sub(start),
-        start + 1,
-        end.min(new_lines.len()).saturating_sub(start),
-    ));
-
-    for i in start..end {
-        let old_line = old_lines.get(i).copied();
-        let new_line = new_lines.get(i).copied();
-        match (old_line, new_line) {
-            (Some(o), Some(n)) if o == n => {
-                out.push_str(&format!(" {o}\n"));
-            }
-            (Some(o), Some(n)) => {
-                out.push_str(&format!("-{o}\n"));
-                out.push_str(&format!("+{n}\n"));
-            }
-            (Some(o), None) => {
-                out.push_str(&format!("-{o}\n"));
-            }
-            (None, Some(n)) => {
-                out.push_str(&format!("+{n}\n"));
-            }
-            (None, None) => {}
-        }
-    }
-
-    out
-}
-
 /// Generate a unified diff between old and new content for a given file path.
 fn unified_diff(old_content: &str, new_content: &str, path: &std::path::Path) -> String {
     format!(
@@ -3026,125 +2336,6 @@ fn append_str_replace_cli_unified_diff(out: &mut String, before: &str, after: &s
     out.push_str(STR_REPLACE_DIFF_START);
     out.push_str(&cap_cli_unified_diff(unified_diff_raw(before, after, path)));
     out.push_str(STR_REPLACE_DIFF_END);
-}
-
-// ─── str_replace fuzzy matching ─────────────────────────────────────────────
-//
-// The canonical structured failure banner lives in `astra-tools::fs_ops::str_replace_fail`.
-// All `str_replace` / `multi_edit` failure paths in this CLI module route through that
-// helper so downstream matchers (hallucination tripwire, step recorder, tool result
-// semantics) can rely on a single sentinel: `❌ STR_REPLACE FAILED — FILE NOT MODIFIED`.
-// The "old_str not found" path additionally appends diagnostic hints below.
-
-/// When old_str not found, emit structured signals about near-misses.
-///
-/// Output is intentionally compact: WHAT/WHY/NEXT banner plus boolean signals
-/// (whitespace_normalized_match, first_line_at, individual_line_match_ratio,
-/// no_partial_match). It does NOT echo file content — the prior `read_file`
-/// tool_result is still in the prompt and is the source of truth. Echoing
-/// nearby lines wastes tokens, breaks prompt-cache prefix matching (echoed
-/// window depends on per-call old_str), and encourages the model to retry
-/// by re-emitting the full new_str instead of fixing the anchor.
-fn str_replace_not_found_hint(content: &str, old_str: &str) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let old_lines: Vec<&str> = old_str.lines().collect();
-    let mut msg = str_replace_fail(
-        "old_str not found in file.",
-        "The exact byte sequence does not appear in the current file content (whitespace, indentation, or quote style may differ; or the file changed since you last read it).",
-        "Refer to the prior read_file tool_result for the current file content; copy the exact bytes into old_str and retry. If the file has changed, re-read it first.",
-    );
-    msg.push('\n');
-
-    let normalized_old = normalize_ws(old_str);
-    let normalized_content = normalize_ws(content);
-    if normalized_content.contains(&normalized_old) {
-        msg.push_str("whitespace_normalized_match: true (check indentation/trailing whitespace)\n");
-        if let Some(first_line) = old_lines.first() {
-            let norm_first = normalize_ws(first_line);
-            for (i, line) in lines.iter().enumerate() {
-                if normalize_ws(line) == norm_first {
-                    msg.push_str(&format!("first_line_at: L{}\n", i + 1));
-                    break;
-                }
-            }
-        }
-        return msg;
-    }
-
-    let mut has_specific_hint = false;
-    if let Some(first_line) = old_lines.first() {
-        let needle = first_line.trim();
-        if !needle.is_empty() {
-            let mut matches: Vec<usize> = Vec::new();
-            for (i, line) in lines.iter().enumerate() {
-                if line.trim() == needle || line.contains(needle) {
-                    matches.push(i + 1);
-                    if matches.len() >= 5 {
-                        break;
-                    }
-                }
-            }
-            if !matches.is_empty() {
-                has_specific_hint = true;
-                msg.push_str(&format!("first_line_at: {matches:?}\n"));
-            }
-        }
-    }
-
-    if old_lines.len() > 1 {
-        let file_line_set: std::collections::HashSet<&str> =
-            lines.iter().map(|l| l.trim()).collect();
-        let matching_count = old_lines
-            .iter()
-            .filter(|ol| {
-                let trimmed = ol.trim();
-                !trimmed.is_empty() && file_line_set.contains(trimmed)
-            })
-            .count();
-        if matching_count > 0 {
-            has_specific_hint = true;
-            msg.push_str(&format!(
-                "individual_line_match_ratio: {matching_count}/{}\n",
-                old_lines.len()
-            ));
-        }
-    }
-
-    if !has_specific_hint {
-        msg.push_str("no_partial_match: true (old_str doesn't appear under any normalization)\n");
-    }
-    msg
-}
-
-/// When old_str found multiple times, show locations.
-fn str_replace_ambiguous_hint(content: &str, old_str: &str, count: usize) -> String {
-    let mut msg = str_replace_fail(
-        &format!("old_str found {count} times — must be unique."),
-        "Multiple exact occurrences match; the edit is ambiguous and cannot apply safely.",
-        "Add more surrounding context to old_str to make it unique, or set replace_all=true. Locations below:",
-    );
-    msg.push('\n');
-    // Find line numbers of each occurrence
-    let lines: Vec<&str> = content.lines().collect();
-    let first_line = old_str.lines().next().unwrap_or("");
-    let needle = first_line.trim();
-    if !needle.is_empty() {
-        let mut locs: Vec<usize> = Vec::new();
-        for (i, line) in lines.iter().enumerate() {
-            if line.contains(needle) {
-                locs.push(i + 1);
-            }
-        }
-        if !locs.is_empty() {
-            msg.push_str(&format!("Locations (first line matches): {:?}\n", locs));
-            msg.push_str("Hint: Add more surrounding context to old_str to make it unique.\n");
-        }
-    }
-    msg
-}
-
-fn normalize_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Like `read_to_string_lossy` but reads at most `max_bytes` from the
@@ -3215,7 +2406,7 @@ fn add_line_numbers_budgeted(
                 // line exceeds the model budget; the shared redacted
                 // truncator drops/keeps the atomic span safely.
                 output.push_str(
-                    &astra_tools::credential_redaction::truncate_redacted_output(
+                    &astra_text_utils::credential_redaction::truncate_redacted_output(
                         rendered, max_chars,
                     ),
                 );
@@ -3252,11 +2443,7 @@ fn push_suffix_if_fits(output: &mut String, suffix: &str, max_chars: usize) {
 #[cfg(test)]
 mod tests {
     use super::super::ToolExecutor;
-    use super::{
-        Language, add_line_numbers, auto_format_file, detect_language, extract_outline,
-        is_unc_path, normalize_ws, similarity_score, str_replace_ambiguous_hint,
-        str_replace_not_found_hint,
-    };
+    use super::{add_line_numbers, is_unc_path, similarity_score};
     use astra_text_utils::str_preview::truncate_str;
     use astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS;
     use serde_json::{Value, json};
@@ -3276,257 +2463,6 @@ mod tests {
         for i in 1..=num_lines {
             writeln!(f, "line {i}: {}", "x".repeat(80)).unwrap();
         }
-    }
-
-    // ── file_outline: Rust ───────────────────────────────────────────────────
-
-    #[test]
-    fn outline_rust_functions_and_structs() {
-        let rust_code = r#"
-use std::collections::HashMap;
-
-pub struct Config {
-    name: String,
-}
-
-pub enum Status {
-    Active,
-    Inactive,
-}
-
-impl Config {
-    pub fn new(name: &str) -> Self {
-        Config { name: name.to_string() }
-    }
-
-    pub(crate) fn validate(&self) -> bool {
-        true
-    }
-}
-
-pub trait Handler {
-    fn handle(&self);
-}
-
-async fn fetch_data(url: &str) -> String {
-    url.to_string()
-}
-
-mod inner {
-    pub fn helper() {}
-}
-"#;
-        let defs = extract_outline(rust_code, Language::Rust);
-        let names: Vec<&str> = defs.iter().map(|(_, s)| s.as_str()).collect();
-        assert!(
-            names.iter().any(|s| s.contains("use std::collections")),
-            "should find use: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("pub struct Config")),
-            "should find struct: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("pub enum Status")),
-            "should find enum: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("impl Config")),
-            "should find impl: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("pub fn new")),
-            "should find pub fn: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("validate")),
-            "should find validate: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("pub trait Handler")),
-            "should find trait: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("async fn fetch_data")),
-            "should find async fn: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("mod inner")),
-            "should find mod: {names:?}"
-        );
-    }
-
-    #[test]
-    fn outline_rust_preserves_line_numbers() {
-        let code = "pub fn first() {}\n\nfn second() {}";
-        let defs = extract_outline(code, Language::Rust);
-        assert_eq!(defs[0].0, 1, "first fn should be line 1");
-        assert_eq!(defs[1].0, 3, "second fn should be line 3");
-    }
-
-    // ── file_outline: Python ─────────────────────────────────────────────────
-
-    #[test]
-    fn outline_python_classes_and_functions() {
-        let py_code = r#"
-import os
-
-class MyClass:
-    def __init__(self):
-        pass
-
-    def method(self):
-        pass
-
-def standalone():
-    return 42
-
-async def async_handler(request):
-    pass
-
-MAX_SIZE = 100
-"#;
-        let defs = extract_outline(py_code, Language::Python);
-        let names: Vec<&str> = defs.iter().map(|(_, s)| s.as_str()).collect();
-        assert!(
-            names.iter().any(|s| s.contains("class MyClass")),
-            "should find class: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("def standalone")),
-            "should find def: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("async def async_handler")),
-            "should find async def: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("MAX_SIZE")),
-            "should find constant: {names:?}"
-        );
-    }
-
-    // ── file_outline: TypeScript ─────────────────────────────────────────────
-
-    #[test]
-    fn outline_typescript_exports_and_classes() {
-        let ts_code = r#"
-export function fetchData(url: string): Promise<string> {
-  return fetch(url);
-}
-
-export class UserService {
-  constructor() {}
-}
-
-export interface Config {
-  name: string;
-}
-
-export type ID = string | number;
-
-const helper = () => {};
-
-export default class App {
-"#;
-        let defs = extract_outline(ts_code, Language::TypeScript);
-        let names: Vec<&str> = defs.iter().map(|(_, s)| s.as_str()).collect();
-        assert!(
-            names
-                .iter()
-                .any(|s| s.contains("export function fetchData")),
-            "should find export function: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("export class UserService")),
-            "should find export class: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("export interface Config")),
-            "should find interface: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("export type ID")),
-            "should find type: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("export default class App")),
-            "should find default class: {names:?}"
-        );
-    }
-
-    // ── file_outline: Go ─────────────────────────────────────────────────────
-
-    #[test]
-    fn outline_go_funcs_and_types() {
-        let go_code = r#"
-package main
-
-func main() {
-    fmt.Println("hello")
-}
-
-type Config struct {
-    Name string
-}
-
-func (c *Config) Validate() bool {
-    return true
-}
-
-type Handler interface {
-    Handle()
-}
-"#;
-        let defs = extract_outline(go_code, Language::Go);
-        let names: Vec<&str> = defs.iter().map(|(_, s)| s.as_str()).collect();
-        assert!(
-            names.iter().any(|s| s.contains("func main")),
-            "should find func main: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("type Config struct")),
-            "should find type struct: {names:?}"
-        );
-        assert!(
-            names
-                .iter()
-                .any(|s| s.contains("func (c *Config) Validate")),
-            "should find method: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("type Handler interface")),
-            "should find interface: {names:?}"
-        );
-    }
-
-    // ── file_outline: language detection ─────────────────────────────────────
-
-    #[test]
-    fn detect_language_from_extension() {
-        assert_eq!(detect_language("rs"), Language::Rust);
-        assert_eq!(detect_language("py"), Language::Python);
-        assert_eq!(detect_language("ts"), Language::TypeScript);
-        assert_eq!(detect_language("tsx"), Language::TypeScript);
-        assert_eq!(detect_language("go"), Language::Go);
-        assert_eq!(detect_language("java"), Language::Java);
-        assert_eq!(detect_language("cpp"), Language::CppLike);
-        assert_eq!(detect_language("txt"), Language::Unknown);
-    }
-
-    // ── file_outline: empty/no-defs ──────────────────────────────────────────
-
-    #[test]
-    fn outline_empty_file() {
-        let defs = extract_outline("", Language::Rust);
-        assert!(defs.is_empty());
-    }
-
-    #[test]
-    fn outline_no_definitions() {
-        let code = "// just comments\n// nothing here\n";
-        let defs = extract_outline(code, Language::Rust);
-        assert!(defs.is_empty());
     }
 
     // ── file_outline: integration via read_file ──────────────────────────────
@@ -3563,6 +2499,54 @@ type Handler interface {
     }
 
     #[test]
+    fn read_file_outline_preserves_language_aliases_and_partial_read_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        for (name, source, signature) in [
+            (
+                "types.pyi",
+                "# def invented(): pass\n\ndef actual(key=\"AKIAIOSFODNN7EXAMPLE\"): ...\n",
+                "def actual",
+            ),
+            (
+                "module.mjs",
+                "// function invented() {}\n\nexport function actual() {}\n",
+                "function actual",
+            ),
+            (
+                "module.mts",
+                "// function invented() {}\n\nexport function actual(): void {}\n",
+                "function actual",
+            ),
+        ] {
+            std::fs::write(dir.path().join(name), source).unwrap();
+            let result = executor.read_file(&serde_json::json!({"path": name, "outline": true}));
+            assert!(result.contains(signature), "{result}");
+            assert!(result.contains("3:"), "{result}");
+            assert!(!result.contains("invented"), "{result}");
+            assert!(!result.contains("AKIAIOSFODNN7EXAMPLE"), "{result}");
+            if name == "types.pyi" {
+                assert!(result.contains("[REDACTED:AWS_ACCESS_KEY]"), "{}", result);
+            }
+            let overwrite =
+                executor.write_file(&serde_json::json!({"path": name, "content": "replacement"}));
+            let rejected: Value = serde_json::from_str(&overwrite).unwrap();
+            assert_eq!(rejected["success"], false, "{overwrite}");
+            assert!(
+                rejected["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("partially read"),
+                "{overwrite}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(name)).unwrap(),
+                source
+            );
+        }
+    }
+
+    #[test]
     fn read_file_outline_empty_result() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("test.txt");
@@ -3577,73 +2561,6 @@ type Handler interface {
         assert!(
             result.contains("no definitions found"),
             "should report empty: {result}"
-        );
-    }
-
-    // ── str_replace: fuzzy matching ──────────────────────────────────────────
-
-    #[test]
-    fn str_replace_not_found_whitespace_hint() {
-        let content = "  fn hello() {\n    println!(\"hi\");\n  }\n";
-        let old_str = "fn hello() {\n  println!(\"hi\");\n}";
-        let msg = str_replace_not_found_hint(content, old_str);
-        assert!(
-            msg.contains("whitespace_normalized_match: true"),
-            "should hint whitespace: {msg}"
-        );
-        assert!(
-            msg.contains("first_line_at: L1"),
-            "should show line number: {msg}"
-        );
-        assert!(
-            !msg.contains("Actual file content"),
-            "hint must not echo file content: {msg}"
-        );
-    }
-
-    #[test]
-    fn str_replace_not_found_first_line_hint() {
-        let content = "line one\nfn target() {\n    body\n}\nline five\n";
-        let old_str = "fn target() {\n    wrong body\n}";
-        let msg = str_replace_not_found_hint(content, old_str);
-        assert!(
-            msg.contains("first_line_at:"),
-            "should show first_line signal: {msg}"
-        );
-        assert!(msg.contains("2"), "should show line number: {msg}");
-        assert!(
-            !msg.contains("Actual file content"),
-            "hint must not echo file content: {msg}"
-        );
-    }
-
-    #[test]
-    fn str_replace_not_found_no_match_at_all() {
-        let content = "fn hello() {}\n";
-        let old_str = "completely_nonexistent_text";
-        let msg = str_replace_not_found_hint(content, old_str);
-        // The unified banner from PR #334 must include all four sentinel
-        // markers — emoji header + WHAT/WHY/NEXT structured lines. This
-        // test pins the contract so a regression unwinds visibly.
-        assert!(
-            msg.contains("STR_REPLACE FAILED"),
-            "must include unified banner sentinel: {msg}"
-        );
-        assert!(msg.contains("WHAT:"), "must include WHAT line: {msg}");
-        assert!(msg.contains("WHY:"), "must include WHY line: {msg}");
-        assert!(msg.contains("NEXT:"), "must include NEXT line: {msg}");
-    }
-
-    #[test]
-    fn str_replace_ambiguous_shows_locations() {
-        let content = "fn foo() {}\nsome stuff\nfn foo() {}\n";
-        let old_str = "fn foo() {}";
-        let msg = str_replace_ambiguous_hint(content, old_str, 2);
-        assert!(msg.contains("2 times"), "should show count: {msg}");
-        assert!(msg.contains("Locations"), "should show locations: {msg}");
-        assert!(
-            msg.contains("unique"),
-            "should hint about uniqueness: {msg}"
         );
     }
 
@@ -3691,29 +2608,58 @@ type Handler interface {
         );
     }
 
-    #[test]
-    fn str_replace_resolves_sanitized_credential_reference() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("settings.txt");
+    #[tokio::test]
+    async fn str_replace_resolves_sanitized_credential_reference() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.txt");
         let raw = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
-        std::fs::write(&file_path, raw).unwrap();
-        let (redacted, count) = astra_tools::credential_redaction::redact_credentials_in_text(raw);
-        assert_eq!(count, 1);
-        let marker = redacted
-            .split_once('=')
-            .and_then(|(_, value)| value.lines().next())
-            .expect("marker should be present");
-
-        let executor = test_executor_in(dir.path());
-        let result = executor.str_replace(&serde_json::json!({
-            "path": "settings.txt",
-            "old_str": marker,
-            "new_str": "[configured-access-key]"
-        }));
-        assert!(result.contains("Replaced successfully"), "{result}");
-        let updated = std::fs::read_to_string(file_path).unwrap();
-        assert!(updated.contains("[configured-access-key]"));
-        assert!(!updated.contains("AKIAIOSFODNN7EXAMPLE"));
+        std::fs::write(&path, raw).unwrap();
+        let session = std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability::ObservabilitySession::new_simple("marker-edit"),
+        ));
+        let executor =
+            test_executor_in(directory.path()).with_observability_session(session.clone());
+        let read = executor
+            .execute_with_metadata("read_file", &json!({"path":"settings.txt"}))
+            .await;
+        assert!(!read.is_error, "{}", read.output);
+        assert!(!read.output.contains("AKIAIOSFODNN7EXAMPLE"));
+        let start = read
+            .output
+            .find("[REDACTED:")
+            .expect("real read returns an opaque marker");
+        let end = read.output[start..].find(']').unwrap() + start + 1;
+        let marker = &read.output[start..end];
+        let result = executor
+            .execute_with_metadata(
+                "str_replace",
+                &json!({
+                    "path":"settings.txt", "old_str":marker, "new_str":"[configured-access-key]"
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(!result.output.contains("AKIAIOSFODNN7EXAMPLE"));
+        let metadata = result.tool_result_fields.unwrap();
+        assert!(
+            !serde_json::to_string(&metadata)
+                .unwrap()
+                .contains("AKIAIOSFODNN7EXAMPLE")
+        );
+        assert_eq!(metadata["workspace_mutation_applied"], true);
+        let expected = b"AWS_ACCESS_KEY_ID=[configured-access-key]\n";
+        assert_eq!(std::fs::read(path).unwrap(), expected);
+        let journal = executor.file_journal.lock().unwrap();
+        let entries: Vec<_> = journal.entries().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].before_content.as_deref(), Some(raw.as_bytes()));
+        assert_eq!(entries[0].after_content, expected);
+        let observed = session.read().unwrap();
+        assert_eq!(observed.fuzzy_match_events.len(), 1);
+        assert_eq!(
+            observed.fuzzy_match_events[0].outcome,
+            astra_runtime::observability::FuzzyMatchOutcome::Matched
+        );
     }
 
     #[test]
@@ -3722,7 +2668,8 @@ type Handler interface {
         let file_path = dir.path().join("settings.txt");
         let raw = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
         std::fs::write(&file_path, raw).unwrap();
-        let (redacted, count) = astra_tools::credential_redaction::redact_credentials_in_text(raw);
+        let (redacted, count) =
+            astra_text_utils::credential_redaction::redact_credentials_in_text(raw);
         assert_eq!(count, 1);
         let marker = redacted
             .split_once('=')
@@ -3761,19 +2708,6 @@ type Handler interface {
         assert!(
             result.contains("Locations"),
             "should show locations: {result}"
-        );
-    }
-
-    // ── str_replace multi-line partial match ─────────────────────────────────
-
-    #[test]
-    fn str_replace_not_found_multiline_partial() {
-        let content = "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n";
-        let old_str = "fn alpha() {}\nfn WRONG() {}\nfn gamma() {}";
-        let msg = str_replace_not_found_hint(content, old_str);
-        assert!(
-            msg.contains("individual_line_match_ratio: 2/3"),
-            "should report partial ratio: {msg}"
         );
     }
 
@@ -3823,6 +2757,69 @@ type Handler interface {
         assert!(
             !result.contains("missing 'path'"),
             "unknown-field contract should fire before legacy missing-path text: {result}"
+        );
+    }
+
+    #[test]
+    fn read_file_argument_failures_preserve_recovery_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("test.txt"),
+            "Error: ordinary file content\n",
+        )
+        .unwrap();
+        let executor = test_executor_in(dir.path());
+        for args in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({"path": ""}),
+            serde_json::json!({"path": "missing.txt", "unknown": true}),
+            serde_json::json!({"path": "missing.txt", "start_line": 0}),
+            serde_json::json!({"path": "missing.txt", "start_line": -1}),
+            serde_json::json!({"path": "missing.txt", "start_line": 1.5}),
+            serde_json::json!({"path": "missing.txt", "end_line": "2"}),
+            serde_json::json!({"path": "missing.txt", "start_line": 3, "end_line": 1}),
+            serde_json::json!({"path": "missing.txt", "outline": 1}),
+        ] {
+            let result = executor.read_file_with_metadata(&args);
+            assert!(result.is_error, "{args}: {result:?}");
+            let metadata = result.metadata.as_ref().unwrap();
+            assert_eq!(metadata["execution_started"], false);
+            assert_eq!(metadata["disposition"], "rejected");
+            assert_eq!(metadata["execution_fact"], "not_executed");
+            assert_eq!(
+                metadata["error_kind"],
+                astra_core::ErrorKind::ToolInvalidArgs.as_str()
+            );
+            let evidence: astra_core::ToolFailureEvidence =
+                serde_json::from_value(metadata["recovery_evidence"].clone()).unwrap();
+            assert_eq!(
+                evidence.cause,
+                astra_core::ToolFailureCause::InvalidArguments
+            );
+            assert_eq!(
+                evidence.recovery_actions,
+                vec![astra_core::ToolRecoveryAction::CorrectArguments]
+            );
+        }
+        let read = |args: &Value| executor.read_file_with_metadata(args);
+        let corrected =
+            read(&serde_json::json!({"path": "test.txt", "start_line": 1, "end_line": 1}));
+        assert!(!corrected.is_error, "{corrected:?}");
+        assert!(corrected.output.contains("Error: ordinary file content"));
+        let missing = read(&serde_json::json!({"path": "missing.txt"}));
+        assert!(missing.is_error);
+        assert!(missing.metadata.as_ref().is_none_or(
+            |metadata| metadata.get("disposition") != Some(&serde_json::json!("rejected"))
+        ));
+        assert!(
+            missing
+                .metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.get("error_kind")
+                    != Some(&serde_json::json!(
+                        astra_core::ErrorKind::ToolInvalidArgs.as_str()
+                    )))
         );
     }
 
@@ -3936,7 +2933,7 @@ type Handler interface {
         );
         // Verify actual file content
         let actual = std::fs::read_to_string(&file_path).unwrap();
-        assert_eq!(actual, "let x = \"world\";");
+        assert_eq!(actual, "let x = \"world\";\n");
     }
 
     #[test]
@@ -3957,59 +2954,7 @@ type Handler interface {
             "should mention normalization: {result}"
         );
         let actual = std::fs::read_to_string(&file_path).unwrap();
-        assert_eq!(actual, "let x = \u{201C}world\u{201D};");
-    }
-
-    #[test]
-    fn str_replace_not_found_hint_whitespace_emits_signal_only_edge_tools() {
-        let content =
-            "  fn big() {\n    a();\n    b();\n    c();\n    d();\n    e();\n    f();\n  }\n";
-        let old_str = "fn big() {\n  a();\n  b();\n  c();\n  d();\n  e();\n  f();\n}";
-        let msg = str_replace_not_found_hint(content, old_str);
-        assert!(
-            msg.contains("whitespace_normalized_match: true"),
-            "should emit whitespace signal, got: {msg}"
-        );
-        assert!(
-            !msg.contains("Actual file content"),
-            "hint must not echo file content, got: {msg}"
-        );
-        assert!(
-            !msg.contains("f();"),
-            "hint must not echo file lines, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn str_replace_not_found_hint_first_line_does_not_echo_file_edge_tools() {
-        let content = "header\nfn foo() {\n    bar();\n    baz();\n}\nfooter\n";
-        let old_str = "fn foo() {\n    bar();\n    qux();\n}";
-        let msg = str_replace_not_found_hint(content, old_str);
-        assert!(
-            msg.contains("first_line_at:"),
-            "should emit first_line signal, got: {msg}"
-        );
-        assert!(
-            !msg.contains("Actual file content"),
-            "hint must not echo file content, got: {msg}"
-        );
-        assert!(
-            !msg.contains("footer"),
-            "hint must not echo file lines, got: {msg}"
-        );
-        assert!(
-            !msg.contains("header"),
-            "hint must not echo file lines, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn str_replace_not_found_hint_individual_lines_edge_tools() {
-        let msg = str_replace_not_found_hint("aaa\nbbb\nccc\n", "aaa\nXXX\nccc");
-        assert!(
-            msg.contains("individual_line_match_ratio: 2/3"),
-            "got: {msg}"
-        );
+        assert_eq!(actual, "let x = \u{201C}world\u{201D};\n");
     }
 
     // Issue #1: replace_all + mixed curly-quote forms → specific error (not generic hint)
@@ -4091,14 +3036,27 @@ type Handler interface {
     fn read_file_large_file_truncation_includes_hint() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("big.txt");
+        let executor = test_executor_in(dir.path());
+        let line_count = executor.scaled_output_limit().saturating_mul(3) / 30 + 1;
         let mut f = std::fs::File::create(&file_path).unwrap();
-        for i in 0..2000 {
+        for i in 0..line_count {
             writeln!(f, "line {i}: {}", "x".repeat(30)).unwrap();
         }
         drop(f);
 
-        let executor = test_executor_in(dir.path());
         let result = executor.read_file(&serde_json::json!({"path": "big.txt"}));
+
+        assert!(result.contains("partial content"), "{result}");
+        let captured = super::read_capped_to_string_lossy(
+            &file_path,
+            executor.scaled_output_limit().saturating_mul(2),
+        )
+        .unwrap();
+        assert!(
+            result.contains(&format!("{}-line sample", captured.lines().count())),
+            "{result}"
+        );
+        assert!(!result.contains(&format!("{line_count} lines")), "{result}");
 
         // Pre-read size gate: large files without a range now auto-degrade
         // to an outline + guidance, not a hard refusal.
@@ -4813,9 +3771,6 @@ type Handler interface {
 
     #[test]
     fn text_utility_functions() {
-        // normalize_ws collapses whitespace
-        assert_eq!(normalize_ws("  fn   hello(  ) "), "fn hello( )");
-
         // truncate_str within limit returns unchanged
         assert_eq!(truncate_str("short", 10), "short");
         // truncate_str over limit truncates with ellipsis
@@ -4829,42 +3784,7 @@ type Handler interface {
         assert!(with_ext > without_ext, "same ext should score higher");
     }
 
-    // ── file_outline: generic fallback ───────────────────────────────────────
-
-    #[test]
-    fn outline_generic_catches_common_keywords() {
-        let code = "function greet(name) {\n  console.log(name);\n}\n\nclass Animal {\n}\n";
-        let defs = extract_outline(code, Language::Unknown);
-        let names: Vec<&str> = defs.iter().map(|(_, s)| s.as_str()).collect();
-        assert!(
-            names.iter().any(|s| s.contains("function greet")),
-            "should find function: {names:?}"
-        );
-        assert!(
-            names.iter().any(|s| s.contains("class Animal")),
-            "should find class: {names:?}"
-        );
-    }
-
     // ── file_outline: strips trailing braces ─────────────────────────────────
-
-    #[test]
-    fn outline_strips_trailing_brace() {
-        let code = "pub fn hello() {\n    body\n}\n";
-        let defs = extract_outline(code, Language::Rust);
-        assert!(!defs.is_empty());
-        // Should have "pub fn hello()" not "pub fn hello() {"
-        assert!(
-            !defs[0].1.ends_with('{'),
-            "should strip brace: {:?}",
-            defs[0].1
-        );
-        assert!(
-            defs[0].1.contains("pub fn hello()"),
-            "signature: {:?}",
-            defs[0].1
-        );
-    }
 
     // ── read_file: similar file suggestions ──────────────────────────────────
 
@@ -4921,48 +3841,557 @@ type Handler interface {
         assert!(with_ext > without_ext, "same ext should score higher");
     }
 
-    // ── auto_format_file tests ──────────────────────────────────────────────
-
     #[test]
-    fn auto_format_skips_without_project_config() {
-        // Unknown extension
-        let tmpdir = tempfile::tempdir().unwrap();
-        let file = tmpdir.path().join("data.xyz");
-        std::fs::write(&file, "content").unwrap();
-        assert!(auto_format_file(&file, tmpdir.path()).is_none());
+    fn file_edits_preserve_candidates_in_formatter_configured_project() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"edit-fixture\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let path = dir.path().join("main.rs");
+        let exe = test_executor_in(dir.path());
+        let created = "fn   main( ){let   value=1;}\n";
+        let (write, applied, already_desired) = exe.write_file_with_applied(&json!({
+            "path": "main.rs",
+            "content": "fn   main( ){let   value=1;}\r\n"
+        }));
+        let write: Value = serde_json::from_str(&write).unwrap();
+        assert_eq!(write["success"], true);
+        assert!(applied);
+        assert!(!already_desired);
+        // Deterministic LF normalization stays; project-configured formatters
+        // must not rewrite whitespace outside the requested candidate.
+        assert_eq!(std::fs::read(&path).unwrap(), created.as_bytes());
+        assert!(
+            write["_cli_unified_diff"]
+                .as_str()
+                .unwrap()
+                .contains(created.trim_end())
+        );
 
-        // .rs without Cargo.toml
-        let file = tmpdir.path().join("main.rs");
-        std::fs::write(&file, "fn main() {}").unwrap();
-        assert!(auto_format_file(&file, tmpdir.path()).is_none());
+        let (replace, applied) = exe.str_replace_with_applied(&json!({
+            "path": "main.rs", "old_str": "value=1", "new_str": "value=2"
+        }));
+        let replaced = "fn   main( ){let   value=2;}\n";
+        assert!(!replace.is_error, "{}", replace.output);
+        assert!(applied);
+        assert_eq!(std::fs::read(&path).unwrap(), replaced.as_bytes());
+        assert!(replace.output.contains(replaced.trim_end()));
 
-        // .py without pyproject.toml
-        let file = tmpdir.path().join("main.py");
-        std::fs::write(&file, "print('hello')").unwrap();
-        assert!(auto_format_file(&file, tmpdir.path()).is_none());
+        let (batch, applied) = exe.multi_edit_with_applied(&json!({
+            "path": "main.rs",
+            "edits": [
+                {"old_str": "value=2", "new_str": "value=3"},
+                {"old_str": "main", "new_str": "entry"}
+            ]
+        }));
+        let batched = "fn   entry( ){let   value=3;}\n";
+        assert!(!batch.is_error, "{}", batch.output);
+        assert!(applied);
+        assert_eq!(std::fs::read(&path).unwrap(), batched.as_bytes());
+        assert!(batch.output.contains(batched.trim_end()));
 
-        // .ts without package.json
-        let file = tmpdir.path().join("app.ts");
-        std::fs::write(&file, "const x = 1;").unwrap();
-        assert!(auto_format_file(&file, tmpdir.path()).is_none());
+        let journal = exe.file_journal.lock().unwrap();
+        let entries: Vec<_> = journal.entries().collect();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].before_content, None);
+        assert_eq!(entries[0].after_content, created.as_bytes());
+        assert_eq!(
+            entries[1].before_content.as_deref(),
+            Some(created.as_bytes())
+        );
+        assert_eq!(entries[1].after_content, replaced.as_bytes());
+        assert_eq!(
+            entries[2].before_content.as_deref(),
+            Some(replaced.as_bytes())
+        );
+        assert_eq!(entries[2].after_content, batched.as_bytes());
+        journal.undo_turn_transactional(0).unwrap();
+        assert!(!path.exists());
+        journal.restore_turn_transactional(0).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), batched.as_bytes());
     }
 
     #[test]
-    fn auto_format_rs_with_cargo_toml_tries_rustfmt() {
-        let tmpdir = tempfile::tempdir().unwrap();
-        // Create Cargo.toml so the guard passes
+    fn cli_prepared_publication_respects_explicit_external_authorization() {
+        let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let project = base.path().join("project");
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let path = outside.join("edit.txt");
+        let exe = test_executor_in(&project);
+        exe.sandbox_policy
+            .write()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .allowed_paths
+            .clear();
+        let args = json!({"path": path, "content": "alpha\r\n"});
+        let (denied, applied, converged) = exe.write_file_with_applied(&args);
+        assert_eq!(
+            serde_json::from_str::<Value>(&denied).unwrap()["success"],
+            false
+        );
+        assert!(!applied && !converged);
+        assert!(!path.exists());
+        exe.expand_sandbox_path(outside).unwrap();
+        let (write, applied, converged) = exe.write_file_with_applied(&args);
+        assert_eq!(
+            serde_json::from_str::<Value>(&write).unwrap()["success"],
+            true
+        );
+        assert!(applied && !converged);
+        let (replace, applied) = exe.str_replace_with_applied(&json!({
+            "path": path, "old_str": "alpha", "new_str": "beta"
+        }));
+        assert!(!replace.is_error && applied, "{}", replace.output);
+        let (batch, applied) = exe.multi_edit_with_applied(&json!({
+            "path": path, "edits": [{"old_str": "beta", "new_str": "gamma"}]
+        }));
+        assert!(!batch.is_error && applied, "{}", batch.output);
+        assert_eq!(std::fs::read(path).unwrap(), b"gamma\n");
+    }
+
+    #[tokio::test]
+    async fn cli_multi_path_batch_uses_explicit_authority_and_rejects_group_denials() {
+        let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let project = base.path().join("project");
+        let first_dir = base.path().join("first");
+        let second_dir = base.path().join("second");
+        for directory in [&project, &first_dir, &second_dir] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let first = first_dir.join("a.txt");
+        let second = second_dir.join("b.txt");
+        for path in [&first, &second] {
+            std::fs::write(path, "before\n").unwrap();
+        }
+        let executor = test_executor_in(&project);
+        executor
+            .sandbox_policy
+            .write()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .allowed_paths
+            .clear();
+        let arguments = json!({"edits":[
+            {"path":first,"old_str":"before","new_str":"after"},
+            {"path":second,"old_str":"before","new_str":"after"}
+        ]});
+        executor.expand_sandbox_path(first_dir.clone()).unwrap();
+        assert!(
+            astra_tools::fs_ops::resolve_path(&project, first.to_str().unwrap()).is_err(),
+            "fixture must be outside the shared default allowed roots"
+        );
+        let read = executor
+            .execute_with_metadata("read_file", &json!({"path":first}))
+            .await;
+        assert!(!read.is_error, "{}", read.output);
+        let denied = executor
+            .execute_with_metadata("str_replace", &arguments)
+            .await;
+        assert!(denied.is_error, "{}", denied.output);
+        assert_eq!(
+            denied.tool_result_fields.as_ref().unwrap()["error_kind"],
+            "sandbox_denied"
+        );
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "before\n");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "before\n");
+        assert_eq!(executor.file_journal.lock().unwrap().entries().count(), 0);
+        executor.expand_sandbox_path(second_dir.clone()).unwrap();
+        for path in [&first, &second] {
+            let read = executor
+                .execute_with_metadata("read_file", &json!({"path":path}))
+                .await;
+            assert!(!read.is_error, "{}", read.output);
+        }
+        let applied = executor
+            .execute_with_metadata("str_replace", &arguments)
+            .await;
+        assert!(!applied.is_error, "{}", applied.output);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "after\n");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "after\n");
+        assert_eq!(executor.file_journal.lock().unwrap().entries().count(), 2);
+        executor
+            .sandbox_policy
+            .write()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .allowed_paths
+            .clear();
+        let denied = executor
+            .execute_with_metadata(
+                "str_replace",
+                &json!({"edits":[
+                    {"path":first,"old_str":"after","new_str":"changed"},
+                    {"path":second,"old_str":"after","new_str":"changed"}
+                ]}),
+            )
+            .await;
+        assert!(denied.is_error, "{}", denied.output);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "after\n");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "after\n");
+        assert_eq!(executor.file_journal.lock().unwrap().entries().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_multi_path_rechecks_alias_after_all_preimages_are_captured() {
+        use std::os::unix::{
+            ffi::OsStrExt,
+            fs::{OpenOptionsExt, symlink},
+        };
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.txt");
+        let other = directory.path().join("other.txt");
+        let second = directory.path().join("second.txt");
+        let alias = directory.path().join("alias.txt");
+        for path in [&first, &other, &second] {
+            std::fs::write(path, "before\n").unwrap();
+        }
+        symlink(&first, &alias).unwrap();
+        let executor = Arc::new(test_executor_in(directory.path()));
+        for path in [&first, &other, &second] {
+            assert!(executor.read_file(&json!({"path":path})).contains("before"));
+        }
+        std::fs::remove_file(&second).unwrap();
+        let fifo_path = std::ffi::CString::new(second.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        let worker = executor.clone();
+        let (sender, receiver) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let outcome = runtime.block_on(worker.execute_with_metadata(
+                "str_replace",
+                &json!({"edits":[
+                    {"path":"alias.txt","old_str":"before","new_str":"after"},
+                    {"path":"second.txt","old_str":"before","new_str":"after"}
+                ]}),
+            ));
+            sender.send(outcome).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut writer = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&second)
+            {
+                Ok(writer) => break writer,
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("batch did not reach the second preimage: {error}"),
+            }
+        };
+        // The second reader is now open, proving the first candidate exists.
+        // Restore a regular file before later staleness/prehash reads, so the
+        // test cannot pass by blocking on an unrelated second FIFO open.
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&other, &alias).unwrap();
+        std::fs::remove_file(&second).unwrap();
+        std::fs::write(&second, "before\n").unwrap();
+        assert!(
+            executor
+                .read_file(&json!({"path":second}))
+                .contains("before")
+        );
+        writer.write_all(b"before\n").unwrap();
+        drop(writer);
+        let outcome = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.join().unwrap();
+        assert!(outcome.is_error, "{}", outcome.output);
+        assert!(
+            outcome.output.contains("binding changed"),
+            "{}",
+            outcome.output
+        );
+        for path in [&first, &other, &second] {
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "before\n");
+        }
+        assert_eq!(executor.file_journal.lock().unwrap().entries().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_multi_path_batch_rejects_duplicate_bound_aliases_without_journal() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target.txt");
+        std::fs::write(&target, "before\n").unwrap();
+        for name in ["first.txt", "second.txt"] {
+            symlink(&target, directory.path().join(name)).unwrap();
+        }
+        let executor = test_executor_in(directory.path());
+        executor
+            .execute_with_metadata("read_file", &json!({"path":"first.txt"}))
+            .await;
+        let result = executor
+            .execute_with_metadata(
+                "str_replace",
+                &json!({"edits":[
+                    {"path":"first.txt","old_str":"before","new_str":"first"},
+                    {"path":"second.txt","old_str":"before","new_str":"second"}
+                ]}),
+            )
+            .await;
+        assert!(result.is_error, "{}", result.output);
+        assert_eq!(
+            result.tool_result_fields.as_ref().unwrap()["workspace_mutation_applied"],
+            false
+        );
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "before\n");
+        assert_eq!(executor.file_journal.lock().unwrap().entries().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_batch_symlink_publishes_shared_candidate_and_journals_exact_bytes() {
+        use std::os::unix::fs::symlink;
+        for (alias_name, target_name, expected) in [
+            ("alias.txt", "target.data", "ALPHA\r\nbeta"),
+            ("alias.data", "target.txt", "ALPHA\nbeta\n"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let target = directory.path().join(target_name);
+            let alias = directory.path().join(alias_name);
+            let original = b"alpha\r\nbeta";
+            std::fs::write(&target, original).unwrap();
+            symlink(&target, &alias).unwrap();
+            let executor = test_executor_in(directory.path());
+            executor
+                .execute_with_metadata("read_file", &json!({"path":alias_name}))
+                .await;
+            let result = executor
+                .execute_with_metadata(
+                    "str_replace",
+                    &json!({
+                        "path":alias_name, "edits":[{"old_str":"alpha", "new_str":"ALPHA"}]
+                    }),
+                )
+                .await;
+            assert!(!result.is_error, "{}", result.output);
+            assert_eq!(
+                result.tool_result_fields.as_ref().unwrap()["workspace_mutation_applied"],
+                true
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), expected.as_bytes());
+            assert_eq!(std::fs::read_link(&alias).unwrap(), target);
+            let bound = executor.bind_file_mutation_target(&alias).unwrap();
+            let journal = executor.file_journal.lock().unwrap();
+            let entries: Vec<_> = journal.entries().collect();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                entries[0].before_content.as_deref(),
+                Some(original.as_slice())
+            );
+            assert_eq!(entries[0].after_content, expected.as_bytes());
+            journal.undo_file(&bound).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), original);
+            assert_eq!(std::fs::read_link(&alias).unwrap(), target);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_prepared_publication_updates_symlink_referent_without_replacing_alias() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.data");
+        let alias = dir.path().join("edit.rs");
+        std::fs::write(&target, b"old\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, &alias).unwrap();
+        let exe = test_executor_in(dir.path());
+        *exe.sandbox_policy.write().unwrap() = Some(
+            astra_runtime::tool_sandbox::SandboxPolicy::permissive(dir.path()),
+        );
+        exe.read_file(&json!({"path": "edit.rs"}));
+        let (write, applied, converged) = exe.write_file_with_applied(&json!({
+            "path": "edit.rs", "content": "alpha\r\n"
+        }));
+        assert_eq!(
+            serde_json::from_str::<Value>(&write).unwrap()["success"],
+            true
+        );
+        assert!(applied && !converged);
+        assert_eq!(std::fs::read(&target).unwrap(), b"alpha\n");
+        let (replace, applied) = exe.str_replace_with_applied(&json!({
+            "path": "edit.rs", "old_str": "alpha", "new_str": "beta"
+        }));
+        assert!(!replace.is_error && applied, "{}", replace.output);
+        let (batch, applied) = exe.multi_edit_with_applied(&json!({
+            "path": "edit.rs", "edits": [{"old_str": "beta", "new_str": "gamma"}]
+        }));
+        assert!(!batch.is_error && applied, "{}", batch.output);
+        assert_eq!(std::fs::read(&target).unwrap(), b"gamma\n");
+        assert_eq!(std::fs::read_link(&alias).unwrap(), target);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let bound = exe.bind_file_mutation_target(&alias).unwrap();
+        exe.file_journal.lock().unwrap().undo_file(&bound).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"beta\n");
+        assert_eq!(std::fs::read_link(&alias).unwrap(), target);
+        let other = dir.path().join("other.data");
+        std::fs::write(&other, b"untouched").unwrap();
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&other, &alias).unwrap();
+        assert!(exe.verify_file_mutation_binding(&alias, &bound).is_err());
+        assert_eq!(std::fs::read(other).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn cli_text_edits_reject_invalid_utf8_without_changing_bytes_or_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.txt");
+        let raw = b"alpha \xff\n";
+        std::fs::write(&path, raw).unwrap();
+        let exe = test_executor_in(dir.path());
+        exe.read_file(&json!({"path": "edit.txt"}));
+        let checkpoint = exe.file_journal_checkpoint();
+        for dry_run in [false, true] {
+            let results = [
+                exe.str_replace_with_applied(&json!({
+                    "path": "edit.txt", "old_str": "alpha", "new_str": "beta",
+                    "dry_run": dry_run
+                })),
+                exe.multi_edit_with_applied(&json!({
+                    "path": "edit.txt", "edits": [{"old_str": "alpha", "new_str": "gamma"}],
+                    "dry_run": dry_run
+                })),
+            ];
+            for (result, applied) in results {
+                assert!(result.is_error && !applied, "{}", result.output);
+                assert!(result.output.contains("not valid UTF-8"));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), raw);
+            assert_eq!(exe.file_journal_checkpoint(), checkpoint);
+        }
+    }
+
+    #[test]
+    fn cli_prepared_write_does_not_treat_read_error_as_missing_preimage() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+        let checkpoint = exe.file_journal_checkpoint();
+        let (result, applied, converged) = exe.write_file_with_applied(&json!({
+            "path": ".", "content": "replacement"
+        }));
+        assert_eq!(
+            serde_json::from_str::<Value>(&result).unwrap()["success"],
+            false
+        );
+        assert!(!applied && !converged);
+        assert_eq!(exe.file_journal_checkpoint(), checkpoint);
+        assert!(dir.path().is_dir());
+    }
+
+    #[test]
+    fn rejected_prepared_publication_cannot_create_an_undo_of_external_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+        for (name, before) in [
+            ("existing.txt", Some(b"original".to_vec())),
+            ("new.txt", None),
+        ] {
+            let path = dir.path().join(name);
+            if let Some(bytes) = &before {
+                std::fs::write(&path, bytes).unwrap();
+            }
+            let prepared = astra_tools::fs_ops::PreparedWriteFile::from_authorized_preimage(
+                path.clone(),
+                name,
+                "candidate",
+                before,
+            );
+            let checkpoint = exe.file_journal_checkpoint();
+            std::fs::write(&path, b"external owner").unwrap();
+            let result = exe.apply_prepared_file_edit(
+                &prepared,
+                "rejected-edit",
+                astra_turn_core::file_edit_journal::EditType::Overwrite,
+            );
+            assert!(result.is_error, "{}", result.output);
+            assert_eq!(exe.file_journal_checkpoint(), checkpoint);
+            exe.file_journal
+                .lock()
+                .unwrap()
+                .undo_turn_since(0, checkpoint);
+            assert_eq!(std::fs::read(&path).unwrap(), b"external owner");
+        }
+    }
+
+    #[test]
+    fn file_edit_preview_and_noop_preserve_formatter_configured_preimage() {
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            tmpdir.path().join("Cargo.toml"),
-            "[package]\nname = \"test\"",
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"edit-fixture\"\n",
         )
         .unwrap();
-        let file = tmpdir.path().join("main.rs");
-        std::fs::write(&file, "fn   main  (  )  {  }").unwrap();
-        let result = auto_format_file(&file, tmpdir.path());
-        // rustfmt may or may not be installed — either formatted or None is ok
-        if let Some(r) = &result {
-            assert!(r.contains("rustfmt"), "should mention rustfmt: {r}");
-        }
+        let path = dir.path().join("main.rs");
+        let source = "fn   main( ){let   value=1;}\n";
+        std::fs::write(&path, source).unwrap();
+        let exe = test_executor_in(dir.path());
+        let checkpoint = exe.file_journal_checkpoint();
+
+        let (write, applied, already_desired) = exe.write_file_with_applied(&json!({
+            "path": "main.rs", "content": source
+        }));
+        let write: Value = serde_json::from_str(&write).unwrap();
+        assert_eq!(write["state"], "already_desired");
+        assert!(!applied);
+        assert!(already_desired);
+        exe.read_file(&json!({"path": "main.rs"}));
+        let (preview, applied) = exe.str_replace_with_applied(&json!({
+            "path": "main.rs", "old_str": "value=1", "new_str": "value=2", "dry_run": true
+        }));
+        assert!(!preview.is_error, "{}", preview.output);
+        assert!(!applied);
+        assert!(preview.output.contains("[DRY RUN]"));
+        assert!(preview.output.contains("fn   main( ){let   value=2;}"));
+        let (preview, applied) = exe.multi_edit_with_applied(&json!({
+            "path": "main.rs", "dry_run": true,
+            "edits": [{"old_str": "value=1", "new_str": "value=2"}]
+        }));
+        assert!(!preview.is_error, "{}", preview.output);
+        assert!(!applied);
+        assert!(preview.output.contains("[DRY RUN]"));
+        let (noop, applied) = exe.str_replace_with_applied(&json!({
+            "path": "main.rs", "old_str": "value=1", "new_str": "value=1"
+        }));
+        assert!(noop.is_error);
+        assert!(!applied);
+        let (normalized_noop, applied) = exe.str_replace_with_applied(&json!({
+            "path": "main.rs", "old_str": "\n", "new_str": "\r\n"
+        }));
+        assert!(normalized_noop.is_error);
+        assert!(!applied);
+        let (cancelled_batch, applied) = exe.multi_edit_with_applied(&json!({
+            "path": "main.rs",
+            "edits": [
+                {"old_str": "value=1", "new_str": "value=2"},
+                {"old_str": "value=2", "new_str": "value=1"}
+            ]
+        }));
+        assert!(cancelled_batch.is_error);
+        assert!(!applied);
+        assert_eq!(std::fs::read(path).unwrap(), source.as_bytes());
+        assert_eq!(exe.file_journal_checkpoint(), checkpoint);
     }
 
     // ─── dry_run / diff preview tests ───────────────────────────────────────
@@ -5263,15 +4692,27 @@ type Handler interface {
         std::fs::write(&a, "alpha beta").unwrap();
         std::fs::write(&b, "gamma delta").unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
-        exe.read_file(&json!({"path": "a.txt"}));
-        exe.read_file(&json!({"path": "b.txt"}));
-
-        let result = exe.str_replace_batch(&json!({
+        let args = json!({
             "edits": [
                 {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
                 {"path": "b.txt", "old_str": "delta", "new_str": "DELTA"}
             ]
-        }));
+        });
+        let checkpoint = exe.file_journal_checkpoint();
+        let unread = exe.str_replace_batch_result(&args);
+        assert!(unread.is_error && unread.output.contains("has not been read"));
+        exe.read_file(&json!({"path": "a.txt"}));
+        exe.read_file(&json!({"path": "b.txt"}));
+        std::fs::write(&b, "external delta").unwrap();
+        let stale = exe.str_replace_batch_result(&args);
+        assert!(stale.is_error && stale.output.contains("modified since last read"));
+        assert_eq!(std::fs::read(&a).unwrap(), b"alpha beta");
+        assert_eq!(std::fs::read(&b).unwrap(), b"external delta");
+        assert_eq!(exe.file_journal_checkpoint(), checkpoint);
+        std::fs::write(&b, "gamma delta").unwrap();
+        exe.read_file(&json!({"path": "b.txt"}));
+
+        let result = exe.str_replace_batch_result(&args).output;
 
         assert!(
             result.contains("Successfully applied edits to 2 file(s)"),
@@ -5279,6 +4720,16 @@ type Handler interface {
         );
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "ALPHA beta\n");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "gamma DELTA\n");
+        assert_eq!(exe.get_cached_content(&a).as_deref(), Some("ALPHA beta\n"));
+        assert_eq!(exe.get_cached_content(&b).as_deref(), Some("gamma DELTA\n"));
+        let journal = exe.file_journal.lock().unwrap();
+        assert_eq!(journal.entries().count(), 2);
+        journal.undo_turn_transactional(0).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"alpha beta");
+        assert_eq!(std::fs::read(&b).unwrap(), b"gamma delta");
+        journal.restore_turn_transactional(0).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"ALPHA beta\n");
+        assert_eq!(std::fs::read(&b).unwrap(), b"gamma DELTA\n");
     }
 
     #[test]
@@ -5292,12 +4743,14 @@ type Handler interface {
         exe.read_file(&json!({"path": "a.txt"}));
         exe.read_file(&json!({"path": "b.txt"}));
 
-        let result = exe.str_replace_batch(&json!({
-            "edits": [
-                {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
-                {"path": "b.txt", "old_str": "missing", "new_str": "MISSING"}
-            ]
-        }));
+        let result = exe
+            .str_replace_batch_result(&json!({
+                "edits": [
+                    {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
+                    {"path": "b.txt", "old_str": "missing", "new_str": "MISSING"}
+                ]
+            }))
+            .output;
 
         assert!(
             result.contains("old_str not found"),
@@ -5325,12 +4778,14 @@ type Handler interface {
         readonly.set_mode(0o444);
         std::fs::set_permissions(&b, readonly).unwrap();
 
-        let _result = exe.str_replace_batch(&json!({
-            "edits": [
-                {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
-                {"path": "b.txt", "old_str": "gamma", "new_str": "GAMMA"}
-            ]
-        }));
+        let _result = exe
+            .str_replace_batch_result(&json!({
+                "edits": [
+                    {"path": "a.txt", "old_str": "alpha", "new_str": "ALPHA"},
+                    {"path": "b.txt", "old_str": "gamma", "new_str": "GAMMA"}
+                ]
+            }))
+            .output;
 
         let mut writable = std::fs::metadata(&b).unwrap().permissions();
         writable.set_mode(0o644);
@@ -5347,11 +4802,13 @@ type Handler interface {
         let tmpdir = tempfile::tempdir().unwrap();
         let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
 
-        let result = exe.str_replace_batch(&json!({
-            "edits": [
-                {"old_str": "alpha", "new_str": "ALPHA"}
-            ]
-        }));
+        let result = exe
+            .str_replace_batch_result(&json!({
+                "edits": [
+                    {"old_str": "alpha", "new_str": "ALPHA"}
+                ]
+            }))
+            .output;
 
         assert!(
             result.contains("top-level path") && result.contains("path inside every edit"),
@@ -5474,31 +4931,6 @@ type Handler interface {
         );
     }
 
-    // NOTE: An end-to-end test for the overlapping-fuzzy-span dedup
-    // path in `multi_edit` is structurally hard to construct because
-    // each edit runs sequentially on the buffer produced by the
-    // previous edit — so by the time edit[1] is evaluated, edit[0]'s
-    // fuzzy span has already been rewritten and no longer matches.
-    // The dedup guard remains valuable as a defence-in-depth check
-    // (e.g. against future refactors that batch fuzzy resolution up
-    // front); the overlap arithmetic itself is covered below.
-    #[test]
-    fn fuzzy_span_overlap_arithmetic_is_half_open() {
-        // Half-open interval overlap: [a,b) ∩ [c,d) non-empty ⇔ a < d && c < b.
-        let cases = [
-            // (span_a, span_b, expected_overlap)
-            ((0usize, 5usize), (5usize, 10usize), false), // touching, not overlapping
-            ((0, 5), (4, 10), true),                      // 1-byte overlap
-            ((0, 10), (3, 7), true),                      // fully contained
-            ((3, 7), (0, 10), true),                      // reverse fully contained
-            ((0, 5), (6, 10), false),                     // gap
-        ];
-        for ((a_s, a_e), (b_s, b_e), expected) in cases {
-            let overlaps = a_s < b_e && b_s < a_e;
-            assert_eq!(overlaps, expected, "[{a_s},{a_e}) vs [{b_s},{b_e})");
-        }
-    }
-
     #[test]
     fn multi_edit_sequential_edits_see_previous_results() {
         let tmpdir = tempfile::tempdir().unwrap();
@@ -5515,7 +4947,7 @@ type Handler interface {
         }));
         assert!(result.contains("Applied 2 edit(s)"), "result: {result}");
         let content = std::fs::read_to_string(&file).unwrap();
-        assert_eq!(content, "AB gamma");
+        assert_eq!(content, "AB gamma\n");
     }
 
     // ─── unified_diff tests ─────────────────────────────────────────────────
@@ -5706,7 +5138,7 @@ type Handler interface {
             "should report count: {result}"
         );
         let content = std::fs::read_to_string(&test_file).unwrap();
-        assert_eq!(content, "qux bar qux baz qux");
+        assert_eq!(content, "qux bar qux baz qux\n");
     }
 
     #[test]
@@ -5937,7 +5369,7 @@ type Handler interface {
         );
 
         let on_disk = std::fs::read_to_string(dir.path().join("chain.txt")).unwrap();
-        assert_eq!(on_disk, "AAA BBB ccc");
+        assert_eq!(on_disk, "AAA BBB ccc\n");
     }
 
     /// Scenario from session 1e627e9a Turn 2: LLM sends str_replace with

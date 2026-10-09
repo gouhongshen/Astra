@@ -27,9 +27,6 @@ use cli::cli_config::cli_utils::{
 };
 use cli::command_router::{execute_cli_command, run_print_mode};
 use cli::exit_code::ExitCode;
-use cli::slash::slash_config;
-#[cfg(test)]
-use cli::slash::slash_router::handle_slash_command;
 // CLI argument structs moved to cli/cli_args.rs
 
 // SSE streaming types moved to cli/streaming_types.rs
@@ -57,60 +54,6 @@ use cli::project_instructions::{
 };
 
 // ════════════════════════════════════════════════════════════════ main ════
-
-fn apply_trace_cli_overlay(
-    overlay: &mut astra_config::runtime_config::RuntimeConfig,
-    trace_profile: Option<&str>,
-    trace_level: Option<&str>,
-    trace_cat: Option<&str>,
-) -> Result<bool, String> {
-    if trace_profile.is_none() && trace_level.is_none() && trace_cat.is_none() {
-        return Ok(false);
-    }
-    overlay.trace =
-        overlay
-            .trace
-            .clone()
-            .with_cli_overrides(trace_profile, trace_level, trace_cat)?;
-    Ok(true)
-}
-
-#[cfg(test)]
-mod trace_overlay_tests {
-    use super::apply_trace_cli_overlay;
-
-    #[test]
-    fn apply_trace_cli_overlay_preserves_existing_overlay_fields() {
-        let mut overlay = astra_config::runtime_config::RuntimeConfig::default();
-        overlay.runtime_limits.max_turns = 17;
-
-        let changed = apply_trace_cli_overlay(&mut overlay, Some("dev"), None, None)
-            .expect("trace overlay should parse");
-
-        assert!(changed);
-        assert_eq!(overlay.runtime_limits.max_turns, 17);
-        assert_eq!(
-            overlay.trace.enabled_categories,
-            astra_config::runtime_config::TraceCategory::individual_categories().to_vec()
-        );
-    }
-
-    #[test]
-    fn apply_trace_cli_overlay_is_noop_without_trace_flags() {
-        let mut overlay = astra_config::runtime_config::RuntimeConfig::default();
-        overlay.runtime_limits.max_turns = 23;
-
-        let changed =
-            apply_trace_cli_overlay(&mut overlay, None, None, None).expect("no-op should succeed");
-
-        assert!(!changed);
-        assert_eq!(overlay.runtime_limits.max_turns, 23);
-        assert_eq!(
-            overlay.trace,
-            astra_config::runtime_config::SessionTraceConfig::default()
-        );
-    }
-}
 
 fn validate_native_directory_source(
     before: Option<std::ffi::OsString>,
@@ -222,58 +165,29 @@ async fn run_async() -> i32 {
         }
     }
     cli::diagnostic_log::init_cli_observability(&cli);
-    let mut cli_overlay = astra_config::runtime_config::RuntimeConfig::default();
-    let mut has_cli_overlay = false;
-    // Accumulate CLI-driven config overrides into a local overlay. The
-    // overlay is NOT installed yet — it will be installed via
-    // set_cli_overlay immediately before the first RuntimeConfig::load()
-    // call. Keeping accumulation and installation close together prevents
-    // a footgun window: any code placed between here and the load() call
-    // would see stale config if the overlay were installed early.
-    //
-    // parse_settings_source handles inline JSON vs. filesystem path;
-    // apply_settings_json parses the JSON into a RuntimeConfig (all fields
-    // default) that `load()` will then merge with non-default-wins
-    // semantics. Malformed input aborts with a clear message instead of
-    // silently dropping the flag.
+    let mut cli_overlay = astra_config::config_overlay::RuntimeConfigLayer::default();
     if let Some(raw) = cli.settings.as_deref() {
-        match astra_config::config_overlay::parse_settings_source(raw) {
-            Ok(json) => match astra_config::config_overlay::apply_settings_json(
-                astra_config::runtime_config::RuntimeConfig::default(),
-                &json,
-            ) {
-                Ok(overlay) => {
-                    cli_overlay = overlay;
-                    has_cli_overlay = true;
-                }
-                Err(err) => {
-                    eprintln!(
-                        "{}",
-                        format!("Error: --settings JSON is invalid: {err}").red()
-                    );
-                    return 2;
-                }
-            },
-            Err(err) => {
-                eprintln!("{}", format!("Error: --settings: {err}").red());
+        match astra_config::config_overlay::parse_settings_source(raw)
+            .and_then(|json| astra_config::config_overlay::RuntimeConfigLayer::from_json(&json))
+        {
+            Ok(layer) => cli_overlay = layer,
+            Err(error) => {
+                eprintln!("{}", format!("Error: --settings: {error}").red());
                 return 2;
             }
         }
     }
-    match apply_trace_cli_overlay(
-        &mut cli_overlay,
+    cli_overlay = match cli_overlay.with_trace_cli_overrides(
         cli.trace_profile.as_deref(),
         cli.trace_level.as_deref(),
         cli.trace_cat.as_deref(),
     ) {
-        Ok(changed) => {
-            has_cli_overlay |= changed;
-        }
-        Err(err) => {
-            eprintln!("{}", format!("Error: {err}").red());
+        Ok(layer) => layer,
+        Err(error) => {
+            eprintln!("{}", format!("Error: {error}").red());
             return 2;
         }
-    }
+    };
     // Apply safety.trust_mode from runtime config to the global guard.
     // Defaults to Strict — users must explicitly opt in via
     // `~/.astra/config/runtime.toml` [safety] trust_mode = "trusted".
@@ -281,9 +195,7 @@ async fn run_async() -> i32 {
     // Install CLI overlay immediately before the first RuntimeConfig::load()
     // to minimise the window where future code could call load()/cached()
     // without the overlay.
-    if has_cli_overlay {
-        astra_config::runtime_config::set_cli_overlay(Some(cli_overlay));
-    }
+    astra_config::runtime_config::set_cli_overlay(Some(cli_overlay));
     astra_runtime::apply_safety_config_from_runtime_config(
         &astra_config::runtime_config::RuntimeConfig::load(),
     );
@@ -382,7 +294,7 @@ async fn run_async() -> i32 {
     }
 
     let _ = (startup_trace, bare);
-    let cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
+    let mut cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
         no_journal_content,
         &allowed_tools,
         &disallowed_tools,
@@ -466,12 +378,12 @@ async fn run_async() -> i32 {
     } else {
         None
     };
+    // Preserve explicit intent before merging with the configured default.
+    cli_context.select_model(cli_model.as_deref());
     let resolved_model = normalize_model_override_owned(cli_model.or(config_default_model));
 
     // Make the resolved model available to slash commands that print
     // model-aware diagnostics without mutating the process environment.
-    slash_config::set_active_model_for_display(resolved_model.clone());
-    slash_config::set_active_offering_id_for_request(None);
 
     // --print mode: headless single-shot, always auto-approve (can't prompt)
     if print_mode {
@@ -501,15 +413,12 @@ async fn run_async() -> i32 {
 
         // For -c, resolve the last session ID from credentials
         let resolved_sid = if continue_last && session_id.is_none() {
-            if cli::session::session_runtime::resolve_cloud_base().is_some()
-                && cli::session::session_runtime::current_access_token(profile.as_deref()).is_some()
-            {
+            if cli::session::session_restore_client::has_server_auth(profile.as_deref()) {
                 cli::cli_config::cli_utils::validated_resumable_last_session_id(
                     &api,
                     profile.as_deref(),
                 )
                 .await
-                .or_else(|| local_resumable_last_session_id(profile.as_deref()))
             } else {
                 local_resumable_last_session_id(profile.as_deref())
             }
@@ -574,7 +483,7 @@ mod tests {
 
     use super::{
         Cli, SessionState, cli, execute_cli_command, format_project_instructions,
-        handle_slash_command, resolve_system_prompt, session_journal,
+        resolve_system_prompt, session_journal,
     };
     use axum::{
         Router,
@@ -582,8 +491,7 @@ mod tests {
     };
     use clap::Parser;
     use cli::cli_config::cli_args::{
-        AuditCmd, AuditShowArgs, AuditToolsArgs, Command, MessagingArgs, ReplayArgs, SessionCmd,
-        SessionShowArgs,
+        AuditCmd, AuditShowArgs, AuditToolsArgs, Command, SessionCmd, SessionIdArgs,
     };
     use cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
@@ -591,7 +499,6 @@ mod tests {
     use cli::permission_manager;
     use cli::project_instructions::discover_instructions_from_paths;
     use cli::session::session_runtime::initialize_session_state;
-    use cli::slash::slash_health;
 
     // ── auth_flow ─────────────────────────────────────────────────────────
 
@@ -600,146 +507,6 @@ mod tests {
     // left the same three tests duplicated here, which meant every
     // `make test-offline` ran them twice under parallel contention and
     // contributed to the slow-case tail.
-
-    // ── slash commands with mock server ───────────────────────────────────
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn slash_model_with_offering_id_preserves_selection_and_display_model() {
-        let app = Router::new().route(
-            "/models",
-            get(|| async {
-                axum::Json(serde_json::json!({
-                    "items": [{
-                        "offering_id": "offer-model",
-                        "access_id": "self-hosted",
-                        "access_kind": "self_hosted",
-                        "access_label": "Self-hosted",
-                        "execution_placement": "server",
-                        "name": "Display Model",
-                        "provider": "openai",
-                        "description": null,
-                        "is_active": true,
-                        "context_window": 128000,
-                        "max_completion_tokens": null,
-                        "architecture": null,
-                        "thinking_capability": null
-                    }],
-                    "next_cursor": null,
-                    "limit": 50,
-                    "total": 1,
-                    "catalog_revision": "sha256:test"
-                }))
-            }),
-        );
-        let base = spawn_mock_app(app).await;
-        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let mut state = SessionState::default();
-        cli::slash::slash_config::set_active_offering_id_for_request(None);
-        let exit = handle_slash_command(
-            "/model offer-model",
-            &api,
-            None,
-            &mut state,
-            Some("fake-token"),
-        )
-        .await
-        .unwrap();
-
-        assert!(!exit);
-        assert_eq!(state.model.as_deref(), Some("Display Model"));
-        assert_eq!(
-            cli::slash::slash_config::active_offering_id_for_request().as_deref(),
-            Some("offer-model")
-        );
-        cli::slash::slash_config::set_active_offering_id_for_request(None);
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn slash_model_with_token_does_not_update_state_when_model_list_fails() {
-        let app = Router::new().route(
-            "/models",
-            get(|| async {
-                (
-                    axum::http::StatusCode::BAD_GATEWAY,
-                    axum::Json(serde_json::json!({"detail": "provider catalog down"})),
-                )
-            }),
-        );
-        let base = spawn_mock_app(app).await;
-        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let mut state = SessionState {
-            model: Some("old-model".to_string()),
-            ..Default::default()
-        };
-        cli::slash::slash_config::set_active_offering_id_for_request(Some("offer-old".to_string()));
-        let exit = handle_slash_command(
-            "/model offer-model",
-            &api,
-            None,
-            &mut state,
-            Some("fake-token"),
-        )
-        .await
-        .unwrap();
-
-        assert!(!exit);
-        assert_eq!(state.model.as_deref(), Some("old-model"));
-        assert_eq!(
-            cli::slash::slash_config::active_offering_id_for_request().as_deref(),
-            Some("offer-old")
-        );
-        cli::slash::slash_config::set_active_offering_id_for_request(None);
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn slash_model_with_token_does_not_update_state_when_model_list_is_empty() {
-        let app = Router::new().route(
-            "/models",
-            get(|| async {
-                axum::Json(serde_json::json!({
-                    "items": [],
-                    "next_cursor": null,
-                    "limit": 50,
-                    "total": 0,
-                    "catalog_revision": "sha256:empty"
-                }))
-            }),
-        );
-        let base = spawn_mock_app(app).await;
-        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
-        let mut state = SessionState {
-            model: Some("old-model".to_string()),
-            ..Default::default()
-        };
-        cli::slash::slash_config::set_active_offering_id_for_request(Some("offer-old".to_string()));
-        let exit = handle_slash_command(
-            "/model offer-model",
-            &api,
-            None,
-            &mut state,
-            Some("fake-token"),
-        )
-        .await
-        .unwrap();
-
-        assert!(!exit);
-        assert_eq!(state.model.as_deref(), Some("old-model"));
-        assert_eq!(
-            cli::slash::slash_config::active_offering_id_for_request().as_deref(),
-            Some("offer-old")
-        );
-        cli::slash::slash_config::set_active_offering_id_for_request(None);
-    }
-
-    // The `slash_exit_writes_session_end_to_journal` and
-    // `slash_quit_writes_session_end_to_journal` tests previously
-    // exercised `finalize_repl_exit`, which lived inside the
-    // line-mode REPL exit path. Both the function and the path are
-    // gone; session_end is now written by the TUI shutdown handler
-    // and exercised by `tui::tests::*`.
 
     // ── command_router ────────────────────────────────────────────────────
 
@@ -765,23 +532,6 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap(), cli::exit_code::ExitCode::Success);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn execute_cli_messaging_bridge_command() {
-        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let result = execute_cli_command(
-            Some(Command::Messaging(MessagingArgs { command: None })),
-            None,
-            None,
-            false,
-            None,
-            &api,
-            false,
-            &cli::cli_config::cli_context::CliContext::default(),
-        )
-        .await;
-        assert!(result.is_ok());
     }
 
     #[serial_test::serial]
@@ -814,7 +564,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
 
         let result = execute_cli_command(
-            Some(Command::Session(SessionCmd::Close(SessionShowArgs {
+            Some(Command::Session(SessionCmd::Close(SessionIdArgs {
                 session_id: "sess-close-1".to_string(),
             }))),
             None,
@@ -863,7 +613,7 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
 
         let result = execute_cli_command(
-            Some(Command::Session(SessionCmd::Delete(SessionShowArgs {
+            Some(Command::Session(SessionCmd::Delete(SessionIdArgs {
                 session_id: "sess-delete-1".to_string(),
             }))),
             None,
@@ -886,34 +636,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_cli_replay_rejects_invalid_session_id_before_auth() {
-        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let error = execute_cli_command(
-            Some(Command::Replay(ReplayArgs {
-                session_id: "../escape".to_string(),
-                sandbox_name: None,
-                mock_mode: true,
-                compare: false,
-            })),
-            None,
-            None,
-            false,
-            None,
-            &api,
-            false,
-            &cli::cli_config::cli_context::CliContext::default(),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(error.contains("invalid session_id"), "got: {error}");
-    }
-
-    #[tokio::test]
     async fn execute_cli_session_close_rejects_invalid_session_id_before_auth() {
         let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
         let error = execute_cli_command(
-            Some(Command::Session(SessionCmd::Close(SessionShowArgs {
+            Some(Command::Session(SessionCmd::Close(SessionIdArgs {
                 session_id: "../escape".to_string(),
             }))),
             None,
@@ -1062,43 +788,6 @@ mod tests {
     // merge_learning_snapshot tests removed: the entity/pattern/calibration
     // learning subsystem has been deleted. Tool-health sync is exercised in
     // the tests below.
-
-    // ── handle_stats_command ─────────────────────────────────────────────────
-
-    // ── handle_tools_command ─────────────────────────────────────────────────
-
-    // ── slash_health::format_sync_age tests ────────────────────────────────────────────
-
-    #[test]
-    fn format_sync_age_various_durations() {
-        let now = chrono::Utc::now();
-        let cases = [
-            (now.to_rfc3339(), "s ago", "just now / seconds"),
-            (
-                (now - chrono::Duration::minutes(5)).to_rfc3339(),
-                "m ago",
-                "minutes",
-            ),
-            (
-                (now - chrono::Duration::hours(2)).to_rfc3339(),
-                "h ago",
-                "hours",
-            ),
-            (
-                (now - chrono::Duration::days(3)).to_rfc3339(),
-                "d ago",
-                "days",
-            ),
-            ("2020-01-01 00:00:00".to_string(), "d ago", "mysql datetime"),
-        ];
-        for (ts, expected, label) in cases {
-            let age = slash_health::format_sync_age(&ts);
-            assert!(
-                age.contains(expected) || age == "just now",
-                "{label}: expected '{expected}', got: {age}"
-            );
-        }
-    }
 
     // ── /allow command tests ──
 
@@ -1364,11 +1053,7 @@ mod tests {
     fn prepare_input_routes_project_instructions_out_of_user_message() {
         let mut state = SessionState::default();
         state.project_instructions = Some("Always use Rust.".to_string());
-        let result = crate::cli::session::session_input::prepare_input(
-            "hello",
-            &state,
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
+        let result = crate::cli::session::session_input::prepare_input("hello", &state);
         assert!(
             result.runtime_required_texts[0].contains("<project_instructions>"),
             "should wrap in tags"
@@ -1380,11 +1065,7 @@ mod tests {
     #[test]
     fn prepare_input_has_no_runtime_context_when_none() {
         let state = SessionState::default();
-        let result = crate::cli::session::session_input::prepare_input(
-            "hello",
-            &state,
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
+        let result = crate::cli::session::session_input::prepare_input("hello", &state);
         assert!(
             result.runtime_required_texts.is_empty(),
             "should not inject when None"
