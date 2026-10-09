@@ -10663,7 +10663,7 @@ impl AgenticRunLifecycleService {
             .iter()
             .map(|binding| binding.binding.id.clone())
             .collect::<Vec<_>>();
-        let (bundle, prepared_skills) =
+        let (mut bundle, prepared_skills) =
             if let Some(snapshot) = descriptors.discovery_snapshot.as_ref() {
                 if snapshot.version
                     != astra_services::runs::RUNTIME_CAPABILITY_DISCOVERY_SNAPSHOT_VERSION
@@ -10711,9 +10711,56 @@ impl AgenticRunLifecycleService {
                 );
                 (bundle?, prepared_skills?)
             };
-        let skill_resolver =
-            apply_normalized_skill_allowlist(prepared_skills.resolver, request_constraints)
-                .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
+        if let Some(config) =
+            super::super::capability_source::CapabilitySourceConfig::parse(&mcp_descriptor.metadata)
+                .map_err(|error| {
+                    error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        error.to_string(),
+                        "capability_source_contract_invalid",
+                    )
+                })?
+        {
+            let transport = bundle.agent_binding_mcp.as_ref().ok_or_else(|| {
+                error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    "capability source requires an authenticated MCP binding",
+                    "capability_source_contract_invalid",
+                )
+            })?;
+            bundle.agent_binding_mcp = Some(Arc::new(
+                transport.with_capability_source(config).map_err(|error| {
+                    error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        error,
+                        "capability_source_contract_invalid",
+                    )
+                })?,
+            ));
+        }
+        bundle.capability_source = bundle
+            .agent_binding_mcp
+            .clone()
+            .and_then(|transport| {
+                super::super::capability_source::CapabilitySourceRuntime::new(
+                    transport,
+                    self.run_engine.store().clone(),
+                )
+            })
+            .map(Arc::new);
+        let resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>> =
+            match bundle.capability_source.clone() {
+                Some(source) => Some(Arc::new(
+                    super::super::capability_source::CapabilitySourceSkillResolver {
+                        source,
+                        base: prepared_skills.resolver,
+                        policy: request_constraints.skill_surfacing_policy(),
+                    },
+                )),
+                None => prepared_skills.resolver,
+            };
+        let skill_resolver = apply_normalized_skill_allowlist(resolver, request_constraints)
+            .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         let visible_skill_names = skill_resolver
             .as_ref()
             .map(|resolver| {
@@ -15562,6 +15609,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
                 executor.set_request_scoped_mcp_schemas(bundle.schemas.clone());
                 executor.set_provider_policy_index(bundle.provider_policy_index.clone());
+                executor.set_capability_source(bundle.capability_source.clone());
             }
             // Wire the plan repository so enter/exit_plan_mode tools work and
             // the write-tool guard can check `active_plan_id`.
@@ -17067,6 +17115,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
                 executor.set_request_scoped_mcp_schemas(bundle.schemas.clone());
                 executor.set_provider_policy_index(bundle.provider_policy_index.clone());
+                executor.set_capability_source(bundle.capability_source.clone());
             }
             if let Some(shared) = &self.shared_pool {
                 executor.set_context_manifest_pool(shared.clone());

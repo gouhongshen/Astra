@@ -25,6 +25,59 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+pub const MAX_SEALED_CAPACITY_BYTES: usize = 128 * 1024;
+pub const MAX_CAPACITY_RPC_TIMEOUT_SECS: u64 = 130;
+pub const MAX_CAPACITY_RPC_INFLIGHT: usize = 64;
+
+pub fn valid_capacity_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeCapacityProvider {
+    pub id: String,
+    /// Public recipient key only; local endpoint and bearer key stay on Edge.
+    pub public_key: String,
+}
+
+// The payload is sealed by the capacity owner, not interpreted by Astra.
+// These wire types are available to both server and Edge feature profiles.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SealedCapacityPayload(pub String);
+
+impl std::fmt::Debug for SealedCapacityPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[sealed capacity payload]")
+    }
+}
+
+impl SealedCapacityPayload {
+    pub fn is_valid(&self) -> bool {
+        !self.0.is_empty()
+            && self.0.len() <= MAX_SEALED_CAPACITY_BYTES
+            && self
+                .0
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityRpcFailure {
+    Invalid,
+    Offline,
+    BindingChanged,
+    Unsupported,
+    Busy,
+    OutcomeUnknown,
+}
+
 pub use astra_turn_types::ToolInvocationIdentity;
 
 /// Edge can inject request-scoped provider authorization into one bash
@@ -135,6 +188,14 @@ pub enum EdgeClientMessage {
     },
 
     /// Edge heartbeat.
+    #[serde(rename = "edge_capacity_result")]
+    CapacityResult {
+        request_id: String,
+        connection_generation: u64,
+        result: Result<SealedCapacityPayload, CapacityRpcFailure>,
+    },
+
+    /// Edge heartbeat.
     #[serde(rename = "edge_ping")]
     Ping {},
 }
@@ -177,6 +238,16 @@ pub enum EdgeServerMessage {
     },
 
     /// Server heartbeat response.
+    #[serde(rename = "edge_capacity_request")]
+    CapacityRequest {
+        request_id: String,
+        connection_generation: u64,
+        provider_id: String,
+        payload: SealedCapacityPayload,
+        timeout_secs: u64,
+    },
+
+    /// Server heartbeat response.
     #[serde(rename = "edge_pong")]
     Pong {},
 
@@ -214,6 +285,7 @@ impl EdgeServerMessage {
             EdgeServerMessage::Closing { .. } => "closing",
             EdgeServerMessage::ToolCancel { .. } => "tool_cancel",
             EdgeServerMessage::ToolResultAck { .. } => "tool_result_ack",
+            EdgeServerMessage::CapacityRequest { .. } => "capacity_request",
         }
     }
 }

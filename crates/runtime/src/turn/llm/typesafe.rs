@@ -3,7 +3,7 @@ use super::client::LlmCallResult;
 use astra_core::{ClassifiedError, ErrorKind};
 use astra_turn_types::{
     JUDGMENT_SCHEMA_VERSION, JudgmentAnswer, JudgmentRequest, JudgmentResponse,
-    judgment_request_from_messages, parse_unique_judgment_json,
+    judgment_request_from_messages, parse_unique_json,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -38,8 +38,8 @@ pub(super) fn response(
     request: &Value,
     started: Instant,
 ) -> Result<LlmCallResult, ClassifiedError> {
-    let value = parse_unique_judgment_json(raw)
-        .map_err(|_| invalid("Malformed TypeSafe judgment response"))?;
+    let value =
+        parse_unique_json(raw).map_err(|_| invalid("Malformed TypeSafe judgment response"))?;
     let response: Response = serde_json::from_value(value)
         .map_err(|_| invalid("Malformed TypeSafe judgment response"))?;
     let judgment_request = JudgmentRequest {

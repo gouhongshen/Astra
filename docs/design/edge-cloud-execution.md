@@ -105,6 +105,33 @@ configuration, not this execution contract.
 
 ## Durable sync dependency
 
+### Sealed live capacity transport
+
+Explicit Edge capacity providers may advertise a bounded public provider ID
+and recipient key under `capacity_rpc_v1`. Handshake admission validates and
+preserves this declaration; local endpoints and bearer keys never leave Edge.
+This is generic transport, not a model tool inventory or another agent loop.
+
+With the durable Edge registry configured, each node publishes its own
+operator-configured `ASTRA_EDGE_CAPACITY_RELAY_ORIGIN` (HTTP(S) origin, no path,
+credentials, query or fragment). This must identify one node, not a load-balanced
+Service. Client-supplied routing metadata is stripped at handshake; only the
+server writes `capacity_relay_v1`. A missing node route rejects capacity-bearing
+registration. Normal Edge registrations do not require this setting.
+
+`GET/POST /service/edges/capacity` require the existing private service key and
+resolve the exact user/workspace/Edge through the canonical registry on every
+request. Describe returns the current globally unique registry socket UUID as
+an opaque string `generation`. Calls freeze that UUID. A non-owning node forwards
+once to the owning node, which rechecks the registry and live socket. Registry
+failure is explicit unavailability; replacement is binding changed. No redirect,
+retry, durable queue, reconnection replay, alternate executor or payload decoding
+is allowed. Loss after dispatch is outcome unknown. The in-process pool counter
+continues to own socket cleanup/result matching but is not an external lease.
+
+An explicitly unconfigured single-process registry uses its live pool directly;
+this is a declared runtime topology, not recovery after a registry failure.
+
 Edge-originated facts that must survive reconnect require durable outbox semantics. A local journal or in-memory ingestion channel is not enough for cloud-edge correctness.
 
 ## Test obligations

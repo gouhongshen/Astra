@@ -81,6 +81,8 @@ pub struct EdgeConnection {
     /// Monotonic in-process connection incarnation. Cleanup from an older
     /// socket may remove only the exact generation it registered.
     pub generation: u64,
+    /// Globally unique socket identity, shared with the durable registry.
+    pub connection_id: String,
     pub user_id: String,
     pub edge_agent_id: String,
     pub hostname: Option<String>,
@@ -176,6 +178,7 @@ fn pool_key(user_id: &str, edge_agent_id: &str) -> String {
 /// Thread-safe pool of live edge WebSocket connections.
 #[derive(Debug, Clone)]
 pub struct EdgeConnectionPool {
+    pub(crate) capacity_rpc: crate::edge_capacity_rpc::CapacityRpcBroker,
     connections: Arc<DashMap<String, EdgeConnection>>,
     /// Pending tool requests dispatched to edges, keyed by request_id.
     /// Used for reconnection dedup: when an edge reconnects, cloud can
@@ -216,6 +219,7 @@ struct PendingRequestEntry {
 impl EdgeConnectionPool {
     pub fn new() -> Self {
         Self {
+            capacity_rpc: Default::default(),
             connections: Arc::new(DashMap::new()),
             pending_requests: Arc::new(DashMap::new()),
             pending_request_ids_by_user: Arc::new(DashMap::new()),
@@ -227,6 +231,44 @@ impl EdgeConnectionPool {
             reconnect_intents: Arc::new(DashMap::new()),
             reconnect_locks: Arc::new(DashMap::new()),
         }
+    }
+
+    pub(crate) fn send_capacity_request(
+        &self,
+        request: &crate::edge_capacity_rpc::EdgeCapacityRpcRequest<'_>,
+        message: EdgeServerMessage,
+    ) -> Result<(), crate::edge_capacity_rpc::CapacityRpcFailure> {
+        use crate::edge_capacity_rpc::{CapacityRpcFailure, EdgeCapacityProvider};
+        let connection = self
+            .connections
+            .get(&pool_key(request.user_id, request.edge_id))
+            .ok_or(CapacityRpcFailure::Offline)?;
+        if connection.sender.is_closed() {
+            return Err(CapacityRpcFailure::Offline);
+        }
+        if connection.workspace_id.as_deref() != Some(request.workspace_id)
+            || connection.connection_id != request.connection_id
+        {
+            return Err(CapacityRpcFailure::BindingChanged);
+        }
+        let providers: Vec<EdgeCapacityProvider> = connection
+            .capabilities
+            .as_ref()
+            .and_then(|value| value.get("capacity_rpc_v1"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .ok_or(CapacityRpcFailure::Unsupported)?;
+        if !providers.iter().any(|item| item.id == request.provider_id) {
+            return Err(CapacityRpcFailure::Unsupported);
+        }
+        // Never queue offline or resend across reconnect. The shard guard
+        // fences route selection and enqueue against connection replacement.
+        connection
+            .sender
+            .try_send(message)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => CapacityRpcFailure::Busy,
+                mpsc::error::TrySendError::Closed(_) => CapacityRpcFailure::Offline,
+            })
     }
 
     /// Acquire the per-key reconnect lock. The edge WS handler holds this across
@@ -404,6 +446,7 @@ impl EdgeConnectionPool {
     ) -> EdgeConnection {
         EdgeConnection {
             generation,
+            connection_id: format!("ws-{}", uuid::Uuid::new_v4()),
             user_id: user_id.to_string(),
             edge_agent_id: edge_agent_id.to_string(),
             hostname,
@@ -508,6 +551,7 @@ impl EdgeConnectionPool {
             workspace_id,
             registry_id,
             None,
+            format!("ws-{}", uuid::Uuid::new_v4()),
             sender,
         )
     }
@@ -526,6 +570,7 @@ impl EdgeConnectionPool {
         workspace_id: Option<String>,
         registry_id: Option<String>,
         materialization_id: Option<String>,
+        connection_id: String,
         sender: EdgeWsSender,
     ) -> u64 {
         let key = pool_key(user_id, edge_agent_id);
@@ -542,6 +587,7 @@ impl EdgeConnectionPool {
             materialization_id,
             sender,
         );
+        connection.connection_id = connection_id;
         // Inherit the pending map: prefer a live previous connection's map, else
         // the one captured by the reservation (previous was cleaned up mid-
         // reconnect but the intent kept its waiters alive). Take a clone and drop
@@ -584,6 +630,8 @@ impl EdgeConnectionPool {
         edge_agent_id: &str,
         generation: u64,
     ) -> bool {
+        self.capacity_rpc
+            .disconnect(user_id, edge_agent_id, generation);
         let key = pool_key(user_id, edge_agent_id);
         // Hold the connections shard lock (via `entry`) while reading the intent
         // so this is atomic with `begin_reconnect` (which sets the intent under
@@ -648,6 +696,7 @@ impl EdgeConnectionPool {
                 let conn = entry.value();
                 let info = EdgeConnectionInfo {
                     generation: conn.generation,
+                    connection_id: conn.connection_id.clone(),
                     edge_agent_id: conn.edge_agent_id.clone(),
                     hostname: conn.hostname.clone(),
                     workspace_dir: conn.workspace_dir.clone(),
@@ -690,6 +739,7 @@ impl EdgeConnectionPool {
                 let conn = entry.value();
                 EdgeConnectionInfo {
                     generation: conn.generation,
+                    connection_id: conn.connection_id.clone(),
                     edge_agent_id: conn.edge_agent_id.clone(),
                     hostname: conn.hostname.clone(),
                     workspace_dir: conn.workspace_dir.clone(),
@@ -713,6 +763,7 @@ impl EdgeConnectionPool {
                 let conn = entry.value();
                 EdgeConnectionInfo {
                     generation: conn.generation,
+                    connection_id: conn.connection_id.clone(),
                     edge_agent_id: conn.edge_agent_id.clone(),
                     hostname: conn.hostname.clone(),
                     workspace_dir: conn.workspace_dir.clone(),
@@ -754,6 +805,7 @@ impl EdgeConnectionPool {
                 let conn = entry.value();
                 EdgeConnectionInfo {
                     generation: conn.generation,
+                    connection_id: conn.connection_id.clone(),
                     edge_agent_id: conn.edge_agent_id.clone(),
                     hostname: conn.hostname.clone(),
                     workspace_dir: conn.workspace_dir.clone(),
@@ -1225,6 +1277,7 @@ pub struct EdgeConnectionInfo {
     /// In-process connection incarnation. It is a liveness fence for a
     /// read-only attestation and is never used as a durable Session generation.
     pub generation: u64,
+    pub connection_id: String,
     pub edge_agent_id: String,
     pub hostname: Option<String>,
     pub workspace_dir: Option<String>,
@@ -1298,6 +1351,7 @@ mod tests {
             None,
             Some("registry-a".into()),
             Some("materialization-a".into()),
+            format!("ws-{}", uuid::Uuid::new_v4()),
             replacement_tx,
         );
         assert!(replacement_generation > generation);

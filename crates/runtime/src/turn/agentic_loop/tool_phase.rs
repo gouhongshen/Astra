@@ -3036,7 +3036,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         if any_newly_activated && let Some(resolver) = &state.skills.resolver {
             // Phase-9: byte-stable schema — no enum, skill list is surfaced
             // via <available_skills> in session-cached prompt prefix.
-            if !resolver.available_skills().is_empty() {
+            if !resolver.available_skills().is_empty() || resolver.has_dynamic_catalog() {
                 host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
             }
         }

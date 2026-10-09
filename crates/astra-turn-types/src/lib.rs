@@ -14,8 +14,10 @@ pub use judgment::{
     JudgmentNoulDecision, JudgmentQuestion, JudgmentRequest, JudgmentResponse,
     JudgmentResponseProvenance, NormalizedJudgmentResponse, NoulCriteria, judgment_messages,
     judgment_request_from_messages, normalize_judgment_response,
-    output_budget_exceeds_completion_cap, parse_unique_judgment_json,
+    output_budget_exceeds_completion_cap,
 };
+mod strict_json;
+pub use strict_json::parse_unique_json;
 mod canonical_token_usage;
 mod canonical_tool_pairing;
 pub use canonical_token_usage::CanonicalTokenUsage;

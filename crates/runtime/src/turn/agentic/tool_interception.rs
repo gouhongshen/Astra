@@ -489,7 +489,20 @@ pub(crate) fn request_allowlist_permits_tool(state: &AgenticLoopState, tool_name
         .request_constraints
         .allowed_tools
         .as_ref()
-        .is_none_or(|allowed| allowed.contains(tool_name))
+        .is_none_or(|allowed| {
+            allowed.contains(tool_name) || source_selection_is_allowed(state, tool_name, allowed)
+        })
+}
+
+fn source_selection_is_allowed(
+    state: &AgenticLoopState,
+    tool_name: &str,
+    allowed: &HashSet<String>,
+) -> bool {
+    state
+        .runtime_tool_executor
+        .as_ref()
+        .is_some_and(|executor| executor.request_allows_source_selection(tool_name, allowed))
 }
 
 fn optional_tool_is_enabled(state: &AgenticLoopState, tool_name: &str) -> bool {
@@ -573,6 +586,7 @@ pub(crate) fn runtime_allows_tool(state: &AgenticLoopState, tool_name: &str) -> 
         return true;
     };
     allowed_tools.contains(tool_name)
+        || source_selection_is_allowed(state, tool_name, &allowed_tools)
         || (exempt_from_skill_allowlist(tool_name)
             && request_allowlist_permits_tool(state, tool_name))
 }
@@ -1064,7 +1078,7 @@ pub(crate) fn dedup_skill_calls(
     let mut short_circuits = Vec::new();
     let mut fresh_tool_calls = Vec::new();
     for tc in tool_calls {
-        if crate::turn::skill_tool::is_skill_call(tc) {
+        if crate::turn::skill_tool::is_skill_activation_call(tc) {
             let skill_name = crate::turn::skill_tool::extract_skill_name(tc);
             if let Some(ref name) = skill_name
                 && let Some(prev) = state.skills.execution.invoked.get_mut(name.as_str())
@@ -1234,7 +1248,7 @@ async fn intercept_skill_calls(
         {
             let name = crate::turn::skill_tool::extract_skill_name(tc);
             if let Some(name) = name {
-                if result.ok && crate::turn::skill_tool::is_skill_call(tc) {
+                if result.ok && crate::turn::skill_tool::is_skill_activation_call(tc) {
                     let execution_topology = crate::turn::skill_tool::declared_execution_topology(
                         resolver.as_ref(),
                         &name,
@@ -1257,7 +1271,7 @@ async fn intercept_skill_calls(
     let mut skill_results = dedup_results;
     let new_skills_fired = fresh_tool_calls
         .iter()
-        .any(|tc| crate::turn::skill_tool::is_skill_call(tc));
+        .any(|tc| crate::turn::skill_tool::is_skill_activation_call(tc));
     skill_results.extend(sr);
     let mut surgically_removed_ids = HashSet::new();
     if new_skills_fired && !remaining.is_empty() {

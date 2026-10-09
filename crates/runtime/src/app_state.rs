@@ -154,6 +154,7 @@ impl Default for AdminState {
 
 #[derive(Clone)]
 pub(crate) struct ExecutionServicesState {
+    pub(crate) edge_capacity_relay_origin: Option<String>,
     pub(crate) edge_registry_service: Arc<dyn EdgeRegistryService>,
     pub(crate) edge_dispatch_service: Arc<dyn EdgeDispatchService>,
     pub(crate) run_lifecycle_service: Arc<dyn RunLifecycleService>,
@@ -162,6 +163,7 @@ pub(crate) struct ExecutionServicesState {
 impl Default for ExecutionServicesState {
     fn default() -> Self {
         Self {
+            edge_capacity_relay_origin: None,
             edge_registry_service: Arc::new(UnconfiguredEdgeRegistryService),
             edge_dispatch_service: Arc::new(UnconfiguredEdgeDispatchService),
             run_lifecycle_service: Arc::new(UnconfiguredRunLifecycleService),
@@ -747,6 +749,15 @@ impl AppState {
     ) -> Self {
         self.execution.edge_registry_service = edge_registry_service;
         self
+    }
+
+    /// Operator-owned address of this exact node, never a load-balanced
+    /// service URL or an endpoint supplied by an Edge or invocation.
+    pub fn with_edge_capacity_relay_origin(mut self, origin: String) -> Result<Self, String> {
+        crate::server::validate_relay_origin(&origin)
+            .map_err(|_| "invalid Edge capacity node origin".to_string())?;
+        self.execution.edge_capacity_relay_origin = Some(origin);
+        Ok(self)
     }
 
     pub fn with_edge_dispatch_service(

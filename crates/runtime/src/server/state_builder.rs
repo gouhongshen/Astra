@@ -66,7 +66,7 @@ pub async fn build_server_state(
     let state = core::install_turn_persistence_services(state, &settings, &shared_pool);
     let state =
         core::install_admin_services(state, &settings, &shared_pool, control_pool.as_ref())?;
-    let state = core::install_execution_services(state, &shared_pool)
+    let state = core::install_execution_services(state, &shared_pool)?
         .with_memoria_config(
             settings.memoria.base_url.clone(),
             settings.memoria.master_key.clone(),

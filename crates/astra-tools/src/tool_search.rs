@@ -41,20 +41,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
     // Returns the compact schema-addressed contract. The host records the
     // selection for typed admission; it must not reinsert the full target
     // schema into the repeated provider `tools[]` prefix.
-    if let Some(tool_names) = select_payload(query) {
-        let mut requested = Vec::new();
-        for name in tool_names
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-        {
-            if !requested
-                .iter()
-                .any(|existing: &String| existing.eq_ignore_ascii_case(name))
-            {
-                requested.push(name.to_string());
-            }
-        }
+    if let Some(requested) = selected_tool_names(query) {
         if requested.is_empty() {
             return tool_search_error("'select:' requires at least one tool name").to_string();
         }
@@ -167,6 +154,26 @@ pub fn tool_selection_contract(schema: &Value) -> Option<Value> {
 pub fn tool_selection_contract_digest(selection: &Value) -> String {
     let canonical = astra_core::canonical_json_string(selection);
     format!("sha256:{:x}", Sha256::digest(canonical.as_bytes()))
+}
+
+/// Parse the same explicit-selection contract used by tool_search. Consumers
+/// resolving lazy sources must not introduce different whitespace or case rules.
+pub fn selected_tool_names(query: &str) -> Option<Vec<String>> {
+    let names = select_payload(query.trim())?;
+    let mut requested = Vec::new();
+    for name in names
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        if !requested
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+        {
+            requested.push(name.to_string());
+        }
+    }
+    Some(requested)
 }
 
 fn select_payload(query: &str) -> Option<&str> {

@@ -376,6 +376,11 @@ impl std::fmt::Display for HeartbeatError {
 
 #[async_trait]
 pub trait EdgeRegistryService: Send + Sync {
+    /// Whether registry lookups own cross-process routing. An explicitly
+    /// unconfigured single-process registry has no durable route to consult.
+    fn has_durable_routing(&self) -> bool {
+        true
+    }
     #[allow(clippy::too_many_arguments)]
     async fn register_or_update(
         &self,
@@ -1920,6 +1925,9 @@ pub struct UnconfiguredEdgeRegistryService;
 
 #[async_trait]
 impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
+    fn has_durable_routing(&self) -> bool {
+        false
+    }
     /// When no cross-pod registry is configured (single-pod deployment), edge
     /// registration is a successful no-op: the connection is tracked in the
     /// in-memory pool and there is no cross-pod source of truth to fail. This is

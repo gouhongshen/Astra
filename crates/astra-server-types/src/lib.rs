@@ -2,6 +2,8 @@ mod completions;
 #[cfg(feature = "server")]
 pub mod conflict_resolver;
 #[cfg(feature = "server")]
+pub mod edge_capacity_rpc;
+#[cfg(feature = "server")]
 pub mod edge_connection_pool;
 pub mod edge_ws_protocol;
 pub mod session_run_tree;

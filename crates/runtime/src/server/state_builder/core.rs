@@ -267,7 +267,19 @@ pub(super) fn install_admin_services(
         )))
 }
 
-pub(super) fn install_execution_services(state: AppState, shared_pool: &SharedPool) -> AppState {
+pub(super) fn install_execution_services(
+    mut state: AppState,
+    shared_pool: &SharedPool,
+) -> Result<AppState, Box<dyn std::error::Error>> {
+    match std::env::var("ASTRA_EDGE_CAPACITY_RELAY_ORIGIN") {
+        Ok(origin) => {
+            state = state
+                .with_edge_capacity_relay_origin(origin)
+                .map_err(std::io::Error::other)?
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(error) => return Err(Box::new(error)),
+    }
     let metrics = state.multi_agent_metrics.clone();
     let edge_registry_service: Arc<dyn EdgeRegistryService> = Arc::new(
         DatabaseEdgeRegistryService::from_shared(shared_pool).with_metrics(metrics.clone()),
@@ -281,10 +293,10 @@ pub(super) fn install_execution_services(state: AppState, shared_pool: &SharedPo
         Arc::clone(&edge_registry_service),
         &load_deployment_tool_policy(),
     );
-    state
+    Ok(state
         .with_edge_registry_service(edge_registry_service)
         .with_edge_dispatch_service(edge_dispatch_service)
-        .with_tool_execution_service(tool_execution_service)
+        .with_tool_execution_service(tool_execution_service))
 }
 
 fn build_shared_tool_execution_service(

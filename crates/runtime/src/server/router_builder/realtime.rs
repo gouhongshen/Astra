@@ -168,6 +168,14 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(edge::edge_service_status_handler::edge_service_status_handler),
         )
         .route(
+            "/service/edges/capacity",
+            get(edge::edge_capacity_handler::describe_capacity)
+                .post(edge::edge_capacity_handler::call_capacity)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    astra_server_types::edge_ws_protocol::MAX_EDGE_MESSAGE_BYTES,
+                )),
+        )
+        .route(
             "/chat/runs/{run_id}",
             get(crate::server::run::handlers::get_run_status_handler)
                 .delete(crate::server::run::handlers::delete_run_handler),

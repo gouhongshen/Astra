@@ -9,6 +9,7 @@
 //! astra-edge --server-url https://astra.example.com --workspace-dir ~/projects/my-app
 //! ```
 
+mod capacity_provider;
 mod invocation_journal;
 mod runtime_process_authorization;
 mod token_manager;
@@ -90,10 +91,14 @@ struct Args {
     /// Auto-reconnect on disconnect
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     reconnect: bool,
+    /// Private local configuration for explicitly enabled sealed capacity providers.
+    #[arg(long)]
+    capacity_providers: Option<PathBuf>,
 }
 
 #[derive(Debug)]
 struct EdgeConfig {
+    capacity_providers: Vec<capacity_provider::LocalCapacityProvider>,
     server_url: String,
     /// Single owner of the token state machine: memory value, token file,
     /// startup fallback and persistence debt (see token_manager.rs).
@@ -456,6 +461,7 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
         .unwrap_or_else(|| default_edge_id(&workspace_dir));
     let materialization_id = load_or_create_materialization_id(&workspace_dir)?;
     Ok(EdgeConfig {
+        capacity_providers: capacity_provider::load(args.capacity_providers.as_deref())?,
         server_url: edge_ws_url(&raw_server_url)?,
         token_manager: token_manager::TokenManager::new(token, fallback_token, token_file),
         workspace_dir,
@@ -960,10 +966,19 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
         hostname,
         workspace_dir: Some(workspace.to_string_lossy().to_string()),
-        capabilities: Some(edge_runtime_environment_capabilities(
-            &config.edge_id,
-            &workspace,
-        )),
+        capabilities: Some({
+            let mut value = edge_runtime_environment_capabilities(&config.edge_id, &workspace);
+            if !config.capacity_providers.is_empty() {
+                value["capacity_rpc_v1"] = serde_json::to_value(
+                    config
+                        .capacity_providers
+                        .iter()
+                        .map(|provider| provider.advertisement())
+                        .collect::<Vec<_>>(),
+                )?;
+            }
+            value
+        }),
     };
     write
         .send(Message::Text(serde_json::to_string(&auth_msg)?.into()))
@@ -1036,6 +1051,13 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     let execution_budget = EdgeExecutionBudget::new();
     let mut invocations = EdgeInvocationTracker::default();
     let mut tasks = JoinSet::new();
+    let capacity_cancel = CancellationToken::new();
+    let capacity_slots = Arc::new(Semaphore::new(
+        astra_server_types::edge_ws_protocol::MAX_CAPACITY_RPC_INFLIGHT,
+    ));
+    let (capacity_completed_tx, mut capacity_completed_rx) = mpsc::channel::<EdgeClientMessage>(
+        astra_server_types::edge_ws_protocol::MAX_CAPACITY_RPC_INFLIGHT,
+    );
     let journal_path = edge_invocation_journal_path_in_root(
         &config.edge_id,
         &workspace,
@@ -1250,6 +1272,31 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                     let _ = completed_tx.send(completion).await;
                                 });
                             }
+                            Ok(EdgeServerMessage::CapacityRequest {
+                                request_id, connection_generation, provider_id, payload, timeout_secs,
+                            }) => {
+                                use astra_server_types::edge_ws_protocol::{CapacityRpcFailure, valid_capacity_identity};
+                                if !valid_capacity_identity(&request_id) || connection_generation == 0 {
+                                    continue;
+                                }
+                                let provider = config.capacity_providers.iter()
+                                    .find(|provider| provider.advertisement().id == provider_id).cloned();
+                                let permit = capacity_slots.clone().try_acquire_owned();
+                                let completed = capacity_completed_tx.clone();
+                                let cancel = capacity_cancel.child_token();
+                                tasks.spawn(async move {
+                                    let result = match (provider, permit) {
+                                        (None, _) => Err(CapacityRpcFailure::Unsupported),
+                                        (_, Err(_)) => Err(CapacityRpcFailure::Busy),
+                                        (Some(provider), Ok(_permit)) => provider.call(payload, timeout_secs, cancel).await,
+                                    };
+                                    // Sealed frames are live-only: never put them in the tool
+                                    // journal, retry outbox, transcript or diagnostic output.
+                                    let _ = completed.try_send(EdgeClientMessage::CapacityResult {
+                                        request_id, connection_generation, result,
+                                    });
+                                });
+                            }
                             Ok(EdgeServerMessage::Pong {}) => {
                                 // heartbeat ack
                             }
@@ -1300,6 +1347,9 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                     _ => {}
                 }
             }
+            Some(completed) = capacity_completed_rx.recv() => {
+                write.send(Message::Text(serde_json::to_string(&completed)?.into())).await?;
+            }
             Some(completed) = completed_rx.recv() => {
                 if !invocations.finish_if_current(&completed.request_id, completed.generation) {
                     tracing::warn!(
@@ -1333,6 +1383,8 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     // Every exit (including journal and socket errors) settles this connection's
     // executions before reconnect can acquire the journal and dispatch again.
     invocations.cancel_all();
+    capacity_cancel.cancel();
+    drop(capacity_completed_tx);
     // A failed append may have left a partial WAL record. Do not append again
     // until open() has validated/recovered it. Other connection failures do
     // not prevent preserving the results produced during cancellation.
@@ -1665,6 +1717,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = EdgeConfig {
+            capacity_providers: Vec::new(),
             server_url: format!("ws://{}/edge/ws", listener.local_addr().unwrap()),
             token_manager: token_manager::TokenManager::new(
                 "test-token".into(),

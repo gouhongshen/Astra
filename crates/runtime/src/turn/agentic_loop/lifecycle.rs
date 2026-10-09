@@ -3047,7 +3047,7 @@ pub(crate) fn configure_loop_host<H: AgenticLoopHost>(host: &mut H, state: &Agen
         // session-cached prompt prefix (see `build_skill_listing_section`),
         // so adding/removing a skill no longer perturbs the tool schema
         // bytes.
-        if !resolver.available_skills().is_empty() {
+        if !resolver.available_skills().is_empty() || resolver.has_dynamic_catalog() {
             host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
         }
     }

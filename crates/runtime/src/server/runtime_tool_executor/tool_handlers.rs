@@ -1716,7 +1716,10 @@ impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
             return astra_tools::cancelled_tool_result(name, false);
         }
-        context.execute_mcp_tool(name, args, None, None).await
+        let request = context.tool_execution_request(name, args);
+        context
+            .execute_mcp_tool(name, args, None, None, &request)
+            .await
     }
 }
 

@@ -876,6 +876,7 @@ pub struct RuntimeToolExecutor {
     /// shared HTTP transport pool. Unlike `mcp_manager`, this never holds a
     /// long-lived authorization-scoped MCP session.
     agent_binding_mcp: Option<Arc<super::runtime_mcp::AgentBindingMcpRuntime>>,
+    capability_source: Option<Arc<super::capability_source::CapabilitySourceRuntime>>,
     /// Request-scoped MCP tool schemas. Joined with the server-side allowlist
     /// only when the matching MCP runtime binding is ready, so deferred
     /// activation reaches MCP tools without treating arbitrary schemas as
@@ -1056,6 +1057,7 @@ impl RuntimeToolExecutor {
             current_discovery_deferred_tool_schemas: Arc::new(std::sync::RwLock::new(Vec::new())),
             mcp_manager: None,
             agent_binding_mcp: None,
+            capability_source: None,
             agent_tool_context: None,
             work_surface_events: WorkSurfaceEventEmitter::new(session_id.clone()),
             tool_route_observer: Arc::new(std::sync::RwLock::new(None)),
@@ -1445,6 +1447,146 @@ impl RuntimeToolExecutor {
         self.agent_binding_mcp = Some(agent_binding_mcp);
     }
 
+    pub(crate) fn set_capability_source(
+        &mut self,
+        source: Option<Arc<super::capability_source::CapabilitySourceRuntime>>,
+    ) {
+        self.capability_source = source;
+    }
+
+    /// An explicit source scope can authorize only a materialized selection
+    /// with a canonical descriptor. Alias shape alone never grants admission.
+    pub(crate) fn request_allows_source_selection(
+        &self,
+        name: &str,
+        allowed: &HashSet<String>,
+    ) -> bool {
+        let Some(parent) = self
+            .capability_source
+            .as_ref()
+            .and_then(|source| source.selection_discovery_tool(name))
+        else {
+            return false;
+        };
+        allowed.contains(&parent)
+            && self
+                .provider_policy_index
+                .read()
+                .is_ok_and(|index| index.descriptor_refs().contains_key(name))
+    }
+
+    pub(crate) async fn restore_source_selections(
+        &self,
+        scope: super::capability_source::SourceScope,
+        activations: &[astra_turn_types::DeferredToolActivation],
+    ) -> Result<Vec<String>, super::capability_source::SourceError> {
+        let Some(source) = &self.capability_source else {
+            return Ok(Vec::new());
+        };
+        source.bind_scope(scope)?;
+        let mut expired = Vec::new();
+        for activation in activations
+            .iter()
+            .filter(|activation| source.custody.owns_selection_shape(&activation.name))
+        {
+            // Restore only indexed descriptors already committed by this run.
+            // Neither checkpoint text nor a matching hash can mint custody.
+            let materialized = match source.materialize(&activation.name, false).await {
+                Ok(materialized) => materialized,
+                Err(
+                    super::capability_source::SourceError::SelectionNotFound
+                    | super::capability_source::SourceError::SelectionChanged,
+                ) => {
+                    expired.push(activation.name.clone());
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            self.install_source_materialization(&materialized)?;
+        }
+        Ok(expired)
+    }
+
+    fn install_source_materialization(
+        &self,
+        materialized: &super::capability_source::MaterializedCapability,
+    ) -> Result<(), super::capability_source::SourceError> {
+        let mut schemas = self
+            .request_scoped_mcp_schemas
+            .write()
+            .map_err(|_| super::capability_source::SourceError::CustodyUnavailable)?;
+        let mut index = self
+            .provider_policy_index
+            .write()
+            .map_err(|_| super::capability_source::SourceError::CustodyUnavailable)?;
+        index
+            .extend_snapshot(&materialized.snapshot)
+            .map_err(|_| super::capability_source::SourceError::SelectionChanged)?;
+        if !schemas
+            .iter()
+            .any(|schema| tool_schema_name(schema) == tool_schema_name(&materialized.schema))
+        {
+            schemas.push(materialized.schema.clone());
+        }
+        Ok(())
+    }
+
+    async fn execute_source_tool_search(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> Option<astra_tools::ToolResult> {
+        let source = self.capability_source.as_ref()?;
+        let query = request.args.get("query")?.as_str()?;
+        let names = astra_tools::tool_search::selected_tool_names(query)?;
+        if !names.iter().any(|name| {
+            source
+                .custody
+                .owns_selection_shape(&name.to_ascii_lowercase())
+        }) {
+            return None;
+        }
+        if names.len() > 8 {
+            return Some(capability_source_error_result(
+                super::capability_source::SourceError::InvalidContract,
+            ));
+        }
+        if let Err(error) = source.request_scope(request) {
+            return Some(capability_source_error_result(error));
+        }
+        let mut pool = self.current_tool_search_pool_schemas();
+        for name in names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .filter(|name| source.custody.owns_selection_shape(name))
+        {
+            let materialized = match source.materialize(&name, true).await {
+                Ok(value) => value,
+                Err(error) => return Some(capability_source_error_result(error)),
+            };
+            if let Err(error) = self.install_source_materialization(&materialized) {
+                return Some(capability_source_error_result(error));
+            }
+        }
+        // Describing a contract does not grant visibility. Use the same
+        // canonical admission projection as ordinary request-scoped MCP.
+        pool.extend(
+            self.ready_request_scoped_mcp_schemas()
+                .into_iter()
+                .filter(|schema| {
+                    tool_schema_name(schema).is_some_and(|name| {
+                        names
+                            .iter()
+                            .any(|selected| selected.eq_ignore_ascii_case(name))
+                    })
+                }),
+        );
+        remove_prompt_schema_conflicts(&mut pool);
+        dedupe_tool_schema_pool(&mut pool);
+        Some(astra_tools::ToolResult::text(
+            astra_tools::tool_search::tool_search(&pool, &request.args),
+        ))
+    }
+
     /// Install request-scoped MCP schemas so
     /// `tool_search(select:NAME)` can resolve them for deferred activation.
     /// Called by the server loop host after request-scoped MCP discovery.
@@ -1466,6 +1608,21 @@ impl RuntimeToolExecutor {
         let mut guard =
             rwlock_write_reset_on_poison(&self.provider_policy_index, "provider_policy_index");
         *guard = index;
+    }
+
+    pub(crate) fn provider_policy_index_handle(
+        &self,
+    ) -> Arc<std::sync::RwLock<astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex>>
+    {
+        self.provider_policy_index.clone()
+    }
+
+    pub(crate) fn source_materialized_schemas(
+        &self,
+    ) -> Result<Vec<Value>, super::capability_source::SourceError> {
+        self.capability_source
+            .as_ref()
+            .map_or_else(|| Ok(Vec::new()), |source| source.materialized_schemas())
     }
 
     pub(crate) fn provider_policy_lookup(&self, public_alias: &str) -> ProviderPolicyLookup {
@@ -1730,6 +1887,7 @@ impl RuntimeToolExecutor {
         args: &Value,
         tool_call_id: Option<&str>,
         semantic_read_condition: Option<&astra_turn_types::SemanticReadCondition>,
+        request: &ToolExecutionRequest,
     ) -> astra_tools::ToolResult {
         let mut interaction_response: Option<ProviderInteractionResponse> = None;
         let mut seen_interaction_ids = HashSet::new();
@@ -1740,25 +1898,33 @@ impl RuntimeToolExecutor {
                         "Agent Binding MCP tool '{name}' is missing its trusted tool call identity."
                     ));
                 };
-                agent_binding_mcp
-                    .call_tool_by_mcp_name(
-                        name,
-                        args,
-                        tool_call_id,
-                        semantic_read_condition,
-                        interaction_response.as_ref(),
-                    )
-                    .await
-                    .map_err(|error| {
-                        mcp_call_error_result(
-                            super::runtime_mcp::redact_mcp_error_text(&format!(
-                                "Agent Binding MCP tool '{name}' failed on server '{}': {error}",
-                                agent_binding_mcp.server_name()
-                            )),
-                            error.side_effects_maybe(),
-                            error.is_timeout(),
+                let result = if let Some(source) = self
+                    .capability_source
+                    .as_ref()
+                    .filter(|source| source.custody.owns_selection_shape(name))
+                {
+                    source.invoke(request, interaction_response.as_ref()).await
+                } else {
+                    agent_binding_mcp
+                        .call_tool_by_mcp_name(
+                            name,
+                            args,
+                            tool_call_id,
+                            semantic_read_condition,
+                            interaction_response.as_ref(),
                         )
-                    })
+                        .await
+                };
+                result.map_err(|error| {
+                    mcp_call_error_result(
+                        super::runtime_mcp::redact_mcp_error_text(&format!(
+                            "Agent Binding MCP tool '{name}' failed on server '{}': {error}",
+                            agent_binding_mcp.server_name()
+                        )),
+                        error.side_effects_maybe(),
+                        error.is_timeout(),
+                    )
+                })
             } else {
                 let Some(mgr) = &self.mcp_manager else {
                     return astra_tools::ToolResult::error(format!(
@@ -1786,10 +1952,15 @@ impl RuntimeToolExecutor {
                         )
                     })
             };
-            let result = match result {
+            let mut result = match result {
                 Ok(result) => result,
                 Err(result) => return result,
             };
+            if let Some(source) = &self.capability_source {
+                if let Err(error) = source.register_result(request, &mut result).await {
+                    return capability_source_error_result(error);
+                }
+            }
             match result.into_provider_outcome() {
                 ProviderCallOutcome::InteractionRequired(request) => {
                     if !seen_interaction_ids.insert(request.request_id.clone()) {
@@ -2279,6 +2450,10 @@ impl RuntimeToolExecutor {
         context.request_scoped_mcp_provider_ready = !self
             .request_scoped_mcp_schemas_snapshot("request_scoped_mcp_admission")
             .is_empty();
+        match self.provider_policy_index.read() {
+            Ok(index) => context.resolved_provider_descriptors = index.descriptor_refs(),
+            Err(_) => context.policy_snapshot_available = false,
+        }
         context
     }
 
@@ -2489,6 +2664,13 @@ impl RuntimeToolExecutor {
     }
 
     fn mcp_executor_tool_readiness(&self, name: &str) -> ExecutorToolReadiness {
+        if self
+            .capability_source
+            .as_ref()
+            .is_some_and(|source| source.owns_materialized(name))
+        {
+            return ExecutorToolReadiness::Ready;
+        }
         if self
             .agent_binding_mcp
             .as_ref()
@@ -4873,6 +5055,11 @@ impl ServerLocalToolTransport for RuntimeToolExecutor {
         request: &ToolExecutionRequest,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        if request.tool_name == "tool_search" {
+            if let Some(result) = self.execute_source_tool_search(request).await {
+                return result;
+            }
+        }
         if astra_runtime_env::is_mcp_namespaced_tool_name(&request.tool_name) {
             if let Some(result) =
                 self.executor_readiness_preflight_result(&request.tool_name, &request.args)
@@ -4885,6 +5072,7 @@ impl ServerLocalToolTransport for RuntimeToolExecutor {
                     &request.args,
                     non_empty_identity(&request.tool_call_id),
                     request.policy.semantic_read_condition.as_ref(),
+                    request,
                 )
                 .await;
         }
@@ -4937,6 +5125,24 @@ impl ToolExecutor for RuntimeToolExecutor {
 #[cfg(test)]
 fn tool_result_from_mcp_tool_call_result(result: McpToolCallResult) -> astra_tools::ToolResult {
     tool_result_from_provider_outcome(result.into_provider_outcome())
+}
+
+fn capability_source_error_result(
+    error: super::capability_source::SourceError,
+) -> astra_tools::ToolResult {
+    let reason = error.to_string();
+    let mut result = astra_tools::ToolResult::error(json!({"status": "failed", "reason": reason,
+        "message": "This capability could not be loaded. Discover and select an available capability before calling it."}).to_string());
+    result.metadata = Some(Map::from_iter([
+        (
+            "error_kind".to_string(),
+            Value::String("tool_binding".to_string()),
+        ),
+        ("reason".to_string(), Value::String(reason)),
+        ("side_effects_maybe".to_string(), Value::Bool(false)),
+        ("retryable".to_string(), Value::Bool(false)),
+    ]));
+    result
 }
 
 fn tool_result_from_provider_outcome(outcome: ProviderCallOutcome) -> astra_tools::ToolResult {
@@ -10889,6 +11095,170 @@ esac
             matched_names.iter().any(|n| n == "agent_fanout"),
             "deferred name from the activatable set must resolve through tool_search; got: {}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_source_executor_search_installs_canonical_offer_and_restores_without_rpc() {
+        use super::super::capability_source::tests::{
+            http_fixture, register_fixture_candidate, request,
+        };
+        let fixture = http_fixture(false).await;
+        let (mut exec, _dir) = test_executor();
+        exec.user_id = fixture.scope.user_id.clone();
+        exec.session_id = fixture.scope.session_id.clone();
+        exec.set_agent_binding_mcp(fixture.transport.clone());
+        exec.set_capability_source(Some(fixture.source()));
+        let key =
+            register_fixture_candidate(exec.capability_source.as_ref().unwrap(), &fixture).await;
+        assert!(key.len() <= 64);
+        assert!(!exec.tool_runtime_ready(&key));
+        let search_request = request(
+            &fixture.scope,
+            "tool_search",
+            json!({"query":format!("  SeLeCt:{},,{key}  ", key.to_ascii_uppercase())}),
+        );
+        let found = exec
+            .execute_source_tool_search(&search_request)
+            .await
+            .unwrap();
+        assert!(!found.is_error, "{found:?}");
+        let value: Value = serde_json::from_str(&found.output).unwrap();
+        assert_eq!(value["matches"][0]["name"], key);
+        assert!(exec.tool_runtime_ready(&key));
+        let offer = exec.tool_admission_context().resolved_provider_descriptors[&key].clone();
+        assert_eq!(
+            offer.identity.native_tool_id.as_str(),
+            fixture.candidate.capability.native_id
+        );
+        let result = exec
+            .execute_mcp_tool(
+                &key,
+                &json!({}),
+                Some("source-call"),
+                None,
+                &request(&fixture.scope, &key, json!({})),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        let (mut reopened, _dir2) = test_executor();
+        reopened.user_id = fixture.scope.user_id.clone();
+        reopened.session_id = fixture.scope.session_id.clone();
+        reopened.set_agent_binding_mcp(fixture.transport.clone());
+        reopened.set_capability_source(Some(fixture.source()));
+        let activations = astra_turn_core::tool::deferred_activation::deferred_tool_activations_from_tool_search_output(&found.output);
+        let expired = reopened
+            .restore_source_selections(fixture.scope.clone(), &activations)
+            .await
+            .unwrap();
+        assert!(expired.is_empty());
+        assert!(reopened.tool_runtime_ready(&key));
+        let restored = reopened
+            .execute_source_tool_search(&search_request)
+            .await
+            .unwrap();
+        assert!(!restored.is_error);
+        assert_eq!(
+            reopened
+                .tool_admission_context()
+                .resolved_provider_descriptors[&key],
+            offer
+        );
+        let calls = fixture.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "astra/capabilities/describe")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "astra/capabilities/invoke")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_source_previous_run_selections_expire_without_hydrating_or_rpc() {
+        use super::super::capability_source::tests::{
+            http_fixture, register_fixture_candidate, request,
+        };
+        let fixture = http_fixture(false).await;
+        let (mut exec, _dir) = test_executor();
+        exec.user_id = fixture.scope.user_id.clone();
+        exec.session_id = fixture.scope.session_id.clone();
+        exec.set_agent_binding_mcp(fixture.transport.clone());
+        exec.set_capability_source(Some(fixture.source()));
+        let key =
+            register_fixture_candidate(exec.capability_source.as_ref().unwrap(), &fixture).await;
+        let found = exec
+            .execute_source_tool_search(&request(
+                &fixture.scope,
+                "tool_search",
+                json!({"query":format!("select:{key}")}),
+            ))
+            .await
+            .unwrap();
+        assert!(!found.is_error);
+        let activations = astra_turn_core::tool::deferred_activation::deferred_tool_activations_from_tool_search_output(&found.output);
+        let engine = crate::server::run::engine::RunEngine::new(fixture.store.clone());
+        engine
+            .persist_status(
+                &fixture.scope.user_id,
+                &fixture.scope.session_id,
+                &fixture.scope.run_id,
+                "completed",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        engine
+            .start_run(
+                "source-next-run",
+                &fixture.scope.user_id,
+                &fixture.scope.session_id,
+            )
+            .await
+            .unwrap();
+        let run = engine
+            .load_run(&fixture.scope.user_id, "source-next-run")
+            .await
+            .unwrap()
+            .unwrap();
+        let scope = super::super::capability_source::SourceScope {
+            run_id: run.run_id,
+            generation: run.run_generation,
+            ..fixture.scope.clone()
+        };
+        let (mut next, _next_dir) = test_executor();
+        next.user_id = scope.user_id.clone();
+        next.session_id = scope.session_id.clone();
+        next.set_agent_binding_mcp(fixture.transport.clone());
+        next.set_capability_source(Some(fixture.source()));
+        assert_eq!(
+            next.restore_source_selections(scope.clone(), &activations)
+                .await
+                .unwrap(),
+            vec![key.clone()]
+        );
+        assert!(!next.tool_runtime_ready(&key));
+        let rejected = next
+            .execute_source_tool_search(&request(
+                &scope,
+                "tool_search",
+                json!({"query":format!("select:{key}")}),
+            ))
+            .await
+            .unwrap();
+        assert!(rejected.is_error);
+        assert_eq!(
+            fixture.calls.lock().unwrap().len(),
+            1,
+            "expired keys cannot cause a provider lookup"
         );
     }
 
