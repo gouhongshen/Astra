@@ -5215,6 +5215,7 @@ pub struct AtomicRunTerminalSettlementCommit {
     pub event_receipts: Vec<AtomicRunTerminalEventReceipt>,
     pub last_event_idx: i64,
     pub latest_event_type: Option<String>,
+    pub projection_hash: String,
 }
 
 /// Authoritative read result for an atomic terminal settlement.
@@ -11793,6 +11794,87 @@ fn compare_recovery_candidate_order(
 
 impl DatabaseRunStateStore {
     #[allow(clippy::too_many_arguments)]
+    async fn upsert_terminal_display_projection_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        run: &DurableRunRecord,
+        request: AtomicRunTerminalSettlementRequest<'_>,
+        next_last_event_idx: i64,
+        latest_event_type: Option<&str>,
+    ) -> Result<String, String> {
+        let projection = build_run_display_projection(
+            &DurableRunRecord {
+                status: request.status.to_string(),
+                waiting_for: request.waiting_for.map(str::to_string),
+                error_message: request.error_message.map(str::to_string),
+                last_event_idx: next_last_event_idx,
+                total_prompt_tokens: request.prompt_tokens,
+                total_completion_tokens: request.completion_tokens,
+                total_tool_calls: request.tool_calls,
+                ..run.clone()
+            },
+            latest_event_type.map(str::to_string),
+            None,
+        );
+        let upsert_sql = matrixone_statement_with_null_shape(
+            "INSERT INTO run_display_projections
+             (run_id, user_id, session_id, status, waiting_for, error_message,
+              projection_event_idx, latest_event_type, latest_checkpoint_id,
+              latest_checkpoint_kind, latest_checkpoint_version, total_prompt_tokens,
+              total_completion_tokens, total_tool_calls, projection_hash, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))
+             ON DUPLICATE KEY UPDATE
+               status = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(status), status),
+               waiting_for = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(waiting_for), waiting_for),
+               error_message = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(error_message), error_message),
+               latest_event_type = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_event_type), latest_event_type),
+               latest_checkpoint_id = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_id), latest_checkpoint_id),
+               latest_checkpoint_kind = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_kind), latest_checkpoint_kind),
+               latest_checkpoint_version = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(latest_checkpoint_version), latest_checkpoint_version),
+               total_prompt_tokens = IF(VALUES(total_prompt_tokens) > total_prompt_tokens, VALUES(total_prompt_tokens), total_prompt_tokens),
+               total_completion_tokens = IF(VALUES(total_completion_tokens) > total_completion_tokens, VALUES(total_completion_tokens), total_completion_tokens),
+               total_tool_calls = IF(VALUES(total_tool_calls) > total_tool_calls, VALUES(total_tool_calls), total_tool_calls),
+               projection_hash = IF(VALUES(projection_event_idx) >= projection_event_idx, VALUES(projection_hash), projection_hash),
+               updated_at = IF(VALUES(projection_event_idx) >= projection_event_idx, NOW(6), updated_at),
+               projection_event_idx = IF(VALUES(projection_event_idx) > projection_event_idx, VALUES(projection_event_idx), projection_event_idx)",
+            [
+                projection.waiting_for.is_some(),
+                projection.error_message.is_some(),
+                projection.latest_event_type.is_some(),
+                projection.latest_checkpoint_id.is_some(),
+                projection.latest_checkpoint_kind.is_some(),
+                projection.latest_checkpoint_version.is_some(),
+            ],
+        );
+        sqlx::query(&upsert_sql)
+            .bind(&projection.run_id)
+            .bind(&projection.user_id)
+            .bind(&projection.session_id)
+            .bind(&projection.status)
+            .bind(&projection.waiting_for)
+            .bind(&projection.error_message)
+            .bind(projection.projection_event_idx)
+            .bind(&projection.latest_event_type)
+            .bind(&projection.latest_checkpoint_id)
+            .bind(&projection.latest_checkpoint_kind)
+            .bind(&projection.latest_checkpoint_version)
+            .bind(projection.total_prompt_tokens as i64)
+            .bind(projection.total_completion_tokens as i64)
+            .bind(projection.total_tool_calls as i64)
+            .bind(&projection.projection_hash)
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| {
+                db_error(
+                    "upsert_atomic_terminal_run_projection",
+                    request.run_id,
+                    source,
+                )
+                .to_string()
+            })?;
+        Ok(projection.projection_hash)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn transition_run_status(
         &self,
         user_id: &str,
@@ -12797,9 +12879,9 @@ impl DatabaseRunStateStore {
     ///
     /// The caller is responsible for committing or rolling back `tx`. `None`
     /// is a resolved ownership/status conflict and leaves the transaction open
-    /// so the caller can roll back its canonical writes. Projection repair is
-    /// deliberately excluded: it is derived state and must run only after the
-    /// authoritative transaction commits.
+    /// so the caller can roll back its canonical writes. The terminal display
+    /// projection is committed from the locked run and staged event receipts;
+    /// replay, conflict, and failure paths retain the full repair.
     pub async fn settle_terminal_in_existing_transaction(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
@@ -13006,6 +13088,14 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|error| error.to_string())?;
         }
+        let projection_hash = Self::upsert_terminal_display_projection_tx(
+            tx,
+            &run,
+            request,
+            next_last_event_idx,
+            event_rows.last().map(|event| event.event_type.as_str()),
+        )
+        .await?;
 
         Ok(Some(AtomicRunTerminalSettlementCommit {
             committed_events: events_to_commit,
@@ -13022,6 +13112,7 @@ impl DatabaseRunStateStore {
                 .collect(),
             last_event_idx: next_last_event_idx,
             latest_event_type: event_rows.last().map(|event| event.event_type.clone()),
+            projection_hash,
         }))
     }
 
@@ -13271,6 +13362,7 @@ impl DatabaseRunStateStore {
                 committed_events,
                 event_receipts: receipts,
                 last_event_idx: run.last_event_idx,
+                projection_hash: String::new(),
             },
         ))
     }
