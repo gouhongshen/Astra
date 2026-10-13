@@ -23851,6 +23851,7 @@ mod tests {
             user_id.into(),
             session_id.into(),
         )
+        .with_explain_analyze_requested(true)
     }
 
     #[cfg(feature = "e2e-hooks")]
@@ -36959,7 +36960,9 @@ mod tests {
 
     #[test]
     fn ordinary_runs_do_not_create_the_explain_analyze_graph_stream() {
-        let mut host = test_host_builder("u", "s").build();
+        let mut host = test_host_builder("u", "s")
+            .with_explain_analyze_requested(false)
+            .build();
         let mut state = create_test_state();
         state.current_run_id = Some("run-1".to_string());
 
@@ -37396,6 +37399,7 @@ mod tests {
             "u-context-budget".to_string(),
             "s-context-budget".to_string(),
         )
+        .with_explain_analyze_requested(true)
         .build();
         let mut state = create_test_state();
         state.current_run_id = Some("run-context-budget".to_string());
@@ -37457,6 +37461,7 @@ mod tests {
                 format!("u-context-{suffix}"),
                 format!("s-context-{suffix}"),
             )
+            .with_explain_analyze_requested(true)
             .build();
             let mut state = create_test_state();
             state.current_run_id = Some(format!("run-context-{suffix}"));
@@ -37536,6 +37541,7 @@ mod tests {
                 "u".to_string(),
                 "s".to_string(),
             )
+            .with_explain_analyze_requested(true)
             .build();
             let mut state = create_test_state();
             state.current_run_id = Some("run-recovery".to_string());
@@ -37652,6 +37658,7 @@ mod tests {
             "u-work-phase".to_string(),
             "s-work-phase".to_string(),
         )
+        .with_explain_analyze_requested(true)
         .build();
         let mut state = create_test_state();
         state.current_run_id = Some("run-work-phase".to_string());
@@ -37710,6 +37717,7 @@ mod tests {
             "http://example.invalid/v1/chat/completions",
             Some(1_000),
         )))
+        .with_explain_analyze_requested(true)
         .build();
         let mut state = create_test_state();
         state.current_run_id = Some("run-phase-resolution".to_string());
@@ -39605,15 +39613,12 @@ mod tests {
 
     #[tokio::test]
     async fn deliver_edge_tools_batches_multiple_approval_prompts() {
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u-batch".to_string(),
-            "s-batch".to_string(),
-        )
-        .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
-        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
-        .build();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<Value>(256);
+        let mut host = test_host_builder("u-batch", "s-batch")
+            .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
+            .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+            .build();
+        host.set_event_tx(event_tx);
         let mut explain_state = create_test_state();
         explain_state.current_run_id = Some("test-run".to_string());
         host.on_turn_started(&explain_state);
@@ -39929,23 +39934,32 @@ mod tests {
     #[tokio::test]
     async fn auto_interaction_mode_delivers_edge_mutation_without_approval_wait() {
         for fail_projection in [false, true] {
-            let mut host = ServerAgenticLoopHostBuilder::new(
-                mock_matrixone(),
-                mock_encryptor(),
-                "u-auto-edge".to_string(),
-                "s-auto-edge".to_string(),
-            )
-            .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
-            .with_interaction_mode(Some(RequestedTurnInteractionMode::Auto))
-            .build();
+            let mut host = test_host_builder("u-auto-edge", "edge-action-session")
+                .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+                .with_interaction_mode(Some(RequestedTurnInteractionMode::Auto))
+                .build();
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<Value>(256);
+            host.set_event_tx(event_tx);
             let sink = Arc::new(InMemoryInteractionSink {
                 fail_projection,
                 ..Default::default()
             });
             host.set_interaction_sink(sink.clone());
+            host.set_approval_audit_context(test_approval_audit_context(
+                "u-auto-edge",
+                "edge-action-session",
+            ));
             let mut explain_state = create_test_state();
-            explain_state.current_run_id = Some("run-auto-edge".to_string());
+            explain_state.current_run_id = Some("test-run".to_string());
+            explain_state.current_session_id = Some("edge-action-session".to_string());
             host.on_turn_started(&explain_state);
+            host.on_turn_phase_started(
+                &explain_state,
+                TurnPhaseKind::ToolExecution,
+                0,
+                0,
+                Instant::now(),
+            );
             host.install_runtime_tool_schemas(
                 vec![json!({
                     "type": "function",
@@ -39966,15 +39980,8 @@ mod tests {
                 }
             });
             host.emit_admitted_tool_call_events(0, std::slice::from_ref(&call));
-            let callback_key = astra_turn_core::edge_ledger::tool_callback_key(
-                &astra_services::multi_agent::EdgeDispatchIdentity::new(
-                    "u-auto-edge",
-                    "s-auto-edge",
-                    "run-auto-edge",
-                    "chain-auto-edge",
-                    "auto-write",
-                ),
-            );
+            let callback_key =
+                tool_callback_key("u-auto-edge", "edge-action-session", "auto-write");
             let ledger = host.edge_callback_ledger.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -39991,15 +39998,10 @@ mod tests {
                 );
             });
 
-            let context = test_edge_action_context("u-auto-edge", "run-auto-edge").await;
+            let context = test_edge_action_context("u-auto-edge", "test-run").await;
             let outcome = tokio::time::timeout(
                 Duration::from_secs(1),
-                host.deliver_edge_tools_via_ledger(
-                    "run-auto-edge",
-                    "chain-auto-edge",
-                    &[call],
-                    &context,
-                ),
+                host.deliver_edge_tools_via_ledger("test-run", "test-chain", &[call], &context),
             )
             .await
             .expect("auto mode must not wait for a human approval");
@@ -45814,6 +45816,7 @@ mod tests {
             .expect("process-local invocation ledger");
 
         let mut first_host = test_host_builder(USER_ID.to_string(), SESSION_ID.to_string())
+        .with_explain_analyze_requested(false)
         .with_execution_binding_snapshot(crate::server::tool_transport::ExecutionBindingSnapshot::inferred(crate::server::tool_transport::WorkspaceBinding::server_sandbox(workspace.path()), crate::server::tool_transport::ExecutorBinding::server_local()))
         .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
         .with_test_inference_ledger(inference_ledger.clone())
@@ -45994,6 +45997,7 @@ mod tests {
         restored_state.user_intent = restored_user_text;
 
         let mut restored_host = test_host_builder(USER_ID.to_string(), SESSION_ID.to_string())
+        .with_explain_analyze_requested(false)
         .with_execution_binding_snapshot(crate::server::tool_transport::ExecutionBindingSnapshot::inferred(crate::server::tool_transport::WorkspaceBinding::server_sandbox(workspace.path()), crate::server::tool_transport::ExecutorBinding::server_local()))
         .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
         .with_test_inference_ledger(inference_ledger.clone())

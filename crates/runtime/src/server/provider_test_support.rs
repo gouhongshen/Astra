@@ -635,6 +635,7 @@ pub fn server_host_builder(
     .with_turn_intent_policy(astra_services::runs::TurnIntentExecutionPolicy::FixedDefault)
     .with_skill_auto_route_policy(astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled)
     .with_static_tool_catalog_admissible(false)
+    .with_explain_analyze_requested(true)
 }
 
 pub fn loop_state(
