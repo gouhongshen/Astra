@@ -463,11 +463,7 @@ async fn db_cancel_session_cross_pod_retains_open_settlement_without_lease() {
             .unwrap()
             .unwrap()
             .run_generation;
-        let open_settlement = json!({
-            "event_type": "run_settlement_started",
-            "idempotency_key": format!("run-settlement-started:{generation}"),
-            "data": {"owner_generation": generation},
-        });
+        let started = AgenticRunLifecycleService::settlement_started_event(generation);
         fixture
             .service
             .run_engine
@@ -475,7 +471,7 @@ async fn db_cancel_session_cross_pod_retains_open_settlement_without_lease() {
                 &fixture.key.owner_user_id,
                 &fixture.key.session_id,
                 &fixture.run_id,
-                open_settlement,
+                started,
             )
             .await
             .unwrap();
@@ -486,11 +482,7 @@ async fn db_cancel_session_cross_pod_retains_open_settlement_without_lease() {
         // Another generation's closed fence must not close the current one.
         let other_generation = generation + 1;
         for event in [
-            json!({
-                "event_type": "run_settlement_started",
-                "idempotency_key": format!("run-settlement-started:{other_generation}"),
-                "data": {"owner_generation": other_generation},
-            }),
+            AgenticRunLifecycleService::settlement_started_event(other_generation),
             AgenticRunLifecycleService::settlement_finished_event(other_generation),
         ] {
             fixture
@@ -585,11 +577,7 @@ async fn db_cancel_session_cross_pod_retains_open_settlement_without_lease() {
                 &fixture.key.owner_user_id,
                 &fixture.key.session_id,
                 &fixture.run_id,
-                json!({
-                    "event_type": "run_settlement_started",
-                    "idempotency_key": format!("run-settlement-started:{}", generation + 10),
-                    "data": {"owner_generation": generation + 10},
-                }),
+                AgenticRunLifecycleService::settlement_started_event(generation + 10),
             )
             .await
             .unwrap();
