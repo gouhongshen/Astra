@@ -12941,12 +12941,6 @@ impl DatabaseRunStateStore {
         if request.expected_statuses.is_empty() {
             return Ok(None);
         }
-        let terminal_origin = cancelled_terminal_origin(request.status, request.events)?;
-        let terminal_error_code = terminal_error_code_from_transition(
-            request.status,
-            request.error_message,
-            request.events,
-        );
         let Some(run) = self
             .load_run_metadata_for_exact_session_tx(
                 tx,
@@ -12959,6 +12953,52 @@ impl DatabaseRunStateStore {
         else {
             return Ok(None);
         };
+        self.settle_terminal_from_locked_run_in_transaction(tx, request, run)
+            .await
+    }
+
+    /// Settle a terminal run in a transaction that already holds the canonical
+    /// session execution admission and run-row locks.
+    ///
+    /// The caller must have acquired admission through the canonical run
+    /// writer; this entry point only avoids re-reading those already locked
+    /// rows before loading the exact run metadata.
+    pub async fn settle_terminal_in_admitted_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        request: AtomicRunTerminalSettlementRequest<'_>,
+    ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
+        validate_expected_run_session_id(request.expected_session_id)?;
+        if request.expected_statuses.is_empty() {
+            return Ok(None);
+        }
+        let run = load_run_metadata_after_session_admission_tx(
+            tx,
+            request.user_id,
+            request.expected_session_id,
+            request.run_id,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        self.settle_terminal_from_locked_run_in_transaction(tx, request, run)
+            .await
+    }
+
+    async fn settle_terminal_from_locked_run_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        request: AtomicRunTerminalSettlementRequest<'_>,
+        run: DurableRunRecord,
+    ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
+        let terminal_origin = cancelled_terminal_origin(request.status, request.events)?;
+        let terminal_error_code = terminal_error_code_from_transition(
+            request.status,
+            request.error_message,
+            request.events,
+        );
         if !request.expected_statuses.contains(&run.status.as_str())
             || run.run_generation != request.expected_owner_generation
         {

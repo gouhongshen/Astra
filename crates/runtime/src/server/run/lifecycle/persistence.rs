@@ -1259,7 +1259,7 @@ async fn persist_server_loop_canonical_append_inner(
     let terminal_commit = if let Some(settlement) = settlement {
         let store = DatabaseRunStateStore::new(pool.clone());
         match store
-            .settle_terminal_in_existing_transaction(
+            .settle_terminal_in_admitted_transaction(
                 &mut tx,
                 atomic_terminal_request(&append, settlement),
             )
