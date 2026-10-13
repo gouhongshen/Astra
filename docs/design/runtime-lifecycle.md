@@ -562,6 +562,13 @@ including slots, active execution, generation-scoped durable settlement fences
 unresolved invocations and unfinished execution-binding switches. Run statuses
 remain truthful when completion wins a cancellation race.
 
+At normal completion, a Server-owned turn commits its canonical context and
+releases its internally acquired writer in one coordinator transaction. Both
+authority audit facts remain durable with that commit. Externally retained
+writers keep the ordinary commit-without-release contract. An exact commit
+replay cannot release a newer writer or a later reservation held by the same
+writer; failure or cancellation cannot expose a half-committed context/release.
+
 An orphan's terminal transition does not itself retire its canonical writer.
 Cleanup rechecks the terminal Run generation and owner under the Session
 execution fence, then releases only the exact internally acquired writer and

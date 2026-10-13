@@ -196,7 +196,7 @@ const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
 const ATTACHED_INTERACTION_DELIVERY_GRACE: Duration = Duration::from_millis(250);
 const DURABLE_LIVE_BATCH_MAX_EVENTS: usize = 64;
 const DURABLE_LIVE_BATCH_MAX_BYTES: usize = 256 * 1024;
-const DURABLE_LIVE_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
+const DURABLE_LIVE_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const HOST_INTERACTION_COMMITTED_FIELD: &str = "_astra_host_interaction_committed";
 
 /// Machine code shared by every "session already has an active run" 409:
@@ -490,8 +490,13 @@ impl ValidatedWorkRuntimeBinding {
 
 #[derive(Default)]
 struct PendingDurableLiveEvents {
-    events: Vec<Value>,
+    events: Vec<PendingLiveEvent>,
     estimated_bytes: usize,
+}
+
+struct PendingLiveEvent {
+    event: Value,
+    requires_persistence: bool,
 }
 
 #[derive(Clone, Default)]
@@ -547,9 +552,16 @@ impl DurableToolTerminalTracker {
 
 impl PendingDurableLiveEvents {
     fn push(&mut self, event: Value) {
+        self.push_ordered(event, true);
+    }
+
+    fn push_ordered(&mut self, event: Value, requires_persistence: bool) {
         let event_bytes = serde_json::to_vec(&event).map_or(0, |encoded| encoded.len());
         self.estimated_bytes = self.estimated_bytes.saturating_add(event_bytes);
-        self.events.push(event);
+        self.events.push(PendingLiveEvent {
+            event,
+            requires_persistence,
+        });
     }
 
     fn should_flush(&self) -> bool {
@@ -557,7 +569,7 @@ impl PendingDurableLiveEvents {
             || self.estimated_bytes >= DURABLE_LIVE_BATCH_MAX_BYTES
     }
 
-    fn take(&mut self) -> Vec<Value> {
+    fn take(&mut self) -> Vec<PendingLiveEvent> {
         self.estimated_bytes = 0;
         std::mem::take(&mut self.events)
     }
@@ -959,20 +971,25 @@ async fn flush_durable_live_events(
         return Ok(());
     }
     let events = pending.take();
+    let durable_events = events
+        .iter()
+        .filter(|entry| entry.requires_persistence)
+        .map(|entry| entry.event.clone())
+        .collect::<Vec<_>>();
     run_engine
-        .append_events_batch(user_id, expected_session_id, run_id, &events)
+        .append_events_batch(user_id, expected_session_id, run_id, &durable_events)
         .await?;
-    durable_tool_terminals.record_committed(&events);
+    durable_tool_terminals.record_committed(&durable_events);
     {
         let mut runs = runs.write().await;
         if let Some(run) = runs.get_mut(run_id) {
-            for event in &events {
+            for event in &durable_events {
                 push_active_run_live_event(run, event.clone());
             }
         }
     }
-    for event in events {
-        deliver_live_fanout_event(live_tx, client_event_tx, run_id, event).await;
+    for entry in events {
+        deliver_live_fanout_event(live_tx, client_event_tx, run_id, entry.event).await;
     }
     Ok(())
 }
@@ -1086,8 +1103,16 @@ async fn process_ordered_live_fanout_event(
             })?;
     }
 
-    if !durable_event_committed && live_delta_event_for_persistence(&event) {
-        pending.push(event);
+    let requires_persistence = !durable_event_committed && live_delta_event_for_persistence(&event);
+    if requires_persistence || !pending.is_empty() {
+        // Preserve presentation order without letting a transient frame split
+        // the durable batch. Both kinds count towards the same byte/row bounds;
+        // only replay facts are inserted and all delivery follows that commit.
+        if requires_persistence {
+            pending.push(event);
+        } else {
+            pending.push_ordered(event, false);
+        }
         if pending.should_flush() {
             flush_durable_live_events(
                 pending,
@@ -1110,24 +1135,7 @@ async fn process_ordered_live_fanout_event(
         return Ok(());
     }
 
-    // A non-durable event may not overtake an earlier durable batch.
-    flush_durable_live_events(
-        pending,
-        run_engine,
-        runs,
-        user_id,
-        expected_session_id,
-        run_id,
-        live_tx,
-        client_event_tx,
-        durable_tool_terminals,
-    )
-    .await
-    .map_err(|detail| LiveFanoutPersistenceError {
-        code: "live_event_persistence_failed",
-        message: "live run event could not be recorded durably",
-        detail,
-    })?;
+    // A live-only event with no earlier pending fact remains immediate.
     deliver_live_fanout_event(live_tx, client_event_tx, run_id, event).await;
     Ok(())
 }
@@ -6701,16 +6709,19 @@ impl AgenticRunLifecycleService {
                 mode,
                 logical_segments,
             };
-            match admission
-                .coordinator
-                .commit_turn(
-                    &admission.reservation,
-                    delta,
-                    &format!("server-run:{run_id}:commit"),
-                )
-                .await
-                .map_err(|error| error.to_string())?
-            {
+            let idempotency_key = format!("server-run:{run_id}:commit");
+            let commit = if admission.release_writer_on_finish {
+                admission
+                    .coordinator
+                    .commit_turn_and_release_writer(&admission.reservation, delta, &idempotency_key)
+                    .await
+            } else {
+                admission
+                    .coordinator
+                    .commit_turn(&admission.reservation, delta, &idempotency_key)
+                    .await
+            };
+            match commit.map_err(|error| error.to_string())? {
                 astra_turn_types::CoordinatorMutationV1::Applied { cursor }
                 | astra_turn_types::CoordinatorMutationV1::AlreadyApplied { cursor } => {
                     Ok(Some(cursor))
@@ -6743,7 +6754,9 @@ impl AgenticRunLifecycleService {
                 "canonical commit succeeded but provider WAL payload retirement is pending"
             );
         }
-        if admission.release_writer_on_finish {
+        // A successful commit already released this exact writer atomically.
+        // Empty/failed commits retain the existing explicit cleanup path.
+        if admission.release_writer_on_finish && !result.as_ref().is_ok_and(Option::is_some) {
             let _ = admission.coordinator.release_writer(&admission.lease).await;
         }
         if let Err(error) = admission.distributed_permit.release().await {

@@ -24177,6 +24177,71 @@ fn agent_progress_is_live_only_while_agent_lifecycle_is_durable() {
     }
 }
 
+#[tokio::test]
+async fn production_fanout_flushes_sparse_event_before_terminal() {
+    // Keep the model open beyond the event deadline: a terminal-triggered
+    // flush must not make the sparse-event timer test pass accidentally.
+    let llm = spawn_incremental_terminal_test_llm(Duration::from_secs(1)).await;
+    let store = Arc::new(
+        FaultInjectedRunStateStore::new(&[], &[]).with_append_delay(Duration::from_millis(40)),
+    );
+    let mut owner = AgenticRunLifecycleService::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+        RunEngine::new(store),
+    )
+    .with_fixture_workspace_provider(
+        Arc::new(tempfile::tempdir().unwrap()),
+        "fanout-timer-fixture",
+    )
+    .with_model_service(Arc::new(ActiveTestModelService::new(llm.base_url.clone())));
+    owner.test_inference_ledger = Some(Default::default());
+    let mut request = test_request("sparse live run");
+    request.execution_policy.turn_intent =
+        astra_services::runs::TurnIntentExecutionPolicy::FixedDefault;
+    request.execution_policy.skill_auto_route =
+        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+    let mut stream = ok(owner.stream_chat("user-1".to_owned(), request).await);
+    let mut rx = stream.event_rx.take().unwrap();
+    owner
+        .server_agent_progress_broadcaster
+        .emit(test_agent_spawned(
+            "agent-timer-canary",
+            "child-timer-canary",
+            &stream.run_id,
+            0,
+        ));
+    tokio::time::timeout(Duration::from_millis(500), async {
+        while let Some(event) = rx.recv().await {
+            assert_ne!(event["type"], "run_finished");
+            if event["type"] == "agent_spawned" && event["agent_id"] == "agent-timer-canary" {
+                return;
+            }
+        }
+        panic!("stream closed before the sparse event");
+    })
+    .await
+    .expect("sparse durable event must flush within 500ms without capacity or terminal");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut completed = false;
+        while let Some(event) = rx.recv().await {
+            if event["type"] == "run_finished" {
+                assert_eq!(event["status"], "completed");
+                completed = true;
+            }
+        }
+        assert!(completed);
+    })
+    .await
+    .unwrap();
+    owner
+        .test_inference_ledger
+        .as_ref()
+        .unwrap()
+        .assert_quiescent();
+}
+
 #[test]
 fn work_task_board_update_is_a_durable_live_lifecycle_edge() {
     let board_update = json!({
@@ -24369,7 +24434,7 @@ async fn structural_explain_events_share_the_bounded_live_microbatch() {
 
     assert!(
         store.appended_batches().is_empty(),
-        "structural events must wait for the 25ms or capacity boundary"
+        "structural events must wait for the timer or capacity boundary"
     );
     assert_eq!(
         live_rx.try_recv(),
@@ -24397,6 +24462,110 @@ async fn structural_explain_events_share_the_bounded_live_microbatch() {
     );
     assert_eq!(live_rx.recv().await.expect("first live explain"), first);
     assert_eq!(live_rx.recv().await.expect("second live explain"), second);
+}
+
+#[tokio::test]
+async fn ordered_microbatch_keeps_transient_frames_behind_the_durable_commit() {
+    for fail_commit in [false, true] {
+        let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+        let engine = RunEngine::new(store.clone());
+        engine
+            .start_run("run-1", "user-1", "session-1")
+            .await
+            .unwrap();
+        drop(engine);
+        let mut owned = Arc::try_unwrap(store).ok().unwrap();
+        // Inject the fanout failure after start-run setup, not into setup.
+        if fail_commit {
+            let next = owned.counters.lock().unwrap().append_calls + 1;
+            owned.fail_append_calls.insert(next);
+        }
+        let store = Arc::new(owned);
+        let engine = RunEngine::new(store.clone());
+        let runs = Arc::new(RwLock::new(HashMap::new()));
+        let (live_tx, mut live_rx) = broadcast::channel(8);
+        let mut delivery = AttachedStreamDelivery::detached();
+        let mut pending = PendingDurableLiveEvents::default();
+        let tracker = DurableToolTerminalTracker::default();
+        let first = json!({"type": "agent_spawned", "agent_id": "agent-1"});
+        let progress = json!({"type": "agent_progress", "agent_id": "agent-1"});
+        let second = json!({"type": "tool_call_end", "call_id": "call-1", "status": "completed"});
+        for event in [first.clone(), progress.clone(), second.clone()] {
+            assert!(
+                process_ordered_live_fanout_event(
+                    event,
+                    &mut pending,
+                    &engine,
+                    &runs,
+                    "user-1",
+                    "session-1",
+                    "run-1",
+                    &live_tx,
+                    &mut delivery,
+                    &tracker,
+                )
+                .await
+                .is_ok()
+            );
+        }
+        assert!(store.appended_batches().is_empty());
+        assert_eq!(
+            live_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        );
+        let result = flush_durable_live_events(
+            &mut pending,
+            &engine,
+            &runs,
+            "user-1",
+            "session-1",
+            "run-1",
+            &live_tx,
+            &mut delivery,
+            &tracker,
+        )
+        .await;
+        if fail_commit {
+            assert!(result.is_err());
+            assert!(store.appended_batches().is_empty());
+            assert_eq!(
+                live_rx.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            );
+            let mut retained = [second];
+            tracker.mark_committed_retained_copies(&mut retained);
+            assert!(tool_terminal_requires_settlement_repair(&retained[0]));
+        } else {
+            result.unwrap();
+            assert_eq!(
+                store.appended_batches(),
+                vec![vec![first.clone(), second.clone()]]
+            );
+            for expected in [first, progress, second] {
+                assert_eq!(live_rx.try_recv().unwrap(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn ordered_microbatch_bounds_include_transient_frames() {
+    let mut pending = PendingDurableLiveEvents::default();
+    pending.push(json!({"type": "agent_spawned"}));
+    for _ in 1..DURABLE_LIVE_BATCH_MAX_EVENTS {
+        assert!(!pending.should_flush());
+        pending.push_ordered(json!({"type": "agent_progress"}), false);
+    }
+    assert!(pending.should_flush());
+    assert_eq!(pending.take().len(), DURABLE_LIVE_BATCH_MAX_EVENTS);
+    assert!(pending.is_empty());
+    assert!(!pending.should_flush());
+    pending.push(json!({"type": "agent_spawned"}));
+    pending.push_ordered(
+        json!({"type": "agent_progress", "text": "x".repeat(DURABLE_LIVE_BATCH_MAX_BYTES)}),
+        false,
+    );
+    assert!(pending.should_flush());
 }
 
 #[test]

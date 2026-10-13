@@ -15250,35 +15250,9 @@ impl DatabaseRunStateStore {
             None => transaction.await?,
         };
 
-        if matches!(claim, DurableRunStartClaim::Started { .. }) {
-            let receipt = initial_event_rows
-                .first()
-                .expect("run insertion always has at least one receipt event");
-            let projection = self.sync_projection_for_user(
-                &receipt.user_id,
-                &receipt.session_id,
-                &receipt.run_id,
-            );
-            let projection_result = match deadline {
-                Some(deadline) if tokio::time::Instant::now() >= deadline => None,
-                Some(deadline) => tokio::time::timeout_at(deadline, projection).await.ok(),
-                None => Some(projection.await),
-            };
-            if let Some(Err(error)) = projection_result {
-                tracing::warn!(
-                    user_id = %receipt.user_id,
-                    run_id = %receipt.run_id,
-                    error = %error,
-                    "run create committed but projection refresh failed or exceeded its deadline"
-                );
-            } else if projection_result.is_none() {
-                tracing::warn!(
-                    user_id = %receipt.user_id,
-                    run_id = %receipt.run_id,
-                    "run create committed but projection refresh was skipped at its deadline"
-                );
-            }
-        }
+        // Creation commits the run, slot, initial events and display projection
+        // atomically. Exact receipt reconciliation proves that same transaction;
+        // neither outcome needs a second transaction to rebuild its projection.
         Ok(claim)
     }
 
@@ -32899,6 +32873,28 @@ mod tests {
                 .count(),
             1
         );
+
+        let durable = store
+            .load_run(&user_id, &run_id)
+            .await
+            .expect("load exactly claimed run")
+            .expect("claimed run exists");
+        let projection = store
+            .load_run_projection(&user_id, &run_id)
+            .await
+            .expect("load projection without repair")
+            .expect("creation committed its display projection");
+        let expected = build_run_display_projection(
+            &durable,
+            durable.events.last().map(extract_event_type),
+            None,
+        );
+        assert_eq!(projection.session_id, session_id);
+        assert_eq!(
+            projection.projection_event_idx,
+            expected.projection_event_idx
+        );
+        assert_eq!(projection.projection_hash, expected.projection_hash);
 
         sqlx::query(
             "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
