@@ -463,7 +463,11 @@ async fn db_cancel_session_cross_pod_retains_open_settlement_without_lease() {
             .unwrap()
             .unwrap()
             .run_generation;
-        let started = AgenticRunLifecycleService::settlement_started_event(generation);
+        let open_settlement = json!({
+            "event_type": "run_settlement_started",
+            "idempotency_key": format!("run-settlement-started:{generation}"),
+            "data": {"owner_generation": generation},
+        });
         fixture
             .service
             .run_engine
@@ -471,7 +475,7 @@ async fn db_cancel_session_cross_pod_retains_open_settlement_without_lease() {
                 &fixture.key.owner_user_id,
                 &fixture.key.session_id,
                 &fixture.run_id,
-                started,
+                open_settlement,
             )
             .await
             .unwrap();
@@ -482,7 +486,11 @@ async fn db_cancel_session_cross_pod_retains_open_settlement_without_lease() {
         // Another generation's closed fence must not close the current one.
         let other_generation = generation + 1;
         for event in [
-            AgenticRunLifecycleService::settlement_started_event(other_generation),
+            json!({
+                "event_type": "run_settlement_started",
+                "idempotency_key": format!("run-settlement-started:{other_generation}"),
+                "data": {"owner_generation": other_generation},
+            }),
             AgenticRunLifecycleService::settlement_finished_event(other_generation),
         ] {
             fixture
@@ -577,7 +585,11 @@ async fn db_cancel_session_cross_pod_retains_open_settlement_without_lease() {
                 &fixture.key.owner_user_id,
                 &fixture.key.session_id,
                 &fixture.run_id,
-                AgenticRunLifecycleService::settlement_started_event(generation + 10),
+                json!({
+                    "event_type": "run_settlement_started",
+                    "idempotency_key": format!("run-settlement-started:{}", generation + 10),
+                    "data": {"owner_generation": generation + 10},
+                }),
             )
             .await
             .unwrap();

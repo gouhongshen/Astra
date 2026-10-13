@@ -9019,16 +9019,6 @@ impl AgenticRunLifecycleService {
         })
     }
 
-    fn settlement_started_event(execution_owner_generation: u64) -> Value {
-        json!({
-            "event_type": "run_settlement_started",
-            "idempotency_key": format!(
-                "run-settlement-started:{execution_owner_generation}"
-            ),
-            "data": {"owner_generation": execution_owner_generation},
-        })
-    }
-
     fn settlement_finished_event(execution_owner_generation: u64) -> Value {
         json!({
             "event_type": "run_settlement_finished",
@@ -9041,64 +9031,15 @@ impl AgenticRunLifecycleService {
 
     fn durable_settlement_is_in_progress(run: &DurableRunRecord) -> bool {
         let generation = run.run_generation;
-        let started_key = format!("run-settlement-started:{generation}");
         let finished_key = format!("run-settlement-finished:{generation}");
         let finalized_key = format!("run-accounting-finalized:{generation}");
-        let started = run.events.iter().any(|event| {
-            event.get("idempotency_key").and_then(Value::as_str) == Some(started_key.as_str())
-        });
         let finalized = run.events.iter().any(|event| {
             event
                 .get("idempotency_key")
                 .and_then(Value::as_str)
                 .is_some_and(|key| key == finalized_key || key == finished_key)
         });
-        started && !finalized
-    }
-
-    async fn persist_settlement_started(
-        run_engine: &RunEngine,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        execution_owner_generation: u64,
-    ) -> bool {
-        let event = Self::settlement_started_event(execution_owner_generation);
-        let mut attempt = 0u64;
-        loop {
-            attempt = attempt.saturating_add(1);
-            match run_engine
-                .append_events_if_current_generation_and_status(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    execution_owner_generation,
-                    &[
-                        STATUS_RUNNING,
-                        STATUS_WAITING,
-                        STATUS_PAUSED,
-                        STATUS_CANCELLED,
-                    ],
-                    std::slice::from_ref(&event),
-                )
-                .await
-            {
-                Ok(committed) => return committed,
-                Err(error) => {
-                    if attempt == 1 || attempt.is_multiple_of(10) {
-                        tracing::warn!(
-                            target: "astra_runtime::run_lifecycle",
-                            run_id,
-                            execution_owner_generation,
-                            error = %error,
-                                attempt,
-                                "retrying required durable settlement fence"
-                        );
-                    }
-                }
-            }
-            tokio::time::sleep(Duration::from_millis((attempt * 10).min(250))).await;
-        }
+        !finalized
     }
 
     async fn persist_settlement_finished(
@@ -15806,14 +15747,6 @@ impl AgenticRunLifecycleService {
                 if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
                     run.settlement_in_progress = true;
                 }
-                let _ = Self::persist_settlement_started(
-                    &run_engine,
-                    &bg_user_id,
-                    &bg_session_id,
-                    &bg_run_id,
-                    execution_owner_generation,
-                )
-                .await;
                 #[cfg(feature = "e2e-hooks")]
                 if !streaming && bg_test_post_loop_settlement_delay_ms > 0 {
                     run_engine

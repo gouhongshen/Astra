@@ -34693,16 +34693,23 @@ async fn cross_pod_resume_waits_for_durable_settlement_fence() {
             .await
             .expect("pause durable run")
     );
-    assert!(
-        AgenticRunLifecycleService::persist_settlement_started(
-            &owner.run_engine,
+    owner
+        .run_engine
+        .append_event(
             "user-1",
             "session-cross-pod-settlement",
             run_id,
-            authority.owner_generation,
+            json!({
+                "event_type": "run_settlement_started",
+                "idempotency_key": format!(
+                    "run-settlement-started:{}",
+                    authority.owner_generation
+                ),
+                "data": {"owner_generation": authority.owner_generation},
+            }),
         )
         .await
-    );
+        .expect("persist settlement fence");
 
     let settlement_engine = owner.run_engine.clone();
     let settlement = tokio::spawn(async move {
@@ -34806,20 +34813,23 @@ async fn cross_pod_settlement_fence_linearizes_with_resume_cas() {
     tokio::time::timeout(Duration::from_secs(1), entered.notified())
         .await
         .expect("resume reached guarded transition barrier");
-    assert!(
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            AgenticRunLifecycleService::persist_settlement_started(
-                &owner.run_engine,
-                "user-1",
-                "session-cross-pod-settlement-cas",
-                run_id,
-                authority.owner_generation,
-            ),
+    owner
+        .run_engine
+        .append_event(
+            "user-1",
+            "session-cross-pod-settlement-cas",
+            run_id,
+            json!({
+                "event_type": "run_settlement_started",
+                "idempotency_key": format!(
+                    "run-settlement-started:{}",
+                    authority.owner_generation
+                ),
+                "data": {"owner_generation": authority.owner_generation},
+            }),
         )
         .await
-        .expect("persist settlement fence")
-    );
+        .expect("persist settlement fence");
     release.notify_one();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
