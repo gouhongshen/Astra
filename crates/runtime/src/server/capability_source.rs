@@ -114,6 +114,7 @@ pub(crate) struct CapabilitySelection {
     pub kind: CapabilityKind,
     pub title: String,
     pub summary: String,
+    pub activation: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,11 +283,16 @@ impl CapabilitySourceCustody {
             if receipts.insert(key.clone(), receipt.clone()).is_some() {
                 return Err(SourceError::InvalidContract);
             }
+            let activation = match receipt.candidate.kind {
+                CapabilityKind::Tool => format!("tool_search(select:{key})"),
+                CapabilityKind::Skill => format!("skill(skill_name:\"{key}\")"),
+            };
             selections.push(CapabilitySelection {
                 selection_key: key,
                 kind: receipt.candidate.kind,
                 title: receipt.candidate.title.clone(),
                 summary: receipt.candidate.summary.clone(),
+                activation,
             });
         }
         let events = receipts
@@ -304,6 +310,14 @@ impl CapabilitySourceCustody {
         key: &str,
     ) -> Result<CapabilityCandidate, SourceError> {
         Ok(self.candidate_receipt(scope, key).await?.candidate)
+    }
+
+    pub(crate) async fn selection_kind(
+        &self,
+        scope: &SourceScope,
+        key: &str,
+    ) -> Result<CapabilityKind, SourceError> {
+        Ok(self.candidate_receipt(scope, key).await?.candidate.kind)
     }
 
     async fn candidate_receipt(
@@ -1588,6 +1602,10 @@ pub(crate) mod tests {
         let key = selections["capabilities"][0]["selection_key"]
             .as_str()
             .unwrap();
+        assert_eq!(
+            selections["capabilities"][0]["activation"],
+            format!("tool_search(select:{key})")
+        );
         assert_eq!(
             source.custody.candidate(&fixture.scope, key).await.unwrap(),
             fixture.candidate

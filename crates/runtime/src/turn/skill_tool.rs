@@ -723,14 +723,17 @@ pub fn skill_tool_schema_v2() -> Value {
         "function": {
             "name": SKILL_TOOL_NAME,
             "description":
-                "Execute a skill from the <available_skills> system listing. \
-                 Call it only when the user's request matches a skill whose \
-                 canonical name or alias appears literally in that listing; \
-                 never invent or infer a skill name. For work this agent owns, \
+                "Execute a skill from the <available_skills> system listing or a discovered \
+                 capability-source Skill. For listed skills, call it only when the user's \
+                 request matches a canonical name or alias in that listing; never invent or \
+                 infer a skill name. For a capability-source selection with kind=skill, copy \
+                 its opaque selection_key exactly into skill_name; title is only a display label. \
+                 For work this agent owns, \
                  call a matching skill before substantive work on that objective. \
                  If a child owns the objective, launch it first and let the child \
                  load its own skills. \
-                 `skill_name` is the listed canonical name or alias. `task` is optional \
+                 `skill_name` is the listed canonical name or alias, or the exact selection_key \
+                 of a discovered Skill. `task` is optional \
                  extra context; omit to use the current conversation. On seeing \
                  `<skill-loaded name=\"...\"/>` in a tool result, follow that \
                  skill's instructions — do not re-invoke it. To read a referenced text file from a selected remote Skill package, provide `resource_path`; this reads content without activating the Skill again.",
@@ -740,7 +743,7 @@ pub fn skill_tool_schema_v2() -> Value {
                     "skill_name": {
                         "type": "string",
                         "description":
-                            "Canonical name or alias of the skill to run."
+                            "Listed canonical name or alias, or exact selection_key of a discovered capability-source Skill."
                     },
                     "task": {
                         "type": "string",
@@ -2373,6 +2376,19 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn skill_schema_accepts_exact_discovered_source_selection() {
+        let schema = skill_tool_schema_v2();
+        let description = schema["function"]["description"].as_str().unwrap();
+        let name_description =
+            schema["function"]["parameters"]["properties"]["skill_name"]["description"]
+                .as_str()
+                .unwrap();
+        assert!(description.contains("copy its opaque selection_key exactly"));
+        assert!(description.contains("title is only a display label"));
+        assert!(name_description.contains("exact selection_key"));
+    }
 
     #[test]
     fn read_only_skill_hook_does_not_execute_shell() {

@@ -100,6 +100,13 @@ that every workload is cheaper. Explicitly pinned utility tools remain supported
 
 A skill may require tools, but it does not make those tools available by itself. Provider decision still controls whether a required capability can run in the current session.
 
+Capability-source discovery returns an opaque, run-scoped `selection_key` and an
+exact activation hint for each result. A Tool selection enters through
+`tool_search(select:...)`; a Skill selection enters through
+`skill(skill_name=...)`. The display title is not an invocation name. Both paths
+resolve the selection against runtime custody and policy before reading or
+executing the capability.
+
 ## Skill lifecycle
 
 ```text

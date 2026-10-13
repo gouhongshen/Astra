@@ -1417,12 +1417,33 @@ impl RuntimeToolExecutor {
             return None;
         }
         if names.len() > 8 {
-            return Some(capability_source_error_result(
+            return Some(capability_source_tool_search_error_result(
                 super::capability_source::SourceError::InvalidContract,
             ));
         }
-        if let Err(error) = source.request_scope(request) {
-            return Some(capability_source_error_result(error));
+        let scope = match source.request_scope(request) {
+            Ok(scope) => scope,
+            Err(error) => return Some(capability_source_tool_search_error_result(error)),
+        };
+        // Source Skills have their own read contract. Selecting them as tools
+        // would describe the wrong capability and hide the useful error.
+        for name in names
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .filter(|name| source.custody.owns_selection_shape(name))
+        {
+            let kind = match source.custody.selection_kind(scope, &name).await {
+                Ok(kind) => kind,
+                Err(error) => return Some(capability_source_tool_search_error_result(error)),
+            };
+            if kind == super::capability_source::CapabilityKind::Skill {
+                let activation = format!("skill(skill_name:\"{name}\")");
+                return Some(astra_tools::ToolResult::error(
+                    json!({"mode":"error","status":"failed","error":"selection_is_skill",
+                        "skill_name":name,"activation":activation})
+                    .to_string(),
+                ));
+            }
         }
         let mut pool = self.current_tool_search_pool_schemas();
         for name in names
@@ -1432,10 +1453,10 @@ impl RuntimeToolExecutor {
         {
             let materialized = match source.materialize(&name, true).await {
                 Ok(value) => value,
-                Err(error) => return Some(capability_source_error_result(error)),
+                Err(error) => return Some(capability_source_tool_search_error_result(error)),
             };
             if let Err(error) = self.install_source_materialization(&materialized) {
-                return Some(capability_source_error_result(error));
+                return Some(capability_source_tool_search_error_result(error));
             }
         }
         // Describing a contract does not grant visibility. Use the same
@@ -5627,6 +5648,14 @@ fn capability_source_error_result(
         ("retryable".to_string(), Value::Bool(false)),
     ]));
     result
+}
+
+fn capability_source_tool_search_error_result(
+    error: super::capability_source::SourceError,
+) -> astra_tools::ToolResult {
+    astra_tools::ToolResult::error(
+        json!({"mode":"error","status":"failed","error":error.to_string()}).to_string(),
+    )
 }
 
 fn mark_mcp_call_dispatched(mut result: astra_tools::ToolResult) -> astra_tools::ToolResult {
@@ -12340,6 +12369,38 @@ pub(crate) mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn capability_source_skill_selection_uses_skill_without_describing_a_tool() {
+        use super::super::capability_source::tests::{
+            http_fixture, register_fixture_candidate, request,
+        };
+        let fixture = http_fixture(true).await;
+        let (mut exec, _dir) = test_executor();
+        exec.user_id = fixture.scope.user_id.clone();
+        exec.session_id = fixture.scope.session_id.clone();
+        exec.set_agent_binding_mcp(fixture.transport.clone());
+        exec.set_capability_source(Some(fixture.source()));
+        let key =
+            register_fixture_candidate(exec.capability_source.as_ref().unwrap(), &fixture).await;
+        let rejected = exec
+            .execute_source_tool_search(&request(
+                &fixture.scope,
+                "tool_search",
+                json!({"query": format!("select:{key}")}),
+            ))
+            .await
+            .unwrap();
+        assert!(rejected.is_error);
+        let error: Value = serde_json::from_str(&rejected.output).unwrap();
+        assert_eq!(error["mode"], "error");
+        assert_eq!(error["status"], "failed");
+        assert_eq!(error["error"], "selection_is_skill");
+        assert_eq!(error["skill_name"], key);
+        assert_eq!(error["activation"], format!("skill(skill_name:\"{key}\")"));
+        assert!(fixture.calls.lock().unwrap().is_empty());
+        assert!(!exec.tool_runtime_ready(&key));
     }
 
     #[tokio::test]
