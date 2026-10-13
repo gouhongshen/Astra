@@ -3816,6 +3816,10 @@ pub struct ServerAgenticLoopHost {
     work_admission_capabilities: Vec<astra_services::WorkAdmissionCapability>,
     /// `true` when this session explicitly requests full LLM request/response capture.
     full_llm_capture: bool,
+    /// `true` only when this root run explicitly requested the Explain Analyze
+    /// graph. Ordinary runs retain lifecycle events but do not create a second
+    /// product graph stream.
+    explain_analyze_requested: bool,
     /// Whether tool-call validation should admit Astra's static tool catalog
     /// even when those tools are not visible in the current loop.
     static_tool_catalog_admissible: bool,
@@ -5472,6 +5476,7 @@ pub struct ServerAgenticLoopHostBuilder {
     skill_auto_route_policy: SkillAutoRouteExecutionPolicy,
     full_llm_capture: bool,
     static_tool_catalog_admissible: bool,
+    explain_analyze_requested: bool,
     plan_resume_hint: Option<String>,
     plan_authoring_active: bool,
     memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
@@ -5566,6 +5571,7 @@ impl ServerAgenticLoopHostBuilder {
             skill_auto_route_policy: SkillAutoRouteExecutionPolicy::Auto,
             full_llm_capture: false,
             static_tool_catalog_admissible: true,
+            explain_analyze_requested: false,
             plan_resume_hint: None,
             plan_authoring_active: false,
             memoria_client: None,
@@ -5781,6 +5787,11 @@ impl ServerAgenticLoopHostBuilder {
 
     pub fn with_full_llm_capture(mut self, full_llm_capture: bool) -> Self {
         self.full_llm_capture = full_llm_capture;
+        self
+    }
+
+    pub fn with_explain_analyze_requested(mut self, requested: bool) -> Self {
+        self.explain_analyze_requested = requested;
         self
     }
 
@@ -6218,6 +6229,7 @@ impl ServerAgenticLoopHostBuilder {
             work_admission_conflict: None,
             work_admission_capabilities: Vec::new(),
             full_llm_capture: self.full_llm_capture,
+            explain_analyze_requested: self.explain_analyze_requested,
             static_tool_catalog_admissible: self.static_tool_catalog_admissible,
             always_load_tool_names,
             edge_callback_ledger: self.edge_callback_ledger,
@@ -19249,6 +19261,21 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             WorkAdmissionTimingBuffer::default();
+        if !self.explain_analyze_requested {
+            if let Some(executor) = state.runtime_tool_executor.as_deref() {
+                executor.set_tool_route_observer(None);
+            }
+            self.explain_analyze_tool_route_observer = None;
+            if let Ok(mut parents) = self.explain_analyze_admission_parents.lock() {
+                parents.clear();
+            }
+            self.explain_analyze_context = None;
+            self.explain_analyze_open_nodes.clear();
+            self.explain_analyze_admission_nodes.clear();
+            self.explain_analyze_admission_decision_details.clear();
+            self.explain_analyze_tool_nodes.clear();
+            return;
+        }
         let Some(run_id) = state.current_run_id.clone() else {
             if let Some(executor) = state.runtime_tool_executor.as_deref() {
                 executor.set_tool_route_observer(None);
@@ -36931,8 +36958,28 @@ mod tests {
     }
 
     #[test]
-    fn explain_analyze_streams_meaningful_stages_as_typed_graph_facts() {
+    fn ordinary_runs_do_not_create_the_explain_analyze_graph_stream() {
         let mut host = test_host_builder("u", "s").build();
+        let mut state = create_test_state();
+        state.current_run_id = Some("run-1".to_string());
+
+        host.on_turn_started(&state);
+        host.on_turn_phase_started(
+            &state,
+            TurnPhaseKind::SemanticAdmission,
+            0,
+            0,
+            Instant::now(),
+        );
+
+        assert!(host.emitted_events.is_empty());
+    }
+
+    #[test]
+    fn explain_analyze_streams_meaningful_stages_as_typed_graph_facts() {
+        let mut host = test_host_builder("u", "s")
+            .with_explain_analyze_requested(true)
+            .build();
         let mut state = create_test_state();
         state.current_run_id = Some("run-1".to_string());
         let started_at = Instant::now();

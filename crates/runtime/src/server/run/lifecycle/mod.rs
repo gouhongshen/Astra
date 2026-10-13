@@ -12881,6 +12881,7 @@ impl AgenticRunLifecycleService {
             .expect("request constraints validated before host construction");
         let authorization =
             LoopEnvironmentAuthorization::fresh(request, &constraints, execution_bindings);
+        let explain = request.explain;
         let mut host = self.build_authorized_host(
             user_id,
             session_id,
@@ -12892,6 +12893,7 @@ impl AgenticRunLifecycleService {
             request.full_llm_capture,
             request.execution_policy.turn_intent,
             request.execution_policy.skill_auto_route,
+            explain,
             request.interactive_client,
             edge_tools,
             edge_profile,
@@ -12926,6 +12928,7 @@ impl AgenticRunLifecycleService {
         full_llm_capture: bool,
         turn_intent_policy: astra_services::runs::TurnIntentExecutionPolicy,
         skill_auto_route_policy: astra_services::runs::SkillAutoRouteExecutionPolicy,
+        explain: bool,
         interactive_client: bool,
         edge_tools: Vec<Value>,
         edge_profile: Map<String, Value>,
@@ -12952,6 +12955,7 @@ impl AgenticRunLifecycleService {
         .with_admitted_model_execution(authorization.model_execution.clone())
         .with_inference_owner_pod_id(self.run_engine.execution_owner_pod_id().map(str::to_string))
         .with_full_llm_capture(full_llm_capture)
+        .with_explain_analyze_requested(explain)
         .with_edge_tools(edge_tools)
         .with_server_service_tool_catalog_enabled(server_service_tool_catalog_enabled)
         .with_static_tool_catalog_admissible(static_tool_catalog_admissible)

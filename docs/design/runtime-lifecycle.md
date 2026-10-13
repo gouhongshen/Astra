@@ -715,6 +715,13 @@ the terminal display projection in one authoritative transaction; a terminal
 projection must preserve the latest committed checkpoint metadata. The
 resolution path rereads the committed projection hash after a lost commit
 acknowledgement instead of synthesizing one.
+
+The Explain Analyze graph is produced only for a root run that explicitly
+requested it. Ordinary runs keep their lifecycle, transcript, trace, and
+recovery events; they do not create the second product graph stream, persist
+its typed graph facts, or publish a graph artifact. Resume carries the run's
+durable Explain request so recovery cannot accidentally change that capture
+policy. Delegated child runs do not inherit the root's Explain request.
 hook DB writes, observer extraction, and auxiliary events keep their existing
 owners. Removing the unused snapshot-link updater does not remove context
 snapshots or their introspection reads. Automatic request/response attribution
