@@ -710,7 +710,11 @@ admission. Cancellation and completion use the same slot as task startup.
 
 The source-only turn core/tool event writers, activity writer, and reflection
 state/lesson writer assembly are retired. Canonical loop append and atomic
-terminal settlement own the transcript and accepted trace-event projections;
+terminal settlement own the transcript, accepted trace-event projections, and
+the terminal display projection in one authoritative transaction; a terminal
+projection must preserve the latest committed checkpoint metadata. The
+resolution path rereads the committed projection hash after a lost commit
+acknowledgement instead of synthesizing one.
 hook DB writes, observer extraction, and auxiliary events keep their existing
 owners. Removing the unused snapshot-link updater does not remove context
 snapshots or their introspection reads. Automatic request/response attribution

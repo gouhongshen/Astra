@@ -11801,6 +11801,56 @@ impl DatabaseRunStateStore {
         next_last_event_idx: i64,
         latest_event_type: Option<&str>,
     ) -> Result<String, String> {
+        let latest_checkpoint = sqlx::query(
+            "SELECT checkpoint_id, checkpoint_kind, checkpoint_version
+             FROM run_checkpoints
+             WHERE user_id = ? AND run_id = ?
+             ORDER BY created_at DESC, checkpoint_id DESC LIMIT 1",
+        )
+        .bind(&run.user_id)
+        .bind(&run.run_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "load_atomic_terminal_projection_checkpoint",
+                &run.run_id,
+                source,
+            )
+            .to_string()
+        })?
+        .map(|row| {
+            Ok::<_, String>((
+                row.try_get("checkpoint_id")
+                    .map_err(|source| {
+                        db_error(
+                            "decode_atomic_terminal_projection_checkpoint_id",
+                            &run.run_id,
+                            source,
+                        )
+                    })
+                    .map_err(|error| error.to_string())?,
+                row.try_get("checkpoint_kind")
+                    .map_err(|source| {
+                        db_error(
+                            "decode_atomic_terminal_projection_checkpoint_kind",
+                            &run.run_id,
+                            source,
+                        )
+                    })
+                    .map_err(|error| error.to_string())?,
+                row.try_get("checkpoint_version")
+                    .map_err(|source| {
+                        db_error(
+                            "decode_atomic_terminal_projection_checkpoint_version",
+                            &run.run_id,
+                            source,
+                        )
+                    })
+                    .map_err(|error| error.to_string())?,
+            ))
+        })
+        .transpose()?;
         let projection = build_run_display_projection(
             &DurableRunRecord {
                 status: request.status.to_string(),
@@ -11813,7 +11863,7 @@ impl DatabaseRunStateStore {
                 ..run.clone()
             },
             latest_event_type.map(str::to_string),
-            None,
+            latest_checkpoint,
         );
         let upsert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO run_display_projections
@@ -13148,6 +13198,22 @@ impl DatabaseRunStateStore {
             }
             AtomicRunTerminalFactMatch::Exact => {}
         }
+        let projection_hash = sqlx::query_scalar::<_, String>(
+            "SELECT projection_hash FROM run_display_projections
+             WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(request.user_id)
+        .bind(request.run_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| {
+            db_error(
+                "resolve_atomic_terminal_projection_hash",
+                request.run_id,
+                source,
+            )
+            .to_string()
+        })?;
         let (receipts, committed_events) = if let Some(expected) = expected_receipts {
             if expected.last().map(|receipt| receipt.event_idx) != Some(run.last_event_idx)
                 && !expected.is_empty()
@@ -13362,7 +13428,7 @@ impl DatabaseRunStateStore {
                 committed_events,
                 event_receipts: receipts,
                 last_event_idx: run.last_event_idx,
-                projection_hash: String::new(),
+                projection_hash: projection_hash.unwrap_or_default(),
             },
         ))
     }

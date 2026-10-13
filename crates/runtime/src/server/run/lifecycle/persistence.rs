@@ -5838,7 +5838,6 @@ mod tests {
             .start_run(&run_id, &user_id, &session_id)
             .await
             .expect("start durable run");
-
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.session_turn = 7;
         state.final_text = "assistant final".to_string();
@@ -6800,11 +6799,21 @@ mod tests {
             astra_services::runs::DatabaseRunStateStore::new(pool.clone())
                 .with_owner_pod_id("canonical-terminal-success-owner"),
         );
-        let engine = crate::server::run::engine::RunEngine::new(store);
+        let engine = crate::server::run::engine::RunEngine::new(store.clone());
         let authority = engine
             .start_run(&run_id, &user_id, &session_id)
             .await
             .expect("start durable run");
+        store
+            .save_checkpoint(astra_services::runs::RunCheckpointWriteRequest {
+                user_id: &user_id,
+                expected_session_id: &session_id,
+                run_id: &run_id,
+                checkpoint_json: r#"{"version":"checkpoint_v1","graceful":true,"last_batch_id":"fixture-terminal-projection"}"#,
+                authority: astra_services::runs::CheckpointWriteAuthority::ControlPlane,
+            })
+            .await
+            .expect("persist pre-terminal checkpoint");
 
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "atomically committed answer".into();
@@ -7065,6 +7074,7 @@ mod tests {
         .expect("read committed terminal projection hash");
         let projection_row = sqlx::query(
             "SELECT status, waiting_for, projection_event_idx, latest_event_type,
+                    latest_checkpoint_id, latest_checkpoint_kind, latest_checkpoint_version,
                     total_prompt_tokens, total_completion_tokens, total_tool_calls,
                     projection_hash
              FROM run_display_projections WHERE user_id = ? AND run_id = ?",
@@ -7120,6 +7130,26 @@ mod tests {
                 .try_get::<String, _>("projection_hash")
                 .unwrap(),
             commit_hash
+        );
+        assert!(
+            projection_row
+                .try_get::<Option<String>, _>("latest_checkpoint_id")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<Option<String>, _>("latest_checkpoint_kind")
+                .unwrap()
+                .as_deref(),
+            Some("resume")
+        );
+        assert_eq!(
+            projection_row
+                .try_get::<Option<String>, _>("latest_checkpoint_version")
+                .unwrap()
+                .as_deref(),
+            Some("checkpoint_v1")
         );
         if let Some(execution_started_at) = execution_started_at {
             let timestamps = sqlx::query(
