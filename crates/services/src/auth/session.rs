@@ -283,6 +283,7 @@ impl ProviderSessionCreationIdentity {
 pub struct SessionCreationResult {
     pub session: SessionRecord,
     pub created: bool,
+    pub admission_facts: SessionAdmissionFacts,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -606,6 +607,7 @@ impl DatabaseSessionService {
                 return Ok(SessionCreationResult {
                     session: record,
                     created: false,
+                    admission_facts: SessionAdmissionFacts::default(),
                 });
             }
             crate::resource_governor::enforce_session_create_quota(quota)?;
@@ -644,6 +646,7 @@ impl DatabaseSessionService {
         Ok(SessionCreationResult {
             session: record,
             created: true,
+            admission_facts,
         })
     }
 
@@ -804,7 +807,7 @@ impl SessionService for DatabaseSessionService {
     {
         self.create_session_record(user_id, Uuid::new_v4().to_string(), request, None)
             .await
-            .map(|result| (result.session, Some(SessionAdmissionFacts::default())))
+            .map(|result| (result.session, Some(result.admission_facts)))
     }
 
     async fn create_provider_session(

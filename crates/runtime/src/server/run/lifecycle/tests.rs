@@ -24465,6 +24465,70 @@ async fn structural_explain_events_share_the_bounded_live_microbatch() {
 }
 
 #[tokio::test]
+async fn committed_interactions_remain_immediate_delivery_boundaries() {
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let engine = RunEngine::new(store.clone());
+    engine
+        .start_run("run-1", "user-1", "session-1")
+        .await
+        .expect("seed durable run");
+    let runs = Arc::new(RwLock::new(HashMap::new()));
+    let (live_tx, mut live_rx) = broadcast::channel(8);
+    let mut client_event_tx = AttachedStreamDelivery::detached();
+    let mut pending = PendingDurableLiveEvents::default();
+    let durable_tool_terminals = DurableToolTerminalTracker::default();
+
+    pending.push(json!({"type": "agent_spawned", "agent_id": "agent-1"}));
+    let committed_interaction = json!({
+        "type": "tool_request",
+        "request_id": "request-1",
+        "tool": "bash",
+        HOST_INTERACTION_COMMITTED_FIELD: true,
+    });
+
+    let result = process_ordered_live_fanout_event(
+        committed_interaction.clone(),
+        &mut pending,
+        &engine,
+        &runs,
+        "user-1",
+        "session-1",
+        "run-1",
+        &live_tx,
+        &mut client_event_tx,
+        &durable_tool_terminals,
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "deliver committed interaction boundary: {:?}",
+        result.err().map(|error| error.detail)
+    );
+
+    assert_eq!(
+        store.appended_batches(),
+        vec![vec![
+            json!({"type": "agent_spawned", "agent_id": "agent-1"})
+        ]]
+    );
+    assert_eq!(
+        live_rx.recv().await.expect("queued event"),
+        json!({
+            "type": "agent_spawned", "agent_id": "agent-1"
+        })
+    );
+    assert_eq!(
+        live_rx.recv().await.expect("committed interaction"),
+        json!({
+            "type": "tool_request",
+            "request_id": "request-1",
+            "tool": "bash",
+        })
+    );
+    assert!(pending.is_empty());
+}
+
+#[tokio::test]
 async fn ordered_microbatch_keeps_transient_frames_behind_the_durable_commit() {
     for fail_commit in [false, true] {
         let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));

@@ -1104,6 +1104,31 @@ async fn process_ordered_live_fanout_event(
     }
 
     let requires_persistence = !durable_event_committed && live_delta_event_for_persistence(&event);
+    let interaction_delivery_boundary = !canonical_edge_interaction_events(&event).is_empty();
+    if interaction_delivery_boundary && !requires_persistence {
+        // Interactions unblock a human or executor even when their canonical
+        // fact was already committed by the interaction sink. Preserve that
+        // boundary; only uncommitted replay facts wait for batch persistence.
+        flush_durable_live_events(
+            pending,
+            run_engine,
+            runs,
+            user_id,
+            expected_session_id,
+            run_id,
+            live_tx,
+            client_event_tx,
+            durable_tool_terminals,
+        )
+        .await
+        .map_err(|detail| LiveFanoutPersistenceError {
+            code: "live_event_persistence_failed",
+            message: "live run event could not be recorded durably",
+            detail,
+        })?;
+        deliver_live_fanout_event(live_tx, client_event_tx, run_id, event).await;
+        return Ok(());
+    }
     if requires_persistence || !pending.is_empty() {
         // Preserve presentation order without letting a transient frame split
         // the durable batch. Both kinds count towards the same byte/row bounds;
