@@ -210,17 +210,13 @@ pub(super) async fn resolve_or_create_chat_session(
             )
             .await
             {
-                Ok(session) => Ok(ResolvedChatSession {
+                Ok((session, session_admission_facts)) => Ok(ResolvedChatSession {
                     session_id: Some(session.session_id),
                     full_llm_capture:
                         crate::turn::llm::exchange_capture::session_full_llm_capture_enabled(Some(
                             &session.metadata,
                         )),
-                    // A custom SessionService may establish an active plan
-                    // while creating the session. Without an explicit fact
-                    // returned by that service, keep the lifecycle's
-                    // authoritative fallback enabled.
-                    session_admission_facts: None,
+                    session_admission_facts,
                 }),
                 Err(error) if is_session_service_unconfigured_error(&error) => {
                     Ok(ResolvedChatSession {
