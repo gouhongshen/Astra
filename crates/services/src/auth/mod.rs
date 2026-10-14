@@ -2213,33 +2213,30 @@ impl AuthService for DatabaseAuthService {
                 error_response(StatusCode::UNAUTHORIZED, "Session expired or revoked")
             })?;
 
-        // Legacy self-hosted access tokens used `origin: "internal"` for the
-        // same Memoria-bound subject. Keep them inside the binding/TTL contract.
-        let memoria_origin = token_origin == "internal"
-            || token_origin == "memoria"
-            || token_origin.starts_with("verified:memoria:");
-        let (memoria_owner, user) = if memoria_origin {
-            let owner = self.memoria_owner(&pool, &user_id).await?;
-            if owner.is_none() {
+        // `internal` claims cannot distinguish legacy Memoria tokens from
+        // ordinary self-hosted tokens, so ownership—not the claim alone—must
+        // decide whether the 15-minute Memoria access window applies. Explicit
+        // Memoria claims still require their binding.
+        let needs_memoria_binding =
+            token_origin == "memoria" || token_origin.starts_with("verified:memoria:");
+        let mut memoria_owner = None;
+        if needs_memoria_binding {
+            let Some(owner) = self.memoria_owner(&pool, &user_id).await? else {
                 return Err(error_response(
                     StatusCode::UNAUTHORIZED,
                     "Memoria identity binding is missing",
                 ));
-            }
-            let user = self
-                .fetch_user_by_id_or_username(&pool, &user_id, None)
-                .await
-                .map_err(|e| map_auth_sqlx(e, "current_user.fetch_user", Some(&pool)))?
-                .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "User not found"))?;
-            (owner, user)
-        } else {
-            let user = self
-                .fetch_user_by_id_or_username(&pool, &user_id, None)
-                .await
-                .map_err(|e| map_auth_sqlx(e, "current_user.fetch_user", Some(&pool)))?
-                .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "User not found"))?;
-            (None, user)
-        };
+            };
+            memoria_owner = Some(owner);
+        }
+        let user = self
+            .fetch_user_by_id_or_username(&pool, &user_id, None)
+            .await
+            .map_err(|e| map_auth_sqlx(e, "current_user.fetch_user", Some(&pool)))?
+            .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "User not found"))?;
+        if memoria_owner.is_none() {
+            memoria_owner = self.memoria_owner(&pool, &user_id).await?;
+        }
         if memoria_owner.is_some()
             && !claims.iat.is_some_and(|iat| {
                 Utc::now().timestamp() - iat < i64::from(memoria::ACCESS_TTL_SECONDS)
