@@ -2213,33 +2213,30 @@ impl AuthService for DatabaseAuthService {
                 error_response(StatusCode::UNAUTHORIZED, "Session expired or revoked")
             })?;
 
-        // Bound legacy Memoria tokens too: earlier builds issued them with
-        // `internal` origin and the self-hosted deployment's longer TTL.
-        let memoria_owner = self.memoria_owner(&pool, &user_id).await?;
-        if (token_origin == "memoria" || token_origin.starts_with("verified:memoria:"))
-            && memoria_owner.is_none()
-        {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                "Memoria identity binding is missing",
-            ));
-        }
-        if memoria_owner.is_some()
-            && !claims.iat.is_some_and(|iat| {
-                Utc::now().timestamp() - iat < i64::from(memoria::ACCESS_TTL_SECONDS)
-            })
-        {
-            return Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                "Memoria access token expired; refresh required",
-            ));
-        }
-
-        let user = self
-            .fetch_user_by_id_or_username(&pool, &user_id, None)
-            .await
-            .map_err(|e| map_auth_sqlx(e, "current_user.fetch_user", Some(&pool)))?
-            .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "User not found"))?;
+        let verified_memoria_origin =
+            token_origin == "memoria" || token_origin.starts_with("verified:memoria:");
+        let (memoria_owner, user) = if verified_memoria_origin {
+            let owner = self.memoria_owner(&pool, &user_id).await?;
+            if owner.is_none() {
+                return Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "Memoria identity binding is missing",
+                ));
+            }
+            let user = self
+                .fetch_user_by_id_or_username(&pool, &user_id, None)
+                .await
+                .map_err(|e| map_auth_sqlx(e, "current_user.fetch_user", Some(&pool)))?
+                .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "User not found"))?;
+            (owner, user)
+        } else {
+            let user = self
+                .fetch_user_by_id_or_username(&pool, &user_id, None)
+                .await
+                .map_err(|e| map_auth_sqlx(e, "current_user.fetch_user", Some(&pool)))?
+                .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "User not found"))?;
+            (None, user)
+        };
 
         if !user.is_active {
             return Err(error_response(StatusCode::UNAUTHORIZED, "User is inactive"));

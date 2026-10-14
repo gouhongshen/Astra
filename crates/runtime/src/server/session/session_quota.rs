@@ -19,13 +19,17 @@ pub(crate) async fn create_session_with_resource_quota(
         &state.resource_governor.check_session_create(&user_id).await,
     )?;
 
-    let session = state
-        .session_service
-        .create_session(user_id.clone(), request)
-        .await?;
-    state
-        .resource_governor
-        .record_session_created(&user_id)
-        .await;
-    Ok(session)
+    let session = tokio::spawn({
+        let service = state.session_service.clone();
+        let user_id = user_id.clone();
+        async move { service.create_session(user_id, request).await }
+    });
+    let usage = tokio::spawn({
+        let governor = state.resource_governor.clone();
+        let user_id = user_id.clone();
+        async move { governor.record_session_created(&user_id).await }
+    });
+    let (session, ()) = tokio::try_join!(session, usage)
+        .map_err(|error| crate::server::internal_error(error.to_string()))?;
+    session
 }
