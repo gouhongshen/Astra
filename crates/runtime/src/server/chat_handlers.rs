@@ -540,6 +540,7 @@ mod session_resolution_tests {
         created: Arc<Mutex<Vec<(String, SessionCreateRequestData)>>>,
         missing_sessions: Arc<Mutex<Vec<String>>>,
         looked_up_session_ids: Arc<Mutex<Vec<String>>>,
+        fail_creation: bool,
     }
 
     impl RecordingSessionService {
@@ -570,6 +571,13 @@ mod session_resolution_tests {
                 .lock()
                 .await
                 .push((user_id.clone(), request.clone()));
+            if self.fail_creation {
+                tokio::task::yield_now().await;
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "creation failed",
+                ));
+            }
             Ok(SessionRecord {
                 session_id: "s-created".to_string(),
                 user_id,
@@ -693,6 +701,24 @@ mod session_resolution_tests {
             email: "u1@example.test".to_string(),
             display_name: None,
         }
+    }
+
+    #[tokio::test]
+    async fn failed_chat_session_creation_does_not_consume_quota() {
+        use astra_services::resource_governor::{InMemoryResourceGovernor, ResourceGovernor};
+
+        let governor = Arc::new(InMemoryResourceGovernor::new());
+        let mut state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(RecordingSessionService {
+                fail_creation: true,
+                ..Default::default()
+            }));
+        state.resource_governor = governor.clone();
+        let result =
+            resolve_or_create_chat_session(&state, &test_user(), None, None, false, false).await;
+        assert!(result.is_err());
+        assert_eq!(result.err().unwrap().0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(governor.get_usage("u1").await.sessions_created, 0);
     }
 
     #[tokio::test]

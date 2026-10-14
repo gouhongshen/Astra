@@ -441,15 +441,12 @@ pub fn spawn_work_runtime_event_projector(
                 _ = interval.tick() => {}
             }
             match project_pending_runtime_events(&pool, MAX_PROJECTION_BATCH).await {
-                Ok(result) if result.total() > 0 => {
-                    tracing::debug!(
-                        target: "astra_services::work_runtime_event_projector",
-                        projected = result.projected,
-                        coverage_expired = result.coverage_expired,
-                        "projected durable Work runtime events"
-                    );
-                    interval.reset();
-                }
+                Ok(result) if result.total() > 0 => tracing::debug!(
+                    target: "astra_services::work_runtime_event_projector",
+                    projected = result.projected,
+                    coverage_expired = result.coverage_expired,
+                    "projected durable Work runtime events"
+                ),
                 Ok(_) => {}
                 Err(error) => tracing::warn!(
                     target: "astra_services::work_runtime_event_projector",
