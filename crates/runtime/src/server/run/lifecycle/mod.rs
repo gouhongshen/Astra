@@ -6758,30 +6758,10 @@ impl AgenticRunLifecycleService {
             }
         }
         .await;
-        if result.as_ref().is_ok_and(Option::is_some) {
-            // Canonical commit is authoritative; absorbed provider WAL
-            // payloads are recoverable until retirement, and session-boundary
-            // retries already converge cleanup. Keep the lagging DELETE off
-            // the user-visible terminal boundary on high-latency storage.
-            spawn_observed(
-                Self::schedule_provider_wal_payload_retirement(admission),
-                "provider_wal_payload_retirement",
-            );
-        }
         // A successful commit already released this exact writer atomically.
         // Empty/failed commits retain the existing explicit cleanup path.
         if admission.release_writer_on_finish && !result.as_ref().is_ok_and(Option::is_some) {
             let _ = admission.coordinator.release_writer(&admission.lease).await;
-        }
-        if let Err(error) = admission.distributed_permit.release().await {
-            tracing::warn!(
-                target: "astra_runtime::canonical_wal",
-                user_id = %admission.lease.key.owner_user_id,
-                session_id = %admission.lease.key.session_id,
-                turn = admission.reservation.reserved_turn,
-                %error,
-                "distributed admission release is pending; the permit will retry on drop"
-            );
         }
         admission.release_started.store(true, Ordering::Release);
         result.map_err(|message| {
@@ -6792,34 +6772,37 @@ impl AgenticRunLifecycleService {
         })
     }
 
-    fn schedule_provider_wal_payload_retirement(
-        admission: &CanonicalTurnAdmission,
-    ) -> impl std::future::Future<Output = ()> + Send + 'static {
-        let pool = admission.inference_pool.clone();
-        let user_id = admission.lease.key.owner_user_id.clone();
-        let session_id = admission.lease.key.session_id.clone();
-        let turn = admission.reservation.reserved_turn;
-        async move {
-            if let Err(error) = astra_services::retire_inference_canonical_transitions_through_turn(
-                &pool,
-                &user_id,
-                &session_id,
-                turn,
+    async fn finish_canonical_turn_cleanup(admission: &CanonicalTurnAdmission, committed: bool) {
+        if let Err(error) = admission.distributed_permit.release().await {
+            tracing::warn!(
+                target: "astra_runtime::canonical_wal",
+                user_id = %admission.lease.key.owner_user_id,
+                session_id = %admission.lease.key.session_id,
+                turn = admission.reservation.reserved_turn,
+                %error,
+                "distributed admission release is pending; the permit will retry on drop"
+            );
+        }
+        if committed
+            && let Err(error) = astra_services::retire_inference_canonical_transitions_through_turn(
+                &admission.inference_pool,
+                &admission.lease.key.owner_user_id,
+                &admission.lease.key.session_id,
+                admission.reservation.reserved_turn,
             )
             .await
-            {
-                // The canonical commit is authoritative. Payload retirement
-                // is lagging work; the next session boundary retries all
-                // absorbed turns instead of broadening this commit contract.
-                tracing::warn!(
-                    target: "astra_runtime::canonical_wal",
-                    user_id,
-                    session_id,
-                    turn,
-                    %error,
-                    "provider WAL payload retirement is pending"
-                );
-            }
+        {
+            // The canonical commit is authoritative. Payload retirement
+            // is lagging work; the next session boundary retries all
+            // absorbed turns instead of broadening this commit contract.
+            tracing::warn!(
+                target: "astra_runtime::canonical_wal",
+                user_id = %admission.lease.key.owner_user_id,
+                session_id = %admission.lease.key.session_id,
+                turn = admission.reservation.reserved_turn,
+                %error,
+                "provider WAL payload retirement is pending"
+            );
         }
     }
 
@@ -15849,6 +15832,7 @@ impl AgenticRunLifecycleService {
                 );
                 let loop_result =
                     run_agentic_loop_with_host_panic_safe(&mut host, &mut state).await;
+                let settlement_timing_started = Instant::now();
                 host.release_execution_capacity_for_wait();
                 if let Some(model) = state.current_model_identity() {
                     persist_ctx.model_name = Some(model.to_owned());
@@ -15864,6 +15848,7 @@ impl AgenticRunLifecycleService {
                     execution_owner_generation,
                 )
                 .await;
+                let settlement_fence_elapsed = settlement_timing_started.elapsed();
                 #[cfg(feature = "e2e-hooks")]
                 if !streaming && bg_test_post_loop_settlement_delay_ms > 0 {
                     run_engine
@@ -15994,6 +15979,7 @@ impl AgenticRunLifecycleService {
                 });
                 park_server_root_mailbox(&mut state).await;
                 host.on_loop_terminal(&state, &loop_result).await;
+                let settlement_drain_elapsed = settlement_timing_started.elapsed();
                 let (loop_result, emitted_events) = host.settle_loop_turn(loop_result);
                 enforce_completed_tool_ledger_closure(&loop_result, &mut state);
                 let allow_empty_delta =
@@ -16317,6 +16303,7 @@ impl AgenticRunLifecycleService {
                 }
 
                 let mut durable_status_committed = !persist_status_update && live_events_flushed;
+                let settlement_preparation_elapsed = settlement_timing_started.elapsed();
                 let mut owner_terminal_committed = false;
                 let mut atomic_terminal_committed = false;
                 let mut streaming_events_committed = false;
@@ -16551,6 +16538,7 @@ impl AgenticRunLifecycleService {
                     }
                 }
 
+                let settlement_terminal_elapsed = settlement_timing_started.elapsed();
                 if owner_terminal_committed {
                     if let Some(run) = runs.write().await.get_mut(&bg_run_id)
                         && let Some(data) = run.events.iter_mut().rev().find_map(|event| {
@@ -16793,6 +16781,18 @@ impl AgenticRunLifecycleService {
                 // side effects must not advertise a live resume/input consumer.
                 drop(_owner_lease_heartbeat);
 
+                tracing::debug!(
+                    target: "astra_runtime::run_settlement",
+                    run_id = %bg_run_id,
+                    fence_ms = settlement_fence_elapsed.as_millis(),
+                    drain_ms = settlement_drain_elapsed.saturating_sub(settlement_fence_elapsed).as_millis(),
+                    preparation_ms = settlement_preparation_elapsed.saturating_sub(settlement_drain_elapsed).as_millis(),
+                    terminal_ms = settlement_terminal_elapsed.saturating_sub(settlement_preparation_elapsed).as_millis(),
+                    canonical_ms = settlement_timing_started.elapsed().saturating_sub(settlement_terminal_elapsed).as_millis(),
+                    owner_terminal_committed,
+                    "run settlement phases completed"
+                );
+
                 if let Some(event_tx) = event_tx.as_ref() {
                     if publish_stream_terminal {
                         // The durable store owns the terminal intent disposition
@@ -16861,6 +16861,9 @@ impl AgenticRunLifecycleService {
                 }
 
                 // Drop event_tx — signals end-of-stream to the HTTP handler.
+                // The finished host also owns interaction-sink sender clones.
+                // Release them before any post-terminal storage cleanup.
+                drop(host);
                 drop(event_tx);
 
                 if !streaming {
@@ -16968,6 +16971,18 @@ impl AgenticRunLifecycleService {
                 .await;
                 if let Some(guard) = bg_root_runtime_context_guard.as_mut() {
                     guard.settle().await;
+                }
+                drop(state);
+                drop(bg_root_runtime_context_guard);
+                // Release resident capacity after dropping the resident
+                // context and its interaction sender clones. This run task
+                // retains cleanup custody without keeping the stream open.
+                if let Some(admission) = canonical_turn.as_ref() {
+                    Self::finish_canonical_turn_cleanup(
+                        admission,
+                        canonical_context_cursor.is_some(),
+                    )
+                    .await;
                 }
             },
             "agentic_loop_owned_execution",

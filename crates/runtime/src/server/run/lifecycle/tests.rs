@@ -33797,6 +33797,113 @@ async fn stream_chat_explain_mode_finishes_a_short_turn() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1; provider is localhost mock"]
+async fn db_stream_terminal_precedes_blocked_quota_cleanup() {
+    let pool = setup_lifecycle_run_db_it().await;
+    let owner = format!("cleanup-owner-{}", Uuid::new_v4());
+    let session = format!("cleanup-session-{}", Uuid::new_v4());
+    crate::server::run::insert_active_run_session_fixture(&pool, &owner, &session).await;
+    let llm = spawn_terminal_test_llm().await;
+    let mut service = db_backed_test_service(&pool, "cleanup-test");
+    service
+        .distributed_weighted_admission
+        .as_mut()
+        .unwrap()
+        .with_admission_wait_timeout(Duration::from_secs(60));
+    let mut request = prepared_test_request("hello");
+    request.session_id = Some(session.clone());
+    request.provider_runtime_authorized = true;
+    request.admitted_model_execution = None;
+    request.runtime_auth = Some(RuntimeAuthRequest {
+        authorization: "Bearer fake-cleanup".into(),
+    });
+    request.capability_descriptors =
+        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+            model_gateway: Some(test_runtime_descriptor(
+                "cleanup-gateway",
+                "model_gateway",
+                &format!("{}/chat/completions", llm.base_url),
+            )),
+            ..Default::default()
+        });
+    request.execution_policy.skill_auto_route =
+        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+    let mut stream = ok(service.stream_chat(owner.clone(), request).await);
+    let run_id = stream.run_id.clone();
+    let mut gate = pool.get().begin().await.unwrap();
+    sqlx::query(
+        "SELECT scope_name FROM session_weighted_admission_gates
+         WHERE scope_name = 'canonical_turn_v1' FOR UPDATE",
+    )
+    .fetch_one(&mut *gate)
+    .await
+    .unwrap();
+
+    let mut events = stream.events;
+    let closed = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(event) = stream.event_rx.as_mut().unwrap().recv().await {
+            events.push(event);
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "quota cleanup held the stream open: provider_requests={}, events={:?}",
+        llm.requests.load(Ordering::SeqCst),
+        events
+            .iter()
+            .map(|event| (replay_event_type(event), chat_stream_event_status(event)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        events.iter().any(|event| {
+            replay_event_type(event) == Some("run_finished")
+                && chat_stream_event_status(event) == Some(STATUS_COMPLETED)
+        }),
+        "{events:?}"
+    );
+    let (completed_turn, writer): (i64, Option<String>) = sqlx::query_as(
+        "SELECT completed_turn, active_writer_json FROM session_context_heads
+         WHERE owner_user_id = ? AND session_id = ? AND branch_id = 'main'",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(completed_turn, 1);
+    assert!(
+        writer.is_none(),
+        "canonical writer must be released before terminal delivery"
+    );
+    let count = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM session_weighted_admission_reservations
+             WHERE owner_user_id = ? AND session_id = ?",
+        )
+        .bind(&owner)
+        .bind(&session)
+        .fetch_one(pool.get())
+        .await
+        .unwrap()
+    };
+    assert_eq!(
+        count().await,
+        1,
+        "the blocked quota remains conservatively reserved"
+    );
+    gate.rollback().await.unwrap();
+    assert!(
+        service
+            .drain_background_tasks(Duration::from_secs(20))
+            .await
+    );
+    assert_eq!(count().await, 0, "the owning run must finish quota cleanup");
+    cleanup_lifecycle_run_fixture(&pool, &owner, &run_id).await;
+    crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1; provider is localhost mock"]
 async fn db_explain_memory_selection_follows_canonical_admitted_turns() {
     let pool = setup_lifecycle_run_db_it().await;
     let owner = format!("memory-explain-owner-{}", Uuid::new_v4());

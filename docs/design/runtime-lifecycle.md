@@ -716,6 +716,16 @@ projection must preserve the latest committed checkpoint metadata. The
 resolution path rereads the committed projection hash after a lost commit
 acknowledgement instead of synthesizing one.
 
+The completed stream follows the durable terminal, canonical conversation
+commit and exact writer release. After its remaining projections and hooks, the
+owning run task drops the resident context and its interaction sender handles,
+then releases distributed capacity and retires absorbed provider WAL payloads.
+Until that cleanup completes, capacity is conservatively reserved. Existing
+permit-drop and expiry handling recover an
+interrupted release, while a later session boundary retries WAL retirement.
+An empty retirement on a writable owned session needs no child-write transaction;
+nonempty or unavailable snapshots retain the canonical lifecycle lock and checks.
+
 The Explain Analyze graph is produced only for a root run that explicitly
 requested it. Ordinary runs keep their lifecycle, transcript, trace, and
 recovery events; they do not create the second product graph stream, persist

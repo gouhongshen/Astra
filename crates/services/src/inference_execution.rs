@@ -4503,6 +4503,44 @@ pub async fn retire_inference_canonical_transitions_through_turn(
                 error,
             )
         })?;
+    // Most session boundaries have nothing left to retire. An empty,
+    // writable snapshot needs no child-write transaction; nonempty or
+    // unavailable snapshots still use the canonical locked boundary below.
+    let pending: Option<i64> = sqlx::query_scalar(
+        "SELECT CASE WHEN
+            EXISTS (SELECT 1 FROM inference_canonical_transition_wal
+                    WHERE user_id = ? AND session_id = ? AND turn_index <= ?)
+            OR EXISTS (SELECT 1 FROM inference_canonical_transition_heads
+                       WHERE user_id = ? AND session_id = ? AND turn_index <= ?)
+            THEN 1 ELSE 0 END
+         FROM agent_sessions session_root
+         JOIN agent_session_lifecycle_fences fence
+           ON fence.user_id = session_root.user_id AND fence.session_id = session_root.session_id
+         WHERE session_root.user_id = ? AND session_root.session_id = ?
+           AND session_root.status <> 'deleting'
+           AND fence.delete_requested_at IS NULL AND fence.database_deleted_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(through_turn))
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(through_turn))
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(connection.connection_mut())
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "check absorbed inference canonical transition retirement work",
+            error,
+        )
+    })?;
+    if pending == Some(0) {
+        connection.release();
+        return Ok(0);
+    }
     let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
