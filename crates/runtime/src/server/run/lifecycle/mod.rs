@@ -20126,9 +20126,9 @@ pub(crate) fn safe_model_spawn_error(
                 | "model_reasoning_unsupported"
                 | "model_purpose_unsupported",
             ) => Some(ErrorKind::InvalidRequest),
+            Some("model_offering_not_found") => Some(ErrorKind::InvalidRequest),
             Some(
                 "model_not_available"
-                | "model_offering_not_found"
                 | "model_offering_unavailable"
                 | "model_selection_changed",
             ) => Some(ErrorKind::ToolUnavailable),

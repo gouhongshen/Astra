@@ -7654,7 +7654,7 @@ pub(crate) mod tests {
             (
                 StatusCode::NOT_FOUND,
                 "model_offering_not_found",
-                Some("tool_unavailable"),
+                Some("invalid_request"),
             ),
             (StatusCode::FORBIDDEN, "unknown_code", Some("auth")),
             (StatusCode::BAD_REQUEST, "unknown_code", None),
