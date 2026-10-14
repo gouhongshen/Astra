@@ -743,11 +743,15 @@ impl CapabilitySourceRuntime {
         Ok(result)
     }
 
-    pub(crate) fn selection_discovery_tool(&self, key: &str) -> Option<String> {
-        self.cached(key)
-            .ok()
-            .flatten()
-            .map(|materialized| materialized.discovery_tool)
+    pub(crate) fn selection_discovery_tool(
+        &self,
+        key: &str,
+    ) -> Option<(String, astra_turn_types::ResolvedToolDescriptorRef)> {
+        let alias = astra_turn_types::PublicToolAlias::new(key).ok()?;
+        let cache = self.materialized.read().ok()?;
+        let materialized = cache.get(key)?;
+        let descriptor = materialized.snapshot.alias_index.get(&alias)?.clone();
+        Some((materialized.discovery_tool.clone(), descriptor))
     }
 
     pub(crate) async fn invoke(

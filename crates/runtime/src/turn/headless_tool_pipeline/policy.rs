@@ -971,6 +971,10 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 }
                 _ => None,
             };
+            let source_discovery_tool = self
+                .ctx
+                .runtime_tool_executor
+                .and_then(|executor| executor.source_selection_discovery_tool(&execution.name));
             resolved_provider_policy = provider_policy.cloned();
             let permission_result = match &provider_lookup {
                 crate::server::runtime_tool_executor::ProviderPolicyLookup::MissingPolicy {
@@ -997,6 +1001,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         effective_permission_timeout,
                         plan_mode_active,
                         provider_policy,
+                        source_discovery_tool.as_deref(),
                     )
                     .await
                 }

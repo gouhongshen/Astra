@@ -33573,6 +33573,7 @@ mod tests {
             .restore_source_selections(fixture.scope.clone(), &[])
             .await
             .unwrap();
+        assert!(executor.source_selection_discovery_tool(&key).is_none());
         let executor = Arc::new(executor);
         let mut state = create_test_state();
         state.runtime_tool_executor = Some(executor.clone());
@@ -33622,6 +33623,17 @@ mod tests {
         );
         assert!(!schema_names(&selected).contains(&key));
         assert!(crate::turn::agentic::tool_interception::runtime_allows_tool(&state, &key));
+        assert_eq!(
+            executor.source_selection_discovery_tool(&key).as_deref(),
+            Some("mcp__source__search")
+        );
+        assert!(
+            executor
+                .source_selection_discovery_tool(
+                    "mcp__cap__aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                )
+                .is_none()
+        );
         let invoked = executor
             .execute_server_local_tool(&request(&fixture.scope, &key, json!({})), None)
             .await
@@ -33662,6 +33674,36 @@ mod tests {
         assert!(
             !ServerAgenticLoopHost::deferred_activation_descriptor_is_current(&forged, &admission)
         );
+
+        // A failed alias installation may leave a source-side materialization
+        // cached. Its discovery scope must not authorize the other indexed
+        // descriptor occupying the same public name.
+        let materialized = source.materialize(&key, false).await.unwrap();
+        let mut colliding_snapshot = materialized.snapshot.clone();
+        let colliding_ref = astra_turn_types::ResolvedToolDescriptorRef::new(
+            descriptor.identity.clone(),
+            "colliding-version",
+        )
+        .unwrap();
+        colliding_snapshot.descriptors[0].descriptor_version =
+            colliding_ref.descriptor_version.clone();
+        colliding_snapshot.alias_index.insert(
+            astra_turn_types::PublicToolAlias::new(&key).unwrap(),
+            colliding_ref,
+        );
+        let mut colliding_index =
+            astra_turn_core::provider_resolution::ResolvedProviderPolicyIndex::from_snapshots(&[
+                colliding_snapshot,
+            ])
+            .unwrap();
+        assert!(
+            colliding_index
+                .extend_snapshot(&materialized.snapshot)
+                .is_err()
+        );
+        executor.set_provider_policy_index(colliding_index);
+        assert!(executor.source_selection_discovery_tool(&key).is_none());
+        assert!(!crate::turn::agentic::tool_interception::runtime_allows_tool(&state, &key));
     }
 
     #[test]
@@ -33771,14 +33813,19 @@ mod tests {
             state.current_run_id = Some(fixture.scope.run_id.clone());
             state.canonical_turn_chain_id = Some("source-turn".into());
             state.context_manifest_user_id = Some(fixture.scope.user_id.clone());
-            state.permission_context =
-                Some(crate::orchestration::PermissionSyncContext::shared_root(
-                    crate::orchestration::PermissionMode::Auto,
-                ));
-            state.skills.request_constraints.allowed_tools = Some(HashSet::from([
+            let allowed_tools = HashSet::from([
                 "mcp__source__search".into(),
                 "tool_search".into(),
-            ]));
+                "skill".into(),
+            ]);
+            state.permission_context = Some(crate::orchestration::PermissionSyncContext::shared(
+                crate::orchestration::InheritedPermissions {
+                    mode: crate::orchestration::PermissionMode::Auto,
+                    allowed_tools: Some(allowed_tools.clone()),
+                    ..Default::default()
+                },
+            ));
+            state.skills.request_constraints.allowed_tools = Some(allowed_tools);
             if skill {
                 state.skills.resolver = Some(Arc::new(
                     super::super::capability_source::CapabilitySourceSkillResolver {

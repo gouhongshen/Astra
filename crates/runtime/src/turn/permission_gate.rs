@@ -74,6 +74,7 @@ pub async fn check_tool_permission(
         mailbox,
         timeout,
         None,
+        None,
     )
     .await
 }
@@ -85,6 +86,7 @@ pub async fn check_tool_permission_with_provider_policy(
     mailbox: Option<&mut AgentMailbox>,
     timeout: Duration,
     provider_policy: Option<&ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
 ) -> PermissionCheckResult {
     let Some(ctx) = permission_context else {
         return PermissionCheckResult::Denied {
@@ -108,6 +110,7 @@ pub async fn check_tool_permission_with_provider_policy(
             &normalized_args,
             &ctx_guard,
             provider_policy,
+            source_discovery_tool,
         );
         astra_turn_core::permission::audit::record_evaluated_envelope(
             tool_name,
@@ -239,6 +242,7 @@ pub async fn check_tool_permission_in_plan_mode(
         timeout,
         plan_mode_active,
         None,
+        None,
     )
     .await
 }
@@ -251,6 +255,7 @@ pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
     timeout: Duration,
     plan_mode_active: bool,
     provider_policy: Option<&ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
 ) -> PermissionCheckResult {
     let normalized_args = match normalized_tool_args(tool_name, args) {
         Ok(args) => args,
@@ -287,6 +292,7 @@ pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
         mailbox,
         timeout,
         provider_policy,
+        source_discovery_tool,
     )
     .await
 }
@@ -354,6 +360,7 @@ mod tests {
             Duration::from_secs(1),
             true,
             Some(&read),
+            None,
         )
         .await;
         assert!(is_allowed(&allowed));
@@ -366,9 +373,67 @@ mod tests {
             Duration::from_secs(1),
             true,
             Some(&unknown),
+            None,
         )
         .await;
         assert!(matches!(denied, PermissionCheckResult::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn materialized_source_selection_uses_only_its_discovery_allowlist_scope() {
+        let policy = provider_policy(astra_turn_types::ResolvedToolEffect::Unknown);
+        let selected = "mcp__cap__selected";
+        let discovery = "mcp__source__search";
+        let context = |allowed: &[&str], deny_selected: bool| {
+            PermissionSyncContext::shared(InheritedPermissions {
+                mode: PermissionMode::Auto,
+                allowed_tools: Some(allowed.iter().map(|tool| (*tool).to_string()).collect()),
+                deny_rules: if deny_selected {
+                    vec![astra_turn_core::permission::types::PermissionRule::tool(
+                        selected,
+                    )]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            })
+        };
+        let permitted = context(&[discovery], false);
+        async fn check(
+            ctx: &PermissionSyncHandle,
+            source: Option<&str>,
+            policy: &ResolvedInvocationPolicy,
+        ) -> PermissionCheckResult {
+            check_tool_permission_with_provider_policy(
+                "mcp__cap__selected",
+                Some("{}"),
+                Some(ctx),
+                None,
+                Duration::from_secs(1),
+                Some(policy),
+                source,
+            )
+            .await
+        }
+        assert!(is_allowed(
+            &check(&permitted, Some(discovery), &policy).await
+        ));
+        assert!(matches!(
+            check(&permitted, None, &policy).await,
+            PermissionCheckResult::Denied { .. }
+        ));
+        assert!(matches!(
+            check(&permitted, Some("mcp__source__wrong"), &policy).await,
+            PermissionCheckResult::Denied { .. }
+        ));
+        assert!(matches!(
+            check(&context(&["tool_search"], false), Some(discovery), &policy).await,
+            PermissionCheckResult::Denied { .. }
+        ));
+        assert!(matches!(
+            check(&context(&[discovery], true), Some(discovery), &policy).await,
+            PermissionCheckResult::Denied { .. }
+        ));
     }
 
     #[tokio::test]

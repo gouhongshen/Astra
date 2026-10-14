@@ -1332,18 +1332,26 @@ impl RuntimeToolExecutor {
         name: &str,
         allowed: &HashSet<String>,
     ) -> bool {
-        let Some(parent) = self
+        self.source_selection_discovery_tool(name)
+            .is_some_and(|parent| allowed.contains(&parent))
+    }
+
+    /// Return the discovery tool for an exact, materialized source selection.
+    /// A matching public alias without an indexed descriptor has no authority.
+    pub(crate) fn source_selection_discovery_tool(&self, name: &str) -> Option<String> {
+        let (parent, descriptor) = self
             .capability_source
             .as_ref()
-            .and_then(|source| source.selection_discovery_tool(name))
-        else {
-            return false;
-        };
-        allowed.contains(&parent)
-            && self
-                .provider_policy_index
-                .read()
-                .is_ok_and(|index| index.descriptor_refs().contains_key(name))
+            .and_then(|source| source.selection_discovery_tool(name))?;
+        self.provider_policy_index
+            .read()
+            .ok()
+            .filter(|index| {
+                index
+                    .resolve(name)
+                    .is_some_and(|policy| policy.descriptor == descriptor)
+            })
+            .map(|_| parent)
     }
 
     pub(crate) async fn restore_source_selections(
