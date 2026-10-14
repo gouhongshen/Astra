@@ -598,8 +598,8 @@ impl DatabaseSessionService {
                         "session_creation_conflict",
                     ));
                 }
-                let record = self
-                    .fetch_session_for_user(&mut *tx, &session_id, &user_id)
+                let (record, admission_facts) = self
+                    .fetch_session_for_user_with_admission_facts(&mut *tx, &session_id, &user_id)
                     .await?
                     .ok_or_else(|| internal_error("failed to read idempotent session"))?;
                 tx.commit().await.map_err(internal_error)?;
@@ -607,7 +607,7 @@ impl DatabaseSessionService {
                 return Ok(SessionCreationResult {
                     session: record,
                     created: false,
-                    admission_facts: SessionAdmissionFacts::default(),
+                    admission_facts,
                 });
             }
             crate::resource_governor::enforce_session_create_quota(quota)?;

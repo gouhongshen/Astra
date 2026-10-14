@@ -44,7 +44,6 @@ pub(super) struct JwtClaims {
     pub(super) token_type: Option<String>,
     pub(super) sid: Option<String>,
     pub(super) origin: Option<String>,
-    #[allow(dead_code)]
     pub(super) iat: Option<i64>,
 }
 
