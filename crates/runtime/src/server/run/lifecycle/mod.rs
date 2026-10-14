@@ -6758,25 +6758,14 @@ impl AgenticRunLifecycleService {
             }
         }
         .await;
-        if result.as_ref().is_ok_and(Option::is_some)
-            && let Err(error) = astra_services::retire_inference_canonical_transitions_through_turn(
-                &admission.inference_pool,
-                &admission.lease.key.owner_user_id,
-                &admission.lease.key.session_id,
-                admission.reservation.reserved_turn,
-            )
-            .await
-        {
-            // The canonical commit is authoritative and must not be reported
-            // as failed because payload retirement is lagging. A later
-            // session boundary retries cleanup for all absorbed turns.
-            tracing::warn!(
-                target: "astra_runtime::canonical_wal",
-                user_id = %admission.lease.key.owner_user_id,
-                session_id = %admission.lease.key.session_id,
-                turn = admission.reservation.reserved_turn,
-                %error,
-                "canonical commit succeeded but provider WAL payload retirement is pending"
+        if result.as_ref().is_ok_and(Option::is_some) {
+            // Canonical commit is authoritative; absorbed provider WAL
+            // payloads are recoverable until retirement, and session-boundary
+            // retries already converge cleanup. Keep the lagging DELETE off
+            // the user-visible terminal boundary on high-latency storage.
+            spawn_observed(
+                Self::schedule_provider_wal_payload_retirement(admission),
+                "provider_wal_payload_retirement",
             );
         }
         // A successful commit already released this exact writer atomically.
@@ -6801,6 +6790,37 @@ impl AgenticRunLifecycleService {
                 format!("canonical turn commit failed: {message}"),
             )
         })
+    }
+
+    fn schedule_provider_wal_payload_retirement(
+        admission: &CanonicalTurnAdmission,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let pool = admission.inference_pool.clone();
+        let user_id = admission.lease.key.owner_user_id.clone();
+        let session_id = admission.lease.key.session_id.clone();
+        let turn = admission.reservation.reserved_turn;
+        async move {
+            if let Err(error) = astra_services::retire_inference_canonical_transitions_through_turn(
+                &pool,
+                &user_id,
+                &session_id,
+                turn,
+            )
+            .await
+            {
+                // The canonical commit is authoritative. Payload retirement
+                // is lagging work; the next session boundary retries all
+                // absorbed turns instead of broadening this commit contract.
+                tracing::warn!(
+                    target: "astra_runtime::canonical_wal",
+                    user_id,
+                    session_id,
+                    turn,
+                    %error,
+                    "provider WAL payload retirement is pending"
+                );
+            }
+        }
     }
 
     pub fn with_memory_extraction_service(
