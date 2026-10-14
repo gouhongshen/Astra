@@ -19651,6 +19651,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         true
     }
 
+    fn owns_post_loop_memory_settlement(&self) -> bool {
+        true
+    }
+
     async fn judge_turn_intent(
         &mut self,
         state: &AgenticLoopState,
