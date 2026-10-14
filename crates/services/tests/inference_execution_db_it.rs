@@ -4296,6 +4296,13 @@ async fn run_inference_admission_fences_generation_owner_lease_guidance_and_canc
     };
     let exact = run_authority().expect("run authority fixture");
 
+    admit_inference_invocation(
+        &shared_pool,
+        &plan_for("exact_empty_control_frontier", exact.clone()),
+    )
+    .await
+    .expect("an exact locked empty control frontier admits without later guidance");
+
     let mut wrong_generation = exact.clone();
     wrong_generation.expected_owner_generation = 1;
     let error = admit_inference_invocation(

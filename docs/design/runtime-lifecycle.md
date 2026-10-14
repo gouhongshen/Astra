@@ -716,6 +716,15 @@ projection must preserve the latest committed checkpoint metadata. The
 resolution path rereads the committed projection hash after a lost commit
 acknowledgement instead of synthesizing one.
 
+Terminal evidence admission reads exact run metadata and its cancellation
+marker under the session/execution/run locks once. Settlement consumes those
+transaction-owned facts; a root's already-locked marker is its complete
+cancellation lineage, while children still validate and lock their ancestors.
+Provider admission likewise needs no later-guidance lookup when its admitted
+control epoch equals the current locked run event frontier. Event append and
+frontier advance remain atomic; a lagging epoch retains the indexed guidance
+query and all owner/generation/lease/cancellation checks still apply.
+
 The completed stream follows the durable terminal, canonical conversation
 commit and exact writer release. After its remaining projections and hooks, the
 owning run task drops the resident context and its interaction sender handles,

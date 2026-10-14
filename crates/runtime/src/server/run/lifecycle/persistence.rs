@@ -1052,15 +1052,24 @@ async fn persist_server_loop_canonical_append_inner(
             return Err(msg);
         }
     };
-    // The owner fence below establishes exact run identity and acquires the
-    // run lock. Do not precede it with another locking existence read.
-    let admission = if append.expected_owner_generation.is_some() {
-        astra_services::storage::admit_session_execution_write(
-            &mut tx,
-            append.session_id,
-            append.user_id,
+    let terminal_admission = if settlement.is_some() {
+        Some(
+            DatabaseRunStateStore::new(pool.clone())
+                .admit_terminal_settlement_in_transaction(
+                    &mut tx,
+                    append.user_id,
+                    append.session_id,
+                    append.run_id,
+                )
+                .await
+                .map_err(|error| format!("canonical session admission failed: {error}"))?
+                .ok_or_else(|| {
+                    format!(
+                        "canonical session admission failed: {}",
+                        sqlx::Error::RowNotFound
+                    )
+                })?,
         )
-        .await
     } else {
         astra_services::storage::admit_session_scoped_run_write(
             &mut tx,
@@ -1069,8 +1078,9 @@ async fn persist_server_loop_canonical_append_inner(
             append.run_id,
         )
         .await
+        .map_err(|error| format!("canonical session admission failed: {error}"))?;
+        None
     };
-    admission.map_err(|error| format!("canonical session admission failed: {error}"))?;
 
     if let Some(expected_owner_generation) = append.expected_owner_generation {
         let Some(lease_duration) = append.owner_lease_duration else {
@@ -1262,6 +1272,7 @@ async fn persist_server_loop_canonical_append_inner(
             .settle_terminal_in_admitted_transaction(
                 &mut tx,
                 atomic_terminal_request(&append, settlement),
+                terminal_admission.expect("terminal evidence owns its transaction admission"),
             )
             .await
         {

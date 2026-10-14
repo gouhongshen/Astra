@@ -5218,6 +5218,14 @@ pub struct AtomicRunTerminalSettlementCommit {
     pub projection_hash: String,
 }
 
+/// Exact run facts read under session/execution/run locks. This value may only
+/// be consumed in its admitting transaction, before that transaction changes
+/// run metadata or appends run events. It is not a cache or execution grant.
+pub struct AtomicRunTerminalSettlementAdmission {
+    run: DurableRunRecord,
+    cancellation_requested: bool,
+}
+
 /// Authoritative read result for an atomic terminal settlement.
 ///
 /// `NotCommitted` is reserved for the original active generation, which may
@@ -12941,8 +12949,8 @@ impl DatabaseRunStateStore {
         if request.expected_statuses.is_empty() {
             return Ok(None);
         }
-        let Some(run) = self
-            .load_run_metadata_for_exact_session_tx(
+        let Some(admission) = self
+            .admit_terminal_settlement_in_transaction(
                 tx,
                 request.user_id,
                 request.expected_session_id,
@@ -12953,37 +12961,80 @@ impl DatabaseRunStateStore {
         else {
             return Ok(None);
         };
-        self.settle_terminal_from_locked_run_in_transaction(tx, request, run)
+        self.settle_terminal_in_admitted_transaction(tx, request, admission)
             .await
     }
 
-    /// Settle a terminal run in a transaction that already holds the canonical
-    /// session execution admission and run-row locks.
+    /// Admit terminal settlement once, returning the exact locked run facts for
+    /// a caller that appends canonical evidence before settling the terminal.
+    pub async fn admit_terminal_settlement_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+    ) -> DbStoreResult<Option<AtomicRunTerminalSettlementAdmission>> {
+        validate_expected_run_session_id(expected_session_id).map_err(|message| {
+            db_error(
+                "admit_terminal_settlement",
+                run_id,
+                sqlx::Error::Protocol(message),
+            )
+        })?;
+        match crate::storage::admit_session_execution_write(tx, expected_session_id, user_id).await
+        {
+            Ok(()) => {}
+            Err(sqlx::Error::RowNotFound) => return Ok(None),
+            Err(source) => return Err(db_error("admit_terminal_settlement", run_id, source)),
+        }
+        let sql = format!(
+            "SELECT {AGENT_RUN_COLUMNS},
+                    CAST(cancellation_requested_at IS NOT NULL AS SIGNED) AS cancellation_requested
+             FROM agent_runs WHERE user_id = ? AND session_id = ? AND run_id = ? FOR UPDATE"
+        );
+        sqlx::query(&sql)
+            .bind(user_id)
+            .bind(expected_session_id)
+            .bind(run_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|source| db_error("admit_terminal_settlement", run_id, source))?
+            .map(|row| {
+                let cancellation_requested = row
+                    .try_get::<i64, _>("cancellation_requested")
+                    .map_err(|source| {
+                        db_error("decode_terminal_cancellation_marker", run_id, source)
+                    })?
+                    != 0;
+                Ok(AtomicRunTerminalSettlementAdmission {
+                    run: run_record_from_row(row)?,
+                    cancellation_requested,
+                })
+            })
+            .transpose()
+    }
+
+    /// Settle using facts owned by the same transaction's canonical admission.
     ///
-    /// The caller must have acquired admission through the canonical run
-    /// writer; this entry point only avoids re-reading those already locked
-    /// rows before loading the exact run metadata.
+    /// Renewing this run's lease is allowed between admission and settlement;
+    /// the terminal CAS still validates its live lease using the DB clock.
     pub async fn settle_terminal_in_admitted_transaction(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         request: AtomicRunTerminalSettlementRequest<'_>,
+        admission: AtomicRunTerminalSettlementAdmission,
     ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
         validate_expected_run_session_id(request.expected_session_id)?;
         if request.expected_statuses.is_empty() {
             return Ok(None);
         }
-        let run = load_run_metadata_after_session_admission_tx(
-            tx,
-            request.user_id,
-            request.expected_session_id,
-            request.run_id,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        let Some(run) = run else {
-            return Ok(None);
-        };
-        self.settle_terminal_from_locked_run_in_transaction(tx, request, run)
+        if admission.run.user_id != request.user_id
+            || admission.run.session_id != request.expected_session_id
+            || admission.run.run_id != request.run_id
+        {
+            return Err("terminal settlement admission does not match the requested run".into());
+        }
+        self.settle_terminal_from_locked_run_in_transaction(tx, request, admission)
             .await
     }
 
@@ -12991,8 +13042,9 @@ impl DatabaseRunStateStore {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         request: AtomicRunTerminalSettlementRequest<'_>,
-        run: DurableRunRecord,
+        admission: AtomicRunTerminalSettlementAdmission,
     ) -> Result<Option<AtomicRunTerminalSettlementCommit>, String> {
+        let run = admission.run;
         let terminal_origin = cancelled_terminal_origin(request.status, request.events)?;
         let terminal_error_code = terminal_error_code_from_transition(
             request.status,
@@ -13005,7 +13057,24 @@ impl DatabaseRunStateStore {
             return Ok(None);
         }
         ensure_terminal_status_immutable(&run, request.status)?;
-        let lineage_markers = lock_durable_lineage_cancellation_markers_tx(tx, &run).await?;
+        let segments = validated_durable_lineage_segments(&run)?;
+        let lineage_markers = if segments.len() == 1 {
+            // The root is the complete lineage and is still write-locked by
+            // admission. A second SELECT cannot observe a different marker.
+            DurableLineageCancellationMarkers {
+                direct: admission.cancellation_requested,
+                ancestor: false,
+            }
+        } else {
+            lock_durable_lineage_cancellation_markers_for_segments_tx(
+                tx,
+                &run.user_id,
+                &run.session_id,
+                &run.run_id,
+                &segments,
+            )
+            .await?
+        };
         if !cancellation_markers_admit_transition(terminal_origin, lineage_markers) {
             return Ok(None);
         }
@@ -38721,6 +38790,105 @@ mod tests {
             .execute(pool.get())
             .await
             .expect("cleanup approval authority sessions");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_terminal_admission_preserves_identity_and_lineage_cancellation() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        for (cancelled, child) in [(false, false), (true, false), (true, true)] {
+            let user_id = format!("terminal-admission-u-{}", Uuid::new_v4());
+            let session_id = format!("terminal-admission-s-{}", Uuid::new_v4());
+            let root_id = format!("terminal-admission-root-{}", Uuid::new_v4());
+            let child_id = format!("terminal-admission-child-{}", Uuid::new_v4());
+            insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+            let mut root = durable_run_record(&root_id);
+            root.user_id = user_id.clone();
+            root.session_id = session_id.clone();
+            store.insert_run(root).await.expect("insert root");
+            if child {
+                let mut run = durable_run_record(&child_id);
+                run.user_id = user_id.clone();
+                run.session_id = session_id.clone();
+                run.parent_run_id = Some(root_id.clone());
+                run.root_run_id = Some(root_id.clone());
+                run.ancestor_path = Some(format!("{root_id}/{child_id}"));
+                run.depth = 1;
+                store.insert_run(run).await.expect("insert child");
+            }
+            if cancelled {
+                sqlx::query("UPDATE agent_runs SET cancellation_requested_at = NOW(6) WHERE user_id = ? AND run_id = ?")
+                    .bind(&user_id).bind(&root_id).execute(pool.get()).await.expect("mark direct or ancestor cancellation");
+            }
+            let run_id = if child { &child_id } else { &root_id };
+            let events = [json!({"event_type":"run_finished", "data":{"status":STATUS_COMPLETED}})];
+            let request = AtomicRunTerminalSettlementRequest {
+                user_id: &user_id,
+                run_id,
+                expected_session_id: &session_id,
+                expected_statuses: &[STATUS_RUNNING],
+                expected_owner_generation: 0,
+                status: STATUS_COMPLETED,
+                waiting_for: None,
+                error_message: None,
+                events: &events,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                tool_calls: 0,
+            };
+            let mut tx = pool.get().begin().await.expect("begin terminal admission");
+            let admission = store
+                .admit_terminal_settlement_in_transaction(&mut tx, &user_id, &session_id, run_id)
+                .await
+                .expect("admit exact run")
+                .expect("run exists");
+            let error = store
+                .settle_terminal_in_admitted_transaction(
+                    &mut tx,
+                    AtomicRunTerminalSettlementRequest {
+                        expected_session_id: "foreign-session",
+                        ..request
+                    },
+                    admission,
+                )
+                .await
+                .expect_err("admission cannot cross session identity");
+            assert!(error.contains("admission does not match"));
+            let admission = store
+                .admit_terminal_settlement_in_transaction(&mut tx, &user_id, &session_id, run_id)
+                .await
+                .expect("read same locked facts")
+                .expect("run exists");
+            let committed = store
+                .settle_terminal_in_admitted_transaction(&mut tx, request, admission)
+                .await
+                .expect("settle exact locked run");
+            assert_eq!(
+                committed.is_some(),
+                !cancelled,
+                "direct and ancestor cancellation must both reject completion"
+            );
+            tx.rollback()
+                .await
+                .expect("rollback isolated test settlement");
+            let run = store.load_run(&user_id, run_id).await.unwrap().unwrap();
+            assert_eq!(run.status, STATUS_RUNNING);
+            assert_eq!(run.total_prompt_tokens, 0);
+            if child {
+                cleanup_database_run_fixture(&pool, &user_id, &child_id).await;
+            }
+            cleanup_database_run_fixture(&pool, &user_id, &root_id).await;
+            sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
+                .bind(&user_id)
+                .execute(pool.get())
+                .await
+                .expect("cleanup slot");
+            sqlx::query("DELETE FROM agent_sessions WHERE user_id = ?")
+                .bind(&user_id)
+                .execute(pool.get())
+                .await
+                .expect("cleanup session");
+        }
     }
 
     #[tokio::test]

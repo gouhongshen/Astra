@@ -1494,6 +1494,11 @@ async fn lock_invocation_scope_authority(
                 }
                 if authority != InvocationScopeAuthority::Live {
                     authority
+                } else if expected.expected_control_epoch == last_event_idx {
+                    // This transaction holds the run-row lock. Event append
+                    // advances this frontier and inserts its rows atomically,
+                    // so an exact frontier has no later guidance to probe.
+                    InvocationScopeAuthority::Live
                 } else {
                     // The run row is held before its event range, preserving
                     // canonical session -> lifecycle-fence/slot -> run -> run-events
