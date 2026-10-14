@@ -2213,8 +2213,11 @@ impl AuthService for DatabaseAuthService {
                 error_response(StatusCode::UNAUTHORIZED, "Session expired or revoked")
             })?;
 
-        let memoria_origin =
-            token_origin == "memoria" || token_origin.starts_with("verified:memoria:");
+        // Legacy self-hosted access tokens used `origin: "internal"` for the
+        // same Memoria-bound subject. Keep them inside the binding/TTL contract.
+        let memoria_origin = token_origin == "internal"
+            || token_origin == "memoria"
+            || token_origin.starts_with("verified:memoria:");
         let (memoria_owner, user) = if memoria_origin {
             let owner = self.memoria_owner(&pool, &user_id).await?;
             if owner.is_none() {
