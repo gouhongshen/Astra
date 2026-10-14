@@ -6911,6 +6911,7 @@ mod tests {
         } else {
             astra_core::STATUS_RUNNING
         };
+        terminal_events.push(crate::server::run::lifecycle::AgenticRunLifecycleService::settlement_finished_test_event(authority.owner_generation));
         let append = || CanonicalLoopAppend {
             user_id: &user_id,
             session_id: &session_id,
@@ -7105,7 +7106,7 @@ mod tests {
                 .try_get::<Option<String>, _>("latest_event_type")
                 .unwrap()
                 .as_deref(),
-            Some("run_finished")
+            Some("run_settlement_finished")
         );
         assert_eq!(
             projection_row

@@ -9064,6 +9064,11 @@ impl AgenticRunLifecycleService {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn settlement_finished_test_event(execution_owner_generation: u64) -> Value {
+        Self::settlement_finished_event(execution_owner_generation)
+    }
+
     fn durable_settlement_is_in_progress(run: &DurableRunRecord) -> bool {
         let generation = run.run_generation;
         let started_key = format!("run-settlement-started:{generation}");
@@ -16305,10 +16310,18 @@ impl AgenticRunLifecycleService {
                     );
                 }
                 if persist_status_update {
+                    let settlement_finished =
+                        Self::settlement_finished_event(execution_owner_generation);
+                    let mut atomic_terminal_events = streaming_events_for_durable.clone();
+                    atomic_terminal_events.push(settlement_finished);
                     let events_for_transition: &[Value] = if persist_streaming_events {
-                        streaming_events_for_durable.as_slice()
+                        atomic_terminal_events.as_slice()
                     } else {
-                        &[]
+                        std::slice::from_ref(
+                            atomic_terminal_events
+                                .last()
+                                .expect("atomic terminal settlement always carries its fence"),
+                        )
                     };
                     let terminal_expected_statuses: &[&str] =
                         if persisted_status == RunStatus::Cancelled {
@@ -16738,14 +16751,15 @@ impl AgenticRunLifecycleService {
                     streaming_events_committed,
                 );
                 let settlement_closed = all_settlement_facts_committed
-                    && Self::persist_settlement_finished(
-                        &run_engine,
-                        &bg_user_id,
-                        &bg_session_id,
-                        &bg_run_id,
-                        execution_owner_generation,
-                    )
-                    .await;
+                    && (atomic_terminal_committed
+                        || Self::persist_settlement_finished(
+                            &run_engine,
+                            &bg_user_id,
+                            &bg_session_id,
+                            &bg_run_id,
+                            execution_owner_generation,
+                        )
+                        .await);
                 let durable_fence_closed = durable_settlement_fence_closed(
                     control_terminal_settlement_committed,
                     settlement_closed,

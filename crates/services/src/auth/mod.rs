@@ -2213,8 +2213,9 @@ impl AuthService for DatabaseAuthService {
                 error_response(StatusCode::UNAUTHORIZED, "Session expired or revoked")
             })?;
 
-        let verified_memoria_origin = token_origin.starts_with("verified:memoria:");
-        let (memoria_owner, user) = if verified_memoria_origin {
+        let memoria_origin =
+            token_origin == "memoria" || token_origin.starts_with("verified:memoria:");
+        let (memoria_owner, user) = if memoria_origin {
             let owner = self.memoria_owner(&pool, &user_id).await?;
             if owner.is_none() {
                 return Err(error_response(
@@ -2236,6 +2237,16 @@ impl AuthService for DatabaseAuthService {
                 .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "User not found"))?;
             (None, user)
         };
+        if memoria_owner.is_some()
+            && !claims.iat.is_some_and(|iat| {
+                Utc::now().timestamp() - iat < i64::from(memoria::ACCESS_TTL_SECONDS)
+            })
+        {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Memoria access token expired; refresh required",
+            ));
+        }
 
         if !user.is_active {
             return Err(error_response(StatusCode::UNAUTHORIZED, "User is inactive"));
