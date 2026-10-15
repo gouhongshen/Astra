@@ -64,6 +64,11 @@ The stable prefix should include:
 
 It should not include volatile provider online/offline status, large task lists, or transient sync counters.
 
+Canonical and resident Bash schemas share the same compact, producer-owned
+execution hint. Unconditional shell syntax limits come first, followed by a
+script route for loops and the existing external-write scope contract. This
+guidance changes neither tool admission nor sandbox permission enforcement.
+
 ## Dynamic blocks
 
 For OpenAI-compatible requests, the provider projection has at most one system
@@ -72,6 +77,10 @@ instructions are consolidated there. Runtime facts and advisory evidence are
 separate user-role messages marked `astra-runtime-context`; this wire role does
 not turn them into canonical human requests. Genuine user content and real
 assistant/tool groups retain their identity and order.
+
+Turn focus and acknowledgments refer to human-authored requests and facts.
+Marked runtime-owned observations are evidence for that active request, not a
+new request to answer or acknowledge, even when their provider wire role is user.
 
 Delivery and authority are independent. Required context is not automatically a
 system instruction. The producer-owned injection kind selects policy; the

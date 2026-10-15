@@ -727,7 +727,7 @@ pub fn skill_tool_schema_v2() -> Value {
                  capability-source Skill. For listed skills, call it only when the user's \
                  request matches a canonical name or alias in that listing; never invent or \
                  infer a skill name. For a capability-source selection with kind=skill, copy \
-                 its opaque selection_key exactly into skill_name; title is only a display label. \
+                 its selection_key exactly into skill_name; title is only a display label. \
                  For work this agent owns, \
                  call a matching skill before substantive work on that objective. \
                  If a child owns the objective, launch it first and let the child \
@@ -2385,7 +2385,7 @@ mod tests {
             schema["function"]["parameters"]["properties"]["skill_name"]["description"]
                 .as_str()
                 .unwrap();
-        assert!(description.contains("copy its opaque selection_key exactly"));
+        assert!(description.contains("copy its selection_key exactly"));
         assert!(description.contains("title is only a display label"));
         assert!(name_description.contains("exact selection_key"));
     }

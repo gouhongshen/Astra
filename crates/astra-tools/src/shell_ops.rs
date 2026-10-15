@@ -20,6 +20,8 @@ use crate::exit_semantics::{
 };
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
+use crate::shell_output_capture::{BashOutputCapture, CaptureReceipt, CaptureWriter};
+
 const GREP_TIMEOUT: Duration = Duration::from_secs(20);
 const GREP_MAX_RENDERED_LINE_CHARS: usize = 1_200;
 
@@ -467,6 +469,11 @@ enum StreamKind {
     Stderr,
 }
 
+struct StreamLimits {
+    stdout: usize,
+    stderr: usize,
+}
+
 pub(crate) struct ReadOnlyCommandOutput {
     pub(crate) stdout: String,
     pub(crate) stderr: String,
@@ -486,6 +493,13 @@ pub(crate) struct ReadOnlyCommandOutput {
     /// This never authorizes a receipt; it forces workspace attribution
     /// quarantine until a later authoritative observation.
     pub(crate) scope_quarantined: bool,
+    capture: Option<PendingCapture>,
+}
+
+struct PendingCapture {
+    owner: BashOutputCapture,
+    streams_complete: bool,
+    command_complete: bool,
 }
 
 const INTERNAL_SCOPE_SETTLED_FIELD: &str = "_astra_scope_settled";
@@ -1513,15 +1527,32 @@ async fn execute_bash_inner(
     let output_limit = per_tool_output_limit("bash");
     let raw_stdout_limit = output_limit.saturating_mul(2).max(16_384);
     let raw_stderr_limit = output_limit.clamp(8_192, 32_768);
+    // Leave room for stderr labels, exit notes, and redaction markers in the
+    // bounded inline view before deciding that the raw bytes need no file.
+    // The model presents at most this many characters. Use the same value as
+    // a conservative byte threshold so Bash never deletes the only directly
+    // readable copy of output that a later model boundary may omit.
+    let capture_inline_threshold =
+        output_limit.min(astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS);
+    let capture = match BashOutputCapture::start(
+        workspace_root,
+        capture_inline_threshold.saturating_sub(1024),
+    ) {
+        Ok(capture) => capture,
+        Err(error) => return attach_source_preimage(ToolResult::error(error), source_preimages),
+    };
 
-    let output = match run_owned_bash_command_with_partial(
+    let mut output = match run_owned_bash_command_with_partial(
         &mut cmd,
         foreground_owner,
         timeout,
-        raw_stdout_limit,
-        raw_stderr_limit,
+        StreamLimits {
+            stdout: raw_stdout_limit,
+            stderr: raw_stderr_limit,
+        },
         ctx.cancel_token.as_deref(),
         "bash command",
+        capture,
     )
     .await
     {
@@ -1549,6 +1580,54 @@ async fn execute_bash_inner(
     // partial value in stdout/stderr for a later pass to miss.
     result = astra_text_utils::credential_redaction::redact_credentials_for_display(&result).0;
 
+    let retain_for_preview = output.stdout_capped
+        || output.stderr_capped
+        || result.len().saturating_add(1024) > capture_inline_threshold;
+    let capture = finish_capture(output.capture.take(), retain_for_preview).await;
+
+    if let Some(Ok(receipt)) = capture.as_ref() {
+        let mut note = format!(
+            "[bash full output: stdout={} ({} bytes, sha256={}); stderr={} ({} bytes, sha256={}); complete={}]",
+            receipt.stdout.path.display(),
+            receipt.stdout.bytes,
+            receipt.stdout.sha256,
+            receipt.stderr.path.display(),
+            receipt.stderr.bytes,
+            receipt.stderr.sha256,
+            receipt.complete,
+        );
+        if receipt.complete {
+            note.push_str("\n[Copy the saved paths exactly; filter or format these files locally, emitting only the fields or sections needed for the answer. Do not rerun the original command merely to change presentation. Compute reported counts, groups and totals with code, not by estimating rows.]");
+        }
+        if let Some(failure) = receipt.failure {
+            note.push_str(&format!(
+                "\n[bash output capture failed: {failure}; files are incomplete]"
+            ));
+        }
+        // Keep the receipt and terminal facts in the inline view. Only a
+        // short, already-redacted preview belongs in the next model round;
+        // the raw complete streams are available through the file paths.
+        let inline_budget =
+            output_limit.min(astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS / 2);
+        let preview_budget = inline_budget.saturating_sub(note.len() + 2 + 512);
+        let preview = if result.len() > preview_budget {
+            if preview_budget > 12 {
+                astra_text_utils::credential_redaction::truncate_redacted_output(
+                    result,
+                    preview_budget - 12,
+                )
+            } else {
+                String::new()
+            }
+        } else {
+            result
+        };
+        result = format!("{note}\n\n{preview}");
+    } else if let Some(Err(failure)) = capture.as_ref() {
+        result =
+            format!("[bash output capture failed: {failure}; no complete output file]\n\n{result}");
+    }
+
     let mut cap_notes = Vec::new();
     if output.stdout_capped {
         cap_notes.push("stdout capped");
@@ -1561,8 +1640,13 @@ async fn execute_bash_inner(
             result.push_str("\n\n");
         }
         result.push_str(&format!(
-            "[bash output capped before completion: {}]",
-            cap_notes.join(", ")
+            "[bash inline preview capped: {}{}]",
+            cap_notes.join(", "),
+            if capture.as_ref().is_some_and(Result::is_ok) {
+                "; read the full output files above"
+            } else {
+                ""
+            },
         ));
     }
 
@@ -1598,6 +1682,7 @@ async fn execute_bash_inner(
             output.scope_ownership,
             output.scope_quarantined,
             output.descendants_terminated,
+            capture.as_ref(),
         );
     }
 
@@ -1623,6 +1708,31 @@ async fn execute_bash_inner(
             output.scope_ownership,
             output.scope_quarantined,
             output.descendants_terminated,
+            capture.as_ref(),
+        );
+    }
+
+    if capture.as_ref().is_some_and(|capture| match capture {
+        Ok(receipt) => !receipt.complete,
+        Err(_) => true,
+    }) {
+        return attach_scope_settled(
+            attach_source_preimage(
+                ToolResult::error(
+                    astra_text_utils::credential_redaction::truncate_redacted_output(
+                        result,
+                        output_limit,
+                    ),
+                )
+                .with_exit_semantics(ExitSemantics::ExecutionError)
+                .with_exit_code(output.exit_code),
+                source_preimages,
+            ),
+            output.scope_settled,
+            output.scope_ownership,
+            output.scope_quarantined,
+            output.descendants_terminated,
+            capture.as_ref(),
         );
     }
 
@@ -1651,6 +1761,7 @@ async fn execute_bash_inner(
                 output.scope_ownership,
                 output.scope_quarantined,
                 output.descendants_terminated,
+                capture.as_ref(),
             );
         }
         return attach_scope_settled(
@@ -1665,6 +1776,7 @@ async fn execute_bash_inner(
             output.scope_ownership,
             output.scope_quarantined,
             output.descendants_terminated,
+            capture.as_ref(),
         );
     }
 
@@ -1693,6 +1805,7 @@ async fn execute_bash_inner(
             output.scope_ownership,
             output.scope_quarantined,
             output.descendants_terminated,
+            capture.as_ref(),
         )
     } else {
         attach_scope_settled(
@@ -1712,6 +1825,7 @@ async fn execute_bash_inner(
             output.scope_ownership,
             output.scope_quarantined,
             output.descendants_terminated,
+            capture.as_ref(),
         )
     }
 }
@@ -1722,6 +1836,7 @@ fn attach_scope_settled(
     ownership: Option<astra_sandbox::ScopeOwnership>,
     quarantined: bool,
     descendants_terminated: bool,
+    capture: Option<&Result<CaptureReceipt, String>>,
 ) -> ToolResult {
     result
         .metadata
@@ -1759,6 +1874,22 @@ fn attach_scope_settled(
         let metadata = result.metadata.as_mut().expect("scope metadata inserted");
         metadata.insert("background_children_reaped".to_string(), Value::Bool(true));
         metadata.insert("descendant_persistence".to_string(), Value::Bool(false));
+    }
+    if let Some(capture) = capture {
+        let value = match capture {
+            Ok(receipt) => serde_json::json!({
+                "stdout": {"path": receipt.stdout.path, "bytes": receipt.stdout.bytes, "sha256": receipt.stdout.sha256},
+                "stderr": {"path": receipt.stderr.path, "bytes": receipt.stderr.bytes, "sha256": receipt.stderr.sha256},
+                "complete": receipt.complete,
+                "failure": receipt.failure,
+            }),
+            Err(failure) => serde_json::json!({"complete": false, "failure": failure}),
+        };
+        result
+            .metadata
+            .as_mut()
+            .expect("scope metadata inserted")
+            .insert("bash_output_capture".into(), value);
     }
     result
 }
@@ -2007,6 +2138,7 @@ pub async fn grep_at_authorized_path(
         scope_ownership: _scope_ownership,
         scope_quarantined: _scope_quarantined,
         descendants_terminated: _descendants_terminated,
+        capture: _capture,
     } = match command_output {
         Ok(output) => output,
         Err(e) => return ToolResult::error(e),
@@ -2288,6 +2420,7 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         scope_ownership: _scope_ownership,
         scope_quarantined: _scope_quarantined,
         descendants_terminated: _descendants_terminated,
+        capture: _capture,
     } = match command_output {
         Ok(output) => output,
         Err(e) => return ToolResult::error(e),
@@ -3378,6 +3511,7 @@ async fn run_grep_with_grep(
         scope_ownership: None,
         scope_quarantined: false,
         descendants_terminated: false,
+        capture: None,
     })
 }
 
@@ -3470,6 +3604,7 @@ async fn run_grep_multiline_locally(
         scope_ownership: None,
         scope_quarantined: false,
         descendants_terminated: false,
+        capture: None,
     })
 }
 
@@ -3914,10 +4049,13 @@ async fn run_readonly_command_with_partial(
         cmd,
         None,
         timeout,
-        max_stdout_bytes,
-        max_stderr_bytes,
+        StreamLimits {
+            stdout: max_stdout_bytes,
+            stderr: max_stderr_bytes,
+        },
         cancel_token,
         command_kind,
+        None,
     )
     .await
 }
@@ -3926,19 +4064,19 @@ async fn run_owned_bash_command_with_partial(
     cmd: &mut Command,
     owner: astra_sandbox::BashInvocationOwner,
     timeout: Duration,
-    max_stdout_bytes: usize,
-    max_stderr_bytes: usize,
+    limits: StreamLimits,
     cancel_token: Option<&CancellationToken>,
     command_kind: &str,
+    capture: (BashOutputCapture, CaptureWriter, CaptureWriter),
 ) -> Result<ReadOnlyCommandOutput, String> {
     run_command_with_partial(
         cmd,
         Some(owner),
         timeout,
-        max_stdout_bytes,
-        max_stderr_bytes,
+        limits,
         cancel_token,
         command_kind,
+        Some(capture),
     )
     .await
 }
@@ -3947,11 +4085,15 @@ async fn run_command_with_partial(
     cmd: &mut Command,
     mut invocation_owner: Option<astra_sandbox::BashInvocationOwner>,
     timeout: Duration,
-    max_stdout_bytes: usize,
-    max_stderr_bytes: usize,
+    limits: StreamLimits,
     cancel_token: Option<&CancellationToken>,
     command_kind: &str,
+    capture: Option<(BashOutputCapture, CaptureWriter, CaptureWriter)>,
 ) -> Result<ReadOnlyCommandOutput, String> {
+    let StreamLimits {
+        stdout: max_stdout_bytes,
+        stderr: max_stderr_bytes,
+    } = limits;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     // Put the child into its own process group so `kill -9 -<pgid>` on
@@ -4011,9 +4153,19 @@ async fn run_command_with_partial(
         .take()
         .ok_or_else(|| format!("Error: failed to capture {command_kind} stderr"))?;
 
+    let (capture_owner, stdout_capture, stderr_capture) = match capture {
+        Some((owner, stdout, stderr)) => (Some(owner), Some(stdout), Some(stderr)),
+        None => (None, None, None),
+    };
+    let capture_state = capture_owner.as_ref().map(BashOutputCapture::state);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(StreamKind, String)>(256);
-    let stdout_task = tokio::spawn(read_stream(stdout, StreamKind::Stdout, tx.clone()));
-    let stderr_task = tokio::spawn(read_stream(stderr, StreamKind::Stderr, tx));
+    let stdout_task = tokio::spawn(read_stream(
+        stdout,
+        StreamKind::Stdout,
+        tx.clone(),
+        stdout_capture,
+    ));
+    let stderr_task = tokio::spawn(read_stream(stderr, StreamKind::Stderr, tx, stderr_capture));
 
     let deadline = tokio::time::Instant::now() + timeout;
     let mut stdout_text = String::new();
@@ -4061,6 +4213,22 @@ async fn run_command_with_partial(
                 break;
             }
             Ok(None) => {
+                if capture_state.as_ref().is_some_and(|state| state.failed()) {
+                    scope_ownership = if let Some(owner) = invocation_owner.take() {
+                        terminate_owned_tokio_child(&mut child, owner, leader_pid).await
+                    } else {
+                        terminate_child_gracefully(&mut child, TERM_GRACE_PERIOD).await;
+                        process_scope
+                            .as_ref()
+                            .and_then(|scope| scope.settle_for_observation(leader_pid))
+                    };
+                    exit_code = child
+                        .try_wait()
+                        .ok()
+                        .flatten()
+                        .map(|status| exit_code_from_status(&status));
+                    break;
+                }
                 if tokio::time::Instant::now() >= deadline {
                     timed_out = true;
                     scope_ownership = if let Some(owner) = invocation_owner.take() {
@@ -4139,6 +4307,11 @@ async fn run_command_with_partial(
                     scope_ownership,
                     scope_quarantined,
                     descendants_terminated: false,
+                    capture: capture_owner.map(|owner| PendingCapture {
+                        owner,
+                        streams_complete: streams_settled,
+                        command_complete: false,
+                    }),
                 });
             }
         }
@@ -4149,7 +4322,8 @@ async fn run_command_with_partial(
     // wait for that descendant indefinitely: the tool boundary must return a
     // typed timeout/cancellation result, and an unsettled stream cannot
     // support a trusted workspace receipt.
-    if !join_command_streams_bounded(stdout_task, stderr_task).await {
+    let streams_settled = join_command_streams_bounded(stdout_task, stderr_task).await;
+    if !streams_settled {
         scope_ownership = None;
         scope_quarantined = true;
     }
@@ -4174,6 +4348,8 @@ async fn run_command_with_partial(
         truncate_partial_line(&mut stderr_text);
     }
 
+    let command_complete =
+        !timed_out && !cancelled && scope_ownership.is_some() && !scope_quarantined;
     Ok(ReadOnlyCommandOutput {
         stdout: stdout_text,
         stderr: stderr_text,
@@ -4186,7 +4362,34 @@ async fn run_command_with_partial(
         scope_ownership,
         scope_quarantined,
         descendants_terminated,
+        capture: capture_owner.map(|owner| PendingCapture {
+            owner,
+            streams_complete: streams_settled,
+            command_complete,
+        }),
     })
+}
+
+async fn finish_capture(
+    capture: Option<PendingCapture>,
+    retain_for_preview: bool,
+) -> Option<Result<CaptureReceipt, String>> {
+    match capture {
+        Some(capture) => match capture
+            .owner
+            .finish(
+                capture.streams_complete,
+                capture.command_complete,
+                retain_for_preview,
+            )
+            .await
+        {
+            Ok(Some(receipt)) => Some(Ok(receipt)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        },
+        None => None,
+    }
 }
 
 const COMMAND_STREAM_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -4282,16 +4485,29 @@ async fn read_stream<R>(
     mut stream: R,
     kind: StreamKind,
     tx: tokio::sync::mpsc::Sender<(StreamKind, String)>,
+    mut capture: Option<CaptureWriter>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut buffer = [0u8; 8192];
+    let mut utf8_pending = Vec::new();
     loop {
         match stream.read(&mut buffer).await {
-            Ok(0) => break,
+            Ok(0) => {
+                let text = decode_stream_utf8(&mut utf8_pending, &[], true);
+                if !text.is_empty() {
+                    let _ = tx.send((kind, text)).await;
+                }
+                break;
+            }
             Ok(read) => {
-                let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
-                if tx.send((kind, text)).await.is_err() {
+                if let Some(writer) = capture.as_mut()
+                    && writer.write(&buffer[..read]).await.is_err()
+                {
+                    break;
+                }
+                let text = decode_stream_utf8(&mut utf8_pending, &buffer[..read], false);
+                if !text.is_empty() && tx.send((kind, text)).await.is_err() {
                     tracing::warn!(
                         stream_kind = ?kind,
                         "command output channel closed; {} bytes of output lost",
@@ -4300,9 +4516,52 @@ async fn read_stream<R>(
                     break;
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                if let Some(writer) = capture.as_ref() {
+                    writer.read_failed();
+                }
+                break;
+            }
         }
     }
+    if let Some(writer) = capture {
+        let _ = writer.finish().await;
+    }
+}
+
+fn decode_stream_utf8(pending: &mut Vec<u8>, bytes: &[u8], eof: bool) -> String {
+    let mut data = std::mem::take(pending);
+    data.extend_from_slice(bytes);
+    let mut display = String::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        match std::str::from_utf8(&data[offset..]) {
+            Ok(text) => {
+                display.push_str(text);
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                display.push_str(
+                    std::str::from_utf8(&data[offset..offset + valid]).expect("UTF-8 valid prefix"),
+                );
+                offset += valid;
+                if let Some(invalid) = error.error_len() {
+                    display.push('\u{FFFD}');
+                    offset += invalid;
+                } else {
+                    if eof {
+                        display.push_str(&String::from_utf8_lossy(&data[offset..]));
+                    } else {
+                        pending.extend_from_slice(&data[offset..]);
+                        debug_assert!(pending.len() <= 3);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    display
 }
 
 fn drain_command_chunks(
@@ -5865,6 +6124,43 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
+    fn validate_execute_bash_preserves_static_redirect_targets() {
+        let dir = tempdir().expect("workspace");
+        let root = dir.path();
+        let command = format!(
+            "mkdir -p '{0}/results' && printf data > '{0}/results/output.json'",
+            root.display()
+        );
+        assert!(
+            validate_execute_bash_command_in_workspace_from(&command, root, root).is_ok(),
+            "static redirects and directory creation inside the workspace must be allowed"
+        );
+
+        let outside = tempdir().expect("outside workspace");
+        let command = format!(
+            "mkdir -p '{0}/results' && printf data > '{1}/output.json'",
+            root.display(),
+            outside.path().display()
+        );
+        assert!(
+            validate_execute_bash_command_in_workspace_from(&command, root, root).is_err(),
+            "a static redirect outside the workspace must still be rejected"
+        );
+        for operator in ["<&-", ">&-"] {
+            for program in ["touch", "mkdir", "cp seed.txt"] {
+                let command = format!(
+                    "{program} {operator} '{}/outside.txt'",
+                    outside.path().display()
+                );
+                assert!(
+                    validate_execute_bash_command_in_workspace_from(&command, root, root).is_err(),
+                    "descriptor closure must not hide a command argument: {command}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn weak_scope_quarantine_uses_process_authority() {
         assert!(bash_scope_requires_attribution_quarantine(Some(
             astra_sandbox::ScopeOwnership::ForegroundProcessGroup
@@ -6482,6 +6778,282 @@ printf 'probe.txt:1:needle\n'
 
         assert!(!result.is_error, "{}", result.output);
         assert_eq!(result.output, "Bearer task-scoped-grant");
+    }
+
+    #[tokio::test]
+    async fn foreground_bash_large_output_is_complete_in_workspace_and_bounded_inline() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "seq 1 20000; seq 1 20000 >&2"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.len() < 100_000);
+        let capture = result
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("bash_output_capture")
+            .unwrap();
+        assert_eq!(capture["complete"], true);
+        let stdout = capture["stdout"]["path"].as_str().unwrap();
+        let stderr = capture["stderr"]["path"].as_str().unwrap();
+        let stdout_bytes = std::fs::read(stdout).unwrap();
+        let stderr_bytes = std::fs::read(stderr).unwrap();
+        assert_eq!(stdout_bytes, stderr_bytes);
+        assert!(stdout_bytes.ends_with(b"20000\n"));
+        assert_eq!(
+            capture["stdout"]["bytes"].as_u64(),
+            Some(stdout_bytes.len() as u64)
+        );
+        assert_eq!(
+            capture["stdout"]["sha256"].as_str(),
+            Some(hex::encode(Sha256::digest(&stdout_bytes)).as_str())
+        );
+        let read = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": format!("tail -n 1 '{}' && tail -n 1 '{}'", stdout, stderr)}),
+        )
+        .await;
+        assert!(!read.is_error, "{}", read.output);
+        assert_eq!(read.output, "20000\n20000\n");
+    }
+
+    #[tokio::test]
+    async fn foreground_bash_small_output_and_explicit_redirect_leave_no_capture_files() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "printf 'small' | wc -c; printf saved > explicit.txt"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output.trim(), "5");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("explicit.txt")).unwrap(),
+            "saved"
+        );
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("bash_output_capture")
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("astra-bash-outputs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn stream_utf8_decoder_preserves_split_characters_and_lossy_invalid_bytes() {
+        let mut pending = Vec::new();
+        let mut first = vec![b'a'; 8191];
+        first.push(0xe4);
+        assert_eq!(
+            decode_stream_utf8(&mut pending, &first, false),
+            "a".repeat(8191)
+        );
+        assert_eq!(pending, [0xe4]);
+        assert_eq!(decode_stream_utf8(&mut pending, &[0xb8, 0xad], false), "中");
+        assert!(pending.is_empty());
+        assert_eq!(decode_stream_utf8(&mut pending, &[0xff], true), "\u{FFFD}");
+    }
+
+    #[tokio::test]
+    async fn foreground_bash_small_utf8_output_is_not_corrupted_or_retained() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "python3 -c 'import sys; sys.stdout.buffer.write(b\"a\" * 4095 + \"中\".encode())'"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output, format!("{}中", "a".repeat(4095)));
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("bash_output_capture")
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("astra-bash-outputs"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_bash_large_nonzero_preserves_exit_and_complete_output() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result =
+            execute_bash(&ctx, &serde_json::json!({"command": "seq 1 50000; exit 7"})).await;
+        assert!(result.is_error);
+        let metadata = result.metadata.as_ref().unwrap();
+        assert_eq!(metadata["exit_code"], 7);
+        assert_eq!(metadata["bash_output_capture"]["complete"], true);
+        let path = metadata["bash_output_capture"]["stdout"]["path"]
+            .as_str()
+            .unwrap();
+        assert!(std::fs::read(path).unwrap().ends_with(b"50000\n"));
+    }
+
+    #[tokio::test]
+    async fn foreground_bash_output_above_model_budget_stays_in_workspace_file() {
+        use sha2::{Digest, Sha256};
+
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(&ctx, &serde_json::json!({"command": "seq 1 10000"})).await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(
+            result.output.len() <= astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS / 2
+        );
+        let receipt = &result.metadata.as_ref().unwrap()["bash_output_capture"];
+        assert_eq!(receipt["complete"], true);
+        let path = receipt["stdout"]["path"].as_str().unwrap();
+        assert!(result.output.contains(path));
+        assert!(
+            result
+                .output
+                .contains(receipt["stdout"]["sha256"].as_str().unwrap())
+        );
+        assert!(result.output.contains("complete=true"));
+        let (receipt_text, preview) = result.output.split_once("\n\n").unwrap();
+        assert!(receipt_text.contains("Copy the saved paths exactly"));
+        assert!(receipt_text.contains("filter or format these files locally"));
+        assert!(receipt_text.contains("only the fields or sections needed"));
+        assert!(receipt_text.contains(
+            "Compute reported counts, groups and totals with code, not by estimating rows"
+        ));
+        assert!(
+            receipt_text
+                .contains("Do not rerun the original command merely to change presentation")
+        );
+        assert!(preview.starts_with("1\n2\n"));
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.len() > astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS);
+        assert!(bytes.len() < per_tool_output_limit("bash"));
+        assert!(bytes.ends_with(b"10000\n"));
+        assert_eq!(
+            receipt["stdout"]["sha256"].as_str(),
+            Some(hex::encode(Sha256::digest(&bytes)).as_str())
+        );
+        let followup = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": format!("tail -n 1 '{}'", path)}),
+        )
+        .await;
+        assert!(!followup.is_error, "{}", followup.output);
+        assert_eq!(followup.output.trim(), "10000");
+    }
+
+    #[tokio::test]
+    async fn foreground_bash_timeout_keeps_partial_capture_without_claiming_completion() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "seq 1 20000; sleep 2", "timeout": 0.2}),
+        )
+        .await;
+        assert!(result.is_error);
+        let metadata = result.metadata.as_ref().unwrap();
+        assert_eq!(metadata["exit_semantics"], "timed_out");
+        assert_eq!(metadata["bash_output_capture"]["complete"], false);
+        assert!(!result.output.contains("Copy the saved paths exactly"));
+        assert!(!result.output.contains("Compute reported counts"));
+        let path = metadata["bash_output_capture"]["stdout"]["path"]
+            .as_str()
+            .unwrap();
+        assert!(std::fs::read(path).unwrap().ends_with(b"20000\n"));
+    }
+
+    #[tokio::test]
+    async fn foreground_bash_stderr_cap_still_retains_full_stderr() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(&ctx, &serde_json::json!({"command": "seq 1 10000 >&2"})).await;
+        assert!(!result.is_error, "{}", result.output);
+        let capture = &result.metadata.as_ref().unwrap()["bash_output_capture"];
+        assert_eq!(capture["complete"], true);
+        let path = capture["stderr"]["path"].as_str().unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.len() > 32_768);
+        assert!(bytes.ends_with(b"10000\n"));
+    }
+
+    #[tokio::test]
+    async fn foreground_bash_binary_and_unicode_output_remain_byte_exact() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        for (command, expected) in [
+            (
+                "python3 -c 'import sys; sys.stdout.buffer.write(bytes([255])*50000)'",
+                vec![255u8; 50_000],
+            ),
+            (
+                "python3 -c 'import sys; sys.stdout.buffer.write(\"中\".encode()*30000)'",
+                "中".repeat(30_000).into_bytes(),
+            ),
+        ] {
+            let result = execute_bash(&ctx, &serde_json::json!({"command": command})).await;
+            assert!(!result.is_error, "{}", result.output);
+            let capture = &result.metadata.as_ref().unwrap()["bash_output_capture"];
+            assert_eq!(capture["complete"], true);
+            let path = capture["stdout"]["path"].as_str().unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_bash_display_redaction_does_not_change_raw_capture() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": format!("printf '{token}\\n'; seq 1 20000")}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(!result.output.contains(token));
+        let capture = &result.metadata.as_ref().unwrap()["bash_output_capture"];
+        let path = capture["stdout"]["path"].as_str().unwrap();
+        assert!(std::fs::read_to_string(path).unwrap().starts_with(token));
+    }
+
+    #[test]
+    fn post_execution_capture_failure_keeps_process_facts() {
+        let failure: Result<CaptureReceipt, String> =
+            Err("Error: unable to read Bash capture".into());
+        let result = attach_scope_settled(
+            ToolResult::error("capture failed".into()).with_exit_code(7),
+            true,
+            Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup),
+            false,
+            false,
+            Some(&failure),
+        );
+        let metadata = result.metadata.unwrap();
+        assert_eq!(metadata[INTERNAL_EXECUTION_STARTED_FIELD], true);
+        assert_eq!(metadata[INTERNAL_SCOPE_SETTLED_FIELD], true);
+        assert_eq!(metadata["exit_code"], 7);
+        assert_eq!(metadata["bash_output_capture"]["complete"], false);
     }
 
     #[tokio::test]

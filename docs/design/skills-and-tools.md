@@ -100,12 +100,25 @@ that every workload is cheaper. Explicitly pinned utility tools remain supported
 
 A skill may require tools, but it does not make those tools available by itself. Provider decision still controls whether a required capability can run in the current session.
 
-Capability-source discovery returns an opaque, run-scoped `selection_key` and an
-exact activation hint for each result. A Tool selection enters through
+Capability-source discovery returns an exact `selection_key` and activation
+hint for each result. Names have the form
+`skill__cap__<native-label>__<16hex>` or `mcp__cap__<native-label>__<16hex>`.
+The label encodes the native ID, not the display title: lowercase ASCII letters,
+digits, underscores and hyphens are retained, other ASCII becomes `_`, and
+non-ASCII codepoints become `u` plus lowercase hex. Whole encoded units are
+retained up to 24 bytes. The suffix hashes the source configuration, discovery
+tool, kind and complete capability reference, including its snapshot and
+descriptor digest. Thus identical source descriptors have stable names across
+runs, while same-name capabilities remain distinct. Conflicting full receipts
+at a short key are rejected, never overwritten or automatically renamed.
+A Tool selection enters through
 `tool_search(select:...)`; a Skill selection enters through
 `skill(skill_name=...)`. The display title is not an invocation name. Both paths
 resolve the selection against runtime custody and policy before reading or
-executing the capability.
+executing the capability. A stable name is not a grant: each run still needs its
+own discovered receipt, with unchanged identity, generation, snapshot and
+current-use checks. Malformed names in the reserved capability namespace fail
+at that owner, without local-name lookup or fuzzy matching.
 
 ## Skill lifecycle
 

@@ -76,6 +76,48 @@ Edge/CLI local runtime may expose local capabilities only within declared author
 
 Path authority must be checked before execution. A model-provided path is not authority by itself.
 
+### Foreground Bash output
+
+The local and Edge foreground Bash executor keeps stdout and stderr pipes as
+the command's own stdout and stderr. It also captures their original bytes in
+separate `0600` files with a shared random 16-lowercase-hex basename and
+`.stdout` / `.stderr` suffixes under the selected workspace's
+`astra-bash-outputs/` directory. This dedicated top-level directory holds
+ordinary user-readable output data, not Astra's private `.astra/` state; it is
+excluded from executor workspace-mutation fingerprints without excluding
+other user paths. Git-backed observation excludes that exact directory before
+its bounded status probe, so retained outputs do not consume the mutation
+observer's byte or entry budget. This is a tap after the top-level Bash
+process, so shell pipelines and explicit redirection keep their normal
+behavior. The file-retention threshold is the lesser of the configured
+per-tool byte limit and the shared 8,000-character model inline budget, minus
+1,024 bytes reserved for status text; stream-preview capping also retains the
+files. Byte counting is conservative for UTF-8. Retained results return both
+file paths, byte counts and SHA-256 digests. The redacted preview uses space
+remaining after the receipt and terminal facts in a 4,000-byte presentation
+target; an exceptionally long workspace path can make the mandatory receipt
+itself exceed that target. A complete capture's receipt instructs the caller
+to copy its paths exactly and filter or format the saved files locally,
+emitting only the fields or sections needed for the answer instead of
+rerunning the original command merely to change presentation. This guidance
+precedes the preview and consumes the same inline budget; incomplete captures
+do not receive it. File names are ordinary workspace paths, not authority or
+aliases; exclusive creation rejects a collision without overwriting a file.
+The inline view remains bounded and applies
+the existing display redaction; the files deliberately contain raw bytes and
+must be treated as ordinary user workspace data, not redacted or immutable
+session artifacts. The digest describes bytes observed when the receipt was
+created, not a guarantee against subsequent same-user modification.
+
+The combined capture hard limit is 50 MiB per invocation. Timeout,
+cancellation, stream failure or the capture limit yields an explicit
+`complete=false` result and never claims that partial files hold the full
+output. A post-execution capture failure preserves the command's exit and
+process-settlement facts. Capture files follow the selected workspace's
+lifetime: an ephemeral workspace disappears with its existing lease; a local
+workspace retains large-output files like any other Bash-created file. There
+is no independent output-file retention service.
+
 File outlines use the shared AST parser for supported languages, including
 Python stub, JavaScript module and TypeScript module extensions. Unsupported
 languages and comment-only files do not acquire signatures from text-prefix

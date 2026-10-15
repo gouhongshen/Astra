@@ -398,7 +398,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "ready_check",
                 "background_ttl",
             ][..],
-            "External mutations only: external_state_paths=minimal absolute roots; evidence needs owned foreground delta.",
+            astra_tools::schemas::BASH_COMMAND_GUIDANCE,
         ),
         "str_replace" => (
             &[

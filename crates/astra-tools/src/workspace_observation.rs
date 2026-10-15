@@ -42,6 +42,11 @@ const TRUSTED_GIT_PATH: &str = "/usr/bin:/bin";
 #[cfg(windows)]
 const TRUSTED_GIT_PATH: &str = r"C:\Windows\System32";
 
+fn is_executor_owned_fingerprint_path(path: &Path) -> bool {
+    matches!(path.components().next(), Some(Component::Normal(name))
+        if name == ".astra" || name == crate::shell_output_capture::CAPTURE_DIRECTORY_NAME)
+}
+
 /// Metadata keys carried in a `ToolResult` and projected into the lossless
 /// `ToolCallRecord`.  The scope value is intentionally explicit so a future
 /// executor cannot accidentally turn an external/scratch observation into a
@@ -3115,6 +3120,17 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
     let Some(mut status_command) = hardened_git_command(root) else {
         return GitFingerprint::UseManifest;
     };
+    let capture_path = relative_root.join(crate::shell_output_capture::CAPTURE_DIRECTORY_NAME);
+    let Some(capture_path) = capture_path.to_str() else {
+        return GitFingerprint::Unknown;
+    };
+    // Exclude the workspace's exact top-level output directory in Git, before
+    // the bounded status probe counts bytes or entries. A nested directory
+    // with the same name remains within the observed workspace.
+    let capture_exclusion = format!(
+        ":(top,exclude,literal){}/",
+        capture_path.replace(std::path::MAIN_SEPARATOR, "/")
+    );
     status_command.args([
         "status",
         "--porcelain=v1",
@@ -3127,6 +3143,7 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
         "--ignored=matching",
         "--",
         ".",
+        &capture_exclusion,
     ]);
     let Some(output) = run_bounded_probe(
         status_command,
@@ -3201,16 +3218,10 @@ fn git_status_fingerprint(root: &Path) -> GitFingerprint {
                 return GitFingerprint::Unknown;
             }
         };
-        // `.astra` is executor/session coordination state, not a user
-        // deliverable. The manifest fallback already excludes this exact
-        // top-level directory; Git-backed observation must use the same
-        // scope so creating or locking workspace coordination files cannot
-        // manufacture a mutation delta.
-        if path_from_workspace
-            .components()
-            .next()
-            .is_some_and(|component| component.as_os_str() == ".astra")
-        {
+        // Executor-owned coordination and Bash capture files must not
+        // manufacture a user-workspace mutation receipt. Only their exact
+        // top-level directories are excluded; nested names remain observable.
+        if is_executor_owned_fingerprint_path(path_from_workspace) {
             continue;
         }
         status.hash(&mut hasher);
@@ -3504,14 +3515,16 @@ fn walk_manifest(
     children.sort_by_key(|entry| entry.file_name());
 
     for entry in children {
-        let name = entry.file_name();
-        if name == ".git" || name == ".astra" {
+        if entry.file_name() == ".git" {
             continue;
         }
         let path = entry.path();
         let Some(relative) = path.strip_prefix(root).ok() else {
             return false;
         };
+        if is_executor_owned_fingerprint_path(relative) {
+            continue;
+        }
         relative.to_string_lossy().hash(hasher);
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             return false;
@@ -6678,6 +6691,113 @@ mod tests {
         .expect("workspace-local lease");
         let after = WorkspaceFingerprint::capture(temp.path()).expect("after fingerprint");
         assert!(!before.changed_from(Some(after)));
+
+        let capture_directory = temp.path().join("astra-bash-outputs");
+        fs::create_dir(&capture_directory).expect("capture directory");
+        fs::write(capture_directory.join("capture.stdout"), "generated").expect("capture");
+        let after_capture = WorkspaceFingerprint::capture(temp.path()).expect("after capture");
+        assert!(!before.changed_from(Some(after_capture.clone())));
+
+        let nested = temp.path().join("user-data/astra-bash-outputs");
+        fs::create_dir_all(&nested).expect("user directory");
+        fs::write(nested.join("notes.txt"), "user content").expect("user content");
+        let after_user = WorkspaceFingerprint::capture(temp.path()).expect("after user change");
+        assert!(after_capture.changed_from(Some(after_user)));
+    }
+
+    #[test]
+    fn capture_output_does_not_mask_other_workspace_changes_in_manifest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("baseline");
+        let capture_directory = temp.path().join("astra-bash-outputs");
+        fs::create_dir(&capture_directory).expect("capture directory");
+        fs::write(capture_directory.join("capture.stdout"), "generated").expect("capture");
+        let after_capture = WorkspaceFingerprint::capture(temp.path()).expect("after capture");
+        assert!(!before.changed_from(Some(after_capture.clone())));
+
+        let nested = temp.path().join("user-data/astra-bash-outputs");
+        fs::create_dir_all(&nested).expect("user directory");
+        fs::write(nested.join("notes.txt"), "user content").expect("user content");
+        let after_user = WorkspaceFingerprint::capture(temp.path()).expect("after user change");
+        assert!(after_capture.changed_from(Some(after_user)));
+    }
+
+    #[test]
+    fn manifest_ignores_nested_git_objects_but_observes_repo_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let nested_repo = temp.path().join("nested-repo");
+        fs::create_dir(&nested_repo).expect("nested repo directory");
+        assert!(
+            Command::new("git")
+                .args(["-C", nested_repo.to_str().unwrap(), "init", "-q"])
+                .status()
+                .expect("git available")
+                .success()
+        );
+        let large_object = fs::File::create(nested_repo.join(".git/objects/large"))
+            .expect("large nested Git object");
+        large_object
+            .set_len((MAX_STATUS_CONTENT_BYTES + 1) as u64)
+            .expect("large nested Git object size");
+        let user_file = nested_repo.join("notes.txt");
+        fs::write(&user_file, "before").expect("initial user file");
+
+        let before = WorkspaceFingerprint::capture(temp.path())
+            .expect("nested Git internals must not exhaust manifest budget");
+        fs::write(&user_file, "after").expect("updated user file");
+        let after = WorkspaceFingerprint::capture(temp.path()).expect("after user change");
+        assert!(before.changed_from(Some(after)));
+    }
+
+    #[test]
+    fn git_fingerprint_excludes_capture_files_before_status_limits() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap(), "init", "-q"])
+                .status()
+                .expect("git available")
+                .success()
+        );
+        let before = WorkspaceFingerprint::capture(temp.path()).expect("baseline");
+        let capture_directory = temp.path().join("astra-bash-outputs");
+        fs::create_dir(&capture_directory).expect("capture directory");
+        for index in 0..=MAX_STATUS_ENTRIES {
+            fs::File::create(capture_directory.join(format!("{index:05}.stdout")))
+                .expect("capture file");
+        }
+        let after = WorkspaceFingerprint::capture(temp.path())
+            .expect("capture files must not consume Git status limits");
+        assert!(!before.changed_from(Some(after.clone())));
+        fs::write(temp.path().join("user.txt"), "user content").expect("user file");
+        let after_user = WorkspaceFingerprint::capture(temp.path()).expect("after user change");
+        assert!(after.changed_from(Some(after_user)));
+    }
+
+    #[test]
+    fn git_fingerprint_excludes_only_capture_directory_of_nested_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            Command::new("git")
+                .args(["-C", temp.path().to_str().unwrap(), "init", "-q"])
+                .status()
+                .expect("git available")
+                .success()
+        );
+        let workspace = temp.path().join("nested/workspace");
+        fs::create_dir_all(&workspace).expect("nested workspace");
+        let before = WorkspaceFingerprint::capture(&workspace).expect("baseline");
+        let capture_directory = workspace.join("astra-bash-outputs");
+        fs::create_dir(&capture_directory).expect("capture directory");
+        fs::write(capture_directory.join("generated.stdout"), "generated").expect("capture file");
+        let after_capture = WorkspaceFingerprint::capture(&workspace).expect("after capture");
+        assert!(!before.changed_from(Some(after_capture.clone())));
+
+        let user_directory = workspace.join("user/astra-bash-outputs");
+        fs::create_dir_all(&user_directory).expect("user directory");
+        fs::write(user_directory.join("notes.txt"), "user content").expect("user file");
+        let after_user = WorkspaceFingerprint::capture(&workspace).expect("after user change");
+        assert!(after_capture.changed_from(Some(after_user)));
     }
 
     #[tokio::test]

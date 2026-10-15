@@ -21,6 +21,45 @@ const CANDIDATE_EVENT: &str = "capability_source_candidate";
 const DESCRIPTOR_EVENT: &str = "capability_source_descriptor";
 const MAX_PAGE: usize = 8;
 const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
+const MAX_SELECTION_LABEL_BYTES: usize = 24;
+
+// Unlike MCP display-name sanitization, selection names must be bounded ASCII
+// for every tool provider. Encode whole codepoints; never split an escape.
+fn selection_label(native_id: &str) -> String {
+    let mut label = String::new();
+    for ch in native_id.chars() {
+        let part = if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            ch.to_ascii_lowercase().to_string()
+        } else if ch.is_ascii() {
+            "_".to_string()
+        } else {
+            format!("u{:x}", u32::from(ch))
+        };
+        if label.len() + part.len() > MAX_SELECTION_LABEL_BYTES {
+            break;
+        }
+        label.push_str(&part);
+    }
+    label
+}
+
+fn valid_selection_key(key: &str) -> bool {
+    ["mcp__cap__", "skill__cap__"].iter().any(|prefix| {
+        key.strip_prefix(prefix)
+            .and_then(|suffix| suffix.rsplit_once("__"))
+            .is_some_and(|(label, digest)| {
+                !label.is_empty()
+                    && label.len() <= MAX_SELECTION_LABEL_BYTES
+                    && label.bytes().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-'
+                    })
+                    && digest.len() == 16
+                    && digest
+                        .bytes()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            })
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -199,14 +238,11 @@ impl CapabilitySourceCustody {
     }
 
     pub(crate) fn owns_selection_shape(&self, key: &str) -> bool {
-        ["mcp", "skill"].iter().any(|kind| {
-            key.strip_prefix(&format!("{kind}__cap__"))
-                .is_some_and(|suffix| {
-                    suffix.len() == 48
-                        && suffix
-                            .bytes()
-                            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-                })
+        // Reserve the namespace even for malformed names. A typo must not
+        // change execution owner by falling through to a local skill/tool.
+        ["mcp__cap__", "skill__cap__"].iter().any(|prefix| {
+            key.get(..prefix.len())
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(prefix))
         })
     }
 
@@ -239,9 +275,6 @@ impl CapabilitySourceCustody {
 
     fn selection_key(&self, receipt: &CandidateReceipt) -> String {
         let digest = content_digest(&json!([
-            receipt.user_id,
-            receipt.session_id,
-            receipt.run_id,
             receipt.source_id,
             receipt.discovery_tool,
             receipt.config_digest,
@@ -249,15 +282,16 @@ impl CapabilitySourceCustody {
             receipt.candidate.capability
         ]));
         format!(
-            "{}__cap__{}",
+            "{}__cap__{}__{}",
             match receipt.candidate.kind {
                 CapabilityKind::Tool => "mcp",
                 CapabilityKind::Skill => "skill",
             },
-            // A 192-bit opaque selection alias fits the model's 64-byte tool
-            // name budget. Custody still validates the complete reference,
-            // source identity and full SHA-256 descriptor digest.
-            &digest[7..55]
+            selection_label(&receipt.candidate.capability.native_id),
+            // A stable short disambiguator is not authority. Registration
+            // rejects conflicting full receipts; resolution still requires
+            // this run's exact receipt and complete descriptor/reference.
+            &digest[7..23]
         )
     }
 
@@ -325,7 +359,7 @@ impl CapabilitySourceCustody {
         scope: &SourceScope,
         key: &str,
     ) -> Result<CandidateReceipt, SourceError> {
-        if !self.owns_selection_shape(key) {
+        if !valid_selection_key(key) {
             return Err(SourceError::SelectionNotFound);
         }
         let value = self
@@ -1141,6 +1175,176 @@ pub(crate) mod tests {
             .unwrap()
             .remove(0)
             .selection_key
+    }
+
+    #[tokio::test]
+    async fn source_selection_names_are_stable_but_discovery_is_run_scoped() {
+        let (store, scope) = fixture().await;
+        let custody = CapabilitySourceCustody::new("source", config(), store.clone());
+        let key = register(&custody, &scope).await;
+        assert!(key.starts_with("mcp__cap__get_me__"), "{key}");
+        assert_eq!(key.rsplit("__").next().unwrap().len(), 16);
+        let mut other = scope.clone();
+        other.run_id = "other-run".into();
+        other.session_id = "other-session".into();
+        let receipt = custody.receipt(&other, "search", candidate().0).unwrap();
+        assert_eq!(custody.selection_key(&receipt), key);
+        assert_eq!(
+            custody.candidate(&other, &key).await.unwrap_err(),
+            SourceError::SelectionNotFound
+        );
+        crate::server::run::engine::RunEngine::new(store.clone())
+            .start_run(&other.run_id, &other.user_id, &other.session_id)
+            .await
+            .unwrap();
+        assert_eq!(register(&custody, &other).await, key);
+        assert_eq!(
+            custody.candidate(&other, &key).await.unwrap(),
+            candidate().0
+        );
+
+        for native_id in ["calendar", "日历/邮箱", &"长名字".repeat(20)] {
+            let mut named = candidate().0;
+            named.capability.native_id = native_id.into();
+            let receipt = custody.receipt(&scope, "search", named).unwrap();
+            let key = custody.selection_key(&receipt);
+            assert!(key.len() <= 64);
+            assert!(
+                key.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            );
+            assert!(custody.owns_selection_shape(&key));
+            let mut renamed = receipt.clone();
+            renamed.candidate.title = "Different display title".into();
+            assert_eq!(custody.selection_key(&renamed), key);
+            for changed in [
+                "source",
+                "config",
+                "discovery",
+                "binding",
+                "reference",
+                "snapshot",
+                "digest",
+                "kind",
+                "native",
+            ] {
+                let mut distinct = receipt.clone();
+                match changed {
+                    "source" => distinct.source_id.push('2'),
+                    "config" => distinct.config_digest.push('2'),
+                    "discovery" => distinct.discovery_tool.push('2'),
+                    "binding" => distinct.candidate.capability.binding_id.push('2'),
+                    "reference" => distinct.candidate.capability.reference.push('2'),
+                    "snapshot" => distinct.candidate.capability.snapshot_revision.push('2'),
+                    "digest" => {
+                        distinct.candidate.capability.descriptor_digest =
+                            format!("sha256:{}", "a".repeat(64))
+                    }
+                    "kind" => distinct.candidate.kind = CapabilityKind::Skill,
+                    "native" => distinct.candidate.capability.native_id.push('2'),
+                    _ => unreachable!(),
+                }
+                assert_ne!(custody.selection_key(&distinct), key, "{changed}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_selection_label_preserves_whole_encoded_units() {
+        assert_eq!(selection_label("Calendar:List"), "calendar_list");
+        assert_eq!(selection_label("日历/邮箱"), "u65e5u5386_u90aeu7bb1");
+        assert_eq!(
+            selection_label(&format!("{}日", "a".repeat(22))),
+            "a".repeat(22)
+        );
+        assert_eq!(
+            selection_label(&"x".repeat(100)),
+            "x".repeat(MAX_SELECTION_LABEL_BYTES)
+        );
+    }
+
+    #[tokio::test]
+    async fn source_selection_collision_does_not_overwrite_or_publish_siblings() {
+        let (store, scope) = fixture().await;
+        let custody = CapabilitySourceCustody::new("source", config(), store.clone());
+        let receipt = custody.receipt(&scope, "search", candidate().0).unwrap();
+        let key = custody.selection_key(&receipt);
+        // Force two distinct full receipts onto one short key without depending
+        // on a probabilistic hash collision or adding a production hash override.
+        let mut collided = receipt.clone();
+        collided.candidate.capability.reference = "other-package-skill".into();
+        store
+            .append_event(
+                &scope.user_id,
+                &scope.session_id,
+                &scope.run_id,
+                receipt_event(CANDIDATE_EVENT, &key, &collided),
+            )
+            .await
+            .unwrap();
+        let mut sibling = candidate().0;
+        sibling.capability.native_id = "sibling".into();
+        let sibling_key =
+            custody.selection_key(&custody.receipt(&scope, "search", sibling.clone()).unwrap());
+        assert_eq!(
+            custody
+                .register(
+                    &scope,
+                    "search",
+                    CapabilityCandidatePage {
+                        contract_version: CONTRACT_VERSION.into(),
+                        candidates: vec![sibling, candidate().0],
+                    }
+                )
+                .await
+                .unwrap_err(),
+            SourceError::SelectionChanged
+        );
+        assert_eq!(
+            custody.load(&scope, CANDIDATE_EVENT, &key).await.unwrap(),
+            Some(serde_json::to_value(collided).unwrap())
+        );
+        assert_eq!(
+            custody.candidate(&scope, &sibling_key).await.unwrap_err(),
+            SourceError::SelectionNotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn source_selection_namespace_never_falls_through_to_local_skills() {
+        use astra_skills::traits::{SkillError, SkillResolver};
+        let fixture = http_fixture(true).await;
+        let source = fixture.source();
+        source.bind_scope(fixture.scope.clone()).unwrap();
+        let resolver = CapabilitySourceSkillResolver {
+            source,
+            base: None,
+            policy: Default::default(),
+        };
+        for name in [
+            "skill__cap__typo",
+            "skill__cap__calendar__0123456789abcde",
+            "skill__cap__calendar__0123456789abcdeg",
+            "skill__cap__calendar__0123456789ABCDEF",
+            "SKILL__CAP__calendar__0123456789abcdef",
+            "skill__cap__aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(
+                matches!(
+                    resolver.resolve_for_execution(name).await,
+                    Err(SkillError::LoadFailed(_))
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    resolver.read_resource(name, "references/calendar.md").await,
+                    Err(SkillError::LoadFailed(_))
+                ),
+                "{name}"
+            );
+        }
+        assert!(fixture.calls.lock().unwrap().is_empty());
     }
 
     pub(crate) struct HttpFixture {

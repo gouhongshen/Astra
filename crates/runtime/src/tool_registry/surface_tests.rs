@@ -117,7 +117,7 @@ fn assert_resident_external_state_contract(resident_bash: &Value, canonical_bash
         .as_str()
         .expect("resident Bash description");
     for cue in [
-        "External mutations only",
+        "For external writes",
         "minimal absolute roots",
         "owned foreground delta",
     ] {
@@ -192,6 +192,36 @@ fn default_always_load_surface_has_a_fixed_schema_budget() {
     assert!(
         bytes > base_bytes,
         "hot Work lifecycle schemas must be included in the default resident surface"
+    );
+}
+
+#[test]
+fn resident_bash_command_guidance_survives_projection() {
+    let canonical = catalog_schemas();
+    let canonical_bash = canonical
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("bash"))
+        .expect("canonical Bash schema");
+    let canonical_command = &canonical_bash["function"]["parameters"]["properties"]["command"];
+    let guidance = astra_tools::schemas::BASH_COMMAND_GUIDANCE;
+    assert_eq!(canonical_command["description"], guidance);
+
+    let resident =
+        ToolSurface::build(canonical, &ToolSurfaceConfig::default(), &[]).always_load_schemas();
+    let resident_bash = resident
+        .iter()
+        .find(|schema| tool_schema_name(schema) == Some("bash"))
+        .expect("resident Bash schema");
+    let description = resident_bash["function"]["description"]
+        .as_str()
+        .expect("model-visible Bash command guidance");
+    assert_eq!(description, guidance);
+    assert!(description.contains("$()/backticks"));
+    assert!(description.starts_with("No $()/backticks"));
+    assert!(description.contains("literal write paths"));
+    assert!(description.contains("Loops via python3"));
+    assert!(
+        resident_bash["function"]["parameters"]["properties"]["command"]["description"].is_null()
     );
 }
 

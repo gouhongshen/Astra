@@ -2759,6 +2759,35 @@ mod tests {
     }
 
     #[test]
+    fn auto_mode_reads_workspace_bash_output_without_weakening_astra_state_guard() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Auto,
+        );
+        let command = "jq -r '.items[]' /sandbox/.moi/astra-bash-outputs/one.stdout";
+        assert!(!crate::cloud::approval_policy::bash_command_is_read_only(
+            command
+        ));
+        let workspace_output =
+            evaluate_permission("bash", &serde_json::json!({"command": command}), &ctx);
+        assert!(
+            matches!(workspace_output.decision, HardDecision::Allow),
+            "ordinary workspace output should follow existing Auto mode: {workspace_output:?}"
+        );
+
+        let private_state = evaluate_permission(
+            "bash",
+            &serde_json::json!({
+                "command": "jq -r '.items[]' /sandbox/.moi/.astra/bash-outputs/one.stdout"
+            }),
+            &ctx,
+        );
+        assert!(
+            matches!(private_state.decision, HardDecision::NeedExternal { .. }),
+            "Astra private state must remain protected: {private_state:?}"
+        );
+    }
+
+    #[test]
     fn evaluate_reading_hidden_home_secret_requires_approval_in_auto_mode() {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,

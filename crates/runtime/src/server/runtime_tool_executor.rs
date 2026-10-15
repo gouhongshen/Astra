@@ -1417,14 +1417,22 @@ impl RuntimeToolExecutor {
         let source = self.capability_source.as_ref()?;
         let query = request.args.get("query")?.as_str()?;
         let names = astra_tools::tool_search::selected_tool_names(query)?;
-        if !names.iter().any(|name| {
-            source
-                .custody
-                .owns_selection_shape(&name.to_ascii_lowercase())
-        }) {
+        // The shared parser has validated select: syntax but deduplicates local
+        // names case-insensitively. Deduplicate source names exactly so a
+        // differently-cased, invalid sibling still receives owner validation.
+        let mut seen_source_names = HashSet::new();
+        let source_names: Vec<_> = query
+            .split_once(':')?
+            .1
+            .split(',')
+            .map(str::trim)
+            .filter(|name| source.custody.owns_selection_shape(name))
+            .filter(|name| seen_source_names.insert(*name))
+            .collect();
+        if source_names.is_empty() {
             return None;
         }
-        if names.len() > 8 {
+        if names.len() > 8 || source_names.len() > 8 {
             return Some(capability_source_tool_search_error_result(
                 super::capability_source::SourceError::InvalidContract,
             ));
@@ -1435,12 +1443,8 @@ impl RuntimeToolExecutor {
         };
         // Source Skills have their own read contract. Selecting them as tools
         // would describe the wrong capability and hide the useful error.
-        for name in names
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .filter(|name| source.custody.owns_selection_shape(name))
-        {
-            let kind = match source.custody.selection_kind(scope, &name).await {
+        for name in &source_names {
+            let kind = match source.custody.selection_kind(scope, name).await {
                 Ok(kind) => kind,
                 Err(error) => return Some(capability_source_tool_search_error_result(error)),
             };
@@ -1454,12 +1458,8 @@ impl RuntimeToolExecutor {
             }
         }
         let mut pool = self.current_tool_search_pool_schemas();
-        for name in names
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .filter(|name| source.custody.owns_selection_shape(name))
-        {
-            let materialized = match source.materialize(&name, true).await {
+        for name in &source_names {
+            let materialized = match source.materialize(name, true).await {
                 Ok(value) => value,
                 Err(error) => return Some(capability_source_tool_search_error_result(error)),
             };
@@ -1474,9 +1474,13 @@ impl RuntimeToolExecutor {
                 .into_iter()
                 .filter(|schema| {
                     tool_schema_name(schema).is_some_and(|name| {
-                        names
-                            .iter()
-                            .any(|selected| selected.eq_ignore_ascii_case(name))
+                        names.iter().any(|selected| {
+                            if source.custody.owns_selection_shape(selected) {
+                                selected == name
+                            } else {
+                                selected.eq_ignore_ascii_case(name)
+                            }
+                        })
                     })
                 }),
         );
@@ -12319,7 +12323,7 @@ pub(crate) mod tests {
         let search_request = request(
             &fixture.scope,
             "tool_search",
-            json!({"query":format!("  SeLeCt:{},,{key}  ", key.to_ascii_uppercase())}),
+            json!({"query":format!("  SeLeCt:{key},,{key}  ")}),
         );
         let found = exec
             .execute_source_tool_search(&search_request)
@@ -12377,6 +12381,54 @@ pub(crate) mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn capability_source_tool_selection_requires_exact_key_without_case_folding() {
+        use super::super::capability_source::tests::{
+            http_fixture, register_fixture_candidate, request,
+        };
+        let fixture = http_fixture(false).await;
+        let (mut exec, _dir) = test_executor();
+        exec.user_id = fixture.scope.user_id.clone();
+        exec.session_id = fixture.scope.session_id.clone();
+        exec.set_agent_binding_mcp(fixture.transport.clone());
+        exec.set_capability_source(Some(fixture.source()));
+        let key =
+            register_fixture_candidate(exec.capability_source.as_ref().unwrap(), &fixture).await;
+        for invalid in [
+            key.to_ascii_uppercase(),
+            key.replace("get_me", "Get_me"),
+            "mcp__cap__typo".into(),
+            format!("{key},{key},{},{key}", key.to_ascii_uppercase()),
+        ] {
+            let rejected = exec
+                .execute_source_tool_search(&request(
+                    &fixture.scope,
+                    "tool_search",
+                    json!({"query": format!("select:{invalid}")}),
+                ))
+                .await
+                .unwrap();
+            assert!(
+                rejected.is_error,
+                "case-folded or malformed key was accepted: {invalid}"
+            );
+            assert!(
+                fixture.calls.lock().unwrap().is_empty(),
+                "invalid name reached provider"
+            );
+        }
+        let selected = exec
+            .execute_source_tool_search(&request(
+                &fixture.scope,
+                "tool_search",
+                json!({"query": format!("select:{}", [key.as_str(); 12].join(","))}),
+            ))
+            .await
+            .unwrap();
+        assert!(!selected.is_error, "{}", selected.output);
+        assert_eq!(fixture.calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -22,6 +22,9 @@
 pub(crate) const DEFAULT_TURN_TIMEOUT_S: u64 = 300;
 pub(crate) const DEFAULT_GLOBAL_OUTPUT_LIMIT: usize = 200_000;
 pub(crate) const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 80_000;
+/// Shared default inline presentation budget at the model tool-result boundary.
+/// Tools may retain complete results outside the inline view.
+pub const DEFAULT_TOOL_RESULT_INLINE_CHARS: usize = 8_000;
 pub(crate) const DEFAULT_MAX_TOOL_RETRIES: usize = 2;
 pub(crate) const DEFAULT_RETRY_BASE_MS: u64 = 500;
 pub(crate) const DEFAULT_MAX_RETRIEVED: usize = 6;

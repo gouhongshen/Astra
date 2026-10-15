@@ -20,6 +20,10 @@ pub const SURFACE_DISCOVERY_SUMMARIES_KEY: &str = "x-astra-surface-discovery-sum
 /// to parse the full function description to discover which action remains.
 pub const PER_ACTION_DISCOVERY_SUMMARIES_KEY: &str = "x-astra-per-action-discovery-summaries";
 
+/// Producer-owned Bash constraints shared by canonical and resident tool schemas.
+/// Keep this wording within the resident schema budget.
+pub const BASH_COMMAND_GUIDANCE: &str = "No $()/backticks; use literal write paths. Loops via python3. For external writes: minimal absolute roots, owned foreground delta.";
+
 /// Rebuild the compact discovery summary after a typed action projection.
 ///
 /// The retained action order is taken from the executable schema, while the
@@ -1416,7 +1420,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "command": {"type": "string", "description": "Shell command to run"},
+                        "command": {"type": "string", "description": BASH_COMMAND_GUIDANCE},
                         "workdir": {"type": "string", "minLength": 1, "description": "Optional execution directory for this call only. Relative paths resolve from the workspace root; absolute paths must remain inside it. The directory must already exist. Defaults to the workspace root and does not persist. Executors without pinned-subdirectory support reject subdirectories rather than weaken path confinement."},
                         "mode": {"type": "string", "enum": ["verify"], "description": "Optional explicit workspace verification contract. Omit this field for calculations, read-only probes, diagnostics, tests, and commands whose stdout is the evidence. Use it only for a foreground command that verifies a bound workspace stayed unchanged after edits; it succeeds only when the command exits zero and the executor proves that fact, and it must not be used for commands that write files."},
                     "timeout": {"type": "number", "default": crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS, "description": "Outer execution timeout in seconds. Set this field to a larger value for long builds/tests, e.g. cargo build or full test suites. A `timeout ...` program inside command does not extend Astra's outer timeout."},
@@ -2924,6 +2928,20 @@ mod tests {
         let description = bash["function"]["description"].as_str().unwrap();
         assert!(description.contains("Self-daemonizing"));
         assert!(description.contains("no persistence guarantee"));
+    }
+
+    #[test]
+    fn bash_schema_explains_static_write_targets_and_command_substitution() {
+        let schemas = all_tool_schemas();
+        let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
+        let description = bash["function"]["parameters"]["properties"]["command"]["description"]
+            .as_str()
+            .expect("bash description");
+        assert_eq!(description, BASH_COMMAND_GUIDANCE);
+        assert!(description.contains("$()/backticks"));
+        assert!(description.starts_with("No $()/backticks"));
+        assert!(description.contains("literal write paths"));
+        assert!(description.contains("Loops via python3"));
     }
 
     #[cfg(not(unix))]
