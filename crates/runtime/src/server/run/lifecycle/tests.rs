@@ -8434,6 +8434,113 @@ async fn server_spawn_batch_prepares_all_slots_and_binds_consumption() {
 }
 
 #[tokio::test]
+async fn server_spawn_missing_configured_name_fails_closed_as_invalid_request() {
+    use astra_turn_core::orchestration_spawn_tool::SpawnAgentInput;
+
+    let model_service = Arc::new(ActiveTestModelService::default());
+    let executor = Arc::new(
+        ServerSpawnAgentExecutor::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        )
+        .with_model_service(Some(model_service.clone())),
+    );
+    let mut context = test_spawn_runtime_context("root-run", "user-a");
+    let reader = astra_services::models::AuthorizedModelCatalogReader::new(
+        model_service.clone(),
+        Arc::new(astra_services::auth::UnconfiguredAuthService),
+        astra_services::AuthPrincipal::internal(astra_services::AuthUserRecord {
+            user_id: "user-a".into(),
+            username: "owner".into(),
+            email: String::new(),
+            display_name: None,
+        }),
+    );
+    reader
+        .read_snapshot()
+        .await
+        .expect("prewarm the request-scoped model catalog");
+    context.model_catalog_reader = Some(reader);
+    executor.set_runtime_context(context).await;
+    let input = SpawnAgentInput {
+        description: "missing model".into(),
+        prompt: "answer".into(),
+        requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::ConfiguredName {
+                model_name: "glm-99.99".into(),
+                source: None,
+            },
+        }),
+        ..Default::default()
+    };
+
+    let error = match Arc::clone(&executor)
+        .prepare_batch(
+            std::slice::from_ref(&input),
+            &test_spawn_context("root-run"),
+            None,
+        )
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("missing configured model must not be substituted"),
+    };
+
+    assert_eq!(
+        error.error_kind(),
+        Some(astra_core::ErrorKind::InvalidRequest),
+        "configured-name admission must remain a request failure, not tool unavailability"
+    );
+}
+
+#[tokio::test]
+async fn server_spawn_missing_offering_fails_closed_as_invalid_request() {
+    use astra_turn_core::orchestration_spawn_tool::SpawnAgentInput;
+
+    let model_service = Arc::new(ActiveTestModelService::default());
+    let executor = Arc::new(
+        ServerSpawnAgentExecutor::new(
+            test_settings(),
+            test_encryptor(),
+            Arc::new(TokioMutex::new(HashMap::new())),
+        )
+        .with_model_service(Some(model_service.clone())),
+    );
+    executor
+        .set_runtime_context(test_spawn_runtime_context("root-run", "user-a"))
+        .await;
+    let input = SpawnAgentInput {
+        description: "missing offering".into(),
+        prompt: "answer".into(),
+        requested_model_policy: Some(astra_turn_types::RequestedModelPolicy::Fixed {
+            selector: astra_turn_types::ModelSelector::OfferingId {
+                offering_id: "invalid".into(),
+            },
+        }),
+        ..Default::default()
+    };
+
+    let error = match Arc::clone(&executor)
+        .prepare_batch(
+            std::slice::from_ref(&input),
+            &test_spawn_context("root-run"),
+            None,
+        )
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("missing Offering must not be substituted"),
+    };
+
+    assert_eq!(
+        error.error_kind(),
+        Some(astra_core::ErrorKind::InvalidRequest),
+        "Exact Offering admission must retain a typed error kind for harness evidence"
+    );
+}
+
+#[tokio::test]
 async fn server_subrun_batch_admits_distinct_offerings_once_and_reuses_parent() {
     use crate::server::delegation::engine::{SubRunExecutor, SubRunModelRequest};
     use astra_turn_core::thinking_config::ThinkingConfig;

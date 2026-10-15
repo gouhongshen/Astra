@@ -20126,11 +20126,9 @@ pub(crate) fn safe_model_spawn_error(
                 | "model_reasoning_unsupported"
                 | "model_purpose_unsupported",
             ) => Some(ErrorKind::InvalidRequest),
+            Some("model_offering_not_found") => Some(ErrorKind::InvalidRequest),
             Some(
-                "model_not_available"
-                | "model_offering_not_found"
-                | "model_offering_unavailable"
-                | "model_selection_changed",
+                "model_not_available" | "model_offering_unavailable" | "model_selection_changed",
             ) => Some(ErrorKind::ToolUnavailable),
             Some("model_admission_incomplete") => Some(ErrorKind::ContractViolation),
             Some("model_catalog_unavailable") => Some(ErrorKind::ServerError),
@@ -20763,6 +20761,14 @@ impl ServerSpawnAgentExecutor {
                     astra_turn_types::ModelSelector::ConfiguredName { .. } => unreachable!(),
                 })
                 .collect::<Vec<_>>();
+            if let Some(model_service) = self.model_service.as_ref() {
+                return model_service
+                    .admit_model_offerings(parent.user_id.clone(), offering_ids)
+                    .await
+                    .map_err(|(status, body)| {
+                        safe_model_spawn_error(status, body.0.error_code.as_deref())
+                    });
+            }
             return admit_model_offering_batch(
                 None,
                 &self.matrixone,
