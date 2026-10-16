@@ -23866,6 +23866,120 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
 }
 
 #[tokio::test]
+async fn durable_live_attach_waits_for_delayed_publication_after_settlement_committed() {
+    let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+    let svc = AgenticRunLifecycleService::new(
+        test_settings(),
+        test_encryptor(),
+        Arc::new(TokioMutex::new(HashMap::new())),
+        engine.clone(),
+    )
+    .with_model_service(Arc::new(ActiveTestModelService::default()));
+    engine
+        .start_run("remote-settled-explain", "user-1", "remote-session")
+        .await
+        .expect("seed remote Explain run");
+    engine
+        .append_event(
+            "user-1",
+            "remote-session",
+            "remote-settled-explain",
+            json!({
+                "event_type": "run_started",
+                "data": {"explain_analyze_requested": true}
+            }),
+        )
+        .await
+        .expect("mark Explain request");
+    assert!(
+        engine
+            .transition_status_with_event_if_current(
+                "user-1",
+                "remote-session",
+                "remote-settled-explain",
+                &[STATUS_RUNNING],
+                STATUS_COMPLETED,
+                None,
+                None,
+                json!({"event_type": "run_finished", "data": {}}),
+            )
+            .await
+            .expect("complete remote Explain run")
+    );
+    engine
+        .append_event(
+            "user-1",
+            "remote-session",
+            "remote-settled-explain",
+            json!({"event_type": "run_settlement_finished", "data": {}}),
+        )
+        .await
+        .expect("commit settlement before publication");
+
+    let mut reconnect = ok(svc
+        .stream_run_live(
+            "remote-settled-explain".to_string(),
+            "user-1".to_string(),
+            0,
+        )
+        .await);
+    let mut reconnect_rx = reconnect
+        .event_rx
+        .take()
+        .expect("settlement must not close an Explain attach before publication");
+
+    let outcome = astra_turn_types::ArtifactPublicationV1 {
+        schema_version: 1,
+        run_id: "remote-settled-explain".into(),
+        turn_id: "turn-1".into(),
+        execution_owner_generation: 1,
+        artifact_type: "explain_analyze_snapshot".into(),
+        recorded: true,
+        result: astra_turn_types::ArtifactPublicationResult::Published {
+            handle: format!("artifact://session/explain-analyze/{}", "c".repeat(64)),
+        },
+    };
+    engine
+        .append_event(
+            "user-1",
+            "remote-session",
+            "remote-settled-explain",
+            json!({
+                "event_type": "artifact_publication",
+                "data": serde_json::to_value(&outcome).expect("publication payload")
+            }),
+        )
+        .await
+        .expect("publish after settlement");
+
+    let mut observed_publication = false;
+    let mut observed_settlement = false;
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while !(observed_publication && observed_settlement) {
+            let event = reconnect_rx
+                .recv()
+                .await
+                .expect("settled Explain attachment must remain open");
+            observed_publication |= event["event_type"] == "artifact_publication";
+            observed_settlement |= event["event_type"] == "run_settlement_finished";
+            assert_ne!(
+                event["event_type"], "artifact_publication_unavailable",
+                "settlement must not replace a later real publication"
+            );
+        }
+    })
+    .await
+    .expect("publication after settlement timeout");
+    assert!(observed_publication && observed_settlement);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), reconnect_rx.recv())
+            .await
+            .expect("attachment close timeout")
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn durable_live_attach_replays_publication_added_between_initial_and_metadata_reads() {
     let outcome = astra_turn_types::ArtifactPublicationV1 {
         schema_version: 1,

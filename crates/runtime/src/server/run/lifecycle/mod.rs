@@ -289,10 +289,6 @@ fn durable_event_index(event: &Value, position: usize) -> i64 {
         .unwrap_or(position as i64)
 }
 
-fn durable_event_is_settlement_finished(event: &Value) -> bool {
-    durable_event_type(event) == Some("run_settlement_finished")
-}
-
 fn durable_event_is_valid_explain_publication(event: &Value) -> bool {
     if durable_event_type(event) != Some("artifact_publication") {
         return false;
@@ -18411,17 +18407,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     durable_event_index(event, position) <= after_event_idx
                         && durable_event_is_valid_explain_publication(event)
                 });
-        let mut settlement_finished = replay_events
-            .iter()
-            .any(durable_event_is_settlement_finished)
-            || durable_run
-                .events
-                .iter()
-                .enumerate()
-                .any(|(position, event)| {
-                    durable_event_index(event, position) <= after_event_idx
-                        && durable_event_is_settlement_finished(event)
-                });
         let turn_id = explain_turn_id_from_durable_run(&durable_run);
         let owner_generation = durable_run.run_generation;
         let latest_complete = Self::durable_live_attach_complete(
@@ -18436,20 +18421,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 event_rx: None,
             });
         }
-        if latest_complete && explain_requested && settlement_finished && !publication_seen {
-            replay_events.push(explain_publication_unavailable_event(
-                &run_id,
-                &turn_id,
-                owner_generation,
-                "publication_outcome_unrecorded",
-                "The Explain Analyze run completed, but the server did not retain a publication outcome.",
-            ));
-            return Ok(ChatStreamRecord {
-                session_id: initial.session_id,
-                run_id,
-                events: replay_events,
-                event_rx: None,
-            });
+        if latest_complete && explain_requested && !publication_seen {
+            // Settlement is not the publication boundary. A terminal Explain
+            // run still owes its bounded publication outcome, so a reconnect
+            // follows the same grace as an already-attached poller.
         }
 
         // The executor may live on another pod, or a concurrent winning start
@@ -18569,7 +18544,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             event_cursor = event_cursor.saturating_add(1);
                         }
                         publication_seen |= durable_event_is_valid_explain_publication(&event);
-                        settlement_finished |= durable_event_is_settlement_finished(&event);
                         if !send_durable_live_attach_event(&event_tx, event, delivery_deadline)
                             .await
                         {
@@ -18601,7 +18575,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             return;
                         }
                         if durable_run_status_kind(&delta.status) == DurableRunStatusKind::Paused
-                            || settlement_finished
                             || publication_deadline
                                 .is_some_and(|deadline| Instant::now() >= deadline)
                         {
@@ -18613,8 +18586,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                     == DurableRunStatusKind::Paused
                                 {
                                     "run_paused_before_publication"
-                                } else if settlement_finished {
-                                    "publication_outcome_unrecorded"
                                 } else {
                                     "publication_timeout"
                                 },
@@ -18622,8 +18593,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                     == DurableRunStatusKind::Paused
                                 {
                                     "The Explain Analyze run paused before the server could publish a report."
-                                } else if settlement_finished {
-                                    "The Explain Analyze run completed, but the server did not retain a publication outcome."
                                 } else {
                                     "The Explain Analyze run completed, but its publication did not arrive before the bounded wait expired."
                                 },
