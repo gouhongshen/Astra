@@ -1071,13 +1071,22 @@ async fn persist_server_loop_canonical_append_inner(
                 })?,
         )
     } else {
-        astra_services::storage::admit_session_scoped_run_write(
-            &mut tx,
-            append.session_id,
-            append.user_id,
-            append.run_id,
-        )
-        .await
+        if append.expected_owner_generation.is_some() {
+            astra_services::storage::admit_session_execution_write(
+                &mut tx,
+                append.session_id,
+                append.user_id,
+            )
+            .await
+        } else {
+            astra_services::storage::admit_session_scoped_run_write(
+                &mut tx,
+                append.session_id,
+                append.user_id,
+                append.run_id,
+            )
+            .await
+        }
         .map_err(|error| format!("canonical session admission failed: {error}"))?;
         None
     };
@@ -7098,7 +7107,7 @@ mod tests {
         .expect("terminal settlement must commit its display projection");
         assert_eq!(
             projection_row.try_get::<String, _>("status").unwrap(),
-            astra_core::STATUS_COMPLETED
+            terminal_status
         );
         assert!(
             projection_row
