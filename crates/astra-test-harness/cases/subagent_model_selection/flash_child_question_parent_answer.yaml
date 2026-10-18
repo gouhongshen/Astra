@@ -1,10 +1,10 @@
 name: flash_child_question_parent_answer
 description: |
-  A GLM child asks its parent a question, waits for the correlated answer,
+  A child asks its parent a question, waits for the correlated answer,
   and only then completes its work.
 prompt: |
   This is a read-only analysis task; do not change files or external state.
-  Ask a GLM 5.2 subagent to produce a one-line handoff marker. Let the normal
+  Ask a {{model}} subagent to produce a one-line handoff marker. Let the normal
   spawn default select the bounded read-only child persona. In its initial
   task, give it both possible outputs: JSON means exactly
   ASTRA-CHILD-ANSWERED-JSON, while TEXT means exactly
@@ -23,7 +23,7 @@ criteria:
   - type: execution_child_results_adopted
     children:
       - expected_result: {text: ASTRA-CHILD-ANSWERED-JSON}
-        model: glm-5.2
+        model: '{{model}}'
         answered_question: true
         workspace_mutation: read_only
   - type: execution_tool_count

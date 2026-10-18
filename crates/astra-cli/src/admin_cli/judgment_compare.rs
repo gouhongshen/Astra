@@ -487,7 +487,7 @@ mod tests {
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(completion(
                 "offer-baseline",
-                r#"{"answers":{"0":{"type":"discrete_noul","decision":"yes"},"1":{"type":"discrete_noul","decision":"no"}}}"#,
+                r#"{"answers":{"0":"yes","1":"no"}}"#,
             )))
             .expect(2)
             .mount(&server)
@@ -510,7 +510,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(truncated_completion(
                     "offer-jev",
-                    r#"{"answers":{"0":{"type":"discrete_noul","decision":"yes"}}}"#,
+                    r#"{"answers":{"0":"yes"}}"#,
                 )),
             )
             .expect(1)
@@ -647,7 +647,7 @@ mod tests {
         );
         assert!(
             selection(
-                r#"{"answers":{"unknown":{"type":"discrete_noul","decision":"yes"}}}"#,
+                r#"{"answers":{"unknown":"yes"}}"#,
                 &case,
                 "chat-fixture",
                 Some(JudgmentResponseProvenance::DiscreteDecision)
@@ -656,7 +656,7 @@ mod tests {
         );
         assert_eq!(
             selection(
-                r#"{"answers":{"0":{"type":"discrete_noul","decision":"unknown"},"1":{"type":"discrete_noul","decision":"no"}}}"#,
+                r#"{"answers":{"0":"unknown","1":"no"}}"#,
                 &case,
                 "chat-fixture",
                 Some(JudgmentResponseProvenance::DiscreteDecision)

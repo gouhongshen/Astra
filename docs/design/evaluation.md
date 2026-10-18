@@ -40,6 +40,32 @@ fixtures
 privacy_scope
 ```
 
+Semantic judges receive ordered user-request/assistant-response pairs, including
+root retry attempts and executed follow-up steps. The evidence stays bounded,
+with explicit content or exchange omission markers; deterministic criteria keep
+their original aggregate. Missing evidence cannot authorize a passing judgment.
+
+Tool-result identity comes from invocation scope, arguments, outcome, complete
+result and typed execution facts. A verified artifact supplies the complete body;
+a bounded error preview is presentation, and cannot contradict an identical
+complete failure body. Error-only records remain failure evidence, and conflicting
+bodies, artifacts, dispositions or typed failure facts are rejected.
+
+For live multi-agent capability tests, execution identity and original result
+custody are deterministic prerequisites; natural-language answer correctness is
+a separate required semantic judgment. An omitted child `expected_result` must
+be paired with a required judge. Both built-in and external judges receive the
+same complete, verified child bodies and identities, separately from parent
+claims. Missing, oversized, or contradictory evidence cannot authorize a pass.
+Explicit text and JSON expectations remain available for actual output-format
+contracts; they must not be imposed accidentally on general collaboration tests.
+
+Public child-adoption diagnostics use closed reason codes from the canonical
+custody verifier, distinguishing a failed condition from unavailable evidence.
+Neither category authorizes semantic judging without verified child evidence.
+Public progress and CI summaries omit raw results, identities, arguments and
+provider error text; diagnostic changes preserve grading and failure classification.
+
 ## Replay modes
 
 | Mode | Meaning |

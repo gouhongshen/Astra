@@ -182,6 +182,278 @@ therefore does not manufacture compaction pressure; compaction mechanics and
 
 ## Quick start
 
+### Manual GitHub Actions run
+
+The **Harness (live models)** workflow builds the selected Git revision's
+Server, CLI and `astra-test`, starts disposable MatrixOne/Memoria dependencies,
+then runs the existing YAML cases with DeepSeek-v4.1-Flash as both agent and judge. Dispatch defaults to the
+full suite. The same execution job is reused by the automatic live regression
+described below; offline PR checks still work without provider secrets.
+
+In the repository's **Settings → Secrets and variables → Actions**, create:
+
+- `HARNESS_GLM_BASE_URL`: the API base URL from the `glm-5.3` entry in your
+  `.models.yaml` (HTTPS, without credentials, query parameters or fragments).
+- `HARNESS_GLM_API_KEY`: that entry's API key.
+- Optional `HARNESS_ADDITIONAL_MODELS_JSON`: a JSON array of genuine supplementary
+  model entries in the existing admin model-file format. Each entry supplies its
+  own endpoint, credentials, protocol and capacity. An explicit Flash entry
+  replaces its shared-endpoint default; other entries inherit nothing.
+  Duplicate names are rejected. Only cases that
+  require additional models need this secret; ordinary delegation uses
+  the selected matrix model, not a fixed GLM version.
+
+Open **Actions → Harness (live models) → Run workflow**. Source inputs default to
+`repository: matrixorigin/astra`, `ref: main` (its latest commit at checkout).
+For a fork, enter e.g. `XuPeng-SH/Astra`; `ref` accepts a branch, tag or exact
+commit SHA available in that repository. The workflow-dispatch branch selects
+the workflow definition, not the source under test. Build checks and the report
+use the actual checked-out SHA. Only select trusted source: its build scripts,
+local actions and executables can access the provider credentials. The checkout
+token must have read access; arbitrary private repositories are not guaranteed.
+Manual/custom checkouts cannot upload build caches. Only automatic pushes of
+the exact main revision save the shared harness cache; existing artifacts may
+be restored in either mode. Sccache remains disabled.
+There is no additional actor or repository allowlist: manual dispatch relies on
+GitHub's repository write-access requirement. No organization membership token
+is needed. This restricts who starts the workflow, not the code they select;
+selected code can read and exfiltrate the provider key, so run only trusted commits.
+
+The live log and Actions Summary show failed checks with numeric expected/observed
+evidence: tool counts, outcome matches, individual JSON predicate matches (in YAML
+order), ordered-receipt progress and duration limits, including failed composites.
+Predicate counts are independent; a passing tool-count check still requires all
+conditions on the **same** canonical call. Missing canonical evidence is reported
+as unavailable, not as zero matches. No additional model or database calls are
+made for this projection.
+
+LLM summaries report the existing judge's grade/threshold or acceptance verdict,
+and distinguish an evaluation error from a negative quality judgment. A case
+without an explicit `judger`/`hard_judger` says **not configured**; a deterministic
+failure does not automatically trigger another LLM diagnosis. These are observed
+check results, not a claimed root-cause analysis. Raw prompts, tool/provider bodies
+and free-form judge diagnostics remain private; public artifacts do not include
+them. Checks without a safe numeric projection explicitly say that their detailed
+payload is withheld. Full private diagnostics remain in the local suite report.
+
+Once execution identity is verified, child-adoption checks publish a closed `child_adoption` diagnostic with status
+`proven`, `contradicted`, or `unavailable`, and a fixed failure reason such as
+`child_not_completed`, `fanout_start_repeated`, `model_mismatch`,
+`result_digest_mismatch`, or `finalization_before_adoption`. Missing evidence has
+separate unavailable reason codes. The grader and public projection use the same
+canonical verifier; these diagnostics do not change verdicts or judge admission.
+No child content, identities, arguments, expected values, or provider error text
+are included. The safe-summary consumer rejects unknown codes and extra fields.
+
+### Small automatic live regression
+
+**Harness regression (live)** runs on relevant `main` pushes, same-repository
+PRs and explicitly trusted forks. Its `pull_request_target` caller is taken from
+the trusted base, not the PR. Before granting credentials it checks both the
+head repository's full name and immutable GitHub ID:
+
+| Trusted fork | Repository ID |
+| --- | --- |
+| `XuPeng-SH/Astra` | `1355430593` |
+| `gouhongshen/Astra` | `1355443432` |
+| `loveRhythm1990/Astra` | `1355489820` |
+
+The allowlist lives in
+[harness-regression.yml](../../.github/workflows/harness-regression.yml).
+A fork cannot grant itself access by editing its copy. Recreated/lookalike
+repositories fail the ID/name check. Adding a fork **trusts everyone who can
+write code to that fork**: its build scripts, cases and executables run with
+model credentials and can leak them. Log masking does not provide isolation.
+This is deliberate credential access for these repositories, not safe execution
+of arbitrary fork code. Revoke an entry if that trust changes.
+
+Other forks and Dependabot PRs are explicitly skipped, not certified as tested.
+Their merged revision runs on `main`; a maintainer can also manually dispatch a
+reviewed exact SHA. Automatic PR execution checks out the accepted fork's exact
+**head SHA**, not the base SHA or a movable branch. The reusable workflow and
+gate remain base-owned; checkout's explicit fork opt-in is reached only after
+authorization. Token permissions stay `contents: read`, checkout credentials
+are not persisted, and PR runs cannot save the shared build cache. The runner
+is disposable. Keep this lane optional in branch protection: offline required
+checks retain existing coverage. Superseded runs are cancelled by PR number.
+Allowlist changes take effect only after they reach the trusted base branch.
+
+The authoritative selection is [ci-regression.txt](ci-regression.txt). The
+selector stages those original files unchanged into one suite; it does not copy
+prompts into the workflow or implement another grader. The 18 roots cover
+distinct delivery, tool, observability, context and delegation boundaries; child
+communication and inherited-model checks bind to the selected model rather than
+requiring an obsolete hard-coded provider version.
+
+| Case | Level / evidence |
+| --- | --- |
+| `hello_text_contains` | Simple: real response, exact marker, no tools |
+| `reasoning_multi_step_logic` | Simple: exact multi-step reasoning answer |
+| `parallel_readonly_batching` | Simple tools: three repository reads, same-batch judgement |
+| `task_agent_profile_callable` | Delegation: one completed child and actual result adoption |
+| `recovered_validation_user_facing_completion` | Medium: failing baseline, edit, successful validation, user-facing delivery |
+| `cache_provider_matrix_regression` | Four turns: stable-prefix/cache diagnostics (the optional cache-ratio check is not a hard cache-hit guarantee) |
+| `flash_missing_child_model_fail_closed` | Unhappy: rejected unavailable model, zero children, no silent substitution |
+| `same_model_fanout_handoff_flash` | Medium: two Flash children, exact slot identities, real child results and parent adoption |
+| `file_edit_prepared_bytes` | File creation, localized edit, read-back and exact on-disk bytes |
+| `read_only_shell_diagnostics` | Read-only shell authorization and truthful output delivery |
+| `introspection_reflection_source_boundary` | Distinct live-process and durable-session evidence |
+| `multi_turn_local_followup_focus` | Topic change, local follow-up and explicit historical recall |
+| `flash_rejected_delegation_preserves_parent_tools` | Parent remains usable after a rejected child request |
+| `flash_fanout_invalid_final_slot` | Atomic rejection: an invalid slot must not launch any child |
+| `flash_child_question_parent_answer` | Correlated child question, parent answer and actual result adoption |
+| `agent_workspace_evidence_chain` | Child reaches the inherited workspace, parent uses its evidence |
+| `work_two_step_execution_journey` | Durable Work establishment, execution and settlement |
+| `flash_model_name_is_output` | Quoted model name is task content, not an execution selector |
+
+All parents and the judge use DeepSeek-v4.1-Flash; this is not independent-model judging.
+Only Flash is registered by default, using the existing `HARNESS_GLM_BASE_URL` and
+`HARNESS_GLM_API_KEY` secrets (the secret names do not select a model).
+GLM-5.3 is temporarily excluded from this regression because its service is unstable.
+The full suite retains `multi_model_fanout_handoff`; explicitly configure its GLM
+dependency in `HARNESS_ADDITIONAL_MODELS_JSON` to run it. The regression does not
+claim heterogeneous-model coverage.
+An explicit `deepseek-v4.1-flash` entry in `HARNESS_ADDITIONAL_MODELS_JSON`
+replaces its default configuration unchanged; other additional models remain
+self-contained. Missing/unavailable models fail preflight;
+they are never silently substituted or omitted. No Jev configuration is required.
+
+Run once, serially, with an aggregate **15-minute execution budget** plus at most
+two minutes for cancellation/settlement. This is a budget, not a measured
+performance claim: build, service startup, registration and artifact publication
+are separate and may make the entire workflow longer. Eighteen roots include
+follow-up turns; these are not counted as additional roots. Per-case timings, results, error classes, usage
+coverage and partial-timeout summaries use the same safe live progress as the
+manual workflow. There is no retry-until-green policy. This sample does not
+replace full-suite, long-task, capacity or deterministic protocol coverage.
+
+To inspect or reproduce the same selection locally:
+
+```sh
+run_dir=$(mktemp -d "$PWD/target/ci-regression.XXXXXX")
+python3 scripts/ci/select_harness_cases.py \
+  --cases crates/astra-test-harness/cases \
+  --list crates/astra-test-harness/ci-regression.txt \
+  --destination "$run_dir/cases"
+# Against a fresh, same-revision Server and a disposable checkout as workspace:
+target/debug/astra-test --suite "$run_dir/cases" \
+  --astra-bin "$PWD/target/debug/astra" --working-dir "$HARNESS_WORKSPACE" \
+  --force-model deepseek-v4.1-flash --judger-model deepseek-v4.1-flash --parallel 1 --runs 1 \
+  --progress-file "$run_dir/progress.jsonl" --report-file "$run_dir/report.json"
+```
+
+Local execution retains the cases' individual deadlines; the aggregate deadline
+and owned-process cleanup are provided by the Actions supervisor. Local raw
+reports can contain task/provider data and must not be uploaded as public artifacts.
+
+### Full manual suite and result reporting
+
+The case-name filter defaults to `*` (all top-level YAML cases, not recursive),
+with 1–3 repetitions. Use `hello*` for a small smoke test. Running all cases can
+incur significant cost and requires each case's additional capabilities. Execution is
+serial, with a 60-minute suite limit and a 120-minute job limit. Cases execute
+in an independent Git clone with the selected SHA and actual origin history.
+Historical-fixture cases still require that history to exist in the selected
+repository. Filters match case names,
+not filenames. No match, unavailable cases and failed cases are not passes.
+
+During execution, Actions displays each case's start, periodic elapsed-time
+heartbeat, terminal result, harness lifecycle duration, error classification,
+failed root/step checks and cumulative counts. A heartbeat proves the harness
+is still waiting, not that the model is making progress. For example:
+
+```text
+[harness] PASSED [12/63] "delegation / glm-5.3 / run 1" · 62.90s · exit=0 · error=none · counts: 10 passed, 2 failed, 0 cancelled, 0 unavailable
+```
+
+The inner run budget is 55 minutes, followed by up to two minutes for existing
+cancellation and settlement before the outer 60-minute Actions limit. Completed
+results are saved incrementally; timeout/crash summaries retain completed rows,
+the last observed active case/elapsed time and queued cases. Unfinished cases
+remain unfinished, not passing or falsely certified as cancelled. Follow-up
+turns are shown under their owning case, not counted as additional cases.
+Deadline termination is unsuccessful even if its completed rows passed.
+The CI command runs inside the existing Linux harness process supervisor, so
+separately grouped or daemonized descendants are also reaped after hard stop.
+Final success requires the supervised Actions step to succeed, not merely a
+complete-looking inner report. The CI helper refuses unsupervised execution.
+
+`astra-test --progress-file PATH` opts into this same secret-free, versioned
+JSONL stream; it requires a new file and cannot be combined with dashboard mode.
+The CLI drains its observer before normal or failing suite exit. Observation
+loss or file-write failure cancels via the existing runner and fails closed.
+Selected custom source revisions must support this option and the repository
+helper; unsupported sources fail explicitly, without an old-log fallback.
+
+Progress uses `astra.harness_progress.v3`. Argument failures include bounded
+validator-authored rule codes and canonical built-in field paths; array indices
+become `*`, and unknown/provider fields are opaque. Private error text, arguments,
+provider responses and judge rationale are not public artifacts. Issue/outcome
+omissions are counted. If a receipt lacks rule details, analysis explicitly says
+the exact invalid field is unknown; an argument rejection does not prove model
+admission was reached. The unavailable-model negative control intentionally
+requires one valid first attempt: accepting a schema error would erase coverage.
+
+The default registered model is DeepSeek-v4.1-Flash and uses the deployment's declared
+`reasoning_effort` protocol, 128,000-token context and 84,000-token output
+ceiling. Prices are deliberately omitted: supply deployment pricing separately
+before making monetary comparisons. Both advisory and required LLM graders run,
+using DeepSeek-v4.1-Flash unless a criterion explicitly selects another model. Grading adds
+provider calls and cost; a same-model judge is not independent quality evidence.
+CLI judgments reserve at least 2,048 generation tokens (or the larger typed-answer
+minimum); the Server bounds the effective request by the admitted Offering's
+output limit and its 8,192-token safety ceiling. Incomplete or malformed judgments
+remain failures/unknown evidence, never accepted truncated answers or automatic retries.
+Complete semantic child evidence has one 64 KiB serialized-request ceiling,
+including questions, escaping, metadata and backend wrappers. It is never
+truncated to obtain a verdict; over-budget requests remain unjudged failures.
+This input allowance is separate from ordinary 8,000-byte text/stderr previews
+and does not increase output limits, deadlines or retry counts.
+Cases may declare `required_models` for supplementary models, independently of
+their parent `models` matrix. These are checked by the existing fail-fast
+preflight after filtering and are not replaced by `--force-model`.
+Prompts and assertion string values can use the explicit `{{model}}` marker,
+bound independently to each resolved matrix model (including `--force-model`).
+This includes follow-up prompts and criteria, nested assertions and exact child
+model identity checks. Unknown or malformed markers fail before execution.
+Model lists, grader model overrides, shell hooks and environment are literal,
+not templates. The delegation follow-up uses this binding and needs no second model.
+The safe preflight sidecar identifies selected model IDs and the unavailable
+model without provider error details. A nonzero agent probe alone does not prove
+model unavailability. Execution/protocol failures leave `unavailable_model`
+null; validated terminal error kinds and codes appear in the diagnostic.
+The `failure` object identifies the model, stage (`execution`, `terminal_protocol`,
+`probe_process` or `session_cleanup`) and available process exit code. It never
+includes raw provider messages. The manual and regression workflows preserve
+these same fields in the safe artifact and job summary.
+Default all-case selection is not a claim that a GLM-5.3-only deployment can run
+every case.
+Cases requiring other models, external clients or special policy need those
+capabilities and must not be interpreted as GLM-only coverage. Memoria uses mock embeddings;
+these runs do not certify production embedding quality.
+
+The job summary and seven-day artifact contain per-case status, timing,
+terminal-reported token/cache counters, binary hashes and root/step criterion
+results with severity and scores. An advisory judge without a score is explicitly
+`unscored`, with `passed: null`, not a successful evaluation. Required judges may
+return a boolean acceptance without a numeric score: their canonical pass/fail
+remains `reported`, without claiming evaluation provenance. Non-judge booleans
+also remain reported harness results, not a new execution certificate. These counters are
+not complete task-tree cost or certified cache ratios; consult usage coverage,
+and never interpret missing evidence as zero. Provider credentials are written
+only into a private temporary model file and removed during cleanup. Raw
+transcripts, Server logs, model configuration and full reports are **not**
+uploaded, because they may contain sensitive provider responses. A setup failure
+without a report fails the workflow. Safe failure diagnostics retain local
+Server readiness status, model registration/activation, lookup exit code and
+step outcomes, without retaining arbitrary provider error text.
+Artifacts also contain a validated safe progress prefix (`progress.safe.jsonl`)
+and complete or explicitly incomplete `summary.json`. A truncated trailing
+record or malformed stream never erases previously validated results and never
+turns an incomplete run into a pass. Raw progress input is not uploaded if its
+schema cannot be certified. Timing distinguishes whole-case lifecycle elapsed
+from agent-reported duration; token counters keep the existing coverage limits.
+
 ```sh
 # Local smoke: one case, no judger, parallel 4
 ./target/release/astra-test \
@@ -311,12 +583,26 @@ focus without duplicating the whole scripted journey.
 | `journal_tool_value_flow { producer, producer_document, producer_path, producer_filter?, consumer, consumer_document, consumer_paths, consumer_filter? }` | successful consumer call satisfying its structural predicate used an exact scalar emitted by a prior matching producer; `*` path segments project any array/object child without relying on result order | journal |
 | `journal_tool_value_flow_bound { producer, producer_document, producer_path, producer_filters, consumer, consumer_document, consumer_paths, consumer_filters, min_turns_after_producer? }` | conjunctive typed filters bind scope/type to successful value flow; optional visible-turn separation proves a later-turn consumer without using prose or event-order guesses | journal |
 | `journal_work_item_execution_from_start { min_distinct_items }` | completed `run_next_work_item` calls report that many distinct server-selected runnable WorkItems from prior `start_work` | journal |
-| `journal_work_replacement_lifecycle { initial_items, cancelled_items, added_items, delivered_items, cancellation_after_deliveries?, added_execution_after_initial_deliveries?, require_added_at_start? }` | exact canonical replacement identities and outcomes; optional bounds separately require prior deliveries before cancellation and prior initial-item deliveries before any added assignment/execution; require_added_at_start checks all added identities are present in the complete genesis board | journal |
+| `journal_work_replacement_lifecycle { initial_items, cancelled_items, added_items, delivered_items, cancellation_after_deliveries?, added_execution_after_initial_deliveries?, require_added_at_start?, require_added_before_execution? }` | exact canonical replacement identities and outcomes; optional bounds require prior deliveries before cancellation and before added execution; require_added_at_start requires the complete genesis board, while require_added_before_execution proves every addition was committed by admission or an accepted scoped proposal before the first scoped execution, including failed executions, and corroborated by a subsequent complete board | journal |
 | `journal_work_graph_patch { require_addition, require_retired_revision, … }` | canonical mutation evidence comes from an admission snapshot, an accepted plan proposal, or a deferred mutation observed after its settlement boundary; retirement is cancellation or supersession, never prose | journal |
 | `judger { question, threshold, model }`             | LLM scores ≥ threshold                                       | LLM         |
 | `hard_judger { question, threshold, model }`        | LLM scores ≥ threshold and failure fails the case            | LLM         |
 
 ### Criterion severity levels
+
+Use deterministic execution criteria for child identity, actual model execution,
+completion, and original-result custody. For natural-language task correctness,
+omit `expected_result` in one top-level `execution_child_results_adopted` and add
+a required `hard_judger`. The existing judge then receives the complete verified
+child bodies, identities, original-result digests, parent requests and response.
+Its rubric should evaluate each child's own answer and faithful parent reporting;
+a correct parent answer cannot compensate for an incorrect child.
+
+This mode requires a single execution, not follow-up steps. Missing, conflicting,
+oversized or truncated required evidence cannot pass, and `--no-judger` cannot
+disable the requirement. Existing explicit `text`, `contains`, and `json` child
+expectations remain deterministic; use them only when that output contract is
+actually required, not to enforce incidental prose or JSON whitespace.
 
 Each criterion has a severity that controls how failures are treated:
 
@@ -329,6 +615,14 @@ Each criterion has a severity that controls how failures are treated:
 Severity is assigned automatically based on criterion type (see
 `criterion_severity()` in `src/criteria.rs`). Case authors do not set
 severity manually.
+
+`all_of` and `any_of` are explicit hard contracts, including when their children
+are normally soft. Use them for required behavior such as exact tool counts or
+cache-specific contracts, not uncalibrated duration, token or round budgets.
+Keep those budgets as independent diagnostic criteria: an exceeded reference
+range is a warning, not proof of a performance regression. Performance gates
+need a comparable baseline and controlled execution conditions. Case timeouts
+remain execution bounds to stop hung runs.
 
 ### Judger scope
 
@@ -535,6 +829,13 @@ inflate `executed_tool_calls` or settlement success.
 
 ## FAIL report artifacts
 
+CI prints failure analysis both when a case settles and in the final summary.
+Tool-count failures include bounded counts of actual disposition, success,
+recognized result status/error category and explicit execution facts. Arbitrary
+tags and result prose remain private. These facts distinguish argument rejection
+from a model-admission error without claiming an unobserved root cause; missing
+evidence remains unavailable. Original criteria and verdicts are unchanged.
+
 On FAIL, each case report includes:
 
 - `text:` / `stderr:` preview (head of each, truncated).
@@ -563,7 +864,12 @@ before cleanup, using the same binary, environment, account and profile as the
 run. The private sidecar also retains the typed Server run tree and Reflect
 response. Its `children` list specifies the complete direct-child set. Every
 child requires an exact model and offering with successful physical provider
-evidence, and its result digest adopted before the same parent finalization.
+evidence, and its result bytes adopted before the same parent finalization.
+Bounded notifications and explicit result reads record byte ranges and hashes
+through the same dependency boundary. Explicit reads count only when present in
+the final request of a successful provider turn. The harness verifies each range
+against the canonical child result and requires gap-free coverage; overlap and
+out-of-order pages are allowed, while a preview alone cannot prove a full read.
 It never falls back to local journal
 events. The run tree must be complete; partial reflection can prove positive
 facts but cannot prove absence. Capture is bounded to 5 MiB and one total
@@ -600,13 +906,27 @@ or `{json: <JSON value>}`. Both expectations require that exact child's bounded,
 unambiguous terminal transcript document. Text compares the actual bytes;
 JSON compares the parsed value. In both cases the untouched observed bytes must
 match the adopted digest; parent output is checked separately.
-Expected serialization and observed raw terminal content are each limited to
-4,096 bytes.
+Literal expected results are limited to 4,096 serialized bytes. Observed content
+uses the bounded capture and semantic-request budgets, not the notification
+preview limit. Semantic judging receives each child's actual tool arguments,
+outcomes and results along with its final answer; custody alone does not certify
+the answer's claims. The complete serialized judge request must fit 64 KiB or
+verification is unavailable, never silently truncated or accepted.
 Whitespace equivalence never excuses a wrong digest, foreign run, missing
 document, or premature finalization. Scalar expectations are not supported.
 Natural parallel children are matched bijectively by distinct model identities,
 never by their output. For same-model children or explicit fanout, specify
-`fanout_group` and each child's `slot_index`. One successful root start receipt
+`fanout_group: {kind: id, value: <group-id>}` or
+`fanout_group: {kind: title, value: <group-title>}` and each child's `slot_index`.
+Titles are independent of IDs, including the product's default title when one is
+omitted. Multiple matching starts are ambiguous. The successful `started`
+receipt must agree with the request and its canonical fanout/observation
+identity projections, including the exact parent. Missing identity evidence is
+unavailable; contradictory identity evidence fails. String selectors are not accepted.
+Producer-typed pre-execution rejections are not launch candidates, but remain
+visible to call-count checks and the judge. Unknown execution is not a rejection;
+contradictory rejection/execution facts fail rather than being discarded.
+One successful root start receipt
 must bind unique slot indexes, agent and run IDs to exactly the authoritative children;
 optional slot labels are not execution identities.
 array position and aggregate counts are insufficient. A successful `get_results`

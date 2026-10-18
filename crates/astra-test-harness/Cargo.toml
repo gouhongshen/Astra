@@ -24,6 +24,7 @@ astra-server-types.workspace = true
 astra-thin-client.workspace = true
 astra-turn-core.workspace = true
 astra-turn-types.workspace = true
+astra-tools.workspace = true
 clap = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

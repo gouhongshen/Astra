@@ -195,7 +195,7 @@ mod tests {
         serde_json::json!({
             "answers": decisions.iter().enumerate().map(|(i, decision)| (
                 i.to_string(),
-                JudgmentAnswer::DiscreteNoul { decision: *decision },
+                *decision,
             )).collect::<std::collections::BTreeMap<_, _>>()
         })
         .to_string()
@@ -327,10 +327,10 @@ mod tests {
     fn malformed_incomplete_unknown_and_duplicate_answers_are_invalid() {
         let ctx = context();
         for raw in [
-            r#"{"answers":{"0":{"type":"discrete_noul","decision":"yes"},"1":{"type":"discrete_noul","decision":"no"},"2":{"type":"discrete_noul","decision":"no"}}}"#,
-            r#"{"answers":{"0":{"type":"discrete_noul","decision":"yes"},"0":{"type":"discrete_noul","decision":"no"}}}"#,
-            r#"{"answers":{"0":{"type":"discrete_noul","decision":"yes"}}}"#,
-            r#"{"answers":{"0":{"type":"noul","noul":1.0},"1":{"type":"discrete_noul","decision":"no"}}}"#,
+            r#"{"answers":{"0":"yes","1":"no","2":"no"}}"#,
+            r#"{"answers":{"0":"yes","0":"no"}}"#,
+            r#"{"answers":{"0":"yes"}}"#,
+            r#"{"answers":{"0":{"type":"noul","noul":1.0},"1":"no"}}"#,
             r#"{"skill_name":"review-changes"}"#,
             r#"[0]"#,
             "not json",

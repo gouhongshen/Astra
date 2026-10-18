@@ -63,7 +63,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
-sqlx = { workspace = true, features = ["chrono"] }
+sqlx = { workspace = true, features = ["chrono", "json"] }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -89,4 +89,5 @@ tempfile = "3"
 # `test-util` enables virtual-time `start_paused` so timeout/retry tests
 # don't wait real seconds.
 tokio = { workspace = true, features = ["io-std", "macros", "rt-multi-thread", "sync", "test-util"] }
+tracing-subscriber.workspace = true
 uuid.workspace = true

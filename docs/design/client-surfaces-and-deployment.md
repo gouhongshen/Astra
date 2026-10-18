@@ -82,10 +82,29 @@ until successful durable settlement. Authentication and session retries resend
 uncommitted facts; notifications arriving after request admission remain queued.
 Durable user guidance keeps its Server acceptance and disposition protocol.
 
+The TUI composer exposes Enter for ordinary submission and Ctrl+Q for explicit
+next-turn conversational input. The latter stays in the existing client-owned
+FIFO and never becomes current-run guidance. Enqueueing alone does not close
+guidance admission or arm the startup ordering latch. The ordinary lifecycle
+handoff, modal/draft gates, session-change restoration, and guidance custody
+rules remain authoritative. Local controls retain their dispatcher semantics.
+This queue has process-local custody, not durable Server acceptance or recovery
+across client restart; it does not add a runtime delivery class or scheduler.
+
 The startup card reserves terminal width before styling and clips text by Unicode
 display cells. Native MOI login uses a short `MOI` display label, not its internal
 credential profile identifier. Narrow or short terminals use a static presentation;
 animated frames must not wrap and invalidate cursor-up row accounting.
+
+Mutable assistant replies use a bounded Markdown tail in both the main viewport
+and the Ctrl+O transcript. When the byte window or rendered-row budget omits earlier
+text, a preview-only notice occupies one row within that same budget; its wording
+shortens to fit narrow terminals. The complete received source remains unchanged.
+Once output settles, the complete reply becomes available in the transcript and
+is queued for native scrollback through the existing background layout and bounded
+drain, independently of the statistics footer. A still-live tool prevents premature
+settlement. The notice does not imply a model context limit, and Ctrl+O does not
+provide the complete reply while it is still streaming.
 
 Inline terminal resize reconciles the viewport with the terminal's cursor
 position before clearing and repainting. The existing crossterm input owner

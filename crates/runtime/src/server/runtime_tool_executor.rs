@@ -81,7 +81,9 @@ use crate::server::tool_route_runtime::{
     ExecutedToolRoute, ToolRouteObserver, ToolRouteRuntimeContext,
     emit_tool_route_completion_events, execute_tool_route_before_completion_events,
 };
-use crate::server::tool_route_selection::{ToolExecutionClass, tool_execution_class};
+use crate::server::tool_route_selection::{
+    ToolExecutionClass, ToolExecutionRouteKind, tool_execution_class,
+};
 use crate::server::tool_session_config::{execute_adjust_config, execute_compress_context};
 use crate::server::tool_session_state_rollback::{
     self, RollbackSessionStateContext, SessionStateRestoreContext, SessionStateRollbackAction,
@@ -252,6 +254,25 @@ pub(crate) struct PendingRuntimeToolCompletion {
     duration_ms: u64,
     binding_fields: Map<String, Value>,
     durable: Option<PendingDurableToolCompletion>,
+}
+
+impl PendingRuntimeToolCompletion {
+    pub(crate) fn provider_input_settlement(
+        &self,
+    ) -> Option<crate::turn::run_control::UserIntentInvocationApplication<'_>> {
+        self.durable.as_ref().map(|pending| {
+            crate::turn::run_control::UserIntentInvocationApplication {
+                identity: &pending.identity,
+                purpose: astra_services::runs::UserIntentApplyPurpose::ProviderAcknowledgement {
+                    dispatch_owner: &pending.owner_id,
+                },
+            }
+        })
+    }
+
+    pub(crate) fn work_attribution(&self) -> &astra_services::runs::WorkInvocationAttribution {
+        &self.boundary.request().policy.work_attribution
+    }
 }
 
 pub(crate) struct GovernableRuntimeToolResult {
@@ -617,7 +638,7 @@ impl ServerWorkspaceAuthority {
 enum ServerWorkspaceAuthorityError {
     RecursiveRunScript,
     Cancelled,
-    Unavailable,
+    Unavailable(astra_tools::workspace_observation::WorkspaceLeaseFailure),
 }
 
 async fn acquire_server_workspace_authority(
@@ -666,13 +687,13 @@ async fn acquire_server_workspace_authority(
         .await
         .map(ServerWorkspaceAuthority::BoundWorkspace)
     } else {
-        Some(ServerWorkspaceAuthority::None)
+        Ok(ServerWorkspaceAuthority::None)
     };
-    authority.ok_or_else(|| {
+    authority.map_err(|failure| {
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             ServerWorkspaceAuthorityError::Cancelled
         } else {
-            ServerWorkspaceAuthorityError::Unavailable
+            ServerWorkspaceAuthorityError::Unavailable(failure)
         }
     })
 }
@@ -716,13 +737,9 @@ pub struct RuntimeToolExecutor {
     pub(super) context_manifest_pool: Option<SharedPool>,
     /// Owner- and session-validated canonical Work branch for typed Work tools.
     pub(super) work_binding: std::sync::OnceLock<WorkRuntimeBinding>,
-    /// Whether this executor is a delegated WorkItem attempt. Root
-    /// coordinators use the same executor type, but must not execute
-    /// Attempt-role tools until their primary attempt has been installed.
-    /// Keeping this as typed executor state lets the final route boundary
-    /// defend against an admission/execution race without inspecting model
-    /// prose or task names.
-    work_item_attempt_bound: bool,
+    /// Exact immutable attempt installed by the delegated lifecycle owner.
+    /// A boolean cannot identify the attempt in dispatch/replay evidence.
+    delegated_work_item: Option<(String, astra_services::runs::DurableWorkItemRunBinding)>,
     active_primary_work_attempt: Arc<std::sync::RwLock<Option<ActivePrimaryWorkAttempt>>>,
     /// Trusted physical-call to durable Work-establishment identity. This is
     /// internal provenance installed by the loop host; provider arguments and
@@ -835,6 +852,8 @@ pub struct RuntimeToolExecutor {
     /// long-lived authorization-scoped MCP session.
     agent_binding_mcp: Option<Arc<super::runtime_mcp::AgentBindingMcpRuntime>>,
     capability_source: Option<Arc<super::capability_source::CapabilitySourceRuntime>>,
+    #[cfg(test)]
+    mcp_before_transport: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Request-scoped MCP tool schemas. Joined with the server-side allowlist
     /// only when the matching MCP runtime binding is ready, so deferred
     /// activation reaches MCP tools without treating arbitrary schemas as
@@ -996,7 +1015,7 @@ impl RuntimeToolExecutor {
             session_artifact_store: None,
             context_manifest_pool: None,
             work_binding: std::sync::OnceLock::new(),
-            work_item_attempt_bound: false,
+            delegated_work_item: None,
             active_primary_work_attempt: Arc::new(std::sync::RwLock::new(None)),
             work_establishment_invocations: Arc::new(std::sync::RwLock::new(HashMap::new())),
             plan_repo: None,
@@ -1015,6 +1034,8 @@ impl RuntimeToolExecutor {
             mcp_manager: None,
             agent_binding_mcp: None,
             capability_source: None,
+            #[cfg(test)]
+            mcp_before_transport: None,
             agent_tool_context: std::sync::RwLock::new(None),
             work_surface_events: WorkSurfaceEventEmitter::new(session_id.clone()),
             tool_route_observer: Arc::new(std::sync::RwLock::new(None)),
@@ -1553,6 +1574,18 @@ impl RuntimeToolExecutor {
         }
     }
 
+    pub(crate) fn collaborator_policy(
+        &self,
+        public_alias: &str,
+        model: Option<&str>,
+    ) -> Result<astra_turn_core::provider_resolution::ResolvedInvocationPolicy, String> {
+        self.provider_policy_index
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .resolve_collaborator(public_alias, model)
+            .cloned()
+    }
+
     pub fn set_current_searchable_tool_schemas(&self, schemas: &[Value]) {
         let allowed = self.provider_visible_runtime_tool_names();
         let conflicts = prompt_schema_conflicting_tool_names(schemas);
@@ -1616,6 +1649,16 @@ impl RuntimeToolExecutor {
         *guard = schemas;
     }
 
+    /// Return the exact provider contract currently admitted for one public
+    /// name. Native stages carry this immutable schema into their child
+    /// executor so argument validation and readiness use the same contract as
+    /// the parent admission boundary.
+    pub(crate) fn current_edge_provider_schema(&self, name: &str) -> Option<Value> {
+        self.current_edge_provider_schemas_snapshot()
+            .into_iter()
+            .find(|schema| tool_schema_name(schema) == Some(name))
+    }
+
     /// Install the host's current deferred contract projection. This is a
     /// private discovery/execution catalog, not a provider-visible schema
     /// surface; it may contain action branches narrowed by current typed
@@ -1650,6 +1693,26 @@ impl RuntimeToolExecutor {
             "current_selected_tool_offers",
         );
         *guard = offers;
+    }
+
+    /// Install one provider offer that was already resolved by canonical
+    /// admission. Native collaborator stages execute before the normal model
+    /// loop installs its wire surface, so they use this same selected-offer
+    /// store rather than falling back to a public tool name.
+    pub(crate) fn set_current_selected_provider_offer(
+        &self,
+        tool_name: &str,
+        policy: &astra_turn_core::provider_resolution::ResolvedInvocationPolicy,
+        route: crate::server::tool_route_selection::ToolExecutionRouteKind,
+    ) {
+        let offer = SelectedToolOfferSnapshot::new_with_route_digest_and_native(
+            tool_name,
+            policy.descriptor.identity.provider_binding.as_str(),
+            route,
+            Some(policy.descriptor.descriptor_version.to_string()),
+            policy.descriptor.identity.native_tool_id.as_str(),
+        );
+        self.set_current_selected_tool_offers(HashMap::from([(tool_name.to_string(), offer)]));
     }
 
     pub fn set_current_activatable_tool_names(&self, names: HashSet<String>) {
@@ -1787,15 +1850,15 @@ impl RuntimeToolExecutor {
 
     async fn execute_mcp_tool(
         &self,
-        name: &str,
-        args: &Value,
-        tool_call_id: Option<&str>,
-        semantic_read_condition: Option<&astra_turn_types::SemanticReadCondition>,
-        prepared: Option<&astra_mcp::PreparedMcpToolCall>,
-        admission_deadline: Option<std::time::Instant>,
         request: &ToolExecutionRequest,
+        prepared: Option<&astra_mcp::PreparedMcpToolCall>,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        let name = request.tool_name.as_str();
+        let args = &request.args;
+        let tool_call_id = non_empty_identity(&request.tool_call_id);
+        let semantic_read_condition = request.policy.semantic_read_condition.as_ref();
+        let admission_deadline = request.policy.admission_deadline;
         let prepared = if self.agent_binding_mcp.is_none() {
             let Some(mgr) = &self.mcp_manager else {
                 return astra_tools::ToolResult::error(format!(
@@ -1820,6 +1883,9 @@ impl RuntimeToolExecutor {
         let mut seen_interaction_ids = HashSet::new();
         loop {
             let prior_dispatch = !seen_interaction_ids.is_empty();
+            if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                return mcp_cancelled_tool_result(name, prior_dispatch);
+            }
             if let Some(result) =
                 astra_tools::dispatch_deadline_result(admission_deadline, prior_dispatch)
             {
@@ -1828,6 +1894,10 @@ impl RuntimeToolExecutor {
                 } else {
                     result
                 };
+            }
+            #[cfg(test)]
+            if let Some(before_transport) = &self.mcp_before_transport {
+                before_transport();
             }
             let result = if let Some(agent_binding_mcp) = &self.agent_binding_mcp {
                 let Some(tool_call_id) = tool_call_id else {
@@ -1862,9 +1932,16 @@ impl RuntimeToolExecutor {
                             tool_call_id,
                             semantic_read_condition,
                             interaction_response.as_ref(),
+                            cancel_token,
                         )
                         .await
                 };
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.is_cancelled_before_dispatch())
+                {
+                    return mcp_cancelled_tool_result(name, prior_dispatch);
+                }
                 result.map_err(|error| {
                     mcp_call_error_result(
                         super::runtime_mcp::redact_mcp_error_text(&format!(
@@ -1883,11 +1960,18 @@ impl RuntimeToolExecutor {
                             .expect("provider interaction response must serialize"),
                     )])
                 });
-                prepared
+                let result = prepared
                     .as_ref()
                     .expect("non-Agent-Binding MCP call was prepared before admission")
-                    .call(args.clone(), protocol_metadata)
-                    .await
+                    .call_with_cancel(args.clone(), protocol_metadata, cancel_token)
+                    .await;
+                if matches!(
+                    result,
+                    Err(astra_mcp::McpToolCallError::CancelledBeforeDispatch)
+                ) {
+                    return mcp_cancelled_tool_result(name, prior_dispatch);
+                }
+                result
                     .map(|result| {
                         astra_mcp::extract_tool_call_result_with_limit(
                             &result,
@@ -1895,7 +1979,7 @@ impl RuntimeToolExecutor {
                         )
                     })
                     .map_err(|error| {
-                        let error = astra_mcp::McpError::Service(error);
+                        let error = astra_mcp::McpError::Service(error.into_service_error());
                         mcp_call_error_result(
                             super::runtime_mcp::redact_mcp_error_text(&format!(
                                 "MCP tool '{name}' failed: {error}"
@@ -2104,8 +2188,12 @@ impl RuntimeToolExecutor {
     /// Delegated attempts receive their immutable binding before execution;
     /// root sessions retain the default coordinator role and instead require
     /// an installed active primary attempt.
-    pub(crate) fn set_work_item_attempt_bound(&mut self, bound: bool) {
-        self.work_item_attempt_bound = bound;
+    pub(crate) fn set_delegated_work_item(
+        &mut self,
+        run_id: String,
+        item: astra_services::runs::DurableWorkItemRunBinding,
+    ) {
+        self.delegated_work_item = Some((run_id, item));
     }
 
     pub(crate) fn has_active_primary_work_attempt(&self) -> bool {
@@ -2115,7 +2203,7 @@ impl RuntimeToolExecutor {
     }
 
     pub(crate) fn has_assigned_work_item_attempt(&self) -> bool {
-        self.work_item_attempt_bound || self.has_active_primary_work_attempt()
+        self.delegated_work_item.is_some() || self.has_active_primary_work_attempt()
     }
 
     pub(super) fn active_primary_work_attempt(&self) -> Option<ActivePrimaryWorkAttempt> {
@@ -2139,7 +2227,7 @@ impl RuntimeToolExecutor {
             };
         };
         let Some(binding) = self.work_binding.get() else {
-            return if active.is_none() {
+            return if active.is_none() && self.delegated_work_item.is_none() {
                 PrimaryWorkHandoff::NoBinding
             } else {
                 PrimaryWorkHandoff::Unavailable {
@@ -2152,25 +2240,39 @@ impl RuntimeToolExecutor {
             || active
                 .as_ref()
                 .is_some_and(|attempt| attempt.executor_run_id != producer_run_id)
+            || self
+                .delegated_work_item
+                .as_ref()
+                .is_some_and(|(run_id, _)| run_id != producer_run_id || active.is_some())
         {
             return PrimaryWorkHandoff::Unavailable {
                 reason: PrimaryWorkUnavailable::BindingMismatch,
             };
         }
-        let item =
-            active.as_ref().map(
+        let item = active
+            .as_ref()
+            .map(
                 |attempt| astra_services::runs::WorkItemRuntimeBindingRequest {
                     item_id: attempt.item_id.clone(),
                     item_revision: attempt.item_revision,
                     attempt_id: attempt.attempt_id.clone(),
                 },
-            );
+            )
+            .or_else(|| {
+                self.delegated_work_item.as_ref().map(|(_, item)| {
+                    astra_services::runs::WorkItemRuntimeBindingRequest {
+                        item_id: item.item_id().as_str().into(),
+                        item_revision: item.item_revision().get(),
+                        attempt_id: item.attempt_id().as_str().into(),
+                    }
+                })
+            });
         let binding = astra_services::runs::WorkRuntimeBindingRequest {
             work_id: binding.work_id.as_str().into(),
             branch_id: binding.branch_id.as_str().into(),
             item,
         };
-        let snapshot = if active.is_some() {
+        let snapshot = if binding.item.is_some() {
             PrimaryWorkHandoff::Active { binding }
         } else {
             PrimaryWorkHandoff::BindingOnly { binding }
@@ -2430,6 +2532,7 @@ impl RuntimeToolExecutor {
                     self.execution_binding.executor().transport,
                     ToolTransportKind::EdgeLedger
                 )
+                && !self.edge_admitted_tools.contains(name)
             {
                 return ExecutorToolReadiness::UnknownTool;
             }
@@ -3269,6 +3372,9 @@ impl RuntimeToolExecutor {
         request.policy.admission_deadline = self
             .admitted_execution_deadline
             .map(|deadline| deadline.monotonic_work_deadline());
+        request.policy.execution_deadline_unix_ms = self
+            .admitted_execution_deadline
+            .map(|deadline| deadline.work_deadline_unix_ms);
         if let Some(offer) = self.selected_offer_for_request(&request, None) {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
@@ -3288,7 +3394,7 @@ impl RuntimeToolExecutor {
         request
     }
 
-    fn tool_execution_request_for_invocation(
+    pub(crate) fn tool_execution_request_for_invocation(
         &self,
         identity: &astra_turn_types::ToolInvocationIdentity,
         name: &str,
@@ -3303,6 +3409,9 @@ impl RuntimeToolExecutor {
         request.policy.admission_deadline = self
             .admitted_execution_deadline
             .map(|deadline| deadline.monotonic_work_deadline());
+        request.policy.execution_deadline_unix_ms = self
+            .admitted_execution_deadline
+            .map(|deadline| deadline.work_deadline_unix_ms);
         if let Some(offer) = self.selected_offer_for_request(&request, resolved_provider_policy) {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
@@ -3565,6 +3674,12 @@ impl RuntimeToolExecutor {
         runtime_control_kind: Option<
             astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind,
         >,
+        force_read_only_workspace: bool,
+        provider_stage_dispatch: Option<
+            tokio::sync::watch::Sender<
+                Option<astra_server_types::edge_connection_pool::ProviderStageDispatchBinding>,
+            >,
+        >,
     ) -> GovernableRuntimeToolResult {
         if runtime_control_kind.is_some_and(|kind| kind.tool_name() != name) {
             return GovernableRuntimeToolResult::completed(
@@ -3599,10 +3714,18 @@ impl RuntimeToolExecutor {
             args,
             resolved_provider_policy,
         );
+        request.provider_stage_dispatch = provider_stage_dispatch;
         request.policy.resolved_provider_policy = resolved_provider_policy.cloned();
         request.policy.permission_grant = permission_grant.cloned();
         request.policy.delegation_model_admission =
             delegation_model_admission.map(|prepared| prepared.admission.clone());
+        if force_read_only_workspace && request.workspace.authority == WorkspaceAuthority::ReadWrite
+        {
+            // Plan mode is a capability ceiling, not a prompt hint. Apply the
+            // downgrade to the canonical request before transport derives its
+            // Edge execution ceiling; no later policy may widen it.
+            request.workspace.authority = WorkspaceAuthority::ReadOnly;
+        }
         if runtime_control_kind
             == Some(astra_turn_core::tool::deferred_activation::RuntimeControlInvocationKind::WorkSettlement)
         {
@@ -3785,6 +3908,73 @@ impl RuntimeToolExecutor {
             .result
     }
 
+    pub(crate) fn work_attribution_for_scope(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+    ) -> astra_services::runs::WorkInvocationAttribution {
+        use astra_services::runs::WorkInvocationAttribution;
+
+        if run_id.trim().is_empty() {
+            return WorkInvocationAttribution::Unknown;
+        }
+        match self.primary_work_handoff(user_id, session_id, run_id) {
+            PrimaryWorkHandoff::NoBinding | PrimaryWorkHandoff::BindingOnly { .. } => {
+                WorkInvocationAttribution::Unbound
+            }
+            PrimaryWorkHandoff::Active { binding } => WorkInvocationAttribution::Attempt {
+                producer_run_id: run_id.to_owned(),
+                binding,
+            },
+            PrimaryWorkHandoff::Unavailable { .. } => WorkInvocationAttribution::Unknown,
+        }
+    }
+
+    fn work_invocation_attribution(
+        &self,
+        request: &ToolExecutionRequest,
+        route: ToolExecutionRouteKind,
+    ) -> astra_services::runs::WorkInvocationAttribution {
+        use astra_runtime_env::{RequiredExecutor, WorkExecutionRole};
+        use astra_services::runs::WorkInvocationAttribution;
+
+        if self.user_id != request.user_id
+            || self.session_id != request.session_id
+            || route == ToolExecutionRouteKind::Unsupported
+        {
+            return WorkInvocationAttribution::Unknown;
+        }
+        if route == ToolExecutionRouteKind::ServerControlPlane
+            && request.policy.delegation_model_admission.is_none()
+        {
+            let Some(spec) = self
+                .tool_execution_service
+                .tool_registry()
+                .get(&request.tool_name)
+                .filter(|spec| spec.required.executor == RequiredExecutor::ControlPlane)
+            else {
+                return WorkInvocationAttribution::Unknown;
+            };
+            let work_control = spec.required.work_execution_role != WorkExecutionRole::Any;
+            let read_only_control = astra_turn_core::tool::categories::classify(
+                &request.tool_name,
+                Some(&request.args),
+            )
+            .category
+            .is_read_only()
+                && request
+                    .policy
+                    .resolved_provider_policy
+                    .as_ref()
+                    .is_none_or(|policy| policy.is_read_only());
+            if work_control || read_only_control {
+                return WorkInvocationAttribution::Control;
+            }
+        }
+        self.work_attribution_for_scope(&request.user_id, &request.session_id, &request.run_id)
+    }
+
     async fn execute_request_before_governance(
         &self,
         mut request: ToolExecutionRequest,
@@ -3930,6 +4120,7 @@ impl RuntimeToolExecutor {
                     .await
             } else {
                 let route = self.tool_execution_service.routing_decision(&request);
+                request.policy.work_attribution = self.work_invocation_attribution(&request, route);
                 let decision = match crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::resolve(
                 &request,
                 route,
@@ -4075,7 +4266,11 @@ impl RuntimeToolExecutor {
                 );
             }
             let admission_deadline = request.policy.admission_deadline;
-            frozen.apply_to_request(&mut request);
+            if let Err(error) = frozen.apply_to_request(&mut request) {
+                return GovernableRuntimeToolResult::completed(
+                    tool_invocation_decision_rejected_result(error.to_string()),
+                );
+            }
             request.policy.admission_deadline = admission_deadline;
             let semantic_read_preparation = self
                 .prepare_semantic_read(&frozen, &identity, &request.args)
@@ -4890,15 +5085,12 @@ impl RuntimeToolExecutor {
                     .await
                     .into();
             }
-            Err(ServerWorkspaceAuthorityError::Unavailable) => {
+            Err(ServerWorkspaceAuthorityError::Unavailable(failure)) => {
                 return lifecycle
                     .finish(
                         name,
                         &call_id,
-                        astra_tools::workspace_lease_unavailable_tool_result_for_workspace(
-                            name,
-                            &self.workspace_root,
-                        ),
+                        astra_tools::workspace_lease_failure_tool_result(name, failure),
                     )
                     .await
                     .into();
@@ -5561,26 +5753,17 @@ impl ServerLocalToolTransport<crate::server::tool_local_transport::RuntimeToolEx
                 Err(ServerWorkspaceAuthorityError::Cancelled) => {
                     return astra_tools::cancelled_tool_result(&request.tool_name, false).into();
                 }
-                Err(ServerWorkspaceAuthorityError::Unavailable) => {
-                    return astra_tools::workspace_lease_unavailable_tool_result_for_workspace(
+                Err(ServerWorkspaceAuthorityError::Unavailable(failure)) => {
+                    return astra_tools::workspace_lease_failure_tool_result(
                         &request.tool_name,
-                        &self.workspace_root,
+                        failure,
                     )
                     .into();
                 }
                 Err(ServerWorkspaceAuthorityError::RecursiveRunScript) => unreachable!(),
             };
             let result = self
-                .execute_mcp_tool(
-                    &request.tool_name,
-                    &request.args,
-                    non_empty_identity(&request.tool_call_id),
-                    request.policy.semantic_read_condition.as_ref(),
-                    prepared.as_ref(),
-                    request.policy.admission_deadline,
-                    request,
-                    cancel_token,
-                )
+                .execute_mcp_tool(request, prepared.as_ref(), cancel_token)
                 .await;
             let result = finalize_mcp_workspace_effect(
                 &self.workspace_root,
@@ -5623,6 +5806,13 @@ impl ToolExecutor for RuntimeToolExecutor {
 
     fn tool_schemas(&self) -> Vec<Value> {
         self.capability_filtered_server_tool_schemas()
+            .into_iter()
+            .filter(|schema| {
+                !schema["function"]["name"].as_str().is_some_and(
+                    crate::server::tool_route_selection::is_intercepted_turn_pipeline_tool,
+                )
+            })
+            .collect()
     }
 
     fn project_root(&self) -> &Path {
@@ -5676,6 +5866,15 @@ fn mark_mcp_call_dispatched(mut result: astra_tools::ToolResult) -> astra_tools:
         .get_or_insert_with(Map::new)
         .insert("mcp_call_dispatched".to_string(), Value::Bool(true));
     result
+}
+
+fn mcp_cancelled_tool_result(name: &str, prior_dispatch: bool) -> astra_tools::ToolResult {
+    let result = astra_tools::cancelled_tool_result(name, prior_dispatch);
+    if prior_dispatch {
+        mark_mcp_call_dispatched(result)
+    } else {
+        result
+    }
 }
 
 fn finalize_mcp_workspace_effect(
@@ -6094,6 +6293,8 @@ pub(crate) mod tests {
                 Some(&grant),
                 None,
                 None,
+                None,
+                false,
                 None,
             )
             .await;
@@ -7440,6 +7641,8 @@ pub(crate) mod tests {
         cache: astra_turn_types::ResolvedSemanticCacheBaseline,
     ) -> astra_turn_core::provider_resolution::ResolvedInvocationPolicy {
         astra_turn_core::provider_resolution::ResolvedInvocationPolicy {
+            runtime_requirements: None,
+            native_collaborator_protocol: None,
             descriptor: astra_turn_types::ResolvedToolDescriptorRef::new(
                 astra_turn_types::ToolIdentity::new(
                     astra_turn_types::ProviderBindingRef::new("binding-a").unwrap(),
@@ -8570,7 +8773,13 @@ pub(crate) mod tests {
     #[test]
     fn visible_server_tools_have_local_execution_handlers() {
         let (exec, _dir) = test_executor();
-        let missing = schema_name_set(exec.tool_schemas())
+        let schema_names = schema_name_set(exec.tool_schemas());
+        for name in ["skill", "discover_skills"] {
+            assert!(!schema_names.contains(name));
+            assert!(!exec.tool_engine.contains(name));
+            assert!(exec.provider_visible_runtime_tool_names().contains(name));
+        }
+        let missing = schema_names
             .into_iter()
             .filter(|schema_name| !exec.tool_engine.contains(schema_name))
             .collect::<Vec<_>>();
@@ -8956,6 +9165,14 @@ pub(crate) mod tests {
         .unwrap();
         let mut request =
             exec.tool_execution_request_for_invocation(&identity, "write_file", &args, None);
+        assert_eq!(
+            request.policy.execution_deadline_unix_ms,
+            Some(deadline.work_deadline_unix_ms)
+        );
+        assert_eq!(
+            request.policy.admission_deadline,
+            Some(deadline.monotonic_work_deadline())
+        );
         request.policy.permission_grant = Some(grant.clone());
         request.policy.admission_snapshot = Some(
             exec.tool_execution_service
@@ -9382,7 +9599,7 @@ pub(crate) mod tests {
         ] {
             let outcome = exec
                 .execute_invocation_before_governance(
-                    "run", "chain", "call", name, args, None, None, None, None, kind,
+                    "run", "chain", "call", name, args, None, None, None, None, kind, false, None,
                 )
                 .await;
             assert_eq!(
@@ -9413,6 +9630,8 @@ pub(crate) mod tests {
                 None,
                 None,
                 Some(RuntimeControlInvocationKind::WorkSettlement),
+                false,
+                None,
             )
             .await;
         assert_eq!(
@@ -9440,6 +9659,8 @@ pub(crate) mod tests {
                 None,
                 None,
                 Some(RuntimeControlInvocationKind::WorkSettlement),
+                false,
+                None,
             )
             .await;
         assert_eq!(
@@ -9623,13 +9844,159 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn intercepted_skills_freeze_work_before_execution_and_reach_journal_criteria() {
+        use crate::turn::agentic::tool_interception::try_prepare_intercepted_tool_round;
+        use crate::turn::agentic_loop::host::tests::make_state;
+        use astra_test_harness::{
+            criteria::{Criterion, evaluate_deterministic_with_session},
+            runner::RunOutcome,
+            session_capture::{JournalEvent, SessionCapture},
+        };
+        use astra_turn_core::tool::deferred_activation::CanonicalToolInvocation;
+
+        struct AdvancingExecutor(Arc<RuntimeToolExecutor>);
+        #[async_trait::async_trait]
+        impl astra_skills::traits::SkillExecutor for AdvancingExecutor {
+            async fn execute(
+                &self,
+                _: &astra_skills::manifest::LoadedSkill,
+                _: &astra_skills::traits::SkillExecutionContext,
+            ) -> Result<astra_skills::traits::SkillExecutionResult, astra_skills::SkillError>
+            {
+                tokio::task::yield_now().await;
+                self.0
+                    .install_active_primary_work_attempt(ActivePrimaryWorkAttempt {
+                        attempt_id: "later-attempt".into(),
+                        executor_run_id: "producer".into(),
+                        item_id: "later-item".into(),
+                        item_revision: 1,
+                        objective: "later objective".into(),
+                        expected_result: "later result".into(),
+                    })
+                    .unwrap();
+                Err(astra_skills::SkillError::Internal(
+                    "execution failed after advancing custody".into(),
+                ))
+            }
+            fn supports(&self, _: &astra_skills::manifest::ExecutionContext) -> bool {
+                true
+            }
+        }
+
+        let provider = astra_skills::providers::bundled::BundledSkillProvider::new();
+        provider.register_from_skill_md(
+            "---\nname: review\ndescription: Review workflow\ncontext: fork\n---\nReview instructions."
+        ).unwrap();
+        let mut registry = crate::skills::UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(provider));
+        registry.discover_all().await.unwrap();
+        registry.load("review").await.unwrap();
+        let resolver = Arc::new(crate::skills::UnifiedSkillResolver::new(Arc::new(registry)));
+        for tool in ["discover_skills", "skill"] {
+            let (executor, _dir) = test_executor();
+            let executor = Arc::new(executor);
+            let mut state = make_state();
+            state.runtime_tool_executor = Some(executor.clone());
+            state.context_manifest_user_id = Some("test-user".into());
+            state.current_session_id = Some("test-session".into());
+            state.current_run_id = Some("producer".into());
+            state.skills.resolver = Some(resolver.clone());
+            state.skills.executor = Some(Arc::new(AdvancingExecutor(executor.clone())));
+            let args = if tool == "skill" {
+                json!({"skill_name":"review"})
+            } else {
+                json!({"query":"review"})
+            };
+            let call = json!({"id":"skill-call","type":"function","function":{"name":tool,"arguments":args.to_string()}});
+            let turn = crate::turn::agentic_loop::host::HostTurnResult {
+                accum: astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum {
+                    tool_calls: vec![call.clone()],
+                    ..Default::default()
+                },
+                ttft_ms: None,
+                error_kind: None,
+            };
+            try_prepare_intercepted_tool_round(
+                &mut state,
+                &turn,
+                Vec::new(),
+                &[CanonicalToolInvocation::ordinary(call.clone())],
+                &[call],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let record = state.stall.tool_call_records.last().unwrap();
+            assert_eq!(
+                record.disposition,
+                Some(astra_services::session_journal::ToolCallDisposition::Executed)
+            );
+            assert_eq!(
+                record.work_attribution,
+                Some(astra_services::runs::WorkInvocationAttribution::Unbound)
+            );
+            assert_eq!(record.ok, tool == "discover_skills");
+            if tool == "skill" {
+                assert_eq!(
+                    executor.work_attribution_for_scope("test-user", "test-session", "producer"),
+                    astra_services::runs::WorkInvocationAttribution::Unknown
+                );
+            }
+            let mut capture = SessionCapture::default();
+            capture.events.push(JournalEvent {
+                event_type: "llm_round".into(),
+                raw: json!({
+                    "producer_scope":{"run_id":"producer"},"turn":1,"round":0,"tool_calls":[record]
+                }),
+            });
+            let criterion: Criterion = serde_json::from_value(json!({
+                "type":"journal_work_replacement_lifecycle", "initial_items":2,
+                "cancelled_items":1,"added_items":1,"delivered_items":2
+            }))
+            .unwrap();
+            // The real serialized invocation passes attribution, even before
+            // genesis; this intentionally incomplete lifecycle fails later.
+            let evaluate = |capture: &SessionCapture| {
+                evaluate_deterministic_with_session(
+                    std::slice::from_ref(&criterion),
+                    &RunOutcome::default(),
+                    Some(capture),
+                )
+                .remove(0)
+            };
+            assert_eq!(
+                evaluate(&capture).detail,
+                "replacement lifecycle lacks canonical Work genesis"
+            );
+            capture.events[0].raw["tool_calls"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("work_attribution");
+            assert_eq!(
+                evaluate(&capture).detail,
+                "executed invocation lacks valid frozen Work attribution"
+            );
+        }
+    }
+
     #[test]
     fn primary_work_handoff_never_confuses_unavailable_with_absent() {
+        use astra_services::runs::WorkInvocationAttribution;
+
         let (executor, _dir) = test_executor();
         assert!(matches!(
             executor.primary_work_handoff("test-user", "test-session", "run"),
             PrimaryWorkHandoff::NoBinding
         ));
+        assert_eq!(
+            executor.work_attribution_for_scope("test-user", "test-session", "run"),
+            WorkInvocationAttribution::Unbound
+        );
+        assert_eq!(
+            executor.work_attribution_for_scope("test-user", "test-session", ""),
+            WorkInvocationAttribution::Unknown
+        );
         for (user, session) in [
             ("other-user", "test-session"),
             ("test-user", "other-session"),
@@ -9640,6 +10007,10 @@ pub(crate) mod tests {
                     reason: PrimaryWorkUnavailable::BindingMismatch
                 }
             ));
+            assert_eq!(
+                executor.work_attribution_for_scope(user, session, "run"),
+                WorkInvocationAttribution::Unknown
+            );
         }
         *executor.active_primary_work_attempt.write().unwrap() = Some(ActivePrimaryWorkAttempt {
             attempt_id: "attempt".into(),
@@ -9655,6 +10026,10 @@ pub(crate) mod tests {
                 reason: PrimaryWorkUnavailable::BindingMismatch
             }
         ));
+        assert_eq!(
+            executor.work_attribution_for_scope("test-user", "test-session", "run"),
+            WorkInvocationAttribution::Unknown
+        );
         let lock = executor.active_primary_work_attempt.clone();
         assert!(
             std::thread::spawn(move || {
@@ -9670,6 +10045,169 @@ pub(crate) mod tests {
                 reason: PrimaryWorkUnavailable::AttemptLockUnavailable
             }
         ));
+        assert_eq!(
+            executor.work_attribution_for_scope("test-user", "test-session", "run"),
+            WorkInvocationAttribution::Unknown
+        );
+    }
+
+    #[test]
+    fn delegated_work_attempt_cannot_be_reported_as_unbound() {
+        use astra_services::runs::DurableWorkItemRunBinding;
+        use astra_services::work::{WorkItemAttemptId, WorkItemId, WorkItemRevision};
+
+        let (mut executor, _dir) = test_executor();
+        executor.set_delegated_work_item(
+            "child-run".into(),
+            DurableWorkItemRunBinding::new(
+                WorkItemId::parse("item").unwrap(),
+                WorkItemRevision::INITIAL,
+                WorkItemAttemptId::parse("attempt").unwrap(),
+            ),
+        );
+        assert!(executor.has_assigned_work_item_attempt());
+        // The lifecycle must also install owner/session/branch custody.
+        // Losing that binding must never become absence evidence.
+        assert!(matches!(
+            executor.primary_work_handoff("test-user", "test-session", "child-run"),
+            PrimaryWorkHandoff::Unavailable {
+                reason: PrimaryWorkUnavailable::BindingMismatch
+            }
+        ));
+        assert_eq!(
+            executor.work_attribution_for_scope("test-user", "test-session", "child-run"),
+            astra_services::runs::WorkInvocationAttribution::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_search_freezes_control_attribution_without_provider_policy() {
+        use astra_services::runs::WorkInvocationAttribution;
+
+        let (mut executor, _dir) = test_executor();
+        executor.enable_durable_invocations();
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "run",
+            "chain",
+            "search",
+        )
+        .unwrap();
+        let grant = crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
+            source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
+            reason: None,
+            updates_hash: None,
+        };
+        let result = executor
+            .execute_invocation_with_metadata(
+                "run",
+                "chain",
+                "search",
+                "tool_search",
+                &json!({"query": "select:read_file"}),
+                None,
+                Some(&grant),
+            )
+            .await;
+        assert!(!result.is_error, "{result:?}");
+        let record = executor
+            .invocation_ledger
+            .as_ref()
+            .unwrap()
+            .get(&identity)
+            .await
+            .unwrap()
+            .unwrap();
+        let decision =
+            crate::server::tool_invocation_decision::ToolInvocationDecisionSnapshot::from_durable(
+                &record.decision,
+            )
+            .unwrap();
+        assert_eq!(
+            decision.work_attribution,
+            WorkInvocationAttribution::Control
+        );
+        assert!(decision.provider_policy.is_none());
+    }
+
+    #[test]
+    fn control_attribution_requires_the_actual_control_plane_owner_and_read_only_semantics() {
+        use astra_services::runs::WorkInvocationAttribution;
+
+        let (executor, _dir) = test_executor();
+        for (name, args, expected) in [
+            (
+                "tool_search",
+                json!({"query": "select:read_file"}),
+                WorkInvocationAttribution::Control,
+            ),
+            ("start_work", json!({}), WorkInvocationAttribution::Control),
+            (
+                "agent",
+                json!({"action": "spawn"}),
+                WorkInvocationAttribution::Unbound,
+            ),
+            ("ask_user", json!({}), WorkInvocationAttribution::Unbound),
+            (
+                "web_fetch",
+                json!({"url": "https://example.com"}),
+                WorkInvocationAttribution::Unbound,
+            ),
+            (
+                "unknown_tool",
+                json!({}),
+                WorkInvocationAttribution::Unknown,
+            ),
+        ] {
+            let mut request = executor.tool_execution_request(name, &args);
+            request.run_id = "run".into();
+            let route = executor.tool_execution_service.routing_decision(&request);
+            assert_eq!(
+                executor.work_invocation_attribution(&request, route),
+                expected,
+                "{name}"
+            );
+        }
+        let mut search = executor.tool_execution_request("tool_search", &json!({"query": "read"}));
+        search.run_id = "run".into();
+        let mut policy = semantic_read_provider_policy(
+            astra_turn_types::ResolvedSemanticCacheBaseline::Disabled,
+        );
+        policy.effect = ResolvedToolEffect::Mutating;
+        search.policy.resolved_provider_policy = Some(policy.clone());
+        assert_eq!(
+            executor
+                .work_invocation_attribution(&search, ToolExecutionRouteKind::ServerControlPlane),
+            WorkInvocationAttribution::Unbound
+        );
+        policy.effect = ResolvedToolEffect::ReadOnly;
+        let mut spawn = executor.tool_execution_request("agent", &json!({"action": "spawn"}));
+        spawn.run_id = "run".into();
+        spawn.policy.resolved_provider_policy = Some(policy.clone());
+        assert_eq!(
+            executor
+                .work_invocation_attribution(&spawn, ToolExecutionRouteKind::ServerControlPlane),
+            WorkInvocationAttribution::Unbound
+        );
+        for name in ["unknown_tool", "web_fetch"] {
+            let mut request = executor.tool_execution_request(name, &json!({}));
+            request.run_id = "run".into();
+            request.policy.resolved_provider_policy = Some(policy.clone());
+            assert_eq!(
+                executor.work_invocation_attribution(
+                    &request,
+                    ToolExecutionRouteKind::ServerControlPlane
+                ),
+                WorkInvocationAttribution::Unknown
+            );
+        }
+        search.user_id = "other-user".into();
+        assert_eq!(
+            executor
+                .work_invocation_attribution(&search, ToolExecutionRouteKind::ServerControlPlane),
+            WorkInvocationAttribution::Unknown
+        );
     }
 
     #[test]
@@ -10749,7 +11287,7 @@ pub(crate) mod tests {
         async fn wait_result(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
-            _timeout: std::time::Duration,
+            _timeout: Option<std::time::Duration>,
         ) -> Result<Option<String>, String> {
             Err("MCP tools must not wait for edge dispatch results".to_string())
         }
@@ -10855,7 +11393,7 @@ pub(crate) mod tests {
         async fn wait_result(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
-            _timeout: std::time::Duration,
+            _timeout: Option<std::time::Duration>,
         ) -> Result<Option<String>, String> {
             Ok(None)
         }
@@ -10914,7 +11452,7 @@ pub(crate) mod tests {
         async fn wait_result(
             &self,
             _identity: &astra_services::multi_agent::EdgeDispatchIdentity,
-            _timeout: std::time::Duration,
+            _timeout: Option<std::time::Duration>,
         ) -> Result<Option<String>, String> {
             if let Some(sender) = self.wait_started.lock().expect("wait started lock").take() {
                 let _ = sender.send(());
@@ -13221,6 +13759,7 @@ pub(crate) mod tests {
             decision: AskUserDecision::Submitted(AskUserAnswers {
                 answers: vec![
                     AskUserQuestionAnswer {
+                        id: None,
                         question: "Which features?".into(),
                         answers: vec!["Beta".into(), "Custom".into()],
                         multi_select: false,
@@ -13230,6 +13769,7 @@ pub(crate) mod tests {
                         }),
                     },
                     AskUserQuestionAnswer {
+                        id: None,
                         question: "Which option?".into(),
                         answers: vec!["first".into()],
                         multi_select: true,
@@ -13345,6 +13885,7 @@ pub(crate) mod tests {
             }),
             decision: AskUserDecision::Submitted(AskUserAnswers {
                 answers: vec![AskUserQuestionAnswer {
+                    id: None,
                     question: "Which option?".into(),
                     answers: vec!["custom".into()],
                     multi_select: false,
@@ -13842,6 +14383,134 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn agent_binding_mcp_cancellation_retains_execution_until_provider_settles() {
+        for notification_status in [
+            Some(axum::http::StatusCode::ACCEPTED),
+            Some(axum::http::StatusCode::NOT_IMPLEMENTED),
+            None,
+        ] {
+            assert_agent_binding_mcp_cancellation_settlement(notification_status, true).await;
+            assert_agent_binding_mcp_cancellation_settlement(notification_status, false).await;
+        }
+    }
+
+    async fn assert_agent_binding_mcp_cancellation_settlement(
+        notification_status: Option<axum::http::StatusCode>,
+        matching_response: bool,
+    ) {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notified = Arc::new(tokio::sync::Notify::new());
+        let settled = Arc::new(tokio::sync::Notify::new());
+        let request_id = Arc::new(StdMutex::new(Value::Null));
+        let app = axum::Router::new().route("/mcp", axum::routing::post({
+            let (started, notified, settled, request_id) = (
+                started.clone(), notified.clone(), settled.clone(), request_id.clone(),
+            );
+            move |axum::Json(body): axum::Json<Value>| {
+                let (started, notified, settled, request_id) = (
+                    started.clone(), notified.clone(), settled.clone(), request_id.clone(),
+                );
+                async move {
+                    match body["method"].as_str().unwrap() {
+                        "tools/call" => {
+                            assert_eq!(body["params"]["call_id"], "call-cancel-test");
+                            *request_id.lock().unwrap() = body["id"].clone();
+                            started.notify_one();
+                            settled.notified().await;
+                            (axum::http::StatusCode::OK, axum::Json(json!({
+                                "jsonrpc": "2.0", "id": if matching_response { body["id"].clone() } else { json!("old-exchange") },
+                                "result": {
+                                    "content": [{"type": "text", "text": "cleanup settled"}],
+                                    "_meta": {"astra.workspace_effect": {"settled": true}}
+                                }
+                            })))
+                        }
+                        "notifications/cancelled" => {
+                            assert_eq!(body["params"]["requestId"], *request_id.lock().unwrap());
+                            assert!(body.get("id").is_none());
+                            notified.notify_one();
+                            let status = match notification_status {
+                                Some(status) => status,
+                                None => std::future::pending().await,
+                            };
+                            (status, axum::Json(Value::Null))
+                        }
+                        other => panic!("unexpected method {other}"),
+                    }
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut exec, _dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function", "function": {
+                "name": "mcp__controlled__write", "parameters": {"type": "object"}
+            }
+        })]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests_at_endpoint(
+                "controlled",
+                &["mcp__controlled__write"],
+                &endpoint,
+            )
+            .with_test_workspace_effect(astra_turn_types::ResolvedToolEffect::Mutating),
+        ));
+        let mut request = exec.tool_execution_request("mcp__controlled__write", &json!({}));
+        request.tool_call_id = "call-cancel-test".into();
+        let token = CancellationToken::new();
+        let execution = <RuntimeToolExecutor as ServerLocalToolTransport<
+            crate::server::tool_local_transport::RuntimeToolExecutionResult,
+        >>::execute_server_local_tool(&exec, &request, Some(&token));
+        tokio::pin!(execution);
+        tokio::select! {
+            result = &mut execution => panic!("must dispatch MCP tool: {:?}", result.result),
+            () = started.notified() => {}
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("tool did not dispatch"),
+        }
+        token.cancel();
+        token.cancel();
+        tokio::select! {
+            result = &mut execution => panic!("notification must not settle tool: {:?}", result.result),
+            () = notified.notified() => {}
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("cancellation did not reach MCP provider"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut execution)
+                .await
+                .is_err()
+        );
+        settled.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut execution)
+            .await
+            .unwrap()
+            .result;
+        let writer = astra_tools::workspace_observation::begin_workspace_writer_with_options(
+            _dir.path(),
+            None,
+            Duration::from_millis(50),
+        )
+        .await;
+        if matching_response {
+            assert!(!result.is_error, "{result:?}");
+            assert!(result.output.contains("cleanup settled"), "{result:?}");
+            assert!(writer.is_ok(), "matching completion admits the next writer");
+        } else {
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(
+                result.metadata.as_ref().unwrap()["workspace_effect_settled"],
+                false
+            );
+            assert!(matches!(
+                writer,
+                Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)
+            ));
+        }
+        server.abort();
+    }
+
     async fn execute_provider_interaction_sequence(
         unique_request_ids: bool,
         decision: astra_tools::ProviderInteractionDecision,
@@ -13855,7 +14524,8 @@ pub(crate) mod tests {
                     |axum::extract::State((calls, unique_request_ids)): axum::extract::State<(
                         Arc<AtomicUsize>,
                         bool,
-                    )>| async move {
+                    )>,
+                     axum::Json(body): axum::Json<Value>| async move {
                         let call = calls.fetch_add(1, Ordering::SeqCst);
                         let request_id = if unique_request_ids {
                             format!("request-{call}")
@@ -13864,7 +14534,7 @@ pub(crate) mod tests {
                         };
                         axum::Json(json!({
                             "jsonrpc": "2.0",
-                            "id": "astra-agent-binding-tools-call",
+                            "id": body["id"],
                             "result": {
                                 "content": [{"type": "text", "text": "choose"}],
                                 "_meta": {
@@ -13992,6 +14662,295 @@ pub(crate) mod tests {
         );
         assert_eq!(provider_calls, 17);
         assert_eq!(gate_calls, 16);
+    }
+
+    #[tokio::test]
+    async fn mcp_transport_preflight_cancellation_preserves_workspace_dispatch_state() {
+        for ordinary_mcp in [false, true] {
+            for prior_dispatch in [false, true] {
+                let (mut exec, dir) = test_executor();
+                let calls_path = dir.path().join("provider-calls");
+                let interaction_result = json!({
+                    "content": [{"type": "text", "text": "choose"}],
+                    "_meta": {"astra/providerInteraction": {
+                        "request_id": "preflight-interaction",
+                        "payload": {"type": "provider.opaque.select"},
+                        "timeout_ms": 60_000
+                    }}
+                });
+                let mut server = None;
+                let mut manager = None;
+                if ordinary_mcp {
+                    let mut client = astra_mcp::McpClientManager::new();
+                    let config = astra_mcp::McpServerConfig {
+                        name: "controlled".into(),
+                        transport: astra_mcp::Transport::Stdio {
+                            command: vec!["python3".into()],
+                            args: vec![
+                                "-u".into(), "-c".into(),
+                                r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'initialize':
+        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'controlled', 'version': '1'}}
+    elif method == 'tools/list':
+        result = {'tools': [{'name': 'write', 'inputSchema': {'type': 'object'}, 'annotations': {'readOnlyHint': False, 'destructiveHint': True}}]}
+    elif method == 'tools/call':
+        with open(sys.argv[1], 'a') as calls:
+            calls.write('call\n')
+        result = json.loads(sys.argv[2])
+    else:
+        raise AssertionError(method)
+    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#.into(),
+                                calls_path.to_str().unwrap().into(),
+                                interaction_result.to_string(),
+                            ],
+                            env: HashMap::new(),
+                        },
+                        description: String::new(),
+                        enabled: true,
+                        retry: astra_mcp::RetryConfig::default(),
+                    };
+                    tokio::time::timeout(Duration::from_secs(5), client.connect(config))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        client
+                            .prepare_tool_call_by_mcp_name("mcp__controlled__write")
+                            .unwrap()
+                            .policy()
+                            .effect,
+                        astra_turn_types::ResolvedToolEffect::Mutating,
+                    );
+                    let client = Arc::new(tokio::sync::RwLock::new(client));
+                    exec.set_mcp_manager(client.clone());
+                    manager = Some(client);
+                } else {
+                    let app = axum::Router::new().route(
+                        "/mcp",
+                        axum::routing::post({
+                            let calls_path = calls_path.clone();
+                            move |axum::Json(body): axum::Json<Value>| {
+                                let calls_path = calls_path.clone();
+                                let interaction_result = interaction_result.clone();
+                                async move {
+                                    use std::io::Write as _;
+
+                                    assert_eq!(body["method"], "tools/call");
+                                    let mut calls = std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(calls_path)
+                                        .unwrap();
+                                    writeln!(calls, "call").unwrap();
+                                    axum::Json(json!({
+                                        "jsonrpc": "2.0", "id": body["id"],
+                                        "result": interaction_result
+                                    }))
+                                }
+                            }
+                        }),
+                    );
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+                    server = Some(tokio::spawn(async move {
+                        axum::serve(listener, app).await.unwrap()
+                    }));
+                    exec.set_agent_binding_mcp(Arc::new(
+                        crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests_at_endpoint(
+                            "controlled",
+                            &["mcp__controlled__write"],
+                            &endpoint,
+                        )
+                        .with_test_workspace_effect(astra_turn_types::ResolvedToolEffect::Mutating),
+                    ));
+                }
+                exec.set_request_scoped_mcp_schemas(vec![json!({
+                    "type": "function", "function": {
+                        "name": "mcp__controlled__write", "parameters": {"type": "object"}
+                    }
+                })]);
+                let gate_calls = Arc::new(AtomicUsize::new(0));
+                exec.set_provider_interaction_gate(Arc::new(FixedProviderInteractionGate {
+                    calls: gate_calls.clone(),
+                    decision: astra_tools::ProviderInteractionDecision::Submitted(json!({})),
+                    wait: None,
+                }));
+                let token = CancellationToken::new();
+                let rounds = Arc::new(AtomicUsize::new(0));
+                exec.mcp_before_transport = Some(Arc::new({
+                    let token = token.clone();
+                    move || {
+                        // Deterministically signal cancellation after the executor's
+                        // check but before the real transport's preflight check.
+                        if rounds.fetch_add(1, Ordering::SeqCst) == usize::from(prior_dispatch) {
+                            token.cancel();
+                        }
+                    }
+                }));
+                let mut request = exec.tool_execution_request("mcp__controlled__write", &json!({}));
+                request.tool_call_id = "call-transport-preflight".into();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    <RuntimeToolExecutor as ServerLocalToolTransport<
+                        crate::server::tool_local_transport::RuntimeToolExecutionResult,
+                    >>::execute_server_local_tool(&exec, &request, Some(&token)),
+                )
+                .await
+                .unwrap()
+                .result;
+                if let Some(server) = server {
+                    server.abort();
+                }
+                if let Some(manager) = manager {
+                    assert!(manager.write().await.disconnect("controlled"));
+                }
+                let calls = match std::fs::read_to_string(&calls_path) {
+                    Ok(calls) => calls.lines().count(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(error) => panic!("cannot read provider dispatches: {error}"),
+                };
+                assert_eq!(calls, usize::from(prior_dispatch));
+                assert_eq!(
+                    gate_calls.load(Ordering::SeqCst),
+                    usize::from(prior_dispatch)
+                );
+                assert!(result.is_error, "{result:?}");
+                let fields = result.metadata.as_ref().unwrap();
+                let writer =
+                    astra_tools::workspace_observation::begin_workspace_writer_with_options(
+                        dir.path(),
+                        None,
+                        Duration::from_millis(100),
+                    )
+                    .await;
+                if prior_dispatch {
+                    assert_eq!(fields["mcp_call_dispatched"], true);
+                    assert_eq!(
+                        fields["error_kind"],
+                        astra_tools::TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED
+                    );
+                    assert!(matches!(writer, Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)));
+                } else {
+                    assert_eq!(fields["cancelled"], true);
+                    assert_ne!(fields.get("mcp_call_dispatched"), Some(&Value::Bool(true)));
+                    assert!(!fields.contains_key("workspace_effect_settled"));
+                    assert!(
+                        writer.is_ok(),
+                        "an undispatched cancellation must allow the next writer"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_interaction_resume_cancellation_quarantines_unsettled_mutation() {
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post({
+                let provider_calls = provider_calls.clone();
+                move |axum::Json(body): axum::Json<Value>| {
+                    provider_calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert_eq!(body["method"], "tools/call");
+                        axum::Json(json!({
+                            "jsonrpc": "2.0", "id": body["id"],
+                            "result": {
+                                "content": [{"type": "text", "text": "choose"}],
+                                "_meta": {
+                                    "astra/providerInteraction": {
+                                        "request_id": "mutating-interaction",
+                                        "payload": {"type": "provider.opaque.select"},
+                                        "timeout_ms": 60_000
+                                    }
+                                }
+                            }
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut exec, dir) = test_executor();
+        exec.set_request_scoped_mcp_schemas(vec![json!({
+            "type": "function", "function": {
+                "name": "mcp__controlled__write", "parameters": {"type": "object"}
+            }
+        })]);
+        exec.set_agent_binding_mcp(Arc::new(
+            crate::server::runtime_mcp::AgentBindingMcpRuntime::for_tests_at_endpoint(
+                "controlled",
+                &["mcp__controlled__write"],
+                &endpoint,
+            )
+            .with_test_workspace_effect(astra_turn_types::ResolvedToolEffect::Mutating),
+        ));
+        let wait = ProjectionWriteBarrier {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            completed: Arc::new(tokio::sync::Notify::new()),
+        };
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        exec.set_provider_interaction_gate(Arc::new(FixedProviderInteractionGate {
+            calls: gate_calls.clone(),
+            decision: astra_tools::ProviderInteractionDecision::Submitted(json!({
+                "selected": "primary"
+            })),
+            wait: Some(wait.clone()),
+        }));
+        let mut request = exec.tool_execution_request("mcp__controlled__write", &json!({}));
+        request.tool_call_id = "call-cancel-at-interaction-resume".into();
+        let token = CancellationToken::new();
+        let execution = <RuntimeToolExecutor as ServerLocalToolTransport<
+            crate::server::tool_local_transport::RuntimeToolExecutionResult,
+        >>::execute_server_local_tool(&exec, &request, Some(&token));
+        tokio::pin!(execution);
+        tokio::select! {
+            result = &mut execution => panic!("must reach interaction gate: {:?}", result.result),
+            () = wait.entered.notified() => {}
+            () = tokio::time::sleep(Duration::from_secs(5)) => panic!("interaction gate was not reached"),
+        }
+        // Model cancellation while the durable submission is being projected:
+        // the gate still returns Submitted, but no continuation may dispatch.
+        token.cancel();
+        wait.release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut execution)
+            .await
+            .unwrap()
+            .result;
+        server.abort();
+
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+        assert!(result.is_error, "{result:?}");
+        let fields = result.metadata.as_ref().unwrap();
+        assert_eq!(fields.get("mcp_call_dispatched"), Some(&Value::Bool(true)));
+        assert_eq!(
+            fields["error_kind"],
+            astra_tools::TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED
+        );
+        assert_eq!(fields["workspace_effect_settled"], false);
+        assert!(
+            matches!(
+                astra_tools::workspace_observation::begin_workspace_writer_with_options(
+                    dir.path(),
+                    None,
+                    Duration::from_millis(100),
+                )
+                .await,
+                Err(astra_tools::workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled)
+            ),
+            "an intermediate interaction response must not admit a later workspace writer"
+        );
     }
 
     #[tokio::test]
@@ -14927,7 +15886,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn bash_timeout_emits_tool_timeout_work_surface_metadata() {
-        let (mut exec, _dir) = test_executor();
+        let (mut exec, dir) = test_executor();
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         exec.set_work_surface_event_tx(tx);
 
@@ -14935,7 +15894,7 @@ pub(crate) mod tests {
             .execute_with_metadata(
                 "bash",
                 &json!({
-                    "command": "printf start; sleep 1",
+                    "command": "printf partial > timeout-marker; printf start; sleep 1",
                     "timeout": 0.1,
                     "_tool_call_id": "call-tool-timeout"
                 }),
@@ -14945,7 +15904,14 @@ pub(crate) mod tests {
         let metadata = result.metadata.as_ref().expect("tool timeout metadata");
         assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
         assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
+        assert_eq!(metadata["execution_started"], true);
+        assert_eq!(metadata["disposition"], "executed");
+        assert_eq!(metadata["side_effects_maybe"], true);
         assert_eq!(metadata["workspace"]["kind"], "server_sandbox");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("timeout-marker")).unwrap(),
+            "partial"
+        );
 
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {

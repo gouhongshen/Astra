@@ -103,6 +103,8 @@ async fn callback_through_pipeline(
         .unwrap();
     let results = host
         .execute_tools_batch(vec![ToolBatchRequest {
+            work_attribution: None,
+            admitted_skill_names: None,
             session_id: "mcp-session".into(),
             run_id: "mcp-run".into(),
             turn_chain_id: "mcp-chain".into(),
@@ -165,6 +167,7 @@ async fn callback_through_pipeline(
     // Use the actual serialized HTTP callback for the server-side result row.
     // The cloud ledger supplies tool/args from the original dispatch identity.
     let edge_results = vec![EdgeToolExecResult {
+        work_attribution: None,
         execution_completion: None,
         request_id: callback.request_id.clone(),
         tool: tool.clone(),
@@ -225,7 +228,6 @@ async fn callback_through_pipeline(
         progress_emitter: None,
         pre_resolved_results: &[],
         runtime_tool_executor: None,
-        external_effect_recovery_paths: None,
         turn_start: None,
         llm_round: 0,
         plan_mode_active: false,

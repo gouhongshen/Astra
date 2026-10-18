@@ -1,5 +1,27 @@
 use rmcp::ServiceError;
 
+/// Failure of a cancellation-aware tool call. Only the transport preflight
+/// can prove that cancellation happened before the request was dispatched.
+#[derive(Debug, thiserror::Error)]
+pub enum McpToolCallError {
+    #[error("MCP tool cancelled before dispatch")]
+    CancelledBeforeDispatch,
+    #[error(transparent)]
+    Service(#[from] ServiceError),
+}
+
+impl McpToolCallError {
+    /// Preserve the existing non-cancellable connection API's error contract.
+    pub fn into_service_error(self) -> ServiceError {
+        match self {
+            Self::CancelledBeforeDispatch => ServiceError::Cancelled {
+                reason: Some("run cancelled before dispatch".into()),
+            },
+            Self::Service(error) => error,
+        }
+    }
+}
+
 /// MCP client errors.
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {

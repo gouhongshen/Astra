@@ -30,12 +30,18 @@ use std::os::unix::process::ExitStatusExt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 
+mod framed;
+pub use framed::{
+    FramedProcess, FramedProcessEnd, FramedProcessInput, FramedProcessLimits, FramedProcessOutcome,
+};
+
 const MAX_CAPTURED_STDOUT_BYTES: usize = 64 * 1024;
 const MAX_CAPTURED_STDERR_BYTES: usize = 32 * 1024;
 const DEFAULT_MAX_CAPTURED_OUTPUT_BYTES: usize =
     MAX_CAPTURED_STDOUT_BYTES + MAX_CAPTURED_STDERR_BYTES;
 const READ_CHUNK_SIZE: usize = 8 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(3);
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(target_os = "linux")]
 const SUPERVISOR_PROTOCOL_VERSION: &str = "2";
@@ -51,7 +57,7 @@ const SUPERVISOR_CONTROL_FD_ENV: &str = "_ASTRA_INTERNAL_PROCESS_CONTROL_FD";
 const SUPERVISOR_RECEIPT_FD_ENV: &str = "_ASTRA_INTERNAL_PROCESS_RECEIPT_FD";
 #[cfg(target_os = "linux")]
 const SUPERVISOR_NONCE_ENV: &str = "_ASTRA_INTERNAL_PROCESS_NONCE";
-#[cfg(target_os = "linux")]
+// Shared by framed startup and the Linux supervisor handshake.
 const SUPERVISOR_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
 const SUPERVISOR_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -352,9 +358,24 @@ impl BashInvocationOwner {
 
     /// Complete the post-spawn handshake before the target is allowed to run.
     pub fn started(&mut self, child_pid: u32) -> std::io::Result<()> {
+        self.started_before(
+            child_pid,
+            std::time::Instant::now() + Duration::from_secs(2),
+            &|| Ok(()),
+        )
+    }
+
+    /// Check the caller's start gate while awaiting READY and immediately
+    /// before START. The blocking worker retains ownership on refusal.
+    fn started_before(
+        &mut self,
+        child_pid: u32,
+        deadline: std::time::Instant,
+        check_start: &impl Fn() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         if let Some(supervisor) = self.supervisor.as_mut() {
             supervisor.spawned();
-            supervisor.start(child_pid)?;
+            supervisor.start_before(child_pid, deadline, check_start)?;
         }
         self.process_scope.join_child(child_pid)
     }
@@ -451,6 +472,17 @@ pub struct InvocationSupervisor {
 }
 
 impl InvocationSupervisor {
+    fn target_released(&self) -> Option<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            Some(self.started)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     /// Prepare a helper command and its authenticated control channel.
     /// [`Self::install`] must be called after all environment filtering and
     /// before spawning the returned command.
@@ -572,6 +604,19 @@ impl InvocationSupervisor {
 
     /// Authenticate the helper before allowing the target to execute.
     pub fn start(&mut self, helper_pid: u32) -> std::io::Result<()> {
+        self.start_before(
+            helper_pid,
+            std::time::Instant::now() + Duration::from_secs(2),
+            &|| Ok(()),
+        )
+    }
+
+    fn start_before(
+        &mut self,
+        helper_pid: u32,
+        deadline: std::time::Instant,
+        check_start: &impl Fn() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         #[cfg(target_os = "linux")]
         {
             if self.ready || self.started {
@@ -583,9 +628,9 @@ impl InvocationSupervisor {
                 "ASTRA_PROCESS_SUPERVISOR {} READY {} {}",
                 SUPERVISOR_PROTOCOL_VERSION, self.nonce, helper_pid
             );
-            let deadline = std::time::Instant::now() + SUPERVISOR_HANDSHAKE_TIMEOUT;
+            let deadline = deadline.min(std::time::Instant::now() + SUPERVISOR_HANDSHAKE_TIMEOUT);
             let actual = self
-                .read_protocol_line(deadline)?
+                .read_protocol_line_before(deadline, check_start)?
                 .ok_or_else(|| std::io::Error::other("supervisor closed before READY"))?;
             if actual != expected {
                 return Err(std::io::Error::other(format!(
@@ -593,14 +638,15 @@ impl InvocationSupervisor {
                 )));
             }
             self.ready = true;
+            check_start()?;
             self.control_write.write_all(b"S")?;
-            self.control_write.flush()?;
             self.started = true;
+            self.control_write.flush()?;
             Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = helper_pid;
+            let _ = (helper_pid, deadline, check_start);
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "invocation supervisor requires Linux",
@@ -672,7 +718,23 @@ impl InvocationSupervisor {
         &mut self,
         deadline: std::time::Instant,
     ) -> std::io::Result<Option<String>> {
+        self.read_protocol_line_before(deadline, &|| Ok(()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_protocol_line_before(
+        &mut self,
+        deadline: std::time::Instant,
+        check_start: &impl Fn() -> std::io::Result<()>,
+    ) -> std::io::Result<Option<String>> {
         loop {
+            check_start()?;
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out waiting for invocation supervisor receipt",
+                ));
+            }
             if let Some(newline) = self.receipt_buffer.iter().position(|byte| *byte == b'\n') {
                 let bytes = self.receipt_buffer.drain(..=newline).collect::<Vec<_>>();
                 let line = std::str::from_utf8(&bytes[..bytes.len() - 1])
@@ -699,12 +761,6 @@ impl InvocationSupervisor {
                 }
                 Ok(read) => self.receipt_buffer.extend_from_slice(&chunk[..read]),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "timed out waiting for invocation supervisor receipt",
-                        ));
-                    }
                     std::thread::sleep(SUPERVISOR_POLL_INTERVAL);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -2050,6 +2106,7 @@ async fn settle_isolated_owner_after_exit(
 /// configured with Tokio's leader-only `kill_on_drop`; cgroup/process-group
 /// fallbacks are synchronously settled here.
 struct IsolatedScopeAbortGuard {
+    supervised: bool,
     owner: Option<BashInvocationOwner>,
     cg_path: Option<PathBuf>,
     leader_pid: Option<u32>,
@@ -2063,6 +2120,9 @@ impl IsolatedScopeAbortGuard {
         leader_pid: Option<u32>,
     ) -> Self {
         Self {
+            supervised: owner
+                .as_ref()
+                .is_some_and(BashInvocationOwner::is_supervised),
             owner,
             cg_path,
             leader_pid,
@@ -2090,13 +2150,56 @@ impl Drop for IsolatedScopeAbortGuard {
             } else {
                 let _ = owner.settle_after_exit_detailed(self.leader_pid);
             }
-        } else {
+        } else if !self.supervised {
             let _ = settle_process_scope_detailed(self.cg_path.as_deref(), self.leader_pid);
         }
         if let Some(cg_path) = self.cg_path.as_deref() {
             cleanup_cgroup(cg_path);
         }
     }
+}
+
+/// Observe real exit status without depending on a signal notification to wake
+/// the cleanup future. The absolute deadline is never renewed by polling.
+async fn wait_for_child_exit(
+    child: &mut tokio::process::Child,
+    deadline: tokio::time::Instant,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "process exit could not be established before the cleanup deadline",
+            ));
+        }
+        tokio::time::sleep_until(deadline.min(now + PROCESS_POLL_INTERVAL)).await;
+    }
+}
+
+async fn kill_and_reap_child(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    // A kill error is not evidence of exit. Even an already-exited child must
+    // be observed through try_wait before any settlement can be trusted.
+    let _ = child.start_kill();
+    wait_for_child_exit(child, tokio::time::Instant::now() + PROCESS_REAP_TIMEOUT).await
+}
+
+async fn reap_child_after_owner_loss(child: &mut tokio::process::Child, supervised: bool) {
+    // The dropped control endpoint asks the supervisor to settle. Never kill
+    // that helper first, and never recover receipt authority in this branch.
+    if supervised
+        && wait_for_child_exit(child, tokio::time::Instant::now() + PROCESS_REAP_TIMEOUT)
+            .await
+            .is_ok()
+    {
+        return;
+    }
+    let _ = kill_and_reap_child(child).await;
 }
 
 /// Stop the owner before its helper. A Linux invocation supervisor is the
@@ -2109,46 +2212,34 @@ async fn terminate_isolated_child(
     leader_pid: Option<u32>,
 ) -> Option<ScopeSettlement> {
     let Some(mut owner) = owner else {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-        return settle_process_scope_detailed(cg_path, leader_pid);
+        let reaped = kill_and_reap_child(child).await.is_ok();
+        let settlement = settle_process_scope_detailed(cg_path, leader_pid);
+        return reaped.then_some(settlement).flatten();
     };
 
     if owner.is_supervised() {
         let owner_result = tokio::task::spawn_blocking(move || {
-            let requested = owner.request_supervised_termination();
-            (owner, requested)
+            let _ = owner.request_supervised_termination();
+            owner
         })
         .await;
-        let Ok((returned_owner, requested)) = owner_result else {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        let Ok(returned_owner) = owner_result else {
+            reap_child_after_owner_loss(child, true).await;
             return None;
         };
         owner = returned_owner;
-        if !requested {
-            // The helper may already be finishing naturally. Give it the same
-            // bounded settlement opportunity, but never promote a forced
-            // helper kill into an authoritative receipt.
-            if tokio::time::timeout(Duration::from_secs(3), child.wait())
-                .await
-                .is_err()
-            {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return None;
-            }
-        } else if tokio::time::timeout(Duration::from_secs(3), child.wait())
+        if wait_for_child_exit(child, tokio::time::Instant::now() + PROCESS_REAP_TIMEOUT)
             .await
             .is_err()
         {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            // A forced helper kill destroys its descendant/receipt authority.
+            let _ = kill_and_reap_child(child).await;
             return None;
         }
     } else {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        let reaped = kill_and_reap_child(child).await.is_ok();
+        let settlement = settle_isolated_owner_after_exit(owner, leader_pid).await;
+        return reaped.then_some(settlement).flatten();
     }
     settle_isolated_owner_after_exit(owner, leader_pid).await
 }
@@ -2521,11 +2612,21 @@ async fn execute_isolated_with_cancel_impl(
         }
     };
 
-    if let Some(owner) = invocation_owner.take() {
+    // This guard follows child creation before the first await. Startup hands
+    // the whole guard to its worker so abrupt future drop cannot lose custody.
+    let mut scope_abort_guard =
+        IsolatedScopeAbortGuard::new(invocation_owner.take(), cg_path.clone(), child.id());
+    if scope_abort_guard.owner.is_some() {
         let child_pid = child.id();
         let Some(started_pid) = child_pid else {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = terminate_isolated_child(
+                &mut child,
+                scope_abort_guard.take_owner(),
+                cg_path.as_deref(),
+                child_pid,
+            )
+            .await;
+            scope_abort_guard.disarm();
             return IsolatedOutput {
                 stdout: String::new(),
                 stderr: "Process ownership handshake failed: child PID unavailable".to_string(),
@@ -2543,48 +2644,21 @@ async fn execute_isolated_with_cancel_impl(
             };
         };
         let started = tokio::task::spawn_blocking(move || {
-            let mut owner = owner;
-            let result = owner.started(started_pid);
-            (owner, result)
+            let mut guard = scope_abort_guard;
+            let result = guard
+                .owner
+                .as_mut()
+                .expect("invocation owner")
+                .started(started_pid);
+            (guard, result)
         })
         .await;
-        match started {
-            Ok((owner, Ok(()))) => invocation_owner = Some(owner),
-            Ok((owner, Err(error))) => {
-                let settlement = terminate_isolated_child(
-                    &mut child,
-                    Some(owner),
-                    cg_path.as_deref(),
-                    child_pid,
-                )
-                .await;
-                return IsolatedOutput {
-                    stdout: String::new(),
-                    stderr: format!("Process ownership handshake failed: {error}"),
-                    exit_code: None,
-                    timed_out: false,
-                    cancelled: false,
-                    execution_started: true,
-                    stdout_capped: false,
-                    stderr_capped: false,
-                    namespace_active: ns_available,
-                    cgroup_active: cg_path.is_some(),
-                    scope_settled: settlement.is_some(),
-                    scope_ownership: settlement.map(|value| value.ownership),
-                    descendants_terminated: settlement
-                        .is_some_and(|value| value.descendants_terminated),
-                };
-            }
+        let (guard, started_result) = match started {
+            Ok(result) => result,
             Err(error) => {
-                if supervised_invocation {
-                    // The blocking worker owns (and will drop) the control
-                    // endpoint, which asks the helper to settle. Do not race
-                    // that cleanup with a leader-only SIGKILL.
-                    let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
-                } else {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                }
+                // The real guard dropped in the failed worker. Give its
+                // supervisor/control endpoint the existing settlement grace.
+                reap_child_after_owner_loss(&mut child, supervised_invocation).await;
                 return IsolatedOutput {
                     stdout: String::new(),
                     stderr: format!("Process ownership handshake worker failed: {error}"),
@@ -2601,13 +2675,35 @@ async fn execute_isolated_with_cancel_impl(
                     descendants_terminated: false,
                 };
             }
+        };
+        scope_abort_guard = guard;
+        if let Err(error) = started_result {
+            let settlement = terminate_isolated_child(
+                &mut child,
+                scope_abort_guard.take_owner(),
+                cg_path.as_deref(),
+                child_pid,
+            )
+            .await;
+            scope_abort_guard.disarm();
+            return IsolatedOutput {
+                stdout: String::new(),
+                stderr: format!("Process ownership handshake failed: {error}"),
+                exit_code: None,
+                timed_out: false,
+                cancelled: false,
+                execution_started: true,
+                stdout_capped: false,
+                stderr_capped: false,
+                namespace_active: ns_available,
+                cgroup_active: cg_path.is_some(),
+                scope_settled: settlement.is_some(),
+                scope_ownership: settlement.map(|value| value.ownership),
+                descendants_terminated: settlement
+                    .is_some_and(|value| value.descendants_terminated),
+            };
         }
     }
-
-    // Declared after `child`, so this guard is dropped first on every abrupt
-    // future teardown. Normal paths explicitly take/disarm it.
-    let mut scope_abort_guard =
-        IsolatedScopeAbortGuard::new(invocation_owner.take(), cg_path.clone(), child.id());
 
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
@@ -2713,8 +2809,10 @@ async fn execute_isolated_with_cancel_impl(
                 .await;
                 scope_abort_guard.disarm();
                 let scope_ownership = scope_settlement.map(|settlement| settlement.ownership);
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                stdout_task.abort();
+                stderr_task.abort();
+                drain_stream_pumps_after_exit(stdout_task, stderr_task, &mut rx, &mut capture)
+                    .await;
                 if let Some(ref cg) = cg_path {
                     cleanup_cgroup(cg);
                 }
@@ -3406,6 +3504,85 @@ mod tests {
             procs_path: None,
         };
         drop(guard); // must not panic
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_reap_deadline_does_not_certify_a_live_process() {
+        let mut child = tokio::process::Command::new("/bin/sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let error = wait_for_child_exit(&mut child, tokio::time::Instant::now())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(child.try_wait().unwrap().is_none());
+        let status = kill_and_reap_child(&mut child).await.unwrap();
+        assert!(!status.success());
+        assert_eq!(child.try_wait().unwrap(), Some(status));
+        // Already-reaped status remains valid even with an expired deadline.
+        assert_eq!(
+            wait_for_child_exit(&mut child, tokio::time::Instant::now())
+                .await
+                .unwrap(),
+            status,
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_reap_preserves_the_real_exit_status() {
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 17"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let status = wait_for_child_exit(
+            &mut child,
+            tokio::time::Instant::now() + PROCESS_REAP_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.code(), Some(17));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn supervised_guard_handoff_does_not_kill_the_helper_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut command, mut owner) = BashInvocationOwner::prepare_with_supervisor_helper(
+            std::env::current_exe().unwrap(),
+            [
+                "--exact".to_string(),
+                SUPERVISOR_HELPER_TEST.to_string(),
+                "--nocapture".to_string(),
+            ],
+            "/bin/sh",
+            &["-c".into(), "sleep 30".into()],
+        )
+        .unwrap();
+        command
+            .current_dir(dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        owner.install(&mut command).unwrap();
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        owner.started(pid).unwrap();
+        let mut guard = IsolatedScopeAbortGuard::new(Some(owner), None, Some(pid));
+        let mut transferred_owner = guard.take_owner().unwrap();
+        drop(guard);
+        // START is the readiness barrier; no sleep or guessed handoff timing.
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(transferred_owner.request_supervised_termination());
+        child.wait().unwrap();
+        assert_eq!(
+            transferred_owner.settle_after_exit(Some(pid)),
+            Some(ScopeOwnership::InvocationSupervisor)
+        );
     }
 
     #[tokio::test]

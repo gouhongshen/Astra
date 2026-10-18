@@ -463,6 +463,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage",
         product_owner="session list, lifecycle cleanup, summaries, project retention",
     ),
+    "agent_session_memory_work": TableMetadata(
+        semantic_owner="astra_services::session_memory_lifecycle / canonical session lifecycle",
+        state_class="durable session-memory operation checkpoints and retry coordination",
+        primary_query="owner/session work lookup and bounded due-work scan by complete, next_attempt_at, and lease expiry",
+        retention_policy="retain frozen inputs and receipts for recovery while the owned Session is retained; session hard delete removes journal rows before the parent aggregate",
+        rebuildability="missed inputs recover from immutable canonical context, but uncertain remote write receipts and partial-stage progress cannot be reconstructed safely from transcript or events alone",
+        merge_guidance="keep separate from agent_sessions and context heads; this checkpoints existing memory algorithms and never grants authority or replaces canonical session/context state",
+        migration_owner="astra_services::storage / session_memory_lifecycle",
+        product_owner="memory extraction, close/exit consolidation, retry diagnostics",
+    ),
     "agent_session_lifecycle_fences": TableMetadata(
         semantic_owner="astra_services::session_lifecycle",
         state_class="durable session lifecycle and irreversible delete-intent authority",

@@ -1,14 +1,14 @@
 //! Memoria-based message compaction.
 //!
 //! Retrieves typed current-session memory for the context pipeline and may
-//! persist a typed compaction episode after a successful summary.
+//! prepare a semantic summary for canonical acceptance by the loop owner.
 //!
 //! Architecture:
 //! ```text
 //! 1. Messages exceed budget threshold
 //! 2. Retrieve typed current-session memory as separate runtime context
 //! 3. Truncate old messages (keep recent turns)
-//! 4. Optionally store a semantic compaction episode after summary succeeds
+//! 4. Return a validated summary candidate; the existing canonical owner commits it
 //! ```
 
 use serde_json::{Value, json};
@@ -78,7 +78,8 @@ impl Default for MemoriaCompactParams {
 
 pub use astra_memoria::{
     MemoriaMemory, MemoriaOperationError, MemoriaPort, MemoriaToolTransport, MemoryScope,
-    ReflectCandidate, ReflectSummary, parse_reflect_candidates, validate_strict_memories,
+    ReflectCandidate, ReflectSummary, confirmed_memory_id, parse_reflect_candidates,
+    parse_reflect_summary, validate_attested_strict_recall_payload, validate_strict_memories,
 };
 
 fn cross_session_abstract(prefix: &str, evidence: &str) -> String {
@@ -105,7 +106,8 @@ fn cross_session_abstract(prefix: &str, evidence: &str) -> String {
     abstract_text
 }
 
-fn encode_episode_memory(session_id: &str, overview: &str) -> String {
+/// Encode the canonical typed episode for every Memoria transport.
+pub fn encode_episode_memory(session_id: &str, overview: &str) -> String {
     let goal = overview
         .lines()
         .find_map(|line| line.trim().strip_prefix("Goal: "))
@@ -121,7 +123,8 @@ fn encode_episode_memory(session_id: &str, overview: &str) -> String {
     .encode()
 }
 
-fn encode_scene_memory(signal: &str, summary: &str) -> String {
+/// Encode the canonical typed semantic scene for every Memoria transport.
+pub fn encode_scene_memory(signal: &str, summary: &str) -> String {
     let prefix = if signal.trim().is_empty() {
         "Recurring cross-session pattern".to_string()
     } else {
@@ -151,9 +154,210 @@ pub struct HttpMemoriaPort {
     owner_user_id: Option<String>,
     owner_binding_required: bool,
     owner_scoped_master: bool,
+    durable_main_branch: bool,
 }
 
 impl HttpMemoriaPort {
+    /// Durable receipts use main, independently of a user's Memoria checkout.
+    pub(crate) fn for_durable_session(mut self) -> Self {
+        self.durable_main_branch = true;
+        self
+    }
+
+    /// Unlike top-k recall, a destructive plan requires evidence that every
+    /// page was read. Overflow or an invalid pagination envelope fails closed.
+    pub(crate) async fn retrieve_scoped_inventory(
+        &self,
+        session_id: &str,
+        max_memories: usize,
+        memory_types: &[&str],
+    ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
+        self.list_scoped_typed(session_id, max_memories, memory_types, true)
+            .await
+    }
+
+    async fn list_scoped_typed(
+        &self,
+        session_id: &str,
+        top_k: usize,
+        memory_types: &[&str],
+        complete_inventory: bool,
+    ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
+        let user_id = self.owner_user_id.as_deref().ok_or_else(|| {
+            "typed Memoria retrieve requires an authenticated owner binding".to_string()
+        })?;
+        let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
+        if top_k == 0 {
+            return if complete_inventory {
+                Err("finalization inventory requires a positive bound".into())
+            } else {
+                Ok(Vec::new())
+            };
+        }
+        let url = format!("{}/v1/memories", self.base_url.trim_end_matches('/'));
+        let requested_types: Vec<Option<&str>> = if memory_types.is_empty() {
+            vec![None]
+        } else {
+            memory_types.iter().copied().map(Some).collect()
+        };
+        let mut memories = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for memory_type in requested_types {
+            let mut cursor: Option<String> = None;
+            let mut seen_cursors = std::collections::HashSet::new();
+            loop {
+                let remaining = top_k - memories.len();
+                if remaining == 0 {
+                    return if complete_inventory {
+                        Err("finalization snapshot exceeds bounded inventory".into())
+                    } else {
+                        Ok(memories)
+                    };
+                }
+                let limit = remaining.min(500).to_string();
+                let mut query = vec![
+                    ("session_id", scope.session_id.as_str()),
+                    ("limit", limit.as_str()),
+                ];
+                if let Some(memory_type) = memory_type {
+                    query.push(("memory_type", memory_type));
+                }
+                if let Some(cursor) = cursor.as_deref() {
+                    query.push(("cursor", cursor));
+                }
+                let resp = self
+                    .request(reqwest::Method::GET, &url, None)?
+                    .query(&query)
+                    .send()
+                    .await
+                    .map_err(|e| format!("Memoria typed list failed: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(self.status_error("typed list", resp.status()).into());
+                }
+                let data: Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("Memoria typed list parse failed: {e}"))?;
+                let page = parse_strict_retrieved_memories(&data, &scope)?;
+                if page.len() > remaining.min(500) {
+                    return Err("Memoria typed list exceeded its requested page limit".into());
+                }
+                let next = match data.get("next_cursor") {
+                    Some(Value::Null) => None,
+                    None if !complete_inventory => None,
+                    Some(Value::String(next))
+                        if next.len() == 32
+                            && next.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            && page.last().is_some_and(|memory| memory.memory_id == *next)
+                            && seen_cursors.insert(next.clone()) =>
+                    {
+                        Some(next.clone())
+                    }
+                    _ => {
+                        return Err(
+                            "Memoria typed list has invalid or missing pagination evidence".into(),
+                        );
+                    }
+                };
+                for memory in page {
+                    if memory_type.is_some_and(|expected| memory.memory_type != expected) {
+                        return Err(
+                            "memory_scope_violation: typed list returned an invalid memory_type"
+                                .into(),
+                        );
+                    }
+                    if !seen.insert(memory.memory_id.clone()) {
+                        return Err("Memoria typed list repeated a memory across pages".into());
+                    }
+                    memories.push(memory);
+                }
+                let Some(next) = next else { break };
+                cursor = Some(next);
+            }
+        }
+        Ok(memories)
+    }
+
+    fn scoped_body(&self, mut body: Value) -> Value {
+        if self.durable_main_branch {
+            body["branch"] = json!("main");
+        }
+        body
+    }
+
+    pub(crate) fn from_transport(transport: MemoriaToolTransport) -> Self {
+        let mut client = Self::new(transport.base_url, transport.credential)
+            .with_owner_user_id(transport.owner_user_id);
+        client.owner_scoped_master = transport.owner_scoped_master;
+        client
+    }
+
+    pub(crate) async fn delete_confirmed_or_absent(&self, memory_id: &str) -> Result<(), String> {
+        astra_memoria::validate_memory_id(memory_id)?;
+        let encoded =
+            percent_encoding::utf8_percent_encode(memory_id, percent_encoding::NON_ALPHANUMERIC);
+        let url = format!(
+            "{}/v1/memories/{encoded}",
+            self.base_url.trim_end_matches('/')
+        );
+        let response = self
+            .request(reqwest::Method::DELETE, &url, None)?
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(self.status_error("delete", response.status()))
+        }
+    }
+
+    /// Dedicated endpoint makes old backends fail before any write. The
+    /// deterministic receipt also rejects incompatible/mixed-version routing.
+    pub(crate) async fn store_idempotent(
+        &self,
+        content: &str,
+        memory_type: &str,
+        session_id: &str,
+        trust_tier: &str,
+        key: &str,
+    ) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+        let owner = self
+            .owner_user_id
+            .as_deref()
+            .ok_or("idempotent write requires an owner")?;
+        let identity = json!(["memoria.store.v1", owner, "main", key]);
+        let digest =
+            Sha256::digest(serde_json::to_vec(&identity).map_err(|error| error.to_string())?);
+        let expected: String = digest[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let url = format!(
+            "{}/v1/memories/idempotent",
+            self.base_url.trim_end_matches('/')
+        );
+        let response = self
+            .request(reqwest::Method::POST, &url, None)?
+            .json(
+                &json!({"content": content, "memory_type": memory_type, "session_id": session_id,
+                "trust_tier": trust_tier, "idempotency_key": key, "branch": "main"}),
+            )
+            .send()
+            .await
+            .map_err(|error| format!("idempotent memory store failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(self.status_error("idempotent store", response.status()));
+        }
+        let payload: Value = response.json().await.map_err(|error| error.to_string())?;
+        let id = confirmed_memory_id(&payload)?;
+        if id != expected {
+            return Err("memory backend returned an incompatible idempotency receipt".into());
+        }
+        Ok(id)
+    }
+
     pub fn new(base_url: String, api_key: String) -> Self {
         Self {
             base_url,
@@ -168,6 +372,7 @@ impl HttpMemoriaPort {
             owner_user_id: None,
             owner_binding_required: false,
             owner_scoped_master: false,
+            durable_main_branch: false,
         }
     }
 
@@ -231,7 +436,7 @@ impl HttpMemoriaPort {
         } else {
             "Bearer"
         };
-        let request = self
+        let mut request = self
             .http
             .request(method, url)
             .header(
@@ -239,6 +444,9 @@ impl HttpMemoriaPort {
                 format!("{authorization_scheme} {}", self.api_key),
             )
             .header("X-Memoria-Tool", "astra");
+        if self.durable_main_branch {
+            request = request.query(&[("branch", "main")]);
+        }
         Ok(match owner {
             Some(owner) => request.header("X-User-Id", owner),
             None => request,
@@ -691,7 +899,7 @@ impl MemoriaPort for HttpMemoriaPort {
 
         let resp = self
             .request(reqwest::Method::POST, &url, Some(user_id))?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria prompt retrieve failed: {e}"))?;
@@ -743,7 +951,7 @@ impl MemoriaPort for HttpMemoriaPort {
         }
         let resp = self
             .request(reqwest::Method::POST, &url, None)?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria retrieve failed: {e}"))?;
@@ -770,53 +978,8 @@ impl MemoriaPort for HttpMemoriaPort {
         top_k: usize,
         memory_types: &[&str],
     ) -> Result<Vec<MemoriaMemory>, astra_memoria::MemoriaOperationError> {
-        let user_id = self.owner_user_id.as_deref().ok_or_else(|| {
-            "typed Memoria retrieve requires an authenticated owner binding".to_string()
-        })?;
-        let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
-        let url = format!("{}/v1/memories", self.base_url.trim_end_matches('/'));
-        let limit = top_k.clamp(1, 500).to_string();
-        let requested_types: Vec<Option<&str>> = if memory_types.is_empty() {
-            vec![None]
-        } else {
-            memory_types.iter().copied().map(Some).collect()
-        };
-        let mut memories = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for memory_type in requested_types {
-            let mut query = vec![
-                ("session_id", scope.session_id.as_str()),
-                ("limit", limit.as_str()),
-            ];
-            if let Some(memory_type) = memory_type {
-                query.push(("memory_type", memory_type));
-            }
-            let resp = self
-                .request(reqwest::Method::GET, &url, None)?
-                .query(&query)
-                .send()
-                .await
-                .map_err(|e| format!("Memoria typed list failed: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(self.status_error("typed list", resp.status()).into());
-            }
-            let data: Value = resp
-                .json()
-                .await
-                .map_err(|e| format!("Memoria typed list parse failed: {e}"))?;
-            for memory in parse_strict_retrieved_memories(&data, &scope)? {
-                if memory_type.is_some_and(|expected| memory.memory_type != expected) {
-                    return Err(
-                        "memory_scope_violation: typed list returned an invalid memory_type".into(),
-                    );
-                }
-                if seen.insert(memory.memory_id.clone()) {
-                    memories.push(memory);
-                }
-            }
-        }
-        memories.truncate(top_k);
-        Ok(memories)
+        self.list_scoped_typed(session_id, top_k, memory_types, false)
+            .await
     }
 
     async fn store(
@@ -844,7 +1007,7 @@ impl MemoriaPort for HttpMemoriaPort {
 
         let resp = self
             .request(reqwest::Method::POST, &url, None)?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria store failed: {e}"))?;
@@ -867,10 +1030,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .await
             .map_err(|e| format!("Memoria store parse failed: {e}"))?;
 
-        data.get("memory_id")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .ok_or_else(|| "Memoria store: no memory_id in response".to_string())
+        astra_memoria::confirmed_memory_id(&data)
     }
 
     /// Purge working memories for a session.
@@ -909,7 +1069,7 @@ impl MemoriaPort for HttpMemoriaPort {
 
         let resp = self
             .request(reqwest::Method::POST, &url, Some(&scope.user_id))?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria purge failed: {e}"))?;
@@ -940,10 +1100,10 @@ impl MemoriaPort for HttpMemoriaPort {
         let url = format!("{}/v1/memories/purge", self.base_url.trim_end_matches('/'));
         let resp = self
             .request(reqwest::Method::POST, &url, None)?
-            .json(&json!({
+            .json(&self.scoped_body(json!({
                 "memory_ids": [memory_id],
                 "reason": "superseded session memory",
-            }))
+            })))
             .send()
             .await
             .map_err(|e| format!("Memoria delete failed: {e}"))?;
@@ -979,7 +1139,7 @@ impl MemoriaPort for HttpMemoriaPort {
         });
         let resp = self
             .request(reqwest::Method::POST, &url, Some(&scope.user_id))?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria store_episode failed: {e}"))?;
@@ -990,11 +1150,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .json()
             .await
             .map_err(|e| format!("Memoria store_episode parse failed: {e}"))?;
-        Ok(data
-            .get("memory_id")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .unwrap_or_default())
+        astra_memoria::confirmed_memory_id(&data)
     }
 
     /// Persist a reflect scene candidate as a semantic memory with a stable
@@ -1026,7 +1182,7 @@ impl MemoriaPort for HttpMemoriaPort {
         }
         let resp = self
             .request(reqwest::Method::POST, &url, None)?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria store_scene failed: {e}"))?;
@@ -1037,11 +1193,7 @@ impl MemoriaPort for HttpMemoriaPort {
             .json()
             .await
             .map_err(|e| format!("Memoria store_scene parse failed: {e}"))?;
-        Ok(data
-            .get("memory_id")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .unwrap_or_default())
+        astra_memoria::confirmed_memory_id(&data)
     }
 
     async fn reflect_session(
@@ -1066,7 +1218,7 @@ impl MemoriaPort for HttpMemoriaPort {
         }
         let resp = self
             .request(reqwest::Method::POST, &url, None)?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria reflect failed: {e}"))?;
@@ -1079,22 +1231,9 @@ impl MemoriaPort for HttpMemoriaPort {
                 text.chars().take(120).collect::<String>()
             ));
         }
-        let data: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        let candidate_payloads = parse_reflect_candidates(&data);
-        let candidate_count = candidate_payloads.len() as u64;
-        Ok(ReflectSummary {
-            synthesized: data
-                .get("synthesized")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            candidates: candidate_count.max(
-                data.get("scenes_created")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            ),
-            candidate_payloads,
-            diagnostics: text.chars().take(200).collect(),
-        })
+        let data: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("Memoria reflect parse failed: {error}"))?;
+        Ok(astra_memoria::parse_reflect_summary(&data))
     }
 
     async fn feedback(
@@ -1122,7 +1261,7 @@ impl MemoriaPort for HttpMemoriaPort {
         }
         let resp = self
             .request(reqwest::Method::POST, &url, None)?
-            .json(&body)
+            .json(&self.scoped_body(body))
             .send()
             .await
             .map_err(|e| format!("Memoria feedback failed: {e}"))?;
@@ -1436,13 +1575,7 @@ pub async fn compact_with_memoria(
         }
     };
 
-    let will_summarize = compact_config
-        .zip(summary_client.as_ref())
-        .is_some_and(|(cfg, _)| cfg.should_summarize(params.tier));
     let summary_token_budget = compact_config.map(|c| c.summary_token_budget).unwrap_or(0);
-
-    let summary_reserve_chars =
-        plan_summary_reservation(params.budget_chars, will_summarize, summary_token_budget);
 
     let session_memory_context =
         build_session_memory_context(&memories, sid, params.tier, params.session_facts.as_ref());
@@ -1461,11 +1594,21 @@ pub async fn compact_with_memoria(
         })
         .fold(0_usize, usize::saturating_add);
 
-    let adjusted_budget_chars = adjusted_message_budget_chars(
-        params.budget_chars,
-        session_memory_chars.saturating_add(retrieved_memory_chars),
-        summary_reserve_chars,
-    );
+    let memory_chars = session_memory_chars.saturating_add(retrieved_memory_chars);
+    let unreserved_budget_chars =
+        adjusted_message_budget_chars(params.budget_chars, memory_chars, 0);
+    // Reserving space for a hypothetical next summary must not manufacture
+    // history loss in an already-fitting working set. This matters after an
+    // accepted summary has become part of that history, even at a high tier.
+    let will_summarize = compact_config
+        .zip(summary_client.as_ref())
+        .is_some_and(|(cfg, _)| cfg.should_summarize(params.tier))
+        && super::compaction::serialized_message_chars(messages) > unreserved_budget_chars;
+    let summary_reserve_chars =
+        plan_summary_reservation(params.budget_chars, will_summarize, summary_token_budget);
+
+    let adjusted_budget_chars =
+        adjusted_message_budget_chars(params.budget_chars, memory_chars, summary_reserve_chars);
 
     // Apply truncation against a budget that leaves room for typed runtime
     // context. Retrieval results are never inserted into history messages.
@@ -1483,16 +1626,17 @@ pub async fn compact_with_memoria(
     // Step 5: Optionally generate an LLM summary. Session working memory is
     // owned by `session_memory::runner`; compaction must not create a second
     // raw-message-derived `working` format.
+    // Pressure alone is not history loss: do not summarize an intact or fully
+    // protected working set merely because its tier is elevated.
     if let Some(cfg) = compact_config
         && let Some(s_client) = summary_client
-        && cfg.should_summarize(params.tier)
+        && will_summarize
+        && result.boundary.is_some()
     {
         match astra_turn_core::cloud_summary::generate_compact_summary(messages, s_client).await {
             Some(summary) => {
                 let summary = truncate_summary_for_budget(summary, cfg.summary_token_budget);
-                result
-                    .runtime_contexts
-                    .push(format!("## Compacted Conversation Summary\n{summary}"));
+                result.history_summary = Some(summary.clone());
 
                 if let Some(ref mut boundary) = result.boundary {
                     boundary.summary = Some(format!(
@@ -2182,6 +2326,7 @@ mod tests {
     struct MockSummaryClient {
         response: Mutex<Option<String>>,
         calls: std::sync::atomic::AtomicUsize,
+        requests: Mutex<Vec<Vec<Value>>>,
     }
 
     impl MockSummaryClient {
@@ -2189,6 +2334,7 @@ mod tests {
             Self {
                 response: Mutex::new(Some(text.to_string())),
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                requests: Mutex::new(Vec::new()),
             }
         }
 
@@ -2196,6 +2342,7 @@ mod tests {
             Self {
                 response: Mutex::new(None),
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                requests: Mutex::new(Vec::new()),
             }
         }
     }
@@ -2205,11 +2352,12 @@ mod tests {
         async fn summarize(
             &self,
             _purpose: astra_turn_types::InferencePurpose,
-            _messages: &[Value],
+            messages: &[Value],
         ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, astra_core::ClassifiedError>
         {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.requests.lock().unwrap().push(messages.to_vec());
             match self.response.lock().unwrap().as_ref() {
                 Some(text) => Ok(astra_turn_core::cloud_summary::SummaryResponse {
                     qualified_usage: None,
@@ -2227,6 +2375,78 @@ mod tests {
                 )),
             }
         }
+    }
+
+    fn history_requiring_compaction() -> Vec<Value> {
+        let call = |id: &str| {
+            json!({"role":"assistant", "tool_calls":[{
+                "id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}
+            }]})
+        };
+        vec![
+            user("old request"),
+            call("old"),
+            json!({"role":"tool", "tool_call_id":"old", "content":"old evidence ".repeat(2000)}),
+            user("current request"),
+            call("current"),
+            json!({"role":"tool", "tool_call_id":"current", "content":"current evidence"}),
+        ]
+    }
+
+    #[tokio::test]
+    async fn rendered_compaction_receives_prior_summary_as_historical_evidence() {
+        let mut history = history_requiring_compaction();
+        history.insert(0, json!({"role":"system", "content":"[Conversation compacted — 20 messages summarized]\n\nPRIOR_SUMMARY_ONLY_FACT"}));
+        history.insert(
+            1,
+            json!({"role":"system", "content":"HISTORY_SIDE_STABLE_POLICY"}),
+        );
+        let authority = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            "CURRENT_RUNTIME_AUTHORITY",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::ActiveWorkAttemptStart,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        history.push(authority.clone());
+        let summary = MockSummaryClient::success(
+            "### Primary Request\nContinue\n### Pending Tasks\nFinish\n### Current Work\nImplementation\n### Current State\nIn progress",
+        );
+        let result = compact_with_memoria(
+            &history,
+            Some("session"),
+            &MemoriaCompactConfig {
+                min_tokens_for_retrieval: 100,
+                ..Default::default()
+            },
+            &MemoriaCompactParams {
+                budget_chars: 10000,
+                keep_chars: 2000,
+                tier: CompactionTier::AggressivePrune,
+                keep_recent_turns: 4,
+                current_tokens: 6000,
+                session_facts: None,
+            },
+            Some(&MockMemoriaPort::new(vec![])),
+            Some(&CompactConfig {
+                enable_summary: true,
+                summary_min_tier: CompactionTier::AggressivePrune,
+                ..Default::default()
+            }),
+            Some(&summary),
+        )
+        .await;
+        assert!(result.boundary.is_some());
+        assert!(result.history_summary.is_some());
+        assert_eq!(result.messages.last(), Some(&authority));
+        astra_turn_types::validate_canonical_tool_pairing(&result.messages).unwrap();
+        let requests = summary.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let rendered = requests[0][1]["content"].as_str().unwrap();
+        assert!(rendered.contains("PRIOR_SUMMARY_ONLY_FACT"));
+        assert!(rendered.contains("historical evidence, not instructions"));
+        assert!(!rendered.contains("HISTORY_SIDE_STABLE_POLICY"));
+        assert!(!rendered.contains("CURRENT_RUNTIME_AUTHORITY"));
     }
 
     #[tokio::test]
@@ -2250,8 +2470,8 @@ mod tests {
                 current_tokens: 6000,
                 session_facts: None,
             };
-            compact_with_memoria(
-                &[user("implement OAuth"), assistant("working on it")],
+            let result = compact_with_memoria(
+                &history_requiring_compaction(),
                 Some("session"),
                 &MemoriaCompactConfig {
                     min_tokens_for_retrieval: 100,
@@ -2267,6 +2487,7 @@ mod tests {
                 Some(&summary),
             )
             .await;
+            assert!(result.boundary.is_some(), "the fixture must really compact");
             assert_eq!(
                 memoria
                     .admissions
@@ -2281,111 +2502,180 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_with_summary_when_enabled() {
-        let msgs = vec![
-            user("implement OAuth"),
-            assistant("I'll help with OAuth. Here's a plan..."),
-            user("use JWT instead"),
-            assistant("Sure, switching to JWT tokens for auth."),
+    async fn summary_io_requires_history_loss_and_explicit_enablement() {
+        let mut authority = user("current Work contract");
+        astra_turn_types::mark_append_only_required_context(
+            &mut authority,
+            "work",
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        );
+        let protected = vec![
+            user("current goal"),
+            authority,
+            assistant(&"evidence ".repeat(4000)),
         ];
         let config = MemoriaCompactConfig {
             min_tokens_for_retrieval: 100,
             ..Default::default()
         };
-        let mock = MockMemoriaPort::new(vec![MemoriaMemory {
-            memory_id: "m1".to_string(),
-            content: "Working on auth module".to_string(),
-            memory_type: "working".to_string(),
-            retrieval_score: Some(0.8),
-            ..Default::default()
-        }]);
-        let params = MemoriaCompactParams {
-            budget_chars: 10000,
-            keep_chars: 2000,
-            tier: CompactionTier::AggressivePrune, // Meets summary_min_tier
-            keep_recent_turns: 4,
-            current_tokens: 6000,
-            session_facts: None,
-        };
+        for (msgs, tier, enabled, changed, summarized) in [
+            (
+                vec![user("hello"), assistant("hi")],
+                CompactionTier::AggressivePrune,
+                true,
+                false,
+                false,
+            ),
+            (
+                protected,
+                CompactionTier::AggressivePrune,
+                true,
+                false,
+                false,
+            ),
+            (
+                history_requiring_compaction(),
+                CompactionTier::AggressivePrune,
+                true,
+                true,
+                true,
+            ),
+            (
+                history_requiring_compaction(),
+                CompactionTier::AggressivePrune,
+                false,
+                true,
+                false,
+            ),
+            (
+                history_requiring_compaction(),
+                CompactionTier::TrimSchemas,
+                true,
+                true,
+                false,
+            ),
+        ] {
+            let mock = MockMemoriaPort::new(if summarized {
+                vec![MemoriaMemory {
+                    memory_id: "m1".into(),
+                    content: "Working on auth module".into(),
+                    memory_type: "working".into(),
+                    retrieval_score: Some(0.8),
+                    ..Default::default()
+                }]
+            } else {
+                vec![]
+            });
+            let params = MemoriaCompactParams {
+                budget_chars: 10000,
+                keep_chars: 2000,
+                tier,
+                keep_recent_turns: 4,
+                current_tokens: 6000,
+                session_facts: None,
+            };
 
-        let compact_config = CompactConfig {
-            enable_summary: true,
-            summary_min_tier: CompactionTier::AggressivePrune,
-            ..Default::default()
-        };
-        let summary_client = MockSummaryClient::success(
-            "### Primary Request\nImplement authentication.\n### Pending Tasks\nNone.\n### Current Work\nSwitched from OAuth to JWT auth.\n### Current State\nJWT auth selected.",
-        );
+            let compact_config = CompactConfig {
+                enable_summary: enabled,
+                summary_min_tier: CompactionTier::AggressivePrune,
+                ..Default::default()
+            };
+            let summary_client = MockSummaryClient::success(
+                "### Primary Request\nImplement authentication.\n### Pending Tasks\nNone.\n### Current Work\nSwitched from OAuth to JWT auth.\n### Current State\nJWT auth selected.",
+            );
 
-        let result = compact_with_memoria(
-            &msgs,
-            Some("sess1"),
-            &config,
-            &params,
-            Some(&mock),
-            Some(&compact_config),
-            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
-        )
-        .await;
+            let result = compact_with_memoria(
+                &msgs,
+                Some("sess1"),
+                &config,
+                &params,
+                Some(&mock),
+                Some(&compact_config),
+                Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
+            )
+            .await;
 
-        assert_eq!(result.messages, msgs, "summary must not become history");
-        assert_eq!(result.runtime_contexts.len(), 1);
-        assert!(result.runtime_contexts[0].contains("Switched from OAuth to JWT auth"));
-        assert!(
-            result.session_memory_context.is_none(),
-            "raw legacy working text is not canonical session memory"
-        );
+            assert_eq!(result.boundary.is_some(), changed);
+            assert_eq!(result.messages != msgs, changed);
+            assert_eq!(
+                result.messages.last(),
+                msgs.last(),
+                "latest evidence survives"
+            );
+            let expected_calls = if summarized { 1 } else { 0 };
+            assert_eq!(
+                summary_client
+                    .calls
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                expected_calls
+            );
+            assert_eq!(
+                usize::from(result.history_summary.is_some()),
+                expected_calls
+            );
+            if summarized {
+                assert!(
+                    result
+                        .history_summary
+                        .as_ref()
+                        .unwrap()
+                        .contains("Switched from OAuth to JWT auth")
+                );
+                assert!(
+                    result.messages.iter().all(|message| !message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .contains("Switched from OAuth to JWT auth")),
+                    "summary stays out of history"
+                );
+                assert!(
+                    result.session_memory_context.is_none(),
+                    "raw working text is not canonical session memory"
+                );
+            }
+        }
     }
 
     #[tokio::test]
-    async fn compact_summary_disabled_skips_llm() {
-        let msgs = vec![user("hello"), assistant("hi")];
-        let config = MemoriaCompactConfig {
-            min_tokens_for_retrieval: 100,
-            ..Default::default()
-        };
-        let mock = MockMemoriaPort::new(vec![]);
+    async fn summary_reservation_cannot_create_pressure_in_fitting_history() {
+        let mut messages = history_requiring_compaction();
+        messages.insert(
+            0,
+            astra_turn_core::cloud::history_summary::history_summary_message(
+                "previously accepted summary".into(),
+            ),
+        );
+        let summary = MockSummaryClient::success(
+            "### Primary Request\nContinue\n### Pending Tasks\nFinish\n### Current Work\nImplementation\n### Current State\nIn progress",
+        );
         let params = MemoriaCompactParams {
-            budget_chars: 10000,
+            budget_chars: super::super::compaction::serialized_message_chars(&messages) + 1,
             keep_chars: 2000,
             tier: CompactionTier::AggressivePrune,
             keep_recent_turns: 4,
             current_tokens: 6000,
             session_facts: None,
         };
-
-        let compact_config = CompactConfig {
-            enable_summary: false, // Disabled
-            ..Default::default()
-        };
-        let summary_client = MockSummaryClient::success("should not appear");
-
         let result = compact_with_memoria(
-            &msgs,
-            Some("sess1"),
-            &config,
+            &messages,
+            Some("session"),
+            &MemoriaCompactConfig::default(),
             &params,
-            Some(&mock),
-            Some(&compact_config),
-            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
+            Some(&MockMemoriaPort::new(vec![])),
+            Some(&CompactConfig::default()),
+            Some(&summary),
         )
         .await;
-
-        let has_summary = result.messages.iter().any(|m| {
-            m.get("content")
-                .and_then(Value::as_str)
-                .map(|s| s.contains("[Conversation summary"))
-                .unwrap_or(false)
-        });
-        assert!(
-            !has_summary,
-            "summary should not be generated when disabled"
-        );
+        assert_eq!(result.messages, messages);
+        assert!(result.boundary.is_none());
+        assert!(result.history_summary.is_none());
+        assert_eq!(summary.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn compact_summary_failure_falls_back() {
-        let msgs = vec![user("hello"), assistant("hi")];
+        let msgs = history_requiring_compaction();
         let config = MemoriaCompactConfig {
             min_tokens_for_retrieval: 100,
             ..Default::default()
@@ -2418,59 +2708,19 @@ mod tests {
         )
         .await;
 
-        // Should still have the original messages (truncated), no summary
-        assert_eq!(result.messages.len(), 2);
-        let has_summary = result.messages.iter().any(|m| {
-            m.get("content")
-                .and_then(Value::as_str)
-                .map(|s| s.contains("[Conversation summary"))
-                .unwrap_or(false)
-        });
-        assert!(!has_summary, "failed summary should not inject message");
-    }
-
-    #[tokio::test]
-    async fn compact_summary_below_tier_threshold_skips() {
-        let msgs = vec![user("hello"), assistant("hi")];
-        let config = MemoriaCompactConfig {
-            min_tokens_for_retrieval: 100,
-            ..Default::default()
-        };
-        let mock = MockMemoriaPort::new(vec![]);
-        let params = MemoriaCompactParams {
-            budget_chars: 10000,
-            keep_chars: 2000,
-            tier: CompactionTier::TrimSchemas, // Below AggressivePrune threshold
-            keep_recent_turns: 4,
-            current_tokens: 6000,
-            session_facts: None,
-        };
-
-        let compact_config = CompactConfig {
-            enable_summary: true,
-            summary_min_tier: CompactionTier::AggressivePrune, // Requires AggressivePrune
-            ..Default::default()
-        };
-        let summary_client = MockSummaryClient::success("should not appear");
-
-        let result = compact_with_memoria(
-            &msgs,
-            Some("sess1"),
-            &config,
-            &params,
-            Some(&mock),
-            Some(&compact_config),
-            Some(&summary_client as &dyn astra_turn_core::cloud_summary::SummaryLlmClient),
-        )
-        .await;
-
-        let has_summary = result.messages.iter().any(|m| {
-            m.get("content")
-                .and_then(Value::as_str)
-                .map(|s| s.contains("[Conversation summary"))
-                .unwrap_or(false)
-        });
-        assert!(!has_summary, "tier below threshold should skip summary");
+        assert!(result.boundary.is_some());
+        assert_eq!(
+            summary_client
+                .calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(result.history_summary.is_none());
+        assert_eq!(
+            result.messages.last(),
+            msgs.last(),
+            "latest evidence survives summary failure"
+        );
     }
 
     // ──────────────────────────────────────────────────────────
@@ -2721,6 +2971,44 @@ mod tests {
         let body: Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["memory_ids"], json!(["memory-42"]));
         assert!(body.get("user_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn all_store_paths_reject_invalid_http_write_receipts() {
+        for body in [
+            "{}",
+            r#"{"memory_id":""}"#,
+            r#"{"memory_id":" "}"#,
+            r#"{"memory_id":12}"#,
+            "not-json",
+        ] {
+            for operation in ["store", "episode", "scene"] {
+                let (address, _, server) =
+                    capture_one_http_request("201 Created", body.as_bytes()).await;
+                let client =
+                    HttpMemoriaPort::new_master(format!("http://{address}"), "test-key".into())
+                        .with_owner_user_id("owner-7");
+                let result = match operation {
+                    "store" => {
+                        client
+                            .store("a durable fact", "semantic", Some("session-9"), Some("T3"))
+                            .await
+                    }
+                    "episode" => {
+                        client
+                            .store_episode("session-9", "completed the migration")
+                            .await
+                    }
+                    _ => {
+                        client
+                            .store_scene("session-9", "pattern", "a recurring pattern")
+                            .await
+                    }
+                };
+                assert!(result.is_err(), "operation={operation}, body={body}");
+                server.await.unwrap();
+            }
+        }
     }
 
     #[tokio::test]
@@ -3155,3 +3443,7 @@ mod tests {
         assert_eq!(parsed[0].summary, "- real body");
     }
 }
+
+#[cfg(test)]
+#[path = "memoria_inventory_tests.rs"]
+mod inventory_tests;

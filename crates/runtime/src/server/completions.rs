@@ -197,6 +197,12 @@ pub(super) async fn completions_handler(
     // 3. Durably admit the logical invocation before provider I/O. Auxiliary
     // work is often session-scoped; callers must not invent an agent run just
     // to satisfy accounting.
+    // The request is an upper bound, not permission to exceed the admitted
+    // Offering. Use one effective budget for capacity accounting and dispatch;
+    // the typed-answer minimum was checked against both limits above.
+    let max_tokens = request
+        .max_tokens
+        .min(admitted.max_completion_tokens.unwrap_or(request.max_tokens));
     let shared_pool = state.shared_pool.as_ref().ok_or_else(|| {
         crate::error_response_coded(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -213,8 +219,7 @@ pub(super) async fn completions_handler(
     // reserve lifecycle state or consume provider capacity.
     let mut messages = request.messages;
     crate::turn::llm::client::strip_empty_assistant_tool_calls(&mut messages);
-    let admission_estimated_tokens =
-        completion_admission_estimated_tokens(&messages, request.max_tokens);
+    let admission_estimated_tokens = completion_admission_estimated_tokens(&messages, max_tokens);
     crate::llm_provider_admission::admit_llm_provider_request(
         Some(shared_pool),
         &admitted.provider,
@@ -230,7 +235,22 @@ pub(super) async fn completions_handler(
         admitted.clone(),
     );
     // 4. Execute through the same typed provider boundary as agent turns.
-    let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+    let thinking = astra_turn_core::thinking_config::ThinkingConfig::bounded_auxiliary(
+        &admitted.provider,
+        admitted
+            .thinking_capability
+            .map(|capability| capability.as_str()),
+        admitted.thinking_protocol.unwrap_or_else(|| {
+            astra_core::model_wire::thinking::canonical_thinking_protocol(
+                &admitted.provider,
+                &admitted.base_url,
+                admitted
+                    .wire_model_name
+                    .as_deref()
+                    .unwrap_or(&admitted.model_name),
+            )
+        }),
+    );
     let parsed = durable_ledger
         .execute_nonstream(
             &state.http_client,
@@ -241,7 +261,7 @@ pub(super) async fn completions_handler(
                 tools: &[],
                 cache_capability: None,
                 route: crate::turn::llm::client::LlmExecutionRoute::from_admitted(&admitted),
-                max_output_tokens: Some(request.max_tokens as usize),
+                max_output_tokens: Some(max_tokens as usize),
                 temperature: Some(request.temperature),
                 thinking: &thinking,
             },
@@ -500,12 +520,17 @@ mod tests {
                     tags: Vec::new(),
                     request_body_overrides: None,
                     fixed_temperature: None,
-                    thinking_protocol: None,
+                    thinking_protocol: (self.provider == "openai").then_some(
+                        astra_core::model_wire::thinking::ThinkingProtocol::ReasoningEffort,
+                    ),
                     prompt_cache_capability: None,
-                    thinking_capability: None,
+                    thinking_capability: (self.provider == "openai")
+                        .then_some(astra_services::models::ThinkingCapability::EffortOnly),
                     context_window: Some(32_000),
                     max_completion_tokens: Some(if self.provider == "cap-limited" {
                         64
+                    } else if self.provider == "openai" {
+                        1_024
                     } else {
                         4_096
                     }),
@@ -971,6 +996,8 @@ mod tests {
                             hanging_request_started.notify_one();
                             return std::future::pending::<axum::response::Response>().await;
                         }
+                        assert_eq!(body["max_completion_tokens"], 1_024);
+                        assert_eq!(body["reasoning_effort"], "low");
                         Json(json!({
                             "id": "provider-session-scope",
                             "choices": [{
@@ -1003,6 +1030,7 @@ mod tests {
             .with_shared_pool(shared_pool.clone());
         let mut request = explicit_completion_request("offer-completion");
         request.session_id = session_id.clone();
+        request.max_tokens = 2_048;
         request.turn = 3;
         request.round = 1;
 

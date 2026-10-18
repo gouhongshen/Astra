@@ -252,7 +252,14 @@ dev-deps-up:
 		exit 1; \
 	fi
 	@mkdir -p deployment/all-in-one/data/matrixone deployment/all-in-one/data/matrixone/logs deployment/all-in-one/data/logs/memoria
-	@$(DEPS_COMPOSE) up -d matrixone
+	@attempt=1; \
+	while ! ( $(DEPS_COMPOSE) up -d matrixone ); do \
+		if [ "$$attempt" -ge 3 ]; then exit 1; fi; \
+		delay=$$((attempt * 5)); \
+		echo "MatrixOne startup failed; retrying in $${delay}s ($$attempt/3)..."; \
+		sleep "$$delay"; \
+		attempt=$$((attempt + 1)); \
+	done
 	@$(MAKE) dev-deps-wait-matrixone
 	@$(MAKE) dev-deps-ensure-memoria
 	@echo "✅ Dependency services started (MatrixOne :6001, Memoria :8100)"
@@ -1323,6 +1330,7 @@ test-online:
 	if [ "$$ONLINE_LANE" = "all" ] || [ "$$ONLINE_LANE" = "core" ] || [ "$$ONLINE_LANE" = "core-runtime" ]; then \
 		echo "Running astra-runtime ignored unit/bin tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE); real provider calls disabled)..."; \
 		RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
+			ASTRA_TEST_DATABASE=$$RUNTIME_IGNORED_DB \
 			ASTRA_TEST_DB_IT=1 \
 			RUST_MIN_STACK=$${RUST_MIN_STACK:-16777216} \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \

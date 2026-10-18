@@ -845,8 +845,17 @@ impl PreparedBashWorkdir {
         }
     }
 
-    #[cfg(unix)]
     fn install_on_tokio_command(&self, command: &mut Command) -> Result<(), String> {
+        self.install_on_std_command(command.as_std_mut())
+    }
+
+    /// Install the pinned working directory after environment/sandbox setup.
+    /// Existing pre-exec ownership hooks remain composed with this hook.
+    #[cfg(unix)]
+    pub fn install_on_std_command(
+        &self,
+        command: &mut std::process::Command,
+    ) -> Result<(), String> {
         use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
 
@@ -855,7 +864,7 @@ impl PreparedBashWorkdir {
             .try_clone()
             .map_err(|error| format!("Error: cannot clone bash workdir handle: {error}"))?;
         unsafe {
-            command.as_std_mut().pre_exec(move || {
+            command.pre_exec(move || {
                 if libc::fchdir(directory.as_raw_fd()) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -866,14 +875,17 @@ impl PreparedBashWorkdir {
     }
 
     #[cfg(not(unix))]
-    fn install_on_tokio_command(&self, command: &mut Command) -> Result<(), String> {
+    pub fn install_on_std_command(
+        &self,
+        command: &mut std::process::Command,
+    ) -> Result<(), String> {
         command.current_dir(&self.path);
         Ok(())
     }
 }
 
 #[cfg(unix)]
-use astra_sandbox::open_directory_beneath;
+use astra_sandbox::{open_directory_beneath, open_filesystem_root};
 
 /// Resolve one Bash invocation's execution directory without changing the
 /// workspace authority boundary. The directory must already exist and its
@@ -924,7 +936,7 @@ pub fn resolve_bash_workdir(
     {
         use std::os::unix::fs::MetadataExt;
 
-        let filesystem_root = std::fs::File::open("/").map_err(|error| {
+        let filesystem_root = open_filesystem_root().map_err(|error| {
             format!(
                 "Error: cannot open filesystem root while pinning bash `workdir`: {error}; no command was run"
             )
@@ -1145,8 +1157,8 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
         )
         .await;
         match lease {
-            Some(guard) => Some(guard),
-            None => {
+            Ok(guard) => Some(guard),
+            Err(failure) => {
                 if ctx
                     .cancel_token
                     .as_ref()
@@ -1154,10 +1166,7 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
                 {
                     return crate::cancelled_tool_result("bash", false);
                 }
-                return crate::workspace_lease_unavailable_tool_result_for_workspace(
-                    "bash",
-                    &ctx.workspace_root,
-                );
+                return crate::workspace_lease_failure_tool_result("bash", failure);
             }
         }
     } else {
@@ -8468,3 +8477,7 @@ mod workdir_tests {
         assert!(!outside.path().join("marker").exists());
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "shell_ops_landlock_tests.rs"]
+mod landlock_tests;

@@ -611,22 +611,21 @@ fn output_format_section() -> &'static str {
      - **Search results**: cite file:line and quote only the key lines.\n\
      - **Build/test output**: report pass/fail/errors. A smoke check proves its slice; state scope/unverified unless broader acceptance ran.\n\
      - **Multiple findings**: use a list or table.\n\
-     - **NEVER repeat a summary/report.**\n\
-     - **Ask the user only for real decisions.** Use `ask_user` only when visible or activated; otherwise ask in your normal response.\n"
+     - **NEVER repeat a summary/report.**\n"
 }
 
 /// Tool error recovery. Scenario-based: diagnose → fix → anti-pattern.
 fn tool_error_recovery_section() -> &'static str {
     "\n## Tool Error Recovery\n\
      ### Retry Budget\n\
-     Fix the cause and retry ONCE, then change path or ask.\n\
+     Fix the cause and retry ONCE, then use a permitted path or report the blocker.\n\
      - **File not found**: confirm; never guess variants.\n\
      - **Tool schema or argument error**: follow the schema; do not mask it by switching to bash/python. `read_file` uses inclusive lines, not offset/limit.\n\
      - **str_replace old_str did not match**: re-read exact lines with unique context.\n\
      - **bash command timeout**: narrow it; no identical longer retry.\n\
      - **Truncated output**: narrow scope or result limit.\n\
      - **ask_user shape error**: use top-level `questions[]` when visible; otherwise ask normally.\n\
-     - **Auth / credential / permission error**: request a permitted path.\n\
+     - **Auth / credential / permission error**: preserve the authorization boundary and report the missing capability.\n\
      - **Non-errors**: a memory read returns empty or search finds nothing; these are evidence.\n\
      - **Unknown tool name**: it is absent from the current capability binding; use visible tools. Do not claim it was 'reclaimed', 'on-demand', or activated.\n"
 }
@@ -652,11 +651,11 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
     );
     if tool_visible(tool_names, "tool_search") {
         body.push_str(
-            "         - Select deferred tools or absent resident fields with `tool_search(query=\"select:NAME\")`, then `invoke_tool`. Reuse contracts across turns; runtime revalidates access. Selection never adds schemas to `tools[]`.\n",
+            "         - Absent fields/actions: Tool Availability Protocol; select via `tool_search(query=\"select:NAME\")`, then `invoke_tool`. Reuse contracts; runtime revalidates access; selection never adds schemas to `tools[]`.\n",
         );
     } else {
         body.push_str(
-            "         - If a needed structured tool is not visible, use a visible alternative or ask in your normal response.\n",
+            "         - If a needed structured tool is not visible, use a permitted visible alternative or report the missing capability.\n",
         );
     }
     let agent_visible = tool_visible(tool_names, "agent");
@@ -675,21 +674,23 @@ pub(crate) fn tool_conditional_section(tool_names: &[&str]) -> String {
         body.push_str(&format!(
             "         - `task` is an agent type, not a callable tool name. {surface_guidance}; `start_work` tracks durable outcomes. Task controls are not Work. Preserve scope, whole-result format and alternatives; defer requested child choices only.\n"
         ));
-        body.push_str(
-            "         - Launch before child-specific checks. Preserve user-assigned model/task pairs and verbatim output constraints; no extra metadata/templates. Keep parent-only reporting out of child briefs. Use runtime model/status receipts, not child self-report. Parent work never replaces child work. One child per objective; fanout controls groups, not duplication.\n",
-        );
+        body.push_str(concat!(
+            "         - Launch before child-specific checks. Preserve user-assigned model/task pairs and verbatim output constraints. Use runtime model/status receipts, not child self-report. ",
+            astra_tools::agent_parent_scope_guidance!(),
+            "\n",
+        ));
     }
     if agent_visible {
         body.push_str(
-"         - Delegation: when the user asks for a child using defaults or a known selector and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. Absent fields/actions: Tool Availability Protocol; preserve constraints. Default `agent_type`: read-only `explore`; review: `code-review`; mutation: `task`/`general-purpose`. Defaults: omit `requested_model_policy` for profile/parent defaults. Only for a user-requested execution-model override, set an exact authorized ID or configured name. Unknown explicit models require `model_catalog` before spawning. Task/quoted model names are not controls; never invent reasoning, read config/credentials, or substitute unavailable/prohibited models.\n",
+            "         - Delegation: when the user asks for a child using defaults or a known selector and all required arguments fit the visible schema, the first native call is `agent(action=\"spawn\", ...)`. Omit `requested_model_policy` for profile/parent defaults. Use it for an Astra Offering override, or use the exact provider tool/model from the current provider directory. Use `model_catalog` only for unknown Astra Offerings; never inspect config/credentials, run provider CLIs, or substitute. Task text is not a control.\n",
         );
         body.push_str(
-            "         - After spawn, do independent requested work, then await child results; no polling or shell sleep. Decisions: `agent(send_message, message_type=question)` then wait; answer with the incoming `request_id`. Final prose is not a coordination message; running is not failure.\n",
+            "         - After spawn, do independent requested work, then await child results; no polling or shell sleep. Use `agent(send_message, message_type=question)` only for an active mailbox; answer with the incoming `request_id`. Continue a completed provider collaborator with spawn+exact collaborator_id, never another identity. Ask once on typed model selection; never guess or present an unstarted child as failure. Final prose is not a coordination message; running is not failure.\n",
         );
     }
     if tool_visible(tool_names, "bash") {
         body.push_str(
-            "         - `tools[]` limits structured calls, not executables available through `bash`. Before declaring an external action unavailable, run one bounded non-secret CLI capability/auth probe. For named services, prefer an authenticated first-party CLI/API; otherwise disclose the evidence boundary.\n",
+            "         - `tools[]` limits structured calls, not executables available through `bash`. For provider collaborators, use the directory's exact structured tool/model; never inspect config/credentials or invoke a provider CLI through `bash`. Other named services without structured capability permit one bounded non-secret CLI/API probe; otherwise disclose evidence.\n",
         );
     }
     body.push_str(&tool_precedence_section(tool_names));
@@ -724,7 +725,7 @@ fn work_lifecycle_section(tool_names: &[&str]) -> String {
 
     if can_start {
         body.push_str(
-            "- `start_work`: declare all known outcomes and `after_initial_tasks` dependencies; defer undecided changes. Once bound, use `propose_work_plan`, never new genesis. Trust IDs, receipts, and `next_action`.\n",
+            "- `start_work`: declare all known outcomes and `after_initial_tasks` dependencies; defer undecided changes. Once bound, use `propose_work_plan`, never new genesis. Trust returned `initial_task`, receipt IDs and state; honor latest user scope before an assigned next action.\n",
         );
         body.push_str(
             "- `activation=start` executes; `activation=defer` only prepares/establishes or honors explicit no-execute, owns no active attempt, and stops without routine decomposition approval.\n",
@@ -732,7 +733,7 @@ fn work_lifecycle_section(tool_names: &[&str]) -> String {
     }
     if can_run_next_work_item {
         body.push_str(
-        "- Existing Work uses the server-selected assignment. `run_next_work_item` handles deferred/recovery; `status=complete` without an item never accepts the latest request or proves completion.\n",
+        "- Execute server-selected assignments within latest user scope; apply requested graph changes first. `run_next_work_item` handles deferred/recovery; `status=complete` without an item never accepts the latest request or proves completion.\n",
         );
     }
     body.push_str(
@@ -741,11 +742,6 @@ fn work_lifecycle_section(tool_names: &[&str]) -> String {
     if can_inspect || can_propose {
         body.push_str(
             "- For add/remove/cancel/replace/reorder, inspect the pinned plan and propose the smallest typed change with returned `context_id` (not branch/work IDs). Confirm only an accepted receipt; cancel via a cancelled revision; apply at the meaningful boundary, not every target; choose the smallest if underspecified. Background tools are never the Work board.\n",
-        );
-    }
-    if can_run_next_work_item && can_start {
-        body.push_str(
-            "- Bound Work is not an active assignment; execute returned `initial_task` or inspect/propose a revision.\n",
         );
     }
     if can_settle {
@@ -1277,7 +1273,7 @@ mod tests {
 
         let executable =
             tool_conditional_section(&["start_work", "run_next_work_item", "settle_work_item"]);
-        assert!(executable.contains("Trust IDs, receipts, and `next_action`"));
+        assert!(executable.contains("honor latest user scope before an assigned next action"));
         assert!(executable.contains("declare all known outcomes"));
         assert!(executable.contains("`after_initial_tasks` dependencies"));
         assert!(!executable.contains("only outcomes executable now"));
@@ -1328,10 +1324,9 @@ mod tests {
         assert!(agent_surface.contains("the first native call is `agent(action=\"spawn\", ...)`"));
         assert!(agent_surface.contains("all required arguments fit the visible schema"));
         assert!(
-            agent_surface
-                .contains("Unknown explicit models require `model_catalog` before spawning")
+            agent_surface.contains("exact provider tool/model from the current provider directory")
         );
-        assert!(agent_surface.contains("or substitute unavailable/prohibited models"));
+        assert!(agent_surface.contains("never inspect config/credentials"));
         assert!(!agent_surface.contains("settle_work_item"));
         let fanout_surface = tool_conditional_section(&["agent_fanout"]);
         assert!(!fanout_surface.contains("call visible `agent` spawn directly"));
@@ -1350,7 +1345,7 @@ mod tests {
         assert!(
             combined_surface.contains("the first native call is `agent(action=\"spawn\", ...)`")
         );
-        assert!(combined_surface.contains("fanout controls groups, not duplication"));
+        assert!(combined_surface.contains(astra_tools::agent_parent_scope_guidance!()));
 
         let stable_work_surface = tool_conditional_section(&[
             "start_work",
@@ -1378,9 +1373,9 @@ mod tests {
             bound_work_surface.contains("Once bound, use `propose_work_plan`, never new genesis")
         );
         assert!(
-            bound_work_surface
-                .contains("execute returned `initial_task` or inspect/propose a revision")
+            bound_work_surface.contains("Trust returned `initial_task`, receipt IDs and state")
         );
+        assert!(bound_work_surface.contains("apply requested graph changes first"));
         assert!(
             bound_work_surface
                 .contains("inspect the pinned plan and propose the smallest typed change")
@@ -1458,7 +1453,7 @@ mod tests {
         assert!(
             !turn_discipline_section().contains("before your first tool call, write ONE sentence")
         );
-        assert!(tool_conditional_section(&["bash"]).contains("authenticated first-party CLI/API"));
+        assert!(tool_conditional_section(&["bash"]).contains("bounded non-secret CLI/API probe"));
     }
 
     #[test]
@@ -1527,16 +1522,21 @@ mod tests {
     #[test]
     fn named_child_model_does_not_require_parent_preflight() {
         let prompt = tool_conditional_section(&["agent", "tool_search", "model_catalog", "bash"]);
-        assert!(prompt.contains("exact authorized ID or configured name"));
-        assert!(prompt.contains("Unknown explicit models require `model_catalog` before spawning"));
-        assert!(prompt.contains("Task/quoted model names are not controls"));
-        assert!(prompt.contains("omit `requested_model_policy` for profile/parent defaults"));
-        assert!(prompt.contains("Only for a user-requested execution-model override"));
+        assert!(prompt.contains("Use it for an Astra Offering override"));
+        assert!(prompt.contains("Use `model_catalog` only for unknown Astra Offerings"));
+        assert!(prompt.contains("Task text is not a control"));
+        assert!(prompt.contains("Omit `requested_model_policy` for profile/parent defaults"));
+        assert!(prompt.contains("exact provider tool/model from the current provider directory"));
+        assert!(
+            prompt.contains(
+                "never inspect config/credentials or invoke a provider CLI through `bash`"
+            )
+        );
         assert!(prompt.contains("the first native call is `agent(action=\"spawn\", ...)`"));
         assert!(prompt.contains("when the user asks for a child"));
         assert!(prompt.contains("Launch before child-specific checks"));
         assert!(prompt.contains("Preserve user-assigned model/task pairs"));
-        assert!(prompt.contains("Parent work never replaces child work"));
+        assert!(prompt.contains(astra_tools::agent_parent_scope_guidance!()));
         assert!(prompt.contains("runtime model/status receipts, not child self-report"));
     }
 
@@ -1774,7 +1774,7 @@ mod tests {
         );
         let guidance = tool_conditional_section(&["bash", "glob", "grep", "read_file"]);
         assert!(guidance.contains("not executables available through `bash`"));
-        assert!(guidance.contains("capability/auth probe"));
+        assert!(guidance.contains("bounded non-secret CLI/API probe"));
         assert!(!guidance.contains("run_build_test"));
         assert!(!tool_conditional_section(&["git"]).contains("Git Workflow"));
         let tokens: u32 = sections
@@ -1846,7 +1846,7 @@ mod tests {
         for surface in [&["agent"][..], &["agent_fanout"][..]] {
             let guidance = tool_conditional_section(surface);
             assert_eq!(guidance.matches("verbatim output constraints").count(), 1);
-            assert!(guidance.contains("Keep parent-only reporting out of child briefs"));
+            assert!(guidance.contains("runtime model/status receipts, not child self-report"));
         }
         let direct = tool_conditional_section(&["agent"]);
         assert!(
@@ -1865,14 +1865,13 @@ mod tests {
         );
         assert!(discoverable.contains("all required arguments fit the visible schema"));
         assert!(discoverable.contains("Absent fields/actions: Tool Availability Protocol"));
-        assert!(discoverable.contains("preserve constraints"));
+        assert!(discoverable.contains("Preserve scope"));
         assert!(discoverable.contains("using defaults or a known selector"));
         assert!(!discoverable.contains("Do not call `tool_search`"));
         assert!(discoverable.contains("the first native call is `agent(action=\"spawn\", ...)`"));
-        assert!(discoverable.contains("exact authorized ID or configured name"));
+        assert!(discoverable.contains("Use it for an Astra Offering override"));
         assert!(
-            discoverable
-                .contains("Unknown explicit models require `model_catalog` before spawning")
+            discoverable.contains("exact provider tool/model from the current provider directory")
         );
     }
 

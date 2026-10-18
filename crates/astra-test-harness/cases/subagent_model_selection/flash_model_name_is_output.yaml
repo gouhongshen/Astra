@@ -13,6 +13,6 @@ criteria:
   - type: execution_child_results_adopted
     children:
       - expected_result: {text: glm-5.2}
-        model: deepseek-v4-flash
+        model: '{{model}}'
   - type: text_equals
     expected: glm-5.2

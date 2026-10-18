@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-07-v100";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-10-17-v105";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -993,6 +993,8 @@ where
 /// admission transaction is what makes the snapshot safe to reuse.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SessionWriteAdmissionFacts {
+    pub(crate) user_id: String,
+    pub(crate) session_id: String,
     session_status: String,
 }
 
@@ -1076,19 +1078,21 @@ where
         }
         Err(error) => return Err(error),
     }
-    let status: Option<String> = query_scalar(
-        "SELECT status FROM agent_sessions
+    let stored: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT user_id, session_id, status FROM agent_sessions
          WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
     )
     .bind(user_id)
     .bind(session_id)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some(status) = status {
+    if let Some((user_id, session_id, status)) = stored {
         if status == "deleting" {
             return Err(sqlx::Error::RowNotFound);
         }
         return Ok(SessionWriteAdmissionFacts {
+            user_id,
+            session_id,
             session_status: status,
         });
     }
@@ -1099,8 +1103,8 @@ where
         Ok(()) | Err(sqlx::Error::RowNotFound) => {}
         Err(error) => return Err(error),
     }
-    let created: Option<String> = query_scalar(
-        "SELECT status FROM agent_sessions
+    let created: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT user_id, session_id, status FROM agent_sessions
          WHERE user_id = ? AND session_id = ? AND status <> 'deleting'
          LIMIT 1 FOR UPDATE",
     )
@@ -1108,8 +1112,12 @@ where
     .bind(session_id)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some(session_status) = created {
-        Ok(SessionWriteAdmissionFacts { session_status })
+    if let Some((user_id, session_id, session_status)) = created {
+        Ok(SessionWriteAdmissionFacts {
+            user_id,
+            session_id,
+            session_status,
+        })
     } else {
         Err(sqlx::Error::RowNotFound)
     }
@@ -1271,6 +1279,63 @@ where
     };
     if result.rows_affected() == 0 {
         return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
+/// Apply only newly captured ingestion effects to already admitted session rows.
+/// Keys must be the stored identities returned by session admission, with one
+/// entry per row. The surrounding transaction owns their lifecycle fences.
+pub(crate) async fn apply_ingestion_session_effects(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    deltas: &std::collections::BTreeMap<(String, String), (i64, bool)>,
+) -> Result<(), sqlx::Error> {
+    if deltas.is_empty() {
+        return Ok(());
+    }
+    if let Some(((user_id, session_id), (delta, false))) = deltas.first_key_value()
+        && deltas.len() == 1
+    {
+        return bump_agent_session_event_count(&mut **tx, session_id, user_id, *delta, None).await;
+    }
+    let mut builder = QueryBuilder::<MySql>::new("UPDATE agent_sessions AS s JOIN (");
+    for (index, ((user_id, session_id), (delta, ended))) in deltas.iter().enumerate() {
+        if index > 0 {
+            builder.push(" UNION ALL ");
+        }
+        builder
+            .push("SELECT ")
+            .push_bind(user_id)
+            .push(" AS user_id, ")
+            .push_bind(session_id)
+            .push(" AS session_id, ")
+            .push_bind(*delta)
+            .push(" AS delta, ")
+            .push_bind(*ended)
+            .push(" AS ended");
+    }
+    builder.push(
+        ") AS d ON s.user_id = d.user_id AND s.session_id = d.session_id \
+         SET s.event_count = s.event_count + d.delta, \
+         s.updated_at = IF(s.last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), s.updated_at), \
+         s.last_active_at = IF(s.last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), s.last_active_at), \
+         s.ended_at = IF(d.ended AND s.status NOT IN ('ended', 'deleting'), NOW(), s.ended_at), \
+         s.status = IF(d.ended AND s.status NOT IN ('ended', 'deleting'), 'ended', s.status) WHERE ",
+    );
+    let mut candidates = builder.separated(" OR ");
+    for (user_id, session_id) in deltas.keys() {
+        candidates
+            .push("(s.user_id = ")
+            .push_bind_unseparated(user_id)
+            .push_unseparated(" AND s.session_id = ")
+            .push_bind_unseparated(session_id)
+            .push_unseparated(")");
+    }
+    let result = builder.build().execute(&mut **tx).await?;
+    if usize::try_from(result.rows_affected()).ok() != Some(deltas.len()) {
+        return Err(sqlx::Error::Protocol(
+            "ingestion effects did not update every admitted session".into(),
+        ));
     }
     Ok(())
 }
@@ -1517,12 +1582,12 @@ pub struct AgentEventEdgeInsert<'a> {
     pub parent_event_ids: &'a [String],
 }
 
-pub async fn insert_agent_event_edges_batch<'e, E>(
-    executor: E,
+pub async fn insert_agent_event_edges_batch<T>(
+    tx: &mut T,
     edges: &[AgentEventEdgeInsert<'_>],
 ) -> Result<(), sqlx::Error>
 where
-    E: sqlx::Executor<'e, Database = MySql>,
+    T: TransactionConnection,
 {
     let normalized = edges
         .iter()
@@ -1537,29 +1602,35 @@ where
         return Ok(());
     }
 
-    let mut builder = QueryBuilder::<MySql>::new(
-        "INSERT INTO agent_event_edges \
+    // Event/byte limits do not bound the number of normalized parent edges.
+    // MySQL allows 65,535 parameters; every edge binds six columns.
+    const BINDS_PER_EDGE: usize = 6;
+    const EDGES_PER_STATEMENT: usize = 65_535 / BINDS_PER_EDGE;
+    for chunk in normalized.chunks(EDGES_PER_STATEMENT) {
+        let mut builder = QueryBuilder::<MySql>::new(
+            "INSERT INTO agent_event_edges \
          (user_id, session_id, child_event_id, parent_event_id, relation_kind, parent_order) ",
-    );
-    builder.push_values(normalized, |mut row, (edge, index, parent_event_id)| {
-        row.push_bind(edge.user_id)
-            .push_bind(edge.session_id)
-            .push_bind(edge.child_event_id)
-            .push_bind(parent_event_id)
-            .push_bind(CAUSAL_EDGE_KIND)
-            .push_bind(i32::try_from(index).unwrap_or(i32::MAX));
-    });
-    builder.push(
-        " ON DUPLICATE KEY UPDATE \
+        );
+        builder.push_values(chunk, |mut row, (edge, index, parent_event_id)| {
+            row.push_bind(edge.user_id)
+                .push_bind(edge.session_id)
+                .push_bind(edge.child_event_id)
+                .push_bind(parent_event_id)
+                .push_bind(CAUSAL_EDGE_KIND)
+                .push_bind(i32::try_from(*index).unwrap_or(i32::MAX));
+        });
+        builder.push(
+            " ON DUPLICATE KEY UPDATE \
          session_id = VALUES(session_id), \
          parent_order = VALUES(parent_order)",
-    );
-    builder.build().execute(executor).await?;
+        );
+        builder.build().execute(&mut **tx).await?;
+    }
     Ok(())
 }
 
-pub async fn insert_agent_event_edges<'e, E>(
-    executor: E,
+pub async fn insert_agent_event_edges<T>(
+    tx: &mut T,
     user_id: &str,
     session_id: &str,
     child_event_id: &str,
@@ -1567,10 +1638,10 @@ pub async fn insert_agent_event_edges<'e, E>(
     parent_event_ids: &[String],
 ) -> Result<(), sqlx::Error>
 where
-    E: sqlx::Executor<'e, Database = MySql>,
+    T: TransactionConnection,
 {
     insert_agent_event_edges_batch(
-        executor,
+        tx,
         &[AgentEventEdgeInsert {
             user_id,
             session_id,
@@ -1887,11 +1958,17 @@ async fn reject_obsolete_weighted_admission_schema(
     const OWNER_USAGE: &str = "session_weighted_admission_owner_usage";
     const REQUIRED_GATE_COLUMNS: &[&str] = &[
         "usage_initialized",
-        "global_resident_bytes",
-        "global_context_tokens",
-        "global_provider_slots",
-        "global_cpu_units",
-        "global_io_bytes",
+        "earliest_expiry_at",
+        "used_resident_bytes",
+        "used_context_tokens",
+        "used_provider_slots",
+        "used_cpu_units",
+        "used_io_bytes",
+        "allocated_resident_bytes",
+        "allocated_context_tokens",
+        "allocated_provider_slots",
+        "allocated_cpu_units",
+        "allocated_io_bytes",
     ];
 
     if !table_exists(pool, database, GATE).await? {
@@ -1908,17 +1985,24 @@ async fn reject_obsolete_weighted_admission_schema(
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema is older than v82; missing {}. Compatibility migration is disabled; recreate database {database} with the current schema",
+            "weighted admission schema does not match the current contract; missing {}. Recreate database {database} with the current schema",
             missing.join(", ")
         )));
     }
     if !table_exists(pool, database, OWNER_USAGE).await? {
         return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema is incomplete for v82; missing table {OWNER_USAGE}. Compatibility migration is disabled; recreate database {database} with the current schema"
+            "weighted admission schema is incomplete; missing table {OWNER_USAGE}. Recreate database {database} with the current schema"
         )));
     }
 
     let mut mismatches = Vec::new();
+    if let Some(column) = gate_columns.get("earliest_expiry_at")
+        && (!column.data_type.eq_ignore_ascii_case("datetime") || !column.nullable)
+    {
+        mismatches.push(format!(
+            "{GATE}.earliest_expiry_at must be nullable DATETIME"
+        ));
+    }
     if let Some(column) = gate_columns.get("usage_initialized")
         && (!column.data_type.eq_ignore_ascii_case("tinyint") || column.nullable)
     {
@@ -1929,11 +2013,16 @@ async fn reject_obsolete_weighted_admission_schema(
         ));
     }
     for name in [
-        "global_resident_bytes",
-        "global_context_tokens",
-        "global_provider_slots",
-        "global_cpu_units",
-        "global_io_bytes",
+        "used_resident_bytes",
+        "used_context_tokens",
+        "used_provider_slots",
+        "used_cpu_units",
+        "used_io_bytes",
+        "allocated_resident_bytes",
+        "allocated_context_tokens",
+        "allocated_provider_slots",
+        "allocated_cpu_units",
+        "allocated_io_bytes",
     ] {
         if let Some(column) = gate_columns.get(name)
             && (!column.data_type.eq_ignore_ascii_case("decimal")
@@ -1980,8 +2069,23 @@ async fn reject_obsolete_weighted_admission_schema(
     }
     if !mismatches.is_empty() {
         return Err(sqlx::Error::Protocol(format!(
-            "weighted admission schema is not the current v82 physical shape: {}. Compatibility migration is disabled; recreate database {database} with the current schema",
+            "weighted admission schema does not match the current physical shape: {}. Recreate database {database} with the current schema",
             mismatches.join(", ")
+        )));
+    }
+    let reservation_columns =
+        weighted_admission_table_shapes(pool, database, "session_weighted_admission_reservations")
+            .await?;
+    // Interrupted fresh bootstrap may not have created this table yet.
+    if !reservation_columns.is_empty()
+        && !reservation_columns
+            .get("idempotency_hash")
+            .is_some_and(|column| {
+                column.data_type.eq_ignore_ascii_case("varchar") && !column.nullable
+            })
+    {
+        return Err(sqlx::Error::Protocol(format!(
+            "weighted admission idempotency_hash must be NOT NULL VARCHAR; recreate database {database} with the current schema"
         )));
     }
     Ok(())
@@ -3569,6 +3673,26 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
+        "agent_session_memory_work",
+        "CREATE TABLE IF NOT EXISTS agent_session_memory_work (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            state_json JSON NOT NULL,
+            lease_token VARCHAR(36) NULL,
+            lease_expires_at DATETIME(6) NULL,
+            next_attempt_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            attempts BIGINT NOT NULL DEFAULT 0,
+            complete BOOLEAN NOT NULL DEFAULT TRUE,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id),
+            INDEX idx_session_memory_due (complete, next_attempt_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
         "agent_session_lifecycle_fences",
         "CREATE TABLE IF NOT EXISTS agent_session_lifecycle_fences (
             session_id VARCHAR(64) NOT NULL,
@@ -4085,21 +4209,35 @@ async fn ensure_core_schema_while_leased(
             scope_name VARCHAR(64) NOT NULL,
             capacity_hash CHAR(64) NULL,
             usage_initialized TINYINT NOT NULL DEFAULT 0,
-            global_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            global_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            global_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            global_cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
-            global_io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            earliest_expiry_at DATETIME(6) NULL,
+            used_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            used_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            used_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            used_cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            used_io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            allocated_resident_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            allocated_context_tokens DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            allocated_provider_slots DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            allocated_cpu_units DECIMAL(20, 0) NOT NULL DEFAULT 0,
+            allocated_io_bytes DECIMAL(20, 0) NOT NULL DEFAULT 0,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (scope_name)
         )",
     )
     .execute(&pool)
     .await?;
-    sqlx::query("INSERT IGNORE INTO session_weighted_admission_gates (scope_name) VALUES (?)")
-        .bind(crate::weighted_admission::DISTRIBUTED_ADMISSION_SCOPE)
-        .execute(&pool)
-        .await?;
+    let mut gates = sqlx::QueryBuilder::<MySql>::new(
+        "INSERT IGNORE INTO session_weighted_admission_gates (scope_name) ",
+    );
+    gates.push_values(
+        0..crate::weighted_admission::DISTRIBUTED_ADMISSION_PARTITIONS,
+        |mut row, partition| {
+            row.push_bind(crate::weighted_admission::distributed_admission_scope(
+                partition,
+            ));
+        },
+    );
+    gates.build().execute(&pool).await?;
 
     core_schema_create!(
         pool,
@@ -4108,10 +4246,10 @@ async fn ensure_core_schema_while_leased(
             scope_name VARCHAR(64) NOT NULL,
             reservation_id CHAR(36) NOT NULL,
             isolation_domain VARCHAR(128) NOT NULL,
-            owner_user_id VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL COLLATE utf8mb4_bin,
             session_id VARCHAR(128) NOT NULL,
             branch_id VARCHAR(128) NOT NULL,
-            idempotency_hash CHAR(64) NOT NULL,
+            idempotency_hash VARCHAR(64) NOT NULL,
             resident_bytes BIGINT NOT NULL,
             context_tokens BIGINT NOT NULL,
             provider_slots BIGINT NOT NULL,
@@ -4119,9 +4257,8 @@ async fn ensure_core_schema_while_leased(
             io_bytes BIGINT NOT NULL,
             expires_at DATETIME(6) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (scope_name, reservation_id),
-            UNIQUE KEY uq_weighted_admission_idempotency
-                (scope_name, isolation_domain, owner_user_id, idempotency_hash),
+            PRIMARY KEY (scope_name, isolation_domain, owner_user_id, idempotency_hash),
+            UNIQUE KEY uq_weighted_admission_reservation (scope_name, reservation_id),
             INDEX idx_weighted_admission_expiry (scope_name, expires_at),
             INDEX idx_weighted_admission_owner_expiry
                 (scope_name, isolation_domain, owner_user_id, expires_at)
@@ -4139,6 +4276,7 @@ async fn ensure_core_schema_while_leased(
             session_id VARCHAR(64) NOT NULL,
             event_type VARCHAR(64) NOT NULL,
             event_id VARCHAR(128) NOT NULL,
+            invocation_supersession_scope_key VARCHAR(64) NULL,
             agent_id VARCHAR(255) NULL,
             subject_run_id VARCHAR(64) NULL,
             interaction_request_id VARCHAR(128) NULL,
@@ -4153,6 +4291,7 @@ async fn ensure_core_schema_while_leased(
             UNIQUE KEY uq_run_event_idx (user_id, run_id, event_idx),
             UNIQUE KEY uq_run_event_idempotency (user_id, run_id, idempotency_key),
             INDEX idx_agent_run_events_control_type_idx (user_id, run_id, event_type, event_idx),
+            INDEX idx_agent_run_events_invocation_control (invocation_supersession_scope_key),
             INDEX idx_agent_run_events_owner_session_run_idx (user_id, session_id, run_id, event_idx),
             INDEX idx_agent_run_events_owner_session_subject (user_id, session_id, event_type, subject_run_id, event_idx),
             INDEX idx_agent_run_events_interaction (user_id, run_id, interaction_request_id, event_type, event_idx),
@@ -4777,17 +4916,15 @@ async fn ensure_core_schema_while_leased(
     .await?;
 
     // Context / decisions / evaluation essentials used by turn persistence
-    core_schema_create!(
-        pool,
-        "ctx_snapshots",
+    let ctx_snapshot_ddl = format!(
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (
             context_capture_id VARCHAR(64) PRIMARY KEY,
             user_id VARCHAR(128) NOT NULL,
             session_id VARCHAR(64) NOT NULL,
-            event_id VARCHAR(128) NOT NULL,
+            event_id VARCHAR({AGENT_EVENT_ID_LEN}) NOT NULL,
             context_data JSON NULL,
-            llm_request_id VARCHAR(64) NULL,
-            llm_response_id VARCHAR(64) NULL,
+            llm_request_id VARCHAR({AGENT_EVENT_ID_LEN}) NULL,
+            llm_response_id VARCHAR({AGENT_EVENT_ID_LEN}) NULL,
             token_budget INT NULL,
             total_tokens BIGINT NULL,
             assembly_time_ms BIGINT NULL,
@@ -4798,9 +4935,10 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_ctx_snapshots_owner_session_created (user_id, session_id, created_at),
             INDEX idx_ctx_snapshots_owner_event_id (user_id, event_id)
         )",
-    )
-    .execute(&pool)
-    .await?;
+    );
+    core_schema_create!(pool, "ctx_snapshots", &ctx_snapshot_ddl)
+        .execute(&pool)
+        .await?;
 
     core_schema_create!(pool, "ctx_decision_audits",
         "CREATE TABLE IF NOT EXISTS ctx_decision_audits (
@@ -5979,20 +6117,47 @@ async fn verify_core_schema_shape(
     // CREATE IF NOT EXISTS does not validate existing tables. Reject missing
     // runtime fields without restoring the historical ALTER/repair path.
     let columns = query(
-        "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ?",
+        "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH
+         FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = ?",
     )
     .bind(database)
     .fetch_all(pool)
     .await?
     .into_iter()
     .map(|row| {
-        Ok((
-            row.try_get::<String, _>("TABLE_NAME")?,
-            row.try_get::<String, _>("COLUMN_NAME")?,
-        ))
+        let table: String = row.try_get("TABLE_NAME")?;
+        let column: String = row.try_get("COLUMN_NAME")?;
+        if table == "agent_run_events"
+            && column == "invocation_supersession_scope_key"
+            && (!row
+                .try_get::<String, _>("DATA_TYPE")?
+                .eq_ignore_ascii_case("varchar")
+                || row.try_get::<String, _>("IS_NULLABLE")? != "YES"
+                || row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")? != Some(64))
+        {
+            return Err(sqlx::Error::Protocol(
+                "agent_run_events.invocation_supersession_scope_key must be nullable VARCHAR(64)"
+                    .into(),
+            ));
+        }
+        Ok((table, column))
     })
     .collect::<Result<BTreeSet<_>, sqlx::Error>>()?;
     for (table, required) in [
+        (
+            "agent_session_memory_work",
+            &[
+                "user_id",
+                "session_id",
+                "state_json",
+                "lease_token",
+                "lease_expires_at",
+                "next_attempt_at",
+                "attempts",
+                "complete",
+                "updated_at",
+            ][..],
+        ),
         ("auth_refresh_tokens", &["session_id"][..]),
         (
             "agent_sessions",
@@ -6016,7 +6181,11 @@ async fn verify_core_schema_shape(
         ("session_weighted_admission_gates", &["capacity_hash"][..]),
         (
             "agent_run_events",
-            &["subject_run_id", "interaction_request_id"][..],
+            &[
+                "subject_run_id",
+                "interaction_request_id",
+                "invocation_supersession_scope_key",
+            ][..],
         ),
         (
             "tool_invocation_ledger",
@@ -6107,6 +6276,23 @@ async fn verify_core_schema_shape(
         &["uq_auth_user_roles_user_role"],
     )
     .await?;
+    ensure_index_shape(
+        &indexes,
+        "session_weighted_admission_reservations",
+        "PRIMARY",
+        &[
+            "scope_name",
+            "isolation_domain",
+            "owner_user_id",
+            "idempotency_hash",
+        ],
+    )?;
+    ensure_index_shape(
+        &indexes,
+        "session_weighted_admission_reservations",
+        "uq_weighted_admission_reservation",
+        &["scope_name", "reservation_id"],
+    )?;
     ensure_index_shape(
         &indexes,
         "auth_user_roles",
@@ -6304,6 +6490,10 @@ async fn verify_core_schema_shape(
         (
             "idx_agent_run_events_control_type_idx",
             &["user_id", "run_id", "event_type", "event_idx"][..],
+        ),
+        (
+            "idx_agent_run_events_invocation_control",
+            &["invocation_supersession_scope_key"][..],
         ),
         (
             "idx_agent_run_events_owner_session_run_idx",
@@ -6865,7 +7055,11 @@ async fn verify_core_schema_shape(
         pool,
         database,
         "ctx_snapshots",
-        &[("event_id", AGENT_EVENT_ID_LEN as u64)],
+        &[
+            ("event_id", AGENT_EVENT_ID_LEN as u64),
+            ("llm_request_id", AGENT_EVENT_ID_LEN as u64),
+            ("llm_response_id", AGENT_EVENT_ID_LEN as u64),
+        ],
     )
     .await?;
     for (index, expected_columns) in [

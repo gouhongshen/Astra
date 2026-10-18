@@ -1260,7 +1260,7 @@ struct CliSseStreamHost<'a> {
     last_permission_selection: Option<astra_turn_types::RunPermissionModeSelection>,
     api: &'a astra_thin_client::ThinClient,
     token: String,
-    auth_profile: Option<&'a str>,
+    owner_auth_snapshot: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     executor_id: &'a str,
     edge_agent_id: String,
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
@@ -1416,6 +1416,7 @@ fn server_context_window_policy_from_accum(accum: &ChatTurnSseAccum) -> Option<(
 
 #[derive(Clone, Debug)]
 struct ToolResultIdentity {
+    work_attribution: Option<astra_services::runs::WorkInvocationAttribution>,
     session_id: String,
     run_id: String,
     turn_chain_id: String,
@@ -1425,6 +1426,7 @@ struct ToolResultIdentity {
 impl ToolResultIdentity {
     fn from_batch_request(req: &ToolBatchRequest) -> Self {
         Self {
+            work_attribution: req.work_attribution.clone(),
             session_id: req.session_id.clone(),
             run_id: req.run_id.clone(),
             turn_chain_id: req.turn_chain_id.clone(),
@@ -1479,11 +1481,20 @@ struct EdgeCallbackFailure {
 pub(crate) fn edge_callback_detach_message(
     operation: &str,
     delivery: &str,
-    error: &impl std::fmt::Display,
+    details: &impl std::fmt::Display,
 ) -> String {
     format!(
-        "Astra could not settle the {operation} callback {delivery}. This client detached; that is not a cancellation of the server run. A timed-out acknowledgement does not prove the server rejected the {operation}. Details: {error}"
+        "Astra could not settle the {operation} callback {delivery}. This client detached; that is not a cancellation of the server run. An unacknowledged callback does not establish the server run's final state. Details: {details}"
     )
+}
+
+fn edge_callback_error_details(error: &astra_thin_client::ThinClientError) -> String {
+    match error {
+        astra_thin_client::ThinClientError::Api { status, body } => {
+            crate::cli::cli_config::cli_utils::read_api_error(status.as_u16(), body)
+        }
+        _ => error.to_string(),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1544,16 +1555,27 @@ fn durable_allow_was_acknowledged(result: &Result<(), PostApprovalError>) -> boo
     }
 }
 
+// Both callback handlers route 401 through mark_edge_auth_failure before this classifier.
 fn edge_callback_error_kind(error: &astra_thin_client::ThinClientError) -> astra_core::ErrorKind {
     match error {
-        astra_thin_client::ThinClientError::Api { status, .. }
-            if *status == reqwest::StatusCode::CONFLICT =>
+        astra_thin_client::ThinClientError::Api { status, body }
+            if *status == reqwest::StatusCode::CONFLICT
+                && serde_json::from_str::<Value>(body).is_ok_and(|value| {
+                    value.get("error_code").and_then(Value::as_str)
+                        == Some(astra_thin_client::EDGE_CALLBACK_PAYLOAD_CONFLICT_CODE)
+                }) =>
         {
             astra_core::ErrorKind::ContractViolation
         }
         astra_thin_client::ThinClientError::Api { status, .. } if status.is_server_error() => {
             astra_core::ErrorKind::ServerError
         }
+        astra_thin_client::ThinClientError::Api { status, .. }
+            if *status == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+        {
+            astra_core::ErrorKind::RateLimit
+        }
+        astra_thin_client::ThinClientError::Api { .. } => astra_core::ErrorKind::InvalidRequest,
         error if error.is_transport() => astra_core::ErrorKind::StreamTransport,
         _ => astra_core::ErrorKind::ContractViolation,
     }
@@ -1744,7 +1766,7 @@ impl<'a> CliSseStreamHost<'a> {
         ctx: EdgeSseContext<'a>,
         term_width: usize,
         render_md: bool,
-        auth_profile: Option<&'a str>,
+        owner_auth_snapshot: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     ) -> Self {
         let suppress_reasoning = ctx.render_policy == RenderPolicy::Silent;
         let active_turn_rollback = ctx.turn_rollback_on_failure.then(|| ActiveTurnRollback {
@@ -1762,7 +1784,7 @@ impl<'a> CliSseStreamHost<'a> {
             last_permission_selection: None,
             api: ctx.api,
             token: ctx.token.to_string(),
-            auth_profile,
+            owner_auth_snapshot,
             executor_id: ctx.executor_id,
             edge_agent_id: ctx.executor_id.to_string(),
             executor: ctx.executor,
@@ -1832,11 +1854,17 @@ impl<'a> CliSseStreamHost<'a> {
             let kind = edge_callback_error_kind(error);
             let delivery = if error.is_transport() {
                 "after bounded transport retries"
+            } else if matches!(error, astra_thin_client::ThinClientError::Api { .. }) {
+                "because the callback endpoint returned an HTTP error"
             } else {
-                "because the server rejected its durable lifecycle state"
+                "because the callback response could not be validated"
             };
             self.callback_failure = Some(EdgeCallbackFailure {
-                message: edge_callback_detach_message(operation, delivery, error),
+                message: edge_callback_detach_message(
+                    operation,
+                    delivery,
+                    &edge_callback_error_details(error),
+                ),
                 kind,
             });
             self.callback_failure_run_id = (!run_id.trim().is_empty()).then(|| run_id.to_string());
@@ -1855,7 +1883,10 @@ impl<'a> CliSseStreamHost<'a> {
             self.mark_edge_auth_failure(run_id);
             true
         } else if !self.render_policy.suppress_tool_ui() {
-            eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
+            eprintln!(
+                "{}",
+                edge_sse_post_tool_result_fail_line(edge_callback_error_details(e)).yellow()
+            );
             self.mark_edge_callback_failure("tool-result", run_id, e);
             false
         } else {
@@ -1873,7 +1904,10 @@ impl<'a> CliSseStreamHost<'a> {
             self.mark_edge_auth_failure(run_id);
             true
         } else if !self.render_policy.suppress_tool_ui() {
-            eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
+            eprintln!(
+                "{}",
+                edge_sse_post_approval_fail_line(edge_callback_error_details(e)).yellow()
+            );
             self.mark_edge_callback_failure("approval", run_id, e);
             false
         } else {
@@ -1882,19 +1916,47 @@ impl<'a> CliSseStreamHost<'a> {
         }
     }
 
+    async fn resolve_edge_owner_bearer(&mut self) -> bool {
+        let Some(owner) = self.owner_auth_snapshot.as_ref() else {
+            return true; // A static bearer has no profile refresh authority.
+        };
+        if !owner.is_current() {
+            return false;
+        }
+        let api = self.api.clone().without_bearer_provider();
+        let Some(token) = session_runtime::owner_access_token(&api, owner, None).await else {
+            return false;
+        };
+        if !owner.is_current() {
+            return false;
+        }
+        self.token = token;
+        true
+    }
+
     async fn refresh_edge_token_after_401(&mut self) -> bool {
-        let Some(profile) = self.auth_profile else {
+        // Fail closed unless a captured owner was admitted at construction and is
+        // still the current login; never reselect current_profile or borrow another.
+        let Some(owner) = self.owner_auth_snapshot.as_ref() else {
             return false;
         };
         if !self.render_policy.is_silent() {
             eprintln!("{}", "  Token expired, attempting refresh…".yellow());
         }
-        if !session_runtime::attempt_token_refresh(self.api, Some(profile)).await {
+        if !owner.is_current() {
             return false;
         }
-        let Some(new_token) = session_runtime::current_access_token(Some(profile)) else {
+        // Detach any inherited bearer provider so it cannot override the
+        // explicitly admitted owner token.
+        let api = self.api.clone().without_bearer_provider();
+        let Some(new_token) =
+            session_runtime::owner_access_token(&api, owner, Some(self.token.as_str())).await
+        else {
             return false;
         };
+        if !owner.is_current() {
+            return false;
+        }
         self.token = new_token;
         if !self.render_policy.is_silent() {
             eprintln!(
@@ -1914,15 +1976,20 @@ impl<'a> CliSseStreamHost<'a> {
         &mut self,
         body: &astra_thin_client::ToolResultRequest,
     ) -> Result<(), PostToolResultError> {
-        let result = self
-            .api
+        if !self.resolve_edge_owner_bearer().await {
+            self.mark_edge_auth_failure(&body.run_id);
+            return Err(PostToolResultError::AuthRefreshFailed);
+        }
+        // Detach any inherited bearer provider so the explicitly admitted owner
+        // token is the only credential source for owned callback posts.
+        let api = self.api.clone().without_bearer_provider();
+        let result = api
             .post_tool_result(Some(self.token.as_str()), Some(self.executor_id), body)
             .await;
         match result {
             Ok(_) => Ok(()),
             Err(e) if is_edge_auth_failure(&e) && self.refresh_edge_token_after_401().await => {
-                let retry = self
-                    .api
+                let retry = api
                     .post_tool_result(Some(self.token.as_str()), Some(self.executor_id), body)
                     .await;
                 match retry {
@@ -1930,10 +1997,12 @@ impl<'a> CliSseStreamHost<'a> {
                     Err(ref retry_err) => {
                         if self.handle_post_tool_result_error(&body.run_id, retry_err) {
                             Err(PostToolResultError::TerminalAuthFailure(
-                                retry_err.to_string(),
+                                edge_callback_error_details(retry_err),
                             ))
                         } else {
-                            Err(PostToolResultError::RequestFailed(retry_err.to_string()))
+                            Err(PostToolResultError::RequestFailed(
+                                edge_callback_error_details(retry_err),
+                            ))
                         }
                     }
                 }
@@ -1942,7 +2011,9 @@ impl<'a> CliSseStreamHost<'a> {
                 if self.handle_post_tool_result_error(&body.run_id, &e) {
                     Err(PostToolResultError::AuthRefreshFailed)
                 } else {
-                    Err(PostToolResultError::RequestFailed(e.to_string()))
+                    Err(PostToolResultError::RequestFailed(
+                        edge_callback_error_details(&e),
+                    ))
                 }
             }
         }
@@ -1952,10 +2023,14 @@ impl<'a> CliSseStreamHost<'a> {
         &mut self,
         body: &astra_thin_client::ApprovalRespondRequest,
     ) -> Result<(), PostApprovalError> {
-        let result = self
-            .api
-            .post_approval(Some(self.token.as_str()), body)
-            .await;
+        if !self.resolve_edge_owner_bearer().await {
+            self.mark_edge_auth_failure(&body.run_id);
+            return Err(PostApprovalError::AuthRefreshFailed);
+        }
+        // Detach any inherited bearer provider so the explicitly admitted owner
+        // token is the only credential source for owned callback posts.
+        let api = self.api.clone().without_bearer_provider();
+        let result = api.post_approval(Some(self.token.as_str()), body).await;
         match result {
             Ok(_) => Ok(()),
             Err(e) if recorded_approval_decision(&e).is_some() => {
@@ -1964,19 +2039,18 @@ impl<'a> CliSseStreamHost<'a> {
                 ))
             }
             Err(e) if is_edge_auth_failure(&e) && self.refresh_edge_token_after_401().await => {
-                let retry = self
-                    .api
-                    .post_approval(Some(self.token.as_str()), body)
-                    .await;
+                let retry = api.post_approval(Some(self.token.as_str()), body).await;
                 if let Err(ref retry_err) = retry {
                     if let Some(decision) = recorded_approval_decision(retry_err) {
                         Err(PostApprovalError::AlreadyRecorded(decision))
                     } else if self.handle_post_approval_error(&body.run_id, retry_err) {
                         Err(PostApprovalError::TerminalAuthFailure(
-                            retry_err.to_string(),
+                            edge_callback_error_details(retry_err),
                         ))
                     } else {
-                        Err(PostApprovalError::RequestFailed(retry_err.to_string()))
+                        Err(PostApprovalError::RequestFailed(
+                            edge_callback_error_details(retry_err),
+                        ))
                     }
                 } else {
                     Ok(())
@@ -1986,7 +2060,9 @@ impl<'a> CliSseStreamHost<'a> {
                 if self.handle_post_approval_error(&body.run_id, &e) {
                     Err(PostApprovalError::AuthRefreshFailed)
                 } else {
-                    Err(PostApprovalError::RequestFailed(e.to_string()))
+                    Err(PostApprovalError::RequestFailed(
+                        edge_callback_error_details(&e),
+                    ))
                 }
             }
         }
@@ -2174,6 +2250,9 @@ impl<'a> CliSseStreamHost<'a> {
 
         let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool, tool_result_fields);
         let result = EdgeToolExecResult {
+            work_attribution: self
+                .tool_result_identity(request_id)
+                .and_then(|identity| identity.work_attribution),
             execution_completion: None,
             request_id: request_id.to_string(),
             tool: tool.to_string(),
@@ -2959,6 +3038,7 @@ impl<'a> CliSseStreamHost<'a> {
         }
 
         let result = EdgeToolExecResult {
+            work_attribution: req.work_attribution.clone(),
             execution_completion: None,
             request_id: req.request_id.clone(),
             tool: req.tool.clone(),
@@ -4250,6 +4330,8 @@ async fn execute_server_budgeted(
         .min(request.execution_timeout_ms);
     if remaining_execution_ms == 0 {
         let mut result = EdgeToolExecResult {
+            work_attribution: request.work_attribution.clone(),
+
             execution_completion: None,
             request_id: request.request_id.clone(),
             tool: request.tool.clone(),
@@ -4741,6 +4823,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             use crate::cli::chat_stream::StreamEvent;
             for effect in &effects {
                 let ev = match effect {
+                    SseRenderEffect::SystemWarning(message) => {
+                        Some(StreamEvent::SystemWarning(message.clone()))
+                    }
                     SseRenderEffect::StreamText {
                         model_item_id,
                         text: s,
@@ -4760,12 +4845,25 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     _ => None,
                 };
                 if let Some(ev) = ev {
-                    self.emit_stream_observation(ev).await;
+                    if matches!(ev, StreamEvent::SystemWarning(_)) {
+                        // Configuration diagnostics are rare control messages;
+                        // preserve each one when the interactive queue is full.
+                        self.emit_stream_event(ev).await;
+                    } else {
+                        self.emit_stream_observation(ev).await;
+                    }
                 }
             }
         }
 
         let policy = self.render_policy;
+        if !policy.is_silent() {
+            for effect in &effects {
+                if let SseRenderEffect::SystemWarning(message) = effect {
+                    eprintln!("{}", message.as_str().yellow());
+                }
+            }
+        }
         match policy {
             RenderPolicy::Silent => return,
             RenderPolicy::FinalOnly => {
@@ -4778,7 +4876,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         SseRenderEffect::ThinkingPreviewChunk { text: s, .. } => {
                             self.render.push_thinking_preview_chunk(s);
                         }
-                        SseRenderEffect::StreamText { .. } => {} // suppressed
+                        SseRenderEffect::StreamText { .. } | SseRenderEffect::SystemWarning(_) => {} // suppressed or already rendered
                     }
                 }
                 return;
@@ -4789,6 +4887,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let mut i = 0usize;
         while i < effects.len() {
             match &effects[i] {
+                SseRenderEffect::SystemWarning(_) => {
+                    i += 1;
+                }
                 SseRenderEffect::StopThinkingSpinner => {
                     // `text_delta` emits Stop then StreamText; in plan-only mode we stream the
                     // assistant body into the reasoning viewport — skipping Stop avoids clearing
@@ -5015,6 +5116,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
         };
         let mut denied_output = None;
+        let admission_source = if cloud_approved
+            || matches!(
+                &decision,
+                crate::cli::permission_manager::GateOutcome::NeedApproval { .. }
+            ) {
+            astra_tools::tool_engine::ToolInvocationAdmissionSource::ParentApproval
+        } else {
+            astra_tools::tool_engine::ToolInvocationAdmissionSource::Policy
+        };
         let mut allowed = match decision {
             crate::cli::permission_manager::GateOutcome::Allow => true,
             crate::cli::permission_manager::GateOutcome::Deny(reason) => {
@@ -5331,6 +5441,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             allowed = false;
         }
         let start = std::time::Instant::now();
+        if matches!(tool, "skill" | "discover_skills") && request.admitted_skill_names.is_none() {
+            allowed = false;
+            denied_output =
+                Some("Error: missing server-admitted skill directory authority".to_string());
+        }
         let mut tool_result_fields = None;
         let mut tool_execution_marked_error = false;
         let mut output = if allowed {
@@ -5338,16 +5453,46 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // Edge-path skill dedup: if the same skill was already invoked
                 // during this SSE stream, return a short dedup message instead
                 // of executing it again.
-                let skill_name = astra_runtime::turn::skill_tool::extract_skill_name(args);
-                let dedup_key = skill_name.unwrap_or_default().to_string();
+                let dedup_key = args
+                    .get("skill_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 if !dedup_key.is_empty() && self.skills_invoked.contains(&dedup_key) {
-                    format!(
-                        "Skill '{}' was already loaded in this turn. \
-                         Follow the instructions already provided.",
-                        dedup_key,
-                    )
+                    let context = astra_runtime::turn::skill_tool::SkillContext {
+                        admitted_skill_names: request
+                            .admitted_skill_names
+                            .as_ref()
+                            .map(|names| names.iter().cloned().collect()),
+                        ..Default::default()
+                    };
+                    let admission = if let Some(resolver) = &self.skill_resolver {
+                        astra_runtime::turn::skill_tool::admit_public_skill(
+                            resolver.as_ref(),
+                            &dedup_key,
+                            &context,
+                        )
+                        .await
+                    } else {
+                        Err("Error: skill resolver not available".to_string())
+                    };
+                    match admission {
+                        Ok(_) => {
+                            tool_result_fields = Some(crate::edge_tools::nonexecuted_tool_result_fields(
+                                astra_services::session_journal::ToolCallDisposition::Suppressed,
+                            ));
+                            format!(
+                                "Skill '{dedup_key}' was already loaded in this turn. Follow the instructions already provided."
+                            )
+                        }
+                        Err(error) => {
+                            tool_result_fields = Some(rejected_tool_result_fields());
+                            tool_execution_marked_error = true;
+                            error
+                        }
+                    }
                 } else if let Some(resolver) = &self.skill_resolver {
-                    let skill_context = self
+                    let mut skill_context = self
                         .perm_manager
                         .as_ref()
                         .map(|manager| {
@@ -5359,6 +5504,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             }
                         })
                         .unwrap_or_default();
+                    skill_context.read_only_execution |= read_only_execution;
+                    skill_context.admitted_skill_names = request
+                        .admitted_skill_names
+                        .as_ref()
+                        .map(|names| names.iter().cloned().collect());
                     let executed = astra_runtime::turn::skill_tool::execute_skill_inline(
                         resolver.as_ref(),
                         tool,
@@ -5387,13 +5537,17 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             } else if tool == astra_runtime::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME {
                 if let Some(resolver) = &self.skill_resolver {
                     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                    let catalog = resolver.available_skills();
-                    let (text, _) = astra_runtime::turn::skill_tool::execute_discover_skills(
-                        query,
-                        &catalog,
-                        std::collections::HashSet::new(),
-                    );
-                    text
+                    let catalog = resolver
+                        .available_skills()
+                        .into_iter()
+                        .filter(|skill| {
+                            request
+                                .admitted_skill_names
+                                .as_ref()
+                                .is_some_and(|names| names.contains(&skill.name))
+                        })
+                        .collect::<Vec<_>>();
+                    astra_runtime::turn::skill_tool::execute_discover_skills(query, &catalog)
                 } else {
                     "Error: skill resolver not available".to_string()
                 }
@@ -5412,6 +5566,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         .map(|identity| identity.turn_chain_id.as_str()),
                     tool_call_id: Some(request_id),
                     command_timeout_cap_ms: request.command_timeout_cap_ms,
+                    admission_source: Some(admission_source),
                     ..Default::default()
                 };
                 let mut outcome = execute_with_invocation_metadata_responsive(
@@ -5608,7 +5763,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     std::sync::Arc::clone(&self.executor),
                                     tool.to_string(),
                                     args.clone(),
-                                    invocation,
+                                    astra_tools::tool_engine::ToolInvocationMetadata {
+                                        admission_source: Some(astra_tools::tool_engine::ToolInvocationAdmissionSource::ParentApproval),
+                                        ..invocation
+                                    },
                                     self.effective_tool_cancel_token(),
                                 )
                                 .await;
@@ -5770,6 +5928,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
         let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool, tool_result_fields);
         self.edge_tool_round.push(EdgeToolExecResult {
+            work_attribution: self
+                .tool_result_identity(request_id)
+                .and_then(|identity| identity.work_attribution),
+
             execution_completion: None,
             request_id: request_id.to_string(),
             tool: tool.to_string(),
@@ -5800,6 +5962,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             .last()
             .cloned()
             .unwrap_or_else(|| EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: String::new(),
                 tool: String::new(),
@@ -6312,6 +6475,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             turn_chain_id: Some(&turn_chain_id),
                             tool_call_id: Some(&request_id),
                             command_timeout_cap_ms,
+                            admission_source: Some(
+                                astra_tools::tool_engine::ToolInvocationAdmissionSource::Policy,
+                            ),
                             ..Default::default()
                         };
                         let exec = catch_tool_execution_panic(
@@ -6535,6 +6701,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         turn_chain_id: Some(&req.turn_chain_id),
                         tool_call_id: Some(&req.request_id),
                         command_timeout_cap_ms: req.command_timeout_cap_ms,
+                        admission_source: Some(
+                            astra_tools::tool_engine::ToolInvocationAdmissionSource::ParentApproval,
+                        ),
                         ..Default::default()
                     },
                     Some(retry_cancel.clone()),
@@ -6620,6 +6789,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let tool_result_fields =
                 self.tool_result_fields_with_cli_runtime(&req.tool, outcome.tool_result_fields);
             let result = EdgeToolExecResult {
+                work_attribution: req.work_attribution.clone(),
+
                 execution_completion: None,
                 request_id: req.request_id.clone(),
                 tool: req.tool.clone(),
@@ -8126,6 +8297,11 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
     invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
 ) -> crate::edge_tools::ToolExecutionOutcome {
+    if crate::edge_tools::is_native_collaborator_tool(&tool_name) {
+        return crate::edge_tools::ToolExecutionOutcome::error(
+            "Native collaborators require canonical child dispatch with an immutable execution grant, not a root tool callback".into(),
+        );
+    }
     if tool_name == "bash"
         && let Some(outcome) = executor
             .bash_detachable_with_metadata(&args, invocation, cancel_token.as_ref())
@@ -8322,6 +8498,7 @@ fn apply_sse_render_effects(
     }
     for effect in effects {
         match effect {
+            SseRenderEffect::SystemWarning(message) => eprintln!("{}", message.yellow()),
             SseRenderEffect::StreamText { text: s, .. } => {
                 if let Some(md) = &mut render.md {
                     md.push(&s);
@@ -8361,7 +8538,7 @@ pub(crate) async fn consume_turn_sse(
     explain_analyze_enabled: bool,
     edge: Option<EdgeSseContext<'_>>,
     pre_clear_lines: usize,
-    auth_profile: Option<&str>,
+    auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
     stream_json_exchange: Option<crate::cli::stream::stream_json::StreamJsonExchange>,
 ) -> TurnResult {
@@ -8406,7 +8583,7 @@ pub(crate) async fn consume_turn_sse(
             ctx,
             term_width,
             render_md && !render_policy.suppress_text(),
-            auth_profile,
+            auth_owner,
         );
         host.explain_analyze_enabled = explain_analyze_enabled;
         host.stream_json_exchange = stream_json_exchange;
@@ -8747,6 +8924,76 @@ mod tests {
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[tokio::test]
+    async fn hook_config_diagnostics_reach_silent_tui_under_backpressure() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let root = tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".astra")).unwrap();
+        std::fs::write(
+            root.path().join(".astra/hooks.json"),
+            r#"{"hooks":[{"event":"pre_tool_use","matchr":"SECRET_MATCHER","action":{"type":"shell","command":"echo SECRET_COMMAND"}}]}"#,
+        )
+        .unwrap();
+        let (tools, _) = astra_runtime::skills::hooks::load_all_hooks(root.path());
+        let message = tools.take_config_diagnostics().pop().unwrap().to_string();
+        let event = astra_services::runs::transform_run_event_for_client(serde_json::json!({
+            "type": "warning", "code": "hook_configuration", "message": message,
+        }));
+        let mut accum = ChatTurnSseAccum::default();
+        let effects = astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+            &format!("data: {event}\n\n"),
+            &mut accum,
+            &mut Vec::new(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(chat_stream::StreamEvent::StatusLine("queued".into()))
+            .await
+            .unwrap();
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "unused",
+                executor_id: "unused",
+                executor: std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(root.path())),
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: Some(tx),
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut cache,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        let delivery = host.on_render_effects(effects);
+        tokio::pin!(delivery);
+        // A full channel retains this diagnostic instead of sampling it away.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut delivery)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::StatusLine(_))
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), delivery)
+            .await
+            .unwrap();
+        let warning = rx.recv().await.unwrap();
+        assert!(matches!(warning,
+            chat_stream::StreamEvent::SystemWarning(text) if text == message && !text.contains("SECRET")));
+        assert!(accum.full_text.is_empty());
+        assert!(accum.error_message.is_none());
+    }
+
     #[test]
     fn unavailable_approval_explains_denial_without_exposing_credentials() {
         let output = approval_unavailable_tool_output(
@@ -8882,6 +9129,7 @@ mod tests {
             host.tool_result_identities.insert(
                 "denied-git".to_string(),
                 ToolResultIdentity {
+                    work_attribution: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -9751,22 +9999,36 @@ mod tests {
         assert!(host.server_tool_calls.contains_key("fanout-call"));
         assert!(!host.server_tool_completed_ids.contains("fanout-call"));
 
-        // Compatibility envelopes may reserve `output: null` and carry the
-        // canonical receipt in `result`. The meaningful receipt must win, and
-        // an accepted running group means the launch action completed.
-        host.on_accepted_sse_event(&serde_json::json!({
-            "type": "tool_call_end",
-            "call_id": "fanout-call",
-            "tool": "agent_fanout",
-            "status": "running",
-            "output": null,
-            "result": {"status": "running", "group_id": "fanout-group"},
-            "duration_ms": 1_250,
-            "transport": "server_local",
-            "executor": {"kind": "server_local"}
-        }))
-        .await
-        .expect("typed fanout receipt accepted");
+        // Real launch metadata can exceed the terminal event budget. Exercise
+        // the shared projector, not a hand-written compact completion, so the
+        // launch closes before [DONE] without weakening receipt validation.
+        let launch = serde_json::json!({
+            "status":"started", "group_id":"fanout-group", "target_count":3,
+            "instruction":"launch guidance ".repeat(400),
+            "work_unit_observation": {
+                "id":"fanout-group", "kind":"agent_fanout", "status":"running",
+                "revision":4, "mode":"current", "wake_policy":"on_attention_or_terminal"
+            }
+        });
+        let projected = astra_services::runs::project_tool_terminal_presentation(
+            serde_json::json!({
+                "type": "tool_call_end",
+                "call_id": "fanout-call",
+                "tool": "agent_fanout",
+                "status": "running",
+                "output": null,
+                "result": launch.to_string(),
+                "duration_ms": 1_250,
+                "transport": "server_local",
+                "executor": {"kind": "server_local"}
+            }),
+            3968,
+        );
+        assert!(projected.to_string().len() <= 3968);
+        assert_eq!(projected["result"]["group_id"], "fanout-group");
+        host.on_accepted_sse_event(&projected)
+            .await
+            .expect("typed fanout receipt accepted");
         assert!(matches!(
             rx.recv().await,
             Some(chat_stream::StreamEvent::ToolCompleted {
@@ -9781,18 +10043,10 @@ mod tests {
         assert!(!host.server_tool_calls.contains_key("fanout-call"));
         assert!(host.server_tool_completed_ids.contains("fanout-call"));
 
+        let mut conflicting_replay = projected.clone();
+        conflicting_replay["executed"] = serde_json::json!(false);
         let replay_execution_conflict = host
-            .on_accepted_sse_event(&serde_json::json!({
-                "type": "tool_call_end",
-                "call_id": "fanout-call",
-                "tool": "agent_fanout",
-                "status": "running",
-                "output": null,
-                "result": {"status": "running", "group_id": "fanout-group"},
-                "executed": false,
-                "transport": "server_local",
-                "executor": {"kind": "server_local"}
-            }))
+            .on_accepted_sse_event(&conflicting_replay)
             .await
             .expect_err("a replayed terminal with a different execution fact must fail closed");
         assert!(replay_execution_conflict.contains("conflicting terminal outcome"));
@@ -10800,6 +11054,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn responsive_bash_uses_real_detach_slot_for_ctrl_b_handoff() {
         let dir = tempdir().expect("tempdir");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
         let (slot, listener) = astra_tools::detach::new_slot_with_handle();
         let executor = std::sync::Arc::new(
             crate::edge_tools::ToolExecutor::new(dir.path()).with_bash_detach_slot(slot),
@@ -10813,6 +11069,7 @@ mod tests {
                 // compound shell command stays foreground so the edge
                 // executor can emit its post-workspace receipt.
                 "command": "sleep 5",
+                "workdir": "nested",
                 "timeout": 30.0,
             }),
             astra_tools::tool_engine::ToolInvocationMetadata::default(),
@@ -10836,6 +11093,31 @@ mod tests {
             .expect("edge bash should hand off promptly after Ctrl+B")
             .expect("payload");
         assert_eq!(payload.command, "sleep 5");
+        #[cfg(target_os = "linux")]
+        {
+            let pid = payload.child.id().expect("live detached child");
+            let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).expect("child cwd");
+            assert_eq!(cwd.canonicalize().unwrap(), nested.canonicalize().unwrap());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let pid = payload.child.id().expect("live detached child").to_string();
+            let probe = std::process::Command::new("/usr/sbin/lsof")
+                .args(["-a", "-p", &pid, "-d", "cwd", "-Fn"])
+                .output()
+                .expect("system lsof child-cwd probe");
+            assert!(probe.status.success(), "child cwd must remain observable");
+            let text = String::from_utf8(probe.stdout).unwrap();
+            let cwd = text
+                .lines()
+                .find_map(|line| line.strip_prefix('n'))
+                .expect("child cwd path");
+            assert_eq!(
+                std::path::Path::new(cwd).canonicalize().unwrap(),
+                nested.canonicalize().unwrap()
+            );
+        }
+
         payload
             .adoption_tx
             .send(Ok("bg-shell-edge".to_string()))
@@ -10846,6 +11128,10 @@ mod tests {
             .expect("detached edge bash should finish the tool call")
             .expect("join");
         assert!(!outcome.is_error, "{outcome:?}");
+        assert_eq!(
+            outcome.tool_result_fields.as_ref().unwrap()["bash_workdir"]["resolved_workspace_relative"],
+            "nested"
+        );
         assert!(
             outcome.output.contains("bash_detached"),
             "{}",
@@ -10928,21 +11214,254 @@ mod tests {
         assert_eq!(accum2.error_message.as_deref(), Some("Cancelled by user"));
     }
 
-    #[test]
-    fn edge_callback_detach_message_does_not_promise_cancellation() {
+    #[tokio::test]
+    async fn edge_callback_detach_message_does_not_promise_cancellation() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(1)))
+            .mount(&server)
+            .await;
+        let client = astra_core::net::client_builder_for_target(&server.uri())
+            .timeout(std::time::Duration::from_millis(20))
+            .build()
+            .expect("client");
+        let error = astra_thin_client::ThinClientError::Http(
+            client.get(server.uri()).send().await.expect_err("timeout"),
+        );
         let message = edge_callback_detach_message(
             "approval",
             "after bounded transport retries",
-            &"HTTP error: error sending request",
+            &super::edge_callback_error_details(&error),
         );
 
         assert!(message.contains("after bounded transport retries"));
+        assert_eq!(
+            edge_callback_error_kind(&error),
+            astra_core::ErrorKind::StreamTransport
+        );
         assert!(message.contains("This client detached"));
         assert!(message.contains("not a cancellation of the server run"));
-        assert!(message.contains("does not prove the server rejected the approval"));
+        assert!(message.contains("does not establish the server run's final state"));
         assert!(!message.contains("astra session cancel"));
         assert!(!message.contains("will be cancelled"));
         assert!(!message.contains("fail-closed"));
+    }
+
+    #[test]
+    fn edge_callback_http_failures_require_producer_codes_for_contract_conflicts() {
+        for (status, body, kind) in [
+            (
+                405,
+                "<html>blocked</html>",
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                "<html>proxy conflict</html>",
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (409, "conflict", astra_core::ErrorKind::InvalidRequest),
+            (
+                403,
+                "<html>denied</html>",
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (429, "rate limited", astra_core::ErrorKind::RateLimit),
+            (
+                502,
+                "<html>bad gateway</html>",
+                astra_core::ErrorKind::ServerError,
+            ),
+            (
+                409,
+                r#"{"detail":"callback result hash mismatch","request_id":"conflict-test"}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                r#"{"message":"blocked"}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                r#"{"error_code":"unknown_gateway_code","detail":"blocked"}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                r#"{"error_code":"run_interaction_authority_lost","detail":"recorded"}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                r#"{"error_code":"run_interaction_superseded","detail":"recorded"}"#,
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                r#"{"error_code":"edge_callback_payload_conflict","detail":"immutable payload differs","request_id":"conflict-test"}"#,
+                astra_core::ErrorKind::ContractViolation,
+            ),
+        ] {
+            let error = astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::from_u16(status).unwrap(),
+                body: body.into(),
+            };
+            assert_eq!(edge_callback_error_kind(&error), kind, "{status}: {body}");
+            let message = edge_callback_detach_message(
+                "tool-result",
+                "because the callback endpoint returned an HTTP error",
+                &super::edge_callback_error_details(&error),
+            );
+            assert!(message.contains(&status.to_string()));
+            assert!(message.contains("not a cancellation of the server run"));
+            assert!(!message.contains("rejected its durable lifecycle state"));
+            assert!(!message.contains("<html>"));
+            if kind == astra_core::ErrorKind::ContractViolation {
+                assert!(message.contains("immutable payload differs"));
+                assert!(message.contains("conflict-test"));
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn edge_callback_rejections_stop_physical_stream_without_reposting() {
+        let page = r#"<!doctype html><html><script>untrusted script</script><textarea>{"traceid":"waf-test-123"}</textarea></html>"#;
+        let conflict_body = |code: Option<&str>| {
+            serde_json::json!({
+                "error_code": code,
+                "message": "blocked",
+                "request_id": "waf-test-123",
+            })
+            .to_string()
+        };
+        for (status, body, expected_kind) in [
+            (405, page.to_string(), astra_core::ErrorKind::InvalidRequest),
+            (
+                409,
+                conflict_body(None),
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                conflict_body(Some(astra_thin_client::RUN_INTERACTION_AUTHORITY_LOST_CODE)),
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                conflict_body(Some(astra_thin_client::RUN_INTERACTION_SUPERSEDED_CODE)),
+                astra_core::ErrorKind::InvalidRequest,
+            ),
+            (
+                409,
+                conflict_body(Some(astra_thin_client::EDGE_CALLBACK_PAYLOAD_CONFLICT_CODE)),
+                astra_core::ErrorKind::ContractViolation,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            for endpoint in ["/tools/result", "/approval/respond"] {
+                Mock::given(method("POST"))
+                    .and(path(endpoint))
+                    .respond_with(ResponseTemplate::new(status).set_body_string(&body))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).unwrap();
+            let workspace = tempdir().unwrap();
+            let executor =
+                std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+            let parent_cancel = tokio_util::sync::CancellationToken::new();
+            for is_approval in [false, true] {
+                let physical_cancel = parent_cancel.child_token();
+                let mut tool_cache = EdgeToolCache::new(10);
+                let ctx = EdgeSseContext {
+                    api: &api,
+                    token: "test-token",
+                    executor_id: "edge-test",
+                    executor: executor.clone(),
+                    render_policy: if is_approval {
+                        RenderPolicy::Silent
+                    } else {
+                        RenderPolicy::Stream
+                    },
+                    perm_manager: None,
+                    cancel_token: Some(&physical_cancel),
+                    stream_event_tx: None,
+                    stream_event_sink: None,
+                    approval_request_tx: None,
+                    ask_user_request_tx: None,
+                    skill_resolver: None,
+                    turn_rollback_on_failure: false,
+                    tool_cache: &mut tool_cache,
+                    incremental_state: None,
+                    request_session_execution_lease: None,
+                };
+                let mut host = CliSseStreamHost::from_edge_ctx(ctx, 80, false);
+                let message = if is_approval {
+                    let result = host
+                        .post_approval_with_auth_retry(&astra_thin_client::ApprovalRespondRequest {
+                            session_id: "test-session".into(),
+                            run_id: "test-run".into(),
+                            request_id: "req-approval".into(),
+                            decision: astra_thin_client::ApprovalDecision::Allow,
+                            reason: None,
+                            tool_name: None,
+                            approval_kind: None,
+                        })
+                        .await;
+                    assert!(
+                        !durable_allow_was_acknowledged(&result),
+                        "an HTTP conflict must not authorize execution"
+                    );
+                    result.expect_err("rejected callback").to_string()
+                } else {
+                    let body = astra_thin_client::ToolResultRequest::new_with_hash(
+                        astra_thin_client::ToolResultRequestParts {
+                            session_id: "test-session".into(),
+                            run_id: "test-run".into(),
+                            turn_chain_id: "test-chain".into(),
+                            request_id: "req-tool".into(),
+                            edge_agent_id: "edge-test".into(),
+                            status: "completed".into(),
+                            output: "already executed".into(),
+                            duration_ms: 1,
+                            tool_result_fields: None,
+                        },
+                    );
+                    match host.post_tool_result_with_auth_retry(&body).await {
+                        Err(PostToolResultError::RequestFailed(message)) => message,
+                        result => panic!("expected HTTP rejection: {result:?}"),
+                    }
+                };
+                assert!(message.contains(&status.to_string()));
+                assert!(message.contains("waf-test-123"));
+                assert!(!message.contains("<html>"));
+                assert!(!message.contains("untrusted script"));
+                assert!(physical_cancel.is_cancelled());
+                assert!(!parent_cancel.is_cancelled());
+                assert!(!host.auth_failure);
+                assert_eq!(host.callback_failure_run_id.as_deref(), Some("test-run"));
+                let mut accum = ChatTurnSseAccum {
+                    error_message: Some("Cancelled by user".into()),
+                    ..Default::default()
+                };
+                apply_edge_callback_failure_result(&mut accum, host.callback_failure.clone());
+                assert_eq!(accum.error_kind, Some(expected_kind));
+                let final_message = accum.error_message.unwrap();
+                assert!(final_message.contains("not a cancellation of the server run"));
+                assert!(final_message.contains("waf-test-123"));
+                assert!(!final_message.contains("<html>"));
+                assert!(!final_message.contains("rejected its durable lifecycle state"));
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len(),
+                2,
+                "only the two callbacks; no retries or Server cancel"
+            );
+        }
     }
 
     #[test]
@@ -10980,7 +11499,7 @@ mod tests {
 
         assert_eq!(
             edge_callback_error_kind(&error),
-            astra_core::ErrorKind::ContractViolation
+            astra_core::ErrorKind::InvalidRequest
         );
     }
 
@@ -11001,7 +11520,7 @@ mod tests {
                 body: r#"{"detail":"approval decision already recorded as deny"}"#.into(),
             }),
             None,
-            "a 409 without the recorded-decision code stays a lifecycle contract failure"
+            "a 409 without the recorded-decision code is not an acknowledgement"
         );
         assert!(durable_allow_was_acknowledged(&Err(
             PostApprovalError::AlreadyRecorded(RecordedApprovalDecision::Allow)
@@ -12050,6 +12569,8 @@ mod tests {
 
     fn parallel_batch_request(owner: &str, id: &str, tool: &str, args: Value) -> ToolBatchRequest {
         ToolBatchRequest {
+            work_attribution: None,
+            admitted_skill_names: None,
             session_id: format!("batch-session-{owner}"),
             run_id: format!("batch-run-{id}"),
             turn_chain_id: format!("batch-chain-{id}"),
@@ -12437,6 +12958,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -12449,6 +12972,8 @@ mod tests {
                     args: serde_json::json!({"path": first.to_string_lossy()}),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "child-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -12503,6 +13028,8 @@ mod tests {
         ] {
             let results = host
                 .execute_tools_batch(vec![ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".into(),
                     run_id: run_id.into(),
                     turn_chain_id: "test-chain".into(),
@@ -12546,6 +13073,8 @@ mod tests {
         }
         let rejected = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                work_attribution: None,
+                admitted_skill_names: None,
                 session_id: "test-session".into(),
                 run_id: "child-run".into(),
                 turn_chain_id: "test-chain".into(),
@@ -12632,6 +13161,7 @@ mod tests {
         host.tool_result_identities.insert(
             "expired-1".to_string(),
             ToolResultIdentity {
+                work_attribution: None,
                 session_id: "test-session".to_string(),
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
@@ -12641,6 +13171,8 @@ mod tests {
 
         let results = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                work_attribution: None,
+                admitted_skill_names: None,
                 session_id: "test-session".to_string(),
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
@@ -12715,6 +13247,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".into(),
                     run_id: "test-run".into(),
                     turn_chain_id: "test-chain".into(),
@@ -12727,6 +13261,8 @@ mod tests {
                     args: serde_json::json!({"path": "one.txt"}),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".into(),
                     run_id: "test-run".into(),
                     turn_chain_id: "test-chain".into(),
@@ -12949,6 +13485,7 @@ mod tests {
             request.session_id = "sess-live".into();
             assert!(host.on_server_tool_surface_admission(&request).is_err());
             host.on_tool_result(&EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: id.into(),
                 tool: request.tool,
@@ -12963,6 +13500,7 @@ mod tests {
         incremental_state.replace_tool_records(Vec::new());
         incremental_state.replace_tools_used(Vec::new());
         host.on_tool_result(&EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "tool-1".to_string(),
             tool: "bash".to_string(),
@@ -13358,8 +13896,42 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn edge_tool_result_401_refreshes_and_retries_without_terminal_auth_failure() {
-        let _creds_guard = crate::tests::isolate_credentials();
+        // 401 recovery is owned by the authenticated credential owner in both
+        // admission shapes: an explicit --profile and the raw omitted-profile
+        // value that still resolved the stored default profile at admission.
+        edge_tool_result_401_refresh_acknowledges_once(Some("test"), "unchanged", false).await;
+        edge_tool_result_401_refresh_acknowledges_once(None, "unchanged", false).await;
+        edge_tool_result_401_refresh_acknowledges_once(None, "unchanged", true).await;
+        for transition in [
+            "current_profile",
+            "replacement",
+            "account",
+            "logout",
+            "proactive_refresh_failure",
+        ] {
+            edge_tool_result_401_refresh_acknowledges_once(None, transition, false).await;
+            edge_tool_result_401_refresh_acknowledges_once(None, transition, true).await;
+        }
+    }
 
+    #[allow(clippy::await_holding_lock)]
+    async fn edge_tool_result_401_refresh_acknowledges_once(
+        auth_profile: Option<&str>,
+        transition: &str,
+        approval: bool,
+    ) {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "test",
+            Some("user-id-1"),
+        )
+        .unwrap();
+
+        let initial_token = if transition == "proactive_refresh_failure" {
+            "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.signature"
+        } else {
+            "expired-token"
+        };
         let mut creds = CredentialsFile {
             current_profile: Some("test".to_string()),
             ..Default::default()
@@ -13368,40 +13940,59 @@ mod tests {
             "test".to_string(),
             Profile {
                 account_id: Some("user-id-1".to_string()),
-                access_token: Some("expired-token".to_string()),
+                access_token: Some(initial_token.to_string()),
                 refresh_token: Some("refresh-token".to_string()),
                 ..Default::default()
             },
         );
         save_credentials(&creds).expect("save credentials");
 
+        let callback_path = if approval {
+            astra_thin_client::paths::APPROVAL_RESPOND
+        } else {
+            astra_thin_client::paths::TOOLS_RESULT
+        };
+        let should_post = matches!(transition, "unchanged" | "current_profile");
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path(astra_thin_client::paths::TOOLS_RESULT))
-            .and(header("authorization", "Bearer expired-token"))
+            .and(path(callback_path))
+            .and(header("authorization", format!("Bearer {initial_token}")))
             .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
                 "error": "expired"
             })))
-            .expect(1)
+            .expect(if should_post { 1 } else { 0 })
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path(astra_thin_client::paths::AUTH_REFRESH))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "user_id": "user-id-1",
-                "access_token": "fresh-token",
-                "refresh_token": "fresh-refresh-token"
-            })))
-            .expect(1)
+            .respond_with(
+                ResponseTemplate::new(if transition == "proactive_refresh_failure" {
+                    401
+                } else {
+                    200
+                })
+                .set_body_json(serde_json::json!({
+                    "user_id": "user-id-1",
+                    "access_token": "fresh-token",
+                    "refresh_token": "fresh-refresh-token"
+                })),
+            )
+            .expect(
+                if should_post || transition == "proactive_refresh_failure" {
+                    1
+                } else {
+                    0
+                },
+            )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path(astra_thin_client::paths::TOOLS_RESULT))
+            .and(path(callback_path))
             .and(header("authorization", "Bearer fresh-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": true
             })))
-            .expect(1)
+            .expect(if should_post { 1 } else { 0 })
             .mount(&server)
             .await;
 
@@ -13409,14 +14000,16 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
         let mut tool_cache = EdgeToolCache::new(10);
+        let parent_cancel = tokio_util::sync::CancellationToken::new();
+        let physical_cancel = parent_cancel.child_token();
         let ctx = EdgeSseContext {
             api: &api,
-            token: "expired-token",
+            token: initial_token,
             executor_id: "edge-test",
             executor,
             render_policy: RenderPolicy::Silent,
             perm_manager: None,
-            cancel_token: None,
+            cancel_token: Some(&physical_cancel),
             stream_event_tx: None,
             stream_event_sink: None,
             approval_request_tx: None,
@@ -13427,7 +14020,28 @@ mod tests {
             incremental_state: None,
             request_session_execution_lease: None,
         };
-        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
+        let auth_owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
+            &api,
+            auth_profile,
+            initial_token,
+        )
+        .await;
+        assert!(auth_owner.is_some());
+        match transition {
+            "current_profile" => creds.current_profile = Some("unrelated-profile".into()),
+            "replacement" => {
+                creds.profiles.get_mut("test").unwrap().access_token = Some("unknown-login".into())
+            }
+            "account" => {
+                creds.profiles.get_mut("test").unwrap().account_id = Some("other-account".into())
+            }
+            "logout" => {
+                creds.profiles.remove("test");
+            }
+            _ => (),
+        }
+        save_credentials(&creds).unwrap();
+        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, auth_owner);
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
                 session_id: "test-session".to_string(),
@@ -13442,11 +14056,64 @@ mod tests {
             },
         );
 
-        let posted = host.post_tool_result_with_auth_retry(&body).await.is_ok();
+        let posted = if approval {
+            host.post_approval_with_auth_retry(&astra_thin_client::ApprovalRespondRequest {
+                request_id: "approval-1".into(),
+                decision: astra_thin_client::ApprovalDecision::Allow,
+                reason: None,
+                session_id: "test-session".into(),
+                run_id: "test-run".into(),
+                tool_name: Some("read_file".into()),
+                approval_kind: None,
+            })
+            .await
+            .is_ok()
+        } else {
+            host.post_tool_result_with_auth_retry(&body).await.is_ok()
+        };
 
-        assert!(posted);
+        assert_eq!(posted, should_post);
+        if !should_post {
+            assert!(host.auth_failure);
+            let mut held_open_peer = futures_util::stream::pending::<Result<Vec<u8>, String>>();
+            let (_, abort) = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                super::consume_sse_stream_cancellable(
+                    &mut held_open_peer,
+                    &mut host,
+                    std::time::Duration::from_secs(300),
+                    Some(&physical_cancel),
+                    None,
+                ),
+            )
+            .await
+            .expect("owner rejection must wake the physical reader before idle timeout");
+            assert!(abort.is_some());
+            assert!(physical_cancel.is_cancelled());
+            assert!(!parent_cancel.is_cancelled());
+            assert_eq!(host.callback_failure_run_id.as_deref(), Some("test-run"));
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                usize::from(transition == "proactive_refresh_failure")
+            );
+            return;
+        }
         assert!(!host.auth_failure);
+        assert!(!physical_cancel.is_cancelled());
+        assert!(!parent_cancel.is_cancelled());
         assert_eq!(host.token, "fresh-token");
+        let posts: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == callback_path)
+            .collect();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(
+            posts[0].body, posts[1].body,
+            "refresh only reposts the identical result and hash"
+        );
     }
 
     #[serial_test::serial]
@@ -13514,7 +14181,13 @@ mod tests {
             incremental_state: None,
             request_session_execution_lease: None,
         };
-        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
+        let auth_owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
+            &api,
+            Some("test"),
+            "expired-token",
+        )
+        .await;
+        let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, auth_owner);
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
                 session_id: "test-session".to_string(),
@@ -14407,20 +15080,133 @@ mod tests {
 
     // ── Edge-path skill dedup tests ─────────────────────────────────────
 
-    #[test]
-    fn skill_dedup() {
-        // hashset tracks invocations
-        let mut invoked = std::collections::HashSet::new();
-        assert!(invoked.insert("code-review".to_string()));
-        assert!(!invoked.insert("code-review".to_string()));
-        assert!(invoked.insert("test-writer".to_string()));
-        // produces correct message
-        let msg = format!(
-            "Skill '{}' was already loaded in this turn. Follow the instructions already provided.",
-            "code-review"
-        );
-        assert!(msg.contains("code-review"));
-        assert!(msg.contains("already loaded"));
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn skill_callbacks_respect_directory_scope_before_dedup() {
+        let workspace = tempdir().unwrap();
+        let directory = workspace.path().join("skills");
+        for name in ["code-review", "test-writer"] {
+            let path = directory.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: Review workflow\n---\n{name} instructions."
+                ),
+            )
+            .unwrap();
+        }
+        let mut registry = astra_runtime::skills::registry::UnifiedSkillRegistry::new();
+        registry.add_provider(Box::new(
+            astra_skills::providers::LocalSkillProvider::with_paths(vec![directory]),
+        ));
+        registry.discover_all().await.unwrap();
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let mut cache = EdgeToolCache::new(8);
+        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        host.skill_resolver = Some(std::sync::Arc::new(
+            astra_runtime::skills::registry::UnifiedSkillResolver::new(std::sync::Arc::new(
+                registry,
+            )),
+        ));
+        let mut requests = Vec::new();
+        let mut results = Vec::new();
+        for (id, tool, args, scope, succeeds) in [
+            (
+                "search",
+                "discover_skills",
+                serde_json::json!({"query":"review"}),
+                Some(vec!["code-review".to_string()]),
+                true,
+            ),
+            (
+                "load",
+                "skill",
+                serde_json::json!({"skill_name":"code-review"}),
+                Some(vec!["code-review".to_string()]),
+                true,
+            ),
+            (
+                "repeat",
+                "skill",
+                serde_json::json!({"skill_name":"code-review"}),
+                Some(vec!["code-review".to_string()]),
+                true,
+            ),
+            (
+                "revoked",
+                "skill",
+                serde_json::json!({"skill_name":"code-review"}),
+                Some(vec![]),
+                false,
+            ),
+            (
+                "excluded",
+                "skill",
+                serde_json::json!({"skill_name":"test-writer"}),
+                Some(vec!["code-review".to_string()]),
+                false,
+            ),
+            (
+                "missing",
+                "skill",
+                serde_json::json!({"skill_name":"code-review"}),
+                None,
+                false,
+            ),
+        ] {
+            let mut request = parallel_batch_request("skills", id, tool, args);
+            request.run_id = "skill-scope-run".to_string();
+            request.turn_chain_id = "skill-scope-chain".to_string();
+            request.admitted_skill_names = scope;
+            host.on_server_tool_surface_admission(&request).unwrap();
+            let mut settled = host.execute_tools_batch(vec![request.clone()]).await;
+            let result = settled.pop().unwrap();
+            assert_eq!(
+                result.status == "completed",
+                succeeds,
+                "{id}: {}",
+                result.output
+            );
+            if id == "search" {
+                assert!(result.output.contains("code-review"));
+                assert!(!result.output.contains("test-writer"));
+            }
+            let record =
+                astra_turn_core::headless::journal::journal_record_edge_tool_result(&result);
+            if id == "repeat" {
+                assert!(result.output.contains("already loaded"));
+                assert_eq!(
+                    record.disposition,
+                    Some(astra_services::session_journal::ToolCallDisposition::Suppressed),
+                );
+                assert_eq!(
+                    result.tool_result_fields.as_ref().unwrap()["executed"],
+                    false
+                );
+                assert_eq!(
+                    record.result_class.as_deref(),
+                    Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS),
+                );
+            } else if succeeds {
+                assert_eq!(
+                    record.disposition,
+                    Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                );
+            }
+            if !succeeds {
+                assert!(!result.output.contains("<skill-loaded"));
+                if id == "revoked" || id == "missing" {
+                    assert_eq!(
+                        record.disposition,
+                        Some(astra_services::session_journal::ToolCallDisposition::Rejected),
+                    );
+                }
+            }
+            requests.push(request);
+            results.push(result);
+        }
+        fixture.assert_settlements(&requests, &results).await;
     }
 
     // ── CLI skill-loaded marker tests ──────────────────────────────────
@@ -14792,6 +15578,7 @@ mod tests {
             host.tool_result_identities.insert(
                 request_id.to_string(),
                 ToolResultIdentity {
+                    work_attribution: None,
                     session_id: "session-1".to_string(),
                     run_id: "run-1".to_string(),
                     turn_chain_id: "turn-1".to_string(),
@@ -15018,6 +15805,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15035,6 +15824,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15127,6 +15918,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15144,6 +15937,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15228,6 +16023,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15245,6 +16042,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15261,6 +16060,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15344,6 +16145,8 @@ mod tests {
 
         let results = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                work_attribution: None,
+                admitted_skill_names: None,
                 session_id: "test-session".to_string(),
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
@@ -15433,6 +16236,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15450,6 +16255,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15548,6 +16355,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15563,6 +16372,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -15680,6 +16491,8 @@ mod tests {
             false,
         );
         let request = |request_id: &str, tool: &str, args: serde_json::Value| ToolBatchRequest {
+            work_attribution: None,
+            admitted_skill_names: None,
             session_id: "test-session".to_string(),
             run_id: "test-run".to_string(),
             turn_chain_id: "test-chain".to_string(),
@@ -16029,6 +16842,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16044,6 +16859,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16058,6 +16875,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16260,6 +17079,8 @@ mod tests {
         while event_rx.try_recv().is_ok() {}
         let result = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                work_attribution: None,
+                admitted_skill_names: None,
                 session_id: "cache-session".into(),
                 run_id: "cache-root".into(),
                 turn_chain_id: "cache-chain".into(),
@@ -16575,6 +17396,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16590,6 +17413,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16604,6 +17429,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16842,6 +17669,7 @@ mod tests {
     #[test]
     fn test_merge_edge_tool_rounds() {
         let consumed = vec![EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "call-exit".to_string(),
             tool: "exit_plan_mode".to_string(),
@@ -16862,6 +17690,7 @@ mod tests {
 
         // deduplicates by request_id (host wins)
         let host = vec![EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "call-exit".to_string(),
             tool: "exit_plan_mode".to_string(),
@@ -16925,6 +17754,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16940,6 +17771,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -16954,6 +17787,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -17040,6 +17875,8 @@ mod tests {
 
         let results = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                work_attribution: None,
+                admitted_skill_names: None,
                 session_id: "test-session".to_string(),
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
@@ -17126,6 +17963,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -17141,6 +17980,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -17236,6 +18077,8 @@ mod tests {
         let results = host
             .execute_tools_batch(vec![
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -17253,6 +18096,8 @@ mod tests {
                     }),
                 },
                 ToolBatchRequest {
+                    work_attribution: None,
+                    admitted_skill_names: None,
                     session_id: "test-session".to_string(),
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
@@ -17339,6 +18184,8 @@ mod tests {
 
         let results = host
             .execute_tools_batch(vec![ToolBatchRequest {
+                work_attribution: None,
+                admitted_skill_names: None,
                 session_id: "test-session".to_string(),
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
@@ -17565,6 +18412,7 @@ mod tests {
         ] {
             let state = IncrementalTurnState::default();
             let result = EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: "req-1".into(),
                 tool: tool.into(),
@@ -17601,6 +18449,7 @@ mod tests {
         sync_incremental_tool_result_state(
             &state,
             &EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: "req-err".into(),
                 tool: "bash".into(),
@@ -17632,6 +18481,7 @@ mod tests {
         sync_incremental_tool_result_state(
             &state,
             &EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: "req-skip".into(),
                 tool: "read_file".into(),
@@ -17661,6 +18511,7 @@ mod tests {
         sync_incremental_tool_result_state(
             &state,
             &EdgeToolExecResult {
+                work_attribution: None,
                 execution_completion: None,
                 request_id: "req-invalid-git".into(),
                 tool: "git".into(),

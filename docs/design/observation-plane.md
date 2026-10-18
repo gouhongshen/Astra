@@ -72,6 +72,18 @@ Introspect should answer:
 - what sync state is safe or degraded;
 - what recent failures matter.
 
+Tool-failure evidence used by SelfModel belongs to the current execution's
+observability session. Publishing a tool round replaces that session's full
+projection, including an empty result after recovery; it must not broadcast
+one execution's health to other sessions sharing an observation hub.
+
+Live execution, canonical tool-boundary feedback, and recorded round/trace
+facts own runtime observations. The separate turn-metrics journal, trend
+renderer, and strategy-change verification projection are retired. Context
+pressure remains a live provider-boundary advisory at 0.70 and 0.90; it does
+not authorize budget changes, tool restrictions, or completion. A fresh
+pressure projection replaces any previous one, including after pressure drops.
+
 ## Reflect
 
 Reflect is agent reasoning over observation facts. It should not mutate state by itself. It can propose strategy, identify uncertainty, and request action.
@@ -238,6 +250,38 @@ in `model_request_context_events`. These records complement `agent_events` and
 are exposed through the existing owner-scoped request queries and session
 observability projection. They do not require full prompt capture.
 
+The accepted row stores immutable request context once. The terminal row stores
+only a strict `model_request_terminal_v1` fact: outcome, response identity,
+usage coverage and normalized usage, error kind, and measurement source. The
+shared reader hydrates the existing full public event from the exact
+owner/session/run/attempt/invocation partner, even when the accepted row lies
+outside the requested page. Missing or inconsistent evidence is an error, not
+an omitted terminal or fabricated usage. Normal terminal writes do not read
+the accepted row; crash recovery retains its existing accepted-context lookup.
+Metrics and paired retention remain unchanged.
+
+Capacity compaction and expiry share one retention owner. Diagnostics remain
+pinned while their invocation is admitted, a physical attempt is open, or any
+settlement debt remains, including quarantined debt. Missing or contradictory
+canonical ownership also prevents deletion. The 2,048-record capacity and
+30-day age are soft limits for unresolved work: diagnostic reclamation must
+not destroy evidence still required for accounting or crash recovery.
+
+Eligible complete pairs are marked and deleted atomically under their physical
+attempt locks. Expiry walks old rows using the existing timestamp/event index,
+then checks the complete bounded owner/attempt groups. A fresh terminal protects
+its old accepted partner. The transient cursor advances past pinned rows even
+when no deletion occurs and wraps after a pass; restart safely repeats work.
+The existing leader sweeper catches up within page/time budgets, checking
+cancellation and leadership between pages. Other cleanup retains its normal
+five-minute cadence. No durable cursor or per-request global sweep is added.
+Unresolved incidents can retain evidence beyond the diagnostic limits; backlog
+convergence still depends on measured service capacity exceeding arrivals.
+
+This storage encoding requires coordinated producer/reader/recovery deployment.
+It does not decode old full-context terminal payloads or migrate/delete them.
+Stored diagnostics must use this encoding before querying with the new reader.
+
 `ModelRequestContextEvent.route` projects non-secret facts from the admitted
 inference plan:
 
@@ -252,15 +296,12 @@ access_kind
 The adjacent request identity owns the Offering, configured model, purpose,
 session/run/turn/round, and physical request ID. Accepted and terminal events
 must agree on route attribution, including recovery after process failure.
-Older records without this projection deserialize with an unknown route;
-readers must not infer selection policy from a model name or missing field.
+The admitted route is required; missing or null routes are invalid records.
 Credentials, owner/admission tokens, endpoint URLs, and raw prompt content do
 not belong in this projection.
 
-Request diagnostics use strict typed readers. Deployments adding route fields
-must upgrade readers and recovery workers before new producers, or drain old
-instances during a coordinated upgrade. Backward reading of stored records
-without route fields does not imply older binaries can read the new projection.
+Request diagnostics use one strict current encoding, without historical
+decoders, migration or mixed-version support.
 
 Usage coverage is independent of request outcome:
 
@@ -268,8 +309,8 @@ Usage coverage is independent of request outcome:
   Full-input budget errors and cache-read share may be computed.
 - `provider_partial`: retain observed token lanes, but do not report them as
   a complete input measurement, budget estimate error, or cache-read share.
-- `unavailable`: usage and measured diagnostic fields are absent. Placeholder
-  zeroes in legacy records are not evidence of zero-token billing.
+- `unavailable`: usage and measured diagnostic fields are absent, not measured
+  zero-token billing.
 
 Session Audit request usage reads retained physical provider attempts for the
 authenticated owner and session. It counts failures, cancellation and unknown

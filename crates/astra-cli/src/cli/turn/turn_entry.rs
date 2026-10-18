@@ -467,6 +467,18 @@ pub(crate) async fn handle_chat_input_with_ui(
         return Ok(InteractiveTurnOutcome::NotStarted);
     }
 
+    // Native collaborator capacity is prepared only after the canonical
+    // session/permission attachment exists. The helper is a no-op for
+    // headless callers, and failure is optional capacity rather than a
+    // reason to reject the ordinary Astra turn.
+    crate::cli::edge_lifecycle::native_delivery::ensure_session_native_delivery(
+        state,
+        ctx.api,
+        token,
+        &session_id,
+    )
+    .await;
+
     // Admission is per actual model turn, not per TUI lifetime. Keep this
     // token in scope through retry and Turn/TurnError settlement, then release
     // it so the next interactive turn (or another surface) can proceed.
@@ -577,6 +589,14 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
 
     let session_id =
         ensure_interactive_session_identity(state, ctx.api, ctx.profile, token).await?;
+
+    crate::cli::edge_lifecycle::native_delivery::ensure_session_native_delivery(
+        state,
+        ctx.api,
+        token,
+        &session_id,
+    )
+    .await;
 
     let _execution_lease = acquire_interactive_turn_admission(state)?;
 
@@ -944,7 +964,21 @@ mod tests {
         let _credentials_guard = crate::tests::isolate_credentials();
         let server = MockLlmServer::start(MockScenario::Slow).await.unwrap();
         let api = astra_thin_client::ThinClient::new(&server.base_url, None).unwrap();
+        // This exercises interactive TUI turns. Production installs native
+        // prompt channels before using Silent rendering; a bare SessionState
+        // has no approval sink and cannot admit Prompt mode on piped stdin.
+        let (approval_tx, mut approval_rx) =
+            tokio::sync::mpsc::channel::<crate::cli::chat_stream::ApprovalRequest>(
+                crate::cli::chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+            );
+        let (ask_user_tx, mut ask_user_rx) =
+            tokio::sync::mpsc::channel::<crate::cli::chat_stream::AskUserRequest>(
+                crate::cli::chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
+            );
         let mut state = SessionState {
+            tui_render_policy: Some(crate::cli::stream::stream_render::RenderPolicy::Silent),
+            tui_approval_request_tx: Some(approval_tx),
+            tui_ask_user_request_tx: Some(ask_user_tx),
             model: Some("gpt-5".into()),
             resume_guidance: Some("verify the unfinished result".into()),
             diagnostics_context: Some("existing diagnostic".into()),
@@ -998,6 +1032,25 @@ mod tests {
         );
         assert!(state.resume_guidance.is_none());
         assert!(state.diagnostics_context.is_none());
+        assert_eq!(
+            state.perm_manager.mode(),
+            crate::cli::permission_manager::PermissionMode::Prompt
+        );
+        let requests = server.received_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request["interaction_mode"] == "prompt")
+        );
+        assert!(matches!(
+            approval_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            ask_user_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

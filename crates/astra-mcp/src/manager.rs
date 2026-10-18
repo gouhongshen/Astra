@@ -81,6 +81,22 @@ impl PreparedMcpToolCall {
             .call_tool_with_metadata(&self.original_tool_name, arguments, protocol_metadata)
             .await
     }
+
+    pub async fn call_with_cancel(
+        &self,
+        arguments: Value,
+        protocol_metadata: Option<serde_json::Map<String, Value>>,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<CallToolResult, crate::McpToolCallError> {
+        self.connection
+            .call_tool_with_metadata_and_cancel(
+                &self.original_tool_name,
+                arguments,
+                protocol_metadata,
+                cancel_token,
+            )
+            .await
+    }
 }
 
 /// MCP client manager for multiple server connections.

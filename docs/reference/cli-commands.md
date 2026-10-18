@@ -2,6 +2,18 @@
 
 Current Rust CLI reference for the single `astra` CLI, including `astra admin`.
 
+## Stdio app server
+
+`astra serve stdio` accepts JSON-RPC requests over piped stdin/stdout. A
+`turn/start` request with `permissionMode: "prompt"` (or `"accept_edits"`)
+uses the same permission manager as the terminal. When a tool needs approval,
+`approval/requested` carries its approval ID; answer with `approval/respond`
+using `approvalId` and `decision` (`allow_once`, `always`, or `deny`).
+`turn/interrupt` closes pending approvals without authorizing execution.
+The approval transport does not provide the `ask_user` question interface.
+Prompt execution without an approval transport or terminal prompt sink fails
+before a model request is admitted.
+
 ## Turn summary
 
 The completion line shows elapsed time, time to first token (`ttft`), primary
@@ -143,6 +155,61 @@ identity. The provider deadline accepts 1–120 seconds. Evaluation sessions are
 closed after definite results; uncertain delivery retains a session for
 inspection. See [quality judgment behavior](../guides/testing.md).
 
+## MCP configuration
+
+Standalone MCP configuration commands run locally without connecting to a server:
+
+```bash
+astra mcp list                        # project scope, with a hint to inspect the effective view
+astra mcp list -s user                # user scope
+astra mcp list --effective            # the configurations selected at chat startup
+astra mcp get example                 # winning definition's type, scope and source
+astra mcp add -s project example /path/to/mcp-server -- --server-argument
+astra mcp add-json -s user remote '{"type":"streamable_http","url":"https://example.com/mcp"}'
+astra mcp remove -s user remote
+```
+
+Project configuration is `$CWD/.astra/mcp.json`; user configuration defaults to
+`~/.astra/mcp.json`. When `ASTRA_LOCAL_STATE_ROOT` is set, its `mcp.json` is the
+user configuration instead. Both files use a top-level `mcpServers` object:
+
+```json
+{
+  "mcpServers": {
+    "example": {"command": "/path/to/mcp-server", "args": ["--server-argument"]},
+    "remote": {"type": "streamable_http", "url": "https://example.com/mcp"}
+  }
+}
+```
+
+`add-json` accepts **one server entry**, such as the `remote` object above,
+without the `mcpServers` wrapper. It supports `stdio` (the default, using
+`command`, `args`, and optional `env`), `sse`, `streamable_http`, and `ws`
+(using `url`, optional `headers`, and optional `auth_token`). Use the exact
+`streamable_http` spelling in configuration; `http` is not a chat-loader alias.
+`add` writes a stdio entry. Both commands default to project scope and reject
+an existing name in that file; remove the existing entry or edit the file to
+replace it. Adding configuration does not install an executable or test access.
+
+Chat discovery selects the **first enabled definition of each name**:
+project config, then skill `manifest.yaml` files in the existing skill search
+path priority, then user config. Manifest files within each skill root are
+sorted by path. A standalone entry with `disabled: true` or a skill entry with
+`enabled: false` does not reserve its name; a lower priority enabled definition
+can still win. Unsupported or incomplete standalone entries are skipped with
+a warning. A malformed file produces a warning and contributes no entries;
+a missing optional file is normal. Configuration changes apply to the next
+chat startup.
+
+`list` and `get` show enabled configurations eligible for discovery, including
+the winning source path. They hide connection settings, including commands,
+arguments, URLs, environment values, headers, and tokens. The effective view
+uses the same loader as chat; it describes configuration, without proving a
+connection or tool availability. In an active chat, `/mcp` shows connected
+servers and tools. The standalone `astra mcp test NAME -s project|user` and
+`astra mcp ping NAME -s project|user` explicitly connect to the selected server;
+for stdio this launches its configured command.
+
 ## astra admin
 
 Global options:
@@ -194,6 +261,23 @@ astra admin skill versions <skill_name>
 astra admin prompt optimize --agent-id <agent_id> [--optimization-type quality]
 astra admin feedback export [--agent-id <agent_id>] [--format jsonl]
 ```
+
+For a custom OpenAI-compatible deployment, transport compatibility does not prove
+support for thinking controls. If the deployment has been verified to support
+`reasoning_effort`, add `thinking_protocol: reasoning_effort` alongside `name`
+and `provider` in its YAML model entry, then run
+`astra admin model load .models.yaml --update-existing`. Keep all existing model
+fields and quirks: supplying quirks replaces the complete stored object.
+`astra admin model check <name>` repeats the check; `model show <name>` exposes
+the observation and diagnostics. An `effort_only` result allows effort selection,
+not thinking Off. An inconclusive check establishes no new capability. A matching
+prior capability may remain available while diagnostics record the latest error.
+
+Explicit CLI model selectors such as `'<name>(thinking:low)'`,
+`'<name>(thinking:medium)'` and `'<name>(thinking:high)'` select depth. A plain
+`<name>` retains the provider default. The declaration alone does not force Low
+and a successful effort probe does not prove that the provider honors every
+level; verify the deployment's supported values before declaring its protocol.
 
 ## Notes
 

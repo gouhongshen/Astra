@@ -241,7 +241,7 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     pub runtime_config: Arc<astra_config::RuntimeConfig>,
     pub api: &'a astra_thin_client::ThinClient,
     pub token: String,
-    pub auth_profile: Option<&'a str>,
+    pub auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     pub offering_id: Option<String>,
     pub model: Option<&'a str>,
     pub cli_context: Option<&'a crate::cli::cli_config::cli_context::CliContext>,
@@ -415,13 +415,12 @@ fn derive_turn_interaction_mode(
                 TurnInteractionMode::Deny
             }
         }
-        // Native prompt channels, not the stream renderer, establish TUI
-        // interaction capability. The TUI intentionally uses Silent while it
-        // renders approval/ask_user overlays itself. Headless callers and
-        // callers without a native prompt sink remain noninteractive.
+        // Approval delivery establishes pause capability independently of TTY
+        // rendering and ask_user. Both TUI and stdio use the canonical
+        // approval channel; terminal callers retain their native prompt sink.
         // Actual tool approvals still pass through the permission engine.
         PermissionMode::Prompt | PermissionMode::AcceptEdits => {
-            if stdin_is_terminal && has_ask_user_request_tx {
+            if has_approval_request_tx || (stdin_is_terminal && has_ask_user_request_tx) {
                 TurnInteractionMode::Prompt
             } else {
                 TurnInteractionMode::NonInteractive
@@ -548,7 +547,8 @@ fn stream_event_requires_ordered_delivery(event: &crate::cli::chat_stream::Strea
     }
     matches!(
         event,
-        crate::cli::chat_stream::StreamEvent::SessionBound(_)
+        crate::cli::chat_stream::StreamEvent::SystemWarning(_)
+            | crate::cli::chat_stream::StreamEvent::SessionBound(_)
             | crate::cli::chat_stream::StreamEvent::AgentLiveGap(_)
             | crate::cli::chat_stream::StreamEvent::RunBound(_)
             | crate::cli::chat_stream::StreamEvent::ToolStarted { .. }
@@ -968,14 +968,32 @@ impl CliServerAdmissionHost<'_> {
             .collect::<Vec<_>>();
 
         let interaction_mode = self.turn_interaction_mode_inherent();
+        if !self.is_plan_subtask
+            && matches!(
+                self.perm_manager.mode(),
+                PermissionMode::Prompt | PermissionMode::AcceptEdits
+            )
+            && !interaction_mode.can_pause_for_user()
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::InvalidRequest,
+                "prompt permission mode requires an approval channel or an interactive terminal prompt sink",
+            ));
+        }
         // The caller-owned token is an input-only cancellation source. Edge
         // callback failures must stop this physical stream and cancel its
         // durable run without being misreported as a user cancellation or
         // cancelling other work that shares the caller token.
         let stream_cancel_token = child_cancellation_scope(state.cancel_token.as_ref());
         let persistent_restricted_tools = state.restricted_tools.clone();
-        let interaction_scoped_restrictions =
+        let mut interaction_scoped_restrictions =
             interaction_scoped_tool_restrictions(interaction_mode);
+        // The stdio approval transport does not implement ask_user. Keep that
+        // capability tied to its own native request channel.
+        if self.ask_user_request_tx.is_none() {
+            interaction_scoped_restrictions
+                .insert(astra_turn_core::interaction_types::ASK_USER_TOOL_NAME.to_string());
+        }
         state
             .restricted_tools
             .extend(interaction_scoped_restrictions.iter().cloned());
@@ -996,7 +1014,7 @@ impl CliServerAdmissionHost<'_> {
                     tool_surface_config: &self.runtime_config.tool_surface,
                     api: self.api,
                     token: self.token.as_str(),
-                    auth_profile: self.auth_profile,
+                    auth_owner: self.auth_owner.clone(),
                     offering_id: effective_offering_id,
                     model: effective_model,
                     cli_context: self.cli_context,
@@ -1300,6 +1318,14 @@ impl CliServerAdmissionHost<'_> {
                 .or(unsettled_physical_owner_run_id);
         }
         Ok(turn_result)
+    }
+
+    pub(super) fn emit_system_warning(&mut self, message: String) {
+        if !self.render_policy.suppress_headless() {
+            eprintln!("{}", message.as_str().yellow());
+            self.pending_clear_lines += 1;
+        }
+        self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::SystemWarning(message));
     }
 
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
@@ -1973,6 +1999,23 @@ mod tests {
     }
 
     #[test]
+    fn hook_config_diagnostics_keep_each_local_warning_in_order() {
+        use crate::cli::chat_stream::StreamEvent;
+        let mut queue = std::collections::VecDeque::new();
+        for message in ["first diagnostic", "second diagnostic"] {
+            let event = StreamEvent::SystemWarning(message.into());
+            assert!(stream_event_requires_ordered_delivery(&event));
+            retain_ordered_stream_event_in_queue(&mut queue, event);
+        }
+        for message in ["first diagnostic", "second diagnostic"] {
+            assert!(
+                matches!(queue.pop_front(), Some(StreamEvent::SystemWarning(text)) if text == message)
+            );
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
     fn work_board_updates_are_never_dropped_as_best_effort_progress() {
         assert!(stream_event_requires_ordered_delivery(
             &crate::cli::chat_stream::StreamEvent::WorkTaskBoardUpdate(json!({
@@ -2562,13 +2605,13 @@ mod tests {
             );
             assert_eq!(
                 derive_turn_interaction_mode(mode, false, true, false, true, true),
-                TurnInteractionMode::NonInteractive,
-                "an approval channel alone cannot display ask_user",
+                TurnInteractionMode::Prompt,
+                "approval delivery does not require an ask_user channel",
             );
             assert_eq!(
                 derive_turn_interaction_mode(mode, false, true, true, true, false),
-                TurnInteractionMode::NonInteractive,
-                "headless execution must remain noninteractive",
+                TurnInteractionMode::Prompt,
+                "stdio approval delivery does not require a terminal",
             );
         }
         for mode in [PermissionMode::Deny, PermissionMode::Plan] {

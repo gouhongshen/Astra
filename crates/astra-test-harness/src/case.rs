@@ -44,6 +44,11 @@ pub struct Case {
     #[serde(default)]
     pub models: Option<Vec<String>>,
 
+    /// Supplementary models needed by the journey (e.g. an explicitly selected
+    /// child model). These prerequisites are not replaced by --force-model.
+    #[serde(default)]
+    pub required_models: Vec<String>,
+
     /// Success criteria evaluated in order. All must pass for the
     /// case to PASS. Order matters — deterministic checks first,
     /// expensive LLM judger last.
@@ -484,6 +489,63 @@ pub fn matches_filter(name: &str, pattern: &str) -> bool {
 }
 
 impl Case {
+    /// Bind the resolved matrix model to prompts and assertions, not execution
+    /// configuration, hooks, environment or grader model overrides.
+    pub fn bind_model(&self, model: &str) -> anyhow::Result<Self> {
+        canonicalize_model_ids(&[model.to_owned()]).map_err(anyhow::Error::msg)?;
+        fn text(value: &mut String, model: &str) -> anyhow::Result<()> {
+            if value.replace("{{model}}", "").contains("{{") {
+                anyhow::bail!("unknown or malformed case binding; only {{{{model}}}} is supported");
+            }
+            *value = value.replace("{{model}}", model);
+            Ok(())
+        }
+        fn leaves(value: &mut serde_json::Value, model: &str) -> anyhow::Result<()> {
+            match value {
+                serde_json::Value::String(value) => text(value, model)?,
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        leaves(item, model)?;
+                    }
+                }
+                serde_json::Value::Object(fields) => {
+                    let grader = fields
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|kind| matches!(kind, "judger" | "hard_judger"));
+                    for (key, value) in fields {
+                        if grader && key == "model" {
+                            if value.as_str().is_some_and(|s| s.contains("{{")) {
+                                anyhow::bail!("grader model overrides must be literal model IDs");
+                            }
+                        } else {
+                            leaves(value, model)?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        fn criteria(
+            values: &mut Vec<super::criteria::Criterion>,
+            model: &str,
+        ) -> anyhow::Result<()> {
+            let mut value = serde_json::to_value(&*values)?;
+            leaves(&mut value, model)?;
+            *values = serde_json::from_value(value)?;
+            super::criteria::validate_criteria(values).map_err(anyhow::Error::msg)
+        }
+        let mut bound = self.clone();
+        text(&mut bound.prompt, model)?;
+        criteria(&mut bound.criteria, model)?;
+        for step in &mut bound.steps {
+            text(&mut step.prompt, model)?;
+            criteria(&mut step.criteria, model)?;
+        }
+        Ok(bound)
+    }
+
     pub(crate) fn cli_wall_time_override_for(&self, timeout_seconds: u64) -> Option<u64> {
         self.cli_wall_time_seconds.filter(|seconds| {
             *seconds > CLI_TERMINAL_RESERVE_SECONDS
@@ -499,6 +561,30 @@ impl Case {
         self.requires_memoria
             || self.cleanup_memory_records
             || super::criteria::requires_memoria_subsystem_health(&self.criteria)
+    }
+
+    pub(crate) fn validate_execution_scope(&self) -> Result<(), String> {
+        super::criteria::validate_criteria(&self.criteria)?;
+        for (i, step) in self.steps.iter().enumerate() {
+            super::criteria::validate_criteria(&step.criteria)
+                .map_err(|error| format!("steps[{i}].{error}"))?;
+        }
+        if super::criteria::semantic_child_adoption(&self.criteria).is_some()
+            && !self.steps.is_empty()
+        {
+            return Err(
+                "semantic child adoption cannot be combined with steps; execution evidence must have one boundary"
+                    .into(),
+            );
+        }
+        for (i, step) in self.steps.iter().enumerate() {
+            if super::criteria::semantic_child_adoption(&step.criteria).is_some() {
+                return Err(format!(
+                    "steps[{i}] cannot contain semantic child adoption; move it to case-level criteria"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Load a case from a YAML file on disk.
@@ -553,6 +639,10 @@ impl Case {
                     .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?,
             );
         }
+        if !case.required_models.is_empty() {
+            case.required_models = canonicalize_model_ids(&case.required_models)
+                .map_err(|e| anyhow::anyhow!("parse {} required_models: {e}", path.display()))?;
+        }
         // Fail fast on reserved-flag abuse so a typo in one case
         // doesn't silently poison an entire suite run.
         validate_extra_cli_args(&case.extra_cli_args)
@@ -605,7 +695,7 @@ impl Case {
         // A case author's YAML typo would otherwise turn into a
         // permanent-FAIL / permanent-PASS that looks like a real
         // regression.
-        crate::criteria::validate_criteria(&case.criteria)
+        case.validate_execution_scope()
             .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
         for (i, step) in case.steps.iter().enumerate() {
             if step.prompt.trim().is_empty() {
@@ -619,10 +709,6 @@ impl Case {
                     "case {}: steps[{i}].timeout_seconds must be >= 1",
                     path.display()
                 );
-            }
-            // Validate step criteria at load time.
-            if let Err(e) = crate::criteria::validate_criteria(&step.criteria) {
-                anyhow::bail!("case {}: steps[{i}].{e}", path.display(),);
             }
             if crate::criteria::requires_session_capture(&step.criteria) {
                 anyhow::bail!(
@@ -690,6 +776,94 @@ impl Case {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_model_binding_preserves_strict_spawn_checks_and_case_configuration() {
+        use crate::criteria::{Criterion, evaluate_deterministic_with_session};
+        use crate::runner::RunOutcome;
+        use crate::session_capture::{JournalEvent, SessionCapture};
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/multi_turn_delegation_followup.yaml");
+        let mut original = Case::from_path(&path).unwrap();
+        original.setup_cmd = Some("literal {{model}}".into());
+        for model in ["glm-5.3", "another-provider/model", "quoted\"\\$()`模型"] {
+            let bound = original.bind_model(model).unwrap();
+            assert!(bound.prompt.contains(model));
+            assert_eq!(bound.setup_cmd, original.setup_cmd);
+            assert!(bound.required_models.is_empty());
+            let checks: Vec<_> = bound
+                .criteria
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c, Criterion::SessionEventCount { json_match: Some(_), event_type, .. }
+                        if event_type == "agent_spawned"
+                    )
+                })
+                .cloned()
+                .collect();
+            assert_eq!(checks.len(), 1);
+            let mut session = SessionCapture::default();
+            for (actual, passes) in [(model, true), ("wrong-model", false)] {
+                session.events = vec![JournalEvent {
+                    event_type: "agent_spawned".into(),
+                    raw: serde_json::json!({"metadata":{"model_configuration":{
+                        "prepared_selection":{"model_name":actual}
+                    }}}),
+                }];
+                assert_eq!(
+                    evaluate_deterministic_with_session(
+                        &checks,
+                        &RunOutcome::new(model),
+                        Some(&session)
+                    )[0]
+                    .passed,
+                    passes
+                );
+            }
+            let projection = serde_json::to_value(&bound).unwrap();
+            assert_eq!(projection["steps"][0]["criteria"][1]["needle"], model);
+            let adopted = bound
+                .criteria
+                .iter()
+                .find_map(|c| match c {
+                    Criterion::SessionChildResultAdopted { spawn_match, .. } => {
+                        spawn_match.as_ref()
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(adopted.equals, serde_json::json!(model));
+        }
+        assert!(original.prompt.contains("{{model}}"));
+        for model in ["", " ", " padded"] {
+            assert!(original.bind_model(model).is_err());
+        }
+        original.prompt = "use {{missing}}".into();
+        assert!(original.bind_model("m").is_err());
+        original.prompt = "use {{model".into();
+        assert!(original.bind_model("m").is_err());
+    }
+
+    #[test]
+    fn required_models_validate_at_the_case_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.yaml");
+        for (models, accepted) in [
+            ("[]", true),
+            ("[glm-5.2, glm-5.3]", true),
+            ("['']", false),
+            ("[' glm-5.2']", false),
+            ("[glm-5.2, glm-5.2]", false),
+        ] {
+            std::fs::write(
+                &path,
+                format!("name: model-prerequisite\nprompt: hello\nrequired_models: {models}\n"),
+            )
+            .unwrap();
+            assert_eq!(Case::from_path(&path).is_ok(), accepted, "{models}");
+        }
+    }
+
     use super::*;
     use tempfile::tempdir;
 
@@ -1185,7 +1359,62 @@ steps:
     }
 
     #[test]
-    fn bundled_active_run_tool_result_case_makes_efficiency_bounds_hard() {
+    fn semantic_child_adoption_requires_one_case_level_execution_boundary() {
+        let dir = tempdir().unwrap();
+        let valid = r#"name: semantic
+prompt: answer the task
+criteria:
+  - type: execution_child_results_adopted
+    children:
+      - model: test-model
+  - type: hard_judger
+    question: Does the child answer the task?
+"#;
+        let valid_path = dir.path().join("valid.yaml");
+        std::fs::write(&valid_path, valid).unwrap();
+        assert!(Case::from_path(&valid_path).is_ok());
+
+        for (name, source) in [
+            (
+                "top-level-with-step.yaml",
+                r#"name: semantic
+prompt: answer
+steps:
+  - prompt: follow up
+criteria:
+  - type: execution_child_results_adopted
+    children:
+      - model: test-model
+  - type: hard_judger
+    question: Does the child answer the task?
+"#,
+            ),
+            (
+                "step-semantic.yaml",
+                r#"name: semantic
+prompt: answer
+criteria:
+  - type: text_contains
+    needle: answer
+steps:
+  - prompt: follow up
+    criteria:
+      - type: execution_child_results_adopted
+        children:
+          - model: test-model
+      - type: hard_judger
+        question: Does the child answer the task?
+"#,
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, source).unwrap();
+            assert!(Case::from_path(&path).is_err(), "{name} must be rejected");
+        }
+    }
+
+    #[test]
+    fn bundled_active_run_tool_result_case_requires_exact_reads_not_round_budget() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("cases/active_run_tool_result_retention.yaml");
         let case = Case::from_path(&path).expect("bundled active-run case must parse");
@@ -1197,7 +1426,7 @@ steps:
                 crate::criteria::Criterion::AllOf { criteria } => Some(criteria),
                 _ => None,
             })
-            .expect("tool and round bounds must be nested in all_of");
+            .expect("exact tool count must be required");
 
         assert!(
             hard_group.iter().any(|criterion| matches!(
@@ -1207,11 +1436,11 @@ steps:
             "the scenario must fail when the model skips or invents tool work"
         );
         assert!(
-            hard_group.iter().any(|criterion| matches!(
+            case.criteria.iter().any(|criterion| matches!(
                 criterion,
                 crate::criteria::Criterion::TurnRoundsBetween { min: 2, max: 15 }
             )),
-            "the scenario must fail on an inefficient multi-round loop"
+            "round budget must remain an independent diagnostic"
         );
         let exact_read_paths = case
             .criteria
@@ -1338,9 +1567,11 @@ steps:
 
     #[test]
     fn every_bundled_case_parses_with_the_strict_criterion_schema() {
-        let cases_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases");
-        let cases = Case::load_dir(&cases_dir).expect("all bundled cases must parse");
-        assert!(!cases.is_empty());
+        for directory in ["cases", "fixtures/review_journey"] {
+            let cases_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(directory);
+            let cases = Case::load_dir(&cases_dir).expect("all bundled cases must parse");
+            assert!(!cases.is_empty());
+        }
     }
 
     #[test]

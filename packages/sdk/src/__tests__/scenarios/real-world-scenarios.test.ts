@@ -100,12 +100,7 @@ describe('scenarios / getRunEvents (buffered SSE) + last_index', () => {
   it('parses run replay body as StreamEvent list', async () => {
     const text =
       'data: {"type":"text_delta","content":"A"}\n\n' + 'data: {"type":"turn_complete"}\n\n';
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      text: () => Promise.resolve(text),
-      headers: new Headers(),
-    } as unknown as Response);
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(text));
 
     const client = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
     const evs = await client.getRunEvents('run-1', 7);
@@ -156,12 +151,7 @@ describe('scenarios / getRunEvents 401 + refresh (second fetch)', () => {
             headers: new Headers(),
           } as unknown as Response);
         }
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          text: () => Promise.resolve(sseText),
-          headers: new Headers(),
-        } as unknown as Response);
+        return Promise.resolve(new Response(sseText));
       }
       throw new Error(`unexpected fetch ${u}`);
     });

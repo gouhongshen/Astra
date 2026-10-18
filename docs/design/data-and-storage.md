@@ -66,11 +66,36 @@ service remains explicit. The owner/name unique constraint is enforced by the
 database, and create or rename conflicts now return HTTP 409 rather than 500.
 Other SQL and malformed persisted-data errors retain their 500 behavior.
 
+## Session-memory recovery journal
+
+Fresh schema contract `2026-10-16-v104` includes `agent_session_memory_work`, keyed
+by canonical Astra owner and Session. It checkpoints the existing extraction
+and governance algorithms: frozen request/write inputs, stage receipts, a
+worker lease and bounded retry timing. Canonical Session status, execution
+settlement and context heads remain authoritative; the journal does not grant
+memory access or create another context lifecycle. Session deletion removes
+its queued inputs through the existing deletion catalog.
+
+Completed extraction drops its input transcript; publication coordinates and
+facts survive independently. Only fully successful governance retires replay
+inventories and receipts. Fenced inspections do not persist state, and finishing
+commits state and lease release together. Uncertain/failed work keeps its exact
+replay data. There remains one row per retained Session, not a global byte bound.
+
+The startup shape guard requires all journal columns. An existing v102 database
+is rejected under the repository's fresh-schema policy; deployment requires a
+new/current-contract database rather than only changing the image. Bootstrap
+does not silently add the journal to an old completion marker. Database
+replacement and preservation of existing data require an operator-owned rollout;
+this memory change performs no automatic reset or migration.
+
 ## Transcript persistence
 
-Fresh schema contract `2026-10-07-v100` stores transcript items and their
+Fresh schema contract `2026-10-08-v101` stores transcript items and their
 committed projection head. Physical page metadata and the unused source event
 position column are removed. The run lookup index is `(user_id, run_id)`.
+Context snapshot anchor, request, and response IDs share the canonical event ID
+capacity, and the schema guard checks all three columns.
 Model thinking observations use only the configuration-bound snapshot; obsolete
 capability and error mirror columns are absent.
 The retired tool-result projection decision/receipt tables and special event
@@ -123,12 +148,54 @@ Retention is a product contract:
   counter update.
 - Terminal capture batches core conversation events and LLM/tool trace events
   through the same writer, sharing session admission and insertion readback.
+- The existing asynchronous ingestion worker combines eligible session heads
+  into count- and charged-byte-bounded transactions. The aggregate event bound
+  or earliest absolute flush deadline triggers dispatch; owner round-robin and
+  one in-flight head per session preserve fairness and ordering. One transaction
+  uses one shared ingestion permit and connection, retaining foreground pool
+  headroom. It inserts event rows together and applies inserted-only counter,
+  session-end and causal-edge effects through set-based writes. Session admission
+  returns stored row identities; input spelling is not a second equality rule.
+  The shared causal-edge writer bounds each statement to 10,922 six-parameter
+  rows, preserving parent order across chunks within the caller's transaction.
+  All facts and effects commit before durable delivery is acknowledged.
+- Cross-session batching couples locks for one bounded database attempt. A
+  failed/uncertain batch retains each session's exact retry head; retries use the
+  same executor one group at a time. An authoritative session rejection rolls
+  back the shared transaction, rejects only that session and retries its peers,
+  including during drain. Database failure is not success, and ambiguous commit
+  replay still requires canonical payload-hash classification. A batch bound of
+  one retains independent-session execution. This writer does not batch the
+  synchronous event API or control-plane admission transactions, and fewer SQL
+  statements do not imply fewer stored rows or unlimited concurrent executions.
 - Poison records should be isolated.
 - Invalid records should not block later independent facts.
 - Slot/lease semantics must avoid permanent deadlock through expiry or repair.
+- Run-event append checks persisted idempotency identities in bounded windows
+  (64 keys, 16 KiB of key bytes; an indivisible key is queried alone), under
+  the existing owner/session/run transaction. Database column equality maps
+  matches to input ordinals; Rust does not normalize persisted identities.
+  Conflicting immutable payloads abort the entire batch, including across
+  windows. Unkeyed events remain distinct. This reduces preflight round trips,
+  not retained event rows or payload bytes; commit reconciliation and display
+  projection repair retain their existing owners.
 - Run mutations retain the deletion-fence → session → execution-slot → run
   lock order. A caller's exact-owner/session/run locking read also establishes
   existence; it does not need a separate existence query in that transaction.
+  Canonical owner-backed appends use their exact-session generation/lease
+  UPDATE as the run fence; appends without execution authority still require
+  explicit run-existence admission. Generic event appends retain the same
+  locked metadata reader but omit the unused checkpoint body. These changes
+  reduce SQL exchanges and returned bytes, not retained data or durability.
+- Run status snapshots omit checkpoint bodies and read their canonical binding
+  and accounting facts in one bounded event query after the metadata lookup.
+  A narrow type/index aggregate selects the earliest event of each binding type
+  and the latest finalized fact, or latest finished fact only when none exists;
+  the selected positions then join back to their owner-scoped payloads.
+  At most four payloads are returned. Selection precedes decoding, so corruption
+  of a selected fact remains an error rather than authorizing fallback. This is
+  a read optimization, not a cache, new authority, retention change, or atomic
+  snapshot across the two reads.
 - Data deletion must propagate to derived artifacts.
 - Decision audits and skill selections acquire canonical non-lazy session
   admission in the same transaction as INSERT. Decision reference checks and

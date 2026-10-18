@@ -5,6 +5,7 @@
 //! progress emitted as notifications.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -14,7 +15,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::chat_stream::{ApprovalRequest, ApprovalResponse, StreamEvent};
-use crate::cli::cli_config::cli_utils::get_profile_and_token;
+use crate::cli::cli_config::cli_utils::{CliOwnerAuthSnapshot, get_profile_and_token};
 use crate::cli::permission_manager::{PermissionLoadPolicy, PermissionManager, PermissionMode};
 use crate::cli::session::session_continuation::{
     SessionContinuation, load_session_continuation_for_recovery,
@@ -44,6 +45,7 @@ struct AppState {
 }
 
 struct ActiveTurn {
+    thread_id: String,
     turn_id: String,
     cancel: Arc<CancellationToken>,
 }
@@ -58,6 +60,9 @@ const SESSION_PERSISTENCE_FAILED_CODE: &str = "session_persistence_failed";
 const SESSION_PROJECTION_FAILED_CODE: &str = "session_projection_failed";
 const SESSION_COMMIT_UNKNOWN_CODE: &str = "session_commit_unknown";
 const TURN_FAILED_CODE: &str = "turn_failed";
+const EDGE_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(30);
+// Leave headroom for gateway clients with a 30-second app-server RPC deadline.
+const SESSION_BIND_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AppServerFailure {
@@ -180,7 +185,16 @@ pub(crate) async fn run_stdio_app_server(
     let writer = JsonWriter;
     let stdin = std::io::stdin();
     let lines = stdin.lock().lines();
+    run_app_server_lines(lines, ctx, state, writer, SESSION_BIND_TIMEOUT).await
+}
 
+async fn run_app_server_lines(
+    lines: impl IntoIterator<Item = std::io::Result<String>>,
+    ctx: ServerContext,
+    state: Arc<Mutex<AppState>>,
+    writer: JsonWriter,
+    session_bind_timeout: Duration,
+) -> Result<(), String> {
     for line in lines {
         let line = line.map_err(|e| format!("stdin read failed: {e}"))?;
         let trimmed = line.trim();
@@ -228,15 +242,28 @@ pub(crate) async fn run_stdio_app_server(
                         continue;
                     }
                 };
-                let thread_id = {
-                    let mut guard = state.lock().await;
-                    set_thread_if_idle(
-                        &mut guard,
-                        "thread/start",
-                        requested,
-                        developer_instructions(&params),
+                if requested.is_some() {
+                    write_response_error(
+                        &writer,
+                        id,
+                        "thread/start cannot select a session ID; use thread/resume",
                     )
+                    .await?;
+                    continue;
+                }
+                let token = match get_profile_and_token(ctx.auth_profile.as_deref()) {
+                    Ok((_, _, _, token)) => token,
+                    Err(error) => {
+                        write_response_error(&writer, id, &error).await?;
+                        continue;
+                    }
                 };
+                let thread_id = with_thread_binding_deadline(
+                    "thread/start",
+                    session_bind_timeout,
+                    start_server_thread(&ctx.api, &token, &state, developer_instructions(&params)),
+                )
+                .await;
                 let thread_id = match thread_id {
                     Ok(thread_id) => thread_id,
                     Err(failure) => {
@@ -263,15 +290,18 @@ pub(crate) async fn run_stdio_app_server(
                         continue;
                     }
                 };
-                let thread_id = {
-                    let mut guard = state.lock().await;
-                    set_thread_if_idle(
-                        &mut guard,
-                        "thread/resume",
-                        Some(thread_id),
+                let thread_id = with_thread_binding_deadline(
+                    "thread/resume",
+                    session_bind_timeout,
+                    resume_server_thread(
+                        &ctx.api,
+                        ctx.auth_profile.as_deref(),
+                        &state,
+                        thread_id,
                         developer_instructions(&params),
-                    )
-                };
+                    ),
+                )
+                .await;
                 let thread_id = match thread_id {
                     Ok(thread_id) => thread_id,
                     Err(failure) => {
@@ -335,58 +365,31 @@ pub(crate) async fn run_stdio_app_server(
                 let task_state = state.clone();
                 let task_writer = writer.clone();
                 let task_thread_id = thread_id.clone();
-                tokio::spawn(async move {
-                    let result = run_turn(
-                        task_ctx,
-                        task_writer.clone(),
-                        TurnRequest {
-                            state: task_state.clone(),
-                            thread_id: task_thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                            message,
-                            params,
-                            developer_instructions: turn_developer_instructions,
-                            permission_mode,
-                            cancel,
-                        },
-                    )
-                    .await;
-                    if let Err(failure) = result {
-                        let terminal_thread_id = failure
-                            .canonical_session_id
-                            .as_deref()
-                            .unwrap_or(&task_thread_id);
-                        let _ = write_notification(
-                            &task_writer,
-                            "error",
-                            turn_failure_params(&failure, &turn_id, terminal_thread_id),
-                        )
-                        .await;
-                        let _ = write_notification(
-                            &task_writer,
-                            "turn/completed",
-                            turn_failed_params(&turn_id, terminal_thread_id, &failure),
-                        )
-                        .await;
-                    }
-                    let mut guard = task_state.lock().await;
-                    if guard
-                        .active_turn
-                        .as_ref()
-                        .is_some_and(|active| active.turn_id == turn_id)
-                    {
-                        guard.active_turn = None;
-                    }
-                });
+                tokio::spawn(execute_turn_task(
+                    task_ctx,
+                    task_writer,
+                    TurnRequest {
+                        state: task_state,
+                        thread_id: task_thread_id,
+                        turn_id,
+                        message,
+                        params,
+                        developer_instructions: turn_developer_instructions,
+                        permission_mode,
+                        cancel,
+                    },
+                ));
             }
             "turn/interrupt" => {
                 let turn_id = {
                     let guard = state.lock().await;
-                    if let Some(active) = guard.active_turn.as_ref() {
-                        active.cancel.cancel();
-                        Some(active.turn_id.clone())
-                    } else {
-                        None
+                    interrupt_matching_turn(&guard, &params)
+                };
+                let turn_id = match turn_id {
+                    Ok(turn_id) => turn_id,
+                    Err(error) => {
+                        write_response_error(&writer, id, &error).await?;
+                        continue;
                     }
                 };
                 if let Some(turn_id) = turn_id {
@@ -431,6 +434,95 @@ pub(crate) async fn run_stdio_app_server(
     Ok(())
 }
 
+async fn execute_turn_task(ctx: ServerContext, writer: JsonWriter, request: TurnRequest) {
+    let state = request.state.clone();
+    let turn_id = request.turn_id.clone();
+    let thread_id = request.thread_id.clone();
+    if let Err(failure) = run_turn(ctx, writer.clone(), request).await {
+        let terminal_thread_id = failure
+            .canonical_session_id
+            .as_deref()
+            .unwrap_or(&thread_id);
+        let _ = write_notification(
+            &writer,
+            "error",
+            turn_failure_params(&failure, &turn_id, terminal_thread_id),
+        )
+        .await;
+        let _ = write_notification(
+            &writer,
+            "turn/completed",
+            turn_failed_params(&turn_id, terminal_thread_id, &failure),
+        )
+        .await;
+    }
+    let mut guard = state.lock().await;
+    if guard
+        .active_turn
+        .as_ref()
+        .is_some_and(|active| active.turn_id == turn_id)
+    {
+        guard.active_turn = None;
+    }
+}
+
+async fn register_edge_before_chat(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<(), AppServerFailure> {
+    tokio::select! {
+        // An interrupt wins a simultaneous registration response before chat starts.
+        biased;
+        _ = cancel.cancelled() => Err(AppServerFailure::turn_failed(
+            "Edge registration interrupted before chat",
+        )),
+        result = tokio::time::timeout(
+            timeout,
+            crate::cli::edge_lifecycle::register_edge_once(api, token),
+        ) => match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(AppServerFailure::turn_failed(format!(
+                "Edge registration failed before chat: {error}"
+            ))),
+            Err(_) => Err(AppServerFailure::turn_failed(
+                "Edge registration timed out before chat",
+            )),
+        },
+    }
+}
+
+async fn prepare_turn_auth(
+    ctx: &ServerContext,
+    cancel: &CancellationToken,
+) -> Result<(String, Option<CliOwnerAuthSnapshot>), AppServerFailure> {
+    let (_, _, _, token) = get_profile_and_token(ctx.auth_profile.as_deref())?;
+    // Registration's native bearer provider may rotate the selected token.
+    // Freeze its owner first; never recapture a later login from the old token.
+    let owner =
+        session_runtime::capture_admitted_auth_owner(&ctx.api, ctx.auth_profile.as_deref(), &token)
+            .await;
+    let unavailable =
+        || AppServerFailure::turn_failed("Sign-in changed or could not be refreshed before chat");
+    if owner.is_none() && crate::cli::native_auth::active().is_some() {
+        return Err(unavailable());
+    }
+    register_edge_before_chat(&ctx.api, &token, cancel, EDGE_REGISTRATION_TIMEOUT).await?;
+    let token = if let Some(owner) = owner.as_ref() {
+        if !owner.is_current() {
+            return Err(unavailable());
+        }
+        session_runtime::owner_access_token(&ctx.api.clone().without_bearer_provider(), owner, None)
+            .await
+            .filter(|_| owner.is_current())
+            .ok_or_else(unavailable)?
+    } else {
+        token
+    };
+    Ok((token, owner))
+}
+
 async fn run_turn(
     ctx: ServerContext,
     writer: JsonWriter,
@@ -469,7 +561,11 @@ async fn run_turn(
     )
     .await?;
 
-    let (_, _, _, token) = get_profile_and_token(ctx.auth_profile.as_deref())?;
+    // The stdio entrypoint bypasses interactive startup, but its turns still
+    // advertise this checkout as an Edge executor. Register its stable
+    // materialization before asking the Server to admit a turn, as one-shot
+    // chat does.
+    let (token, auth_owner) = prepare_turn_auth(&ctx, &cancel).await?;
     let mut cli_context = crate::cli::cli_config::cli_context::CliContext::default();
     cli_context.select_model(params.get("model").and_then(Value::as_str));
     let model = params
@@ -544,7 +640,7 @@ async fn run_turn(
     let chat_ctx = BasicCliChatContext {
         mcp_manager: None,
         api: &ctx.api,
-        auth_profile: ctx.auth_profile.as_deref(),
+        auth_owner,
         message: &message,
         offering_id: None,
         model: model.as_deref(),
@@ -654,33 +750,146 @@ fn begin_turn(
         ));
     }
 
-    let thread_id = requested_thread_id
-        .or_else(|| state.thread_id.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let bound_thread_id = state.thread_id.clone().ok_or_else(|| {
+        AppServerFailure::turn_failed("turn/start requires thread/start or thread/resume")
+    })?;
+    if requested_thread_id
+        .as_deref()
+        .is_some_and(|requested| requested != bound_thread_id.as_str())
+    {
+        return Err(AppServerFailure::turn_failed(
+            "turn/start threadId does not match the bound thread; use thread/resume to switch sessions",
+        ));
+    }
     let turn_developer_instructions =
         requested_developer_instructions.or_else(|| state.developer_instructions.clone());
     state.active_turn = Some(ActiveTurn {
+        thread_id: bound_thread_id.clone(),
         turn_id: turn_id.to_string(),
         cancel,
     });
-    Ok((thread_id, turn_developer_instructions))
+    Ok((bound_thread_id, turn_developer_instructions))
 }
 
 fn set_thread_if_idle(
     state: &mut AppState,
     method: &str,
-    requested_thread_id: Option<String>,
+    thread_id: String,
     requested_developer_instructions: Option<String>,
 ) -> Result<String, AppServerFailure> {
     if let Some(active) = state.active_turn.as_ref() {
         return Err(AppServerFailure::turn_conflict(method, &active.turn_id));
     }
-    let thread_id = requested_thread_id
-        .or_else(|| state.thread_id.clone())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     state.thread_id = Some(thread_id.clone());
     state.developer_instructions = requested_developer_instructions;
     Ok(thread_id)
+}
+
+async fn with_thread_binding_deadline<F>(
+    method: &str,
+    deadline: Duration,
+    binding: F,
+) -> Result<String, AppServerFailure>
+where
+    F: Future<Output = Result<String, AppServerFailure>>,
+{
+    // The stdio reader awaits binding inline. Bound the entire operation,
+    // including response-body reads and resume hydration, so a stalled Server
+    // cannot prevent the reader from dispatching the next JSON-RPC request.
+    tokio::time::timeout(deadline, binding)
+        .await
+        .unwrap_or_else(|_| {
+            Err(AppServerFailure::turn_failed(format!(
+                "{method} timed out while binding the Server session"
+            )))
+        })
+}
+
+async fn start_server_thread(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    state: &Arc<Mutex<AppState>>,
+    developer_instructions: Option<String>,
+) -> Result<String, AppServerFailure> {
+    {
+        let guard = state.lock().await;
+        if let Some(active) = guard.active_turn.as_ref() {
+            return Err(AppServerFailure::turn_conflict(
+                "thread/start",
+                &active.turn_id,
+            ));
+        }
+    }
+    // Publish only a Server-issued identity. The old local UUID was not a
+    // session and made the first turn fail with "Session not found".
+    let session_id = crate::cli::slash::slash_state::create_server_session_identity(api, token)
+        .await
+        .map_err(AppServerFailure::turn_failed)?;
+    let mut guard = state.lock().await;
+    set_thread_if_idle(
+        &mut guard,
+        "thread/start",
+        session_id,
+        developer_instructions,
+    )
+}
+
+async fn resume_server_thread(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &Arc<Mutex<AppState>>,
+    session_id: String,
+    developer_instructions: Option<String>,
+) -> Result<String, AppServerFailure> {
+    {
+        let guard = state.lock().await;
+        if let Some(active) = guard.active_turn.as_ref() {
+            return Err(AppServerFailure::turn_conflict(
+                "thread/resume",
+                &active.turn_id,
+            ));
+        }
+    }
+    // Share the normal headless resume preflight: an ACK must mean that the
+    // canonical Server session and its ResumeBundle can actually be restored.
+    let routing = crate::cli::one_shot_session_routing::resolve_one_shot_session_routing(
+        api,
+        profile,
+        Some(session_id.clone()),
+        true,
+    )
+    .await
+    .map_err(AppServerFailure::turn_failed)?;
+    if routing.server_session_id.as_deref() != Some(session_id.as_str()) {
+        return Err(AppServerFailure::turn_failed(
+            "thread/resume did not return the requested Server session",
+        ));
+    }
+    let mut guard = state.lock().await;
+    set_thread_if_idle(
+        &mut guard,
+        "thread/resume",
+        session_id,
+        developer_instructions,
+    )
+}
+
+fn interrupt_matching_turn(state: &AppState, params: &Value) -> Result<Option<String>, String> {
+    let thread_id = requested_thread_id(params)?
+        .ok_or_else(|| "turn/interrupt missing threadId".to_string())?;
+    let turn_id = params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "turn/interrupt missing turnId".to_string())?;
+    let Some(active) = state.active_turn.as_ref() else {
+        return Ok(None);
+    };
+    if active.thread_id != thread_id || active.turn_id != turn_id {
+        return Err("turn/interrupt target does not match the active turn".to_string());
+    }
+    active.cancel.cancel();
+    Ok(Some(active.turn_id.clone()))
 }
 
 fn publish_committed_session_authority(state: &mut AppState, failure: &AppServerFailure) {
@@ -1215,22 +1424,31 @@ async fn write_json_line(writer: &JsonWriter, value: Value) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::{
-        AppServerFailure, AppState, SESSION_COMMIT_UNKNOWN_CODE, SESSION_PERSISTENCE_FAILED_CODE,
-        SESSION_PROJECTION_FAILED_CODE, TURN_CONFLICT_CODE, app_server_continuation,
-        approval_response_from_params, begin_turn, explain_mode_from_params, extract_turn_message,
-        join_or_abort_app_server_task, next_thread_id_after_turn, permission_mode_from_params,
-        persist_app_server_turn, publish_committed_session_authority, register_pending_approval,
-        requested_thread_id, response_failure_value, set_thread_if_idle, stream_event_notification,
-        thread_started_params, turn_completed_params, turn_failed_params, turn_failure_params,
+        AppServerFailure, AppState, JsonWriter, SESSION_COMMIT_UNKNOWN_CODE,
+        SESSION_PERSISTENCE_FAILED_CODE, SESSION_PROJECTION_FAILED_CODE, ServerContext,
+        TURN_CONFLICT_CODE, TurnRequest, app_server_continuation, approval_response_from_params,
+        begin_turn, execute_turn_task, explain_mode_from_params, extract_turn_message,
+        interrupt_matching_turn, join_or_abort_app_server_task, next_thread_id_after_turn,
+        permission_mode_from_params, persist_app_server_turn, publish_committed_session_authority,
+        register_edge_before_chat, register_pending_approval, requested_thread_id,
+        response_failure_value, resume_server_thread, run_app_server_lines, set_thread_if_idle,
+        start_server_thread, stream_event_notification, thread_started_params,
+        turn_completed_params, turn_failed_params, turn_failure_params,
+        with_thread_binding_deadline,
     };
     use crate::ExplainMode;
     use crate::cli::chat_stream::{ApprovalResponse, StreamEvent};
+    use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use crate::cli::command_router::HeadlessCanonicalCommitStatus;
     use crate::cli::permission_manager::PermissionMode;
+    use crate::test_utils::ProcessEnvGuard;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::sync::{Barrier, Mutex, oneshot};
+    use tokio::sync::{Barrier, Mutex, Notify, oneshot};
     use tokio_util::sync::CancellationToken;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn runtime_feedback_frame() -> astra_turn_core::context_feedback::RuntimeFeedbackFrame {
         serde_json::from_value(serde_json::json!({
@@ -1386,6 +1604,715 @@ mod tests {
         assert_eq!(params["turn"]["id"], "turn-1");
         assert_eq!(params["threadId"], "sess-123");
         assert_eq!(params["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn thread_start_binds_a_real_server_session_before_turn_admission() {
+        let server = MockServer::start().await;
+        let session_id = uuid::Uuid::new_v4().to_string();
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "session_id": session_id,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = Arc::new(Mutex::new(AppState::default()));
+
+        let bound = start_server_thread(
+            &api,
+            "test-token",
+            &state,
+            Some("gateway instructions".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bound, session_id);
+        let guard = state.lock().await;
+        assert_eq!(guard.thread_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(
+            guard.developer_instructions.as_deref(),
+            Some("gateway instructions")
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn failed_thread_creation_preserves_the_current_thread() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("existing-session".to_string()),
+            ..Default::default()
+        }));
+        assert!(
+            start_server_thread(&api, "test-token", &state, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some("existing-session")
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_thread_start_preserves_binding_and_allows_next_request() {
+        let server = MockServer::start().await;
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let response_attempts = attempts.clone();
+        let response_session_id = session_id.clone();
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let response = ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "session_id": response_session_id,
+                }));
+                if response_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    response.set_delay(Duration::from_secs(10))
+                } else {
+                    response
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("existing-session".to_string()),
+            developer_instructions: Some("existing instructions".to_string()),
+            ..Default::default()
+        }));
+
+        let failure = with_thread_binding_deadline(
+            "thread/start",
+            Duration::from_secs(1),
+            start_server_thread(&api, "test-token", &state, None),
+        )
+        .await
+        .expect_err("stalled session creation must time out");
+        assert!(failure.message.contains("thread/start timed out"));
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some("existing-session")
+        );
+        assert_eq!(
+            state.lock().await.developer_instructions.as_deref(),
+            Some("existing instructions")
+        );
+
+        let bound = with_thread_binding_deadline(
+            "thread/start",
+            Duration::from_secs(2),
+            start_server_thread(&api, "test-token", &state, None),
+        )
+        .await
+        .expect("the next request must be processed after the timeout");
+        assert_eq!(bound, session_id);
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn stalled_thread_resume_preflight_allows_next_request() {
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        let resume_id = uuid::Uuid::new_v4().to_string();
+        let next_id = uuid::Uuid::new_v4().to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{resume_id}")))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "session_id": next_id,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("existing-session".to_string()),
+            ..Default::default()
+        }));
+
+        let failure = with_thread_binding_deadline(
+            "thread/resume",
+            Duration::from_secs(1),
+            resume_server_thread(&api, Some("default"), &state, resume_id, None),
+        )
+        .await
+        .expect_err("stalled resume preflight must time out");
+        assert!(failure.message.contains("thread/resume timed out"));
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some("existing-session")
+        );
+
+        let bound = with_thread_binding_deadline(
+            "thread/start",
+            Duration::from_secs(2),
+            start_server_thread(&api, "test-token", &state, None),
+        )
+        .await
+        .expect("the next request must be processed after the timeout");
+        assert_eq!(bound, next_id);
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn stalled_thread_resume_restore_allows_next_request() {
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        let resume_id = uuid::Uuid::new_v4().to_string();
+        let next_id = uuid::Uuid::new_v4().to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{resume_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": resume_id,
+                "turn_count": 1,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{resume_id}/resume")))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "session_id": next_id,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("existing-session".to_string()),
+            ..Default::default()
+        }));
+
+        let failure = with_thread_binding_deadline(
+            "thread/resume",
+            Duration::from_secs(1),
+            resume_server_thread(&api, Some("default"), &state, resume_id, None),
+        )
+        .await
+        .expect_err("stalled restore must time out");
+        assert!(failure.message.contains("thread/resume timed out"));
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some("existing-session")
+        );
+
+        let bound = with_thread_binding_deadline(
+            "thread/start",
+            Duration::from_secs(2),
+            start_server_thread(&api, "test-token", &state, None),
+        )
+        .await
+        .expect("the next request must be processed after the timeout");
+        assert_eq!(bound, next_id);
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn stdio_reader_dispatches_next_start_after_stalled_start() {
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                account_id: Some("test-account".to_string()),
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let response_attempts = attempts.clone();
+        let response_session_id = session_id.clone();
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let response = ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "session_id": response_session_id,
+                }));
+                if response_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    response.set_delay(Duration::from_secs(10))
+                } else {
+                    response
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let ctx = ServerContext {
+            api: astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            auth_profile: Some("default".to_string()),
+            default_model: None,
+            system_prompt: None,
+            auto_approve: false,
+        };
+        let lines = (1..=2).map(|id| {
+            Ok(serde_json::json!({"id": id, "method": "thread/start", "params": {}}).to_string())
+        });
+
+        run_app_server_lines(
+            lines,
+            ctx,
+            state.clone(),
+            JsonWriter,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the stdio reader must settle the timeout and dispatch the next line");
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn stdio_reader_dispatches_next_start_after_stalled_resume() {
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                account_id: Some("test-account".to_string()),
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        let resume_id = uuid::Uuid::new_v4().to_string();
+        let next_id = uuid::Uuid::new_v4().to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{resume_id}")))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "session_id": next_id,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("existing-session".to_string()),
+            ..Default::default()
+        }));
+        let ctx = ServerContext {
+            api: astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+            auth_profile: Some("default".to_string()),
+            default_model: None,
+            system_prompt: None,
+            auto_approve: false,
+        };
+        let lines = vec![
+            Ok(serde_json::json!({
+                "id": 1,
+                "method": "thread/resume",
+                "params": {"threadId": resume_id},
+            })
+            .to_string()),
+            Ok(serde_json::json!({"id": 2, "method": "thread/start", "params": {}}).to_string()),
+        ];
+
+        run_app_server_lines(
+            lines,
+            ctx,
+            state.clone(),
+            JsonWriter,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the stdio reader must settle the timeout and dispatch the next line");
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some(next_id.as_str())
+        );
+        server.verify().await;
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn missing_server_resume_does_not_publish_a_stale_thread() {
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let server = MockServer::start().await;
+        let missing_id = uuid::Uuid::new_v4().to_string();
+        Mock::given(method("GET"))
+            .and(path(format!("/sessions/{missing_id}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("existing-session".to_string()),
+            ..Default::default()
+        }));
+
+        assert!(
+            resume_server_thread(&api, Some("default"), &state, missing_id, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state.lock().await.thread_id.as_deref(),
+            Some("existing-session")
+        );
+        server.verify().await;
+    }
+
+    #[test]
+    fn interrupt_only_cancels_the_exact_active_thread_and_turn() {
+        let mut state = AppState {
+            thread_id: Some("session-1".to_string()),
+            ..Default::default()
+        };
+        let cancel = Arc::new(CancellationToken::new());
+        begin_turn(
+            &mut state,
+            Some("session-1".to_string()),
+            "turn-1",
+            cancel.clone(),
+            None,
+        )
+        .unwrap();
+        for params in [
+            serde_json::json!({"threadId": "other", "turnId": "turn-1"}),
+            serde_json::json!({"threadId": "session-1", "turnId": "old-turn"}),
+            serde_json::json!({"threadId": "session-1"}),
+        ] {
+            assert!(interrupt_matching_turn(&state, &params).is_err());
+            assert!(!cancel.is_cancelled());
+        }
+        let matched = interrupt_matching_turn(
+            &state,
+            &serde_json::json!({"threadId": "session-1", "turnId": "turn-1"}),
+        )
+        .unwrap();
+        assert_eq!(matched.as_deref(), Some("turn-1"));
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stdio_registration_keeps_native_owner_across_refresh_and_rejects_replacement() {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use rsa::{pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts};
+        use wiremock::matchers::header;
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _credentials = crate::tests::isolate_credentials();
+        let _registry = ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _env_token = ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        // A generated, test-only key signs the loopback refresh response. No
+        // operator credentials or external provider are involved.
+        let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 2048).unwrap();
+        let der = key.to_pkcs1_der().unwrap();
+        let encoding = jsonwebtoken::EncodingKey::from_rsa_der(der.as_bytes());
+        for transition in ["rotation", "replacement", "refresh_failure"] {
+            let root = tempfile::tempdir().unwrap();
+            let store =
+                astra_credentials::native::NativeStore::with_directory(root.path().join("native"));
+            let server = MockServer::start().await;
+            let issuer = format!("{}/realms/moi", server.uri());
+            let mut session = crate::cli::native_auth::test_session();
+            session.environment.issuer = issuer.clone();
+            session.environment.astra_url = server.uri();
+            session.environment.moi_url = format!("{}/newmoi", server.uri());
+            session.environment.authorization_endpoint =
+                format!("{issuer}/protocol/openid-connect/auth");
+            session.environment.token_endpoint = format!("{issuer}/protocol/openid-connect/token");
+            session.environment.revocation_endpoint =
+                format!("{issuer}/protocol/openid-connect/revoke");
+            session.environment.jwks_uri = format!("{issuer}/protocol/openid-connect/certs");
+            session.expires_at = astra_credentials::native::unix_now().unwrap() + 10;
+            let (session, _) = store.publish(session).unwrap();
+            let binding = crate::cli::native_auth::binding_for_test(store.clone(), session.clone());
+            let _active = crate::cli::native_auth::install_active_for_test(binding.clone());
+            let _identity =
+                crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                    &binding.profile_name(),
+                    Some(&session.astra_user_id),
+                )
+                .unwrap();
+            let now = astra_credentials::native::unix_now().unwrap();
+            let mut jwt_header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+            jwt_header.kid = Some("stdio-test".into());
+            let rotated = jsonwebtoken::encode(
+                &jwt_header,
+                &serde_json::json!({
+                    "iss": issuer, "sub": session.subject, "sid": session.session_id,
+                    "azp": "astra-cli", "aud": ["astra-api", "aistudio-api"],
+                    "iat": now, "exp": now + 900
+                }),
+                &encoding,
+            )
+            .unwrap();
+            Mock::given(method("GET")).and(path("/realms/moi/protocol/openid-connect/certs"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"keys": [{
+                    "kty":"RSA", "alg":"RS256", "use":"sig", "kid":"stdio-test",
+                    "n":URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()), "e":URL_SAFE_NO_PAD.encode(key.e().to_bytes_be())
+                }]}))).expect(usize::from(transition != "refresh_failure") as u64).mount(&server).await;
+            Mock::given(method("POST")).and(path("/realms/moi/protocol/openid-connect/token"))
+                .respond_with(ResponseTemplate::new(if transition == "refresh_failure" {400} else {200})
+                    .set_body_json(serde_json::json!({"access_token":rotated,"refresh_token":"synthetic-rotated", "expires_in":900,"token_type":"Bearer"})))
+                .expect(1).mount(&server).await;
+            let replacement_store = store.clone();
+            let replacement_session = session.clone();
+            Mock::given(method("POST"))
+                .and(path("/agents/edge"))
+                .and(header("authorization", format!("Bearer {rotated}")))
+                .respond_with(move |_: &wiremock::Request| {
+                    if transition == "replacement" {
+                        replacement_store
+                            .publish(replacement_session.clone())
+                            .unwrap();
+                    }
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true}))
+                })
+                .expect(usize::from(transition != "refresh_failure") as u64)
+                .mount(&server)
+                .await;
+            let ctx = ServerContext {
+                api: astra_thin_client::ThinClient::new(&server.uri(), None)
+                    .unwrap()
+                    .with_bearer_provider(binding),
+                auth_profile: None,
+                default_model: None,
+                system_prompt: None,
+                auto_approve: false,
+            };
+            let prepared = super::prepare_turn_auth(&ctx, &CancellationToken::new()).await;
+            if transition == "rotation" {
+                let (token, owner) = prepared.expect("registration and confirmed rotation");
+                let owner =
+                    owner.expect("registration must not downgrade native owner to static bearer");
+                assert!(owner.is_current());
+                assert_eq!(store.current().unwrap().generation, session.generation);
+                assert_eq!(
+                    token, rotated,
+                    "turn admission uses the same owner's rotated bearer"
+                );
+                assert_eq!(
+                    crate::cli::session::session_runtime::owner_access_token(
+                        &ctx.api.clone().without_bearer_provider(),
+                        &owner,
+                        None
+                    )
+                    .await
+                    .as_deref(),
+                    Some(rotated.as_str())
+                );
+            } else {
+                assert!(
+                    prepared.is_err(),
+                    "{transition} cannot admit a downgraded/static turn"
+                );
+            }
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stalled_edge_registration_interrupt_releases_turn_and_session_lease() {
+        let _registry_guard = ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                account_id: Some("test-account".to_string()),
+                access_token: Some("test-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let server = MockServer::start().await;
+        let request_seen = Arc::new(Notify::new());
+        let seen_by_mock = request_seen.clone();
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(move |_: &wiremock::Request| {
+                seen_by_mock.notify_one();
+                ResponseTemplate::new(200).set_delay(Duration::from_secs(10))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let session_id = format!("app-server-edge-register-{}", uuid::Uuid::new_v4());
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some(session_id.clone()),
+            ..Default::default()
+        }));
+        let cancel = Arc::new(CancellationToken::new());
+        begin_turn(
+            &mut *state.lock().await,
+            Some(session_id.clone()),
+            "turn-stalled",
+            cancel.clone(),
+            None,
+        )
+        .unwrap();
+        let task = tokio::spawn(execute_turn_task(
+            ServerContext {
+                api: astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+                auth_profile: None,
+                default_model: None,
+                system_prompt: None,
+                auto_approve: false,
+            },
+            JsonWriter,
+            TurnRequest {
+                state: state.clone(),
+                thread_id: session_id.clone(),
+                turn_id: "turn-stalled".to_string(),
+                message: "hello".to_string(),
+                params: serde_json::json!({}),
+                developer_instructions: None,
+                permission_mode: PermissionMode::Auto,
+                cancel: cancel.clone(),
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(5), request_seen.notified())
+            .await
+            .expect("Edge registration request should reach the Server");
+        assert!(matches!(
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id),
+            Err(astra_services::session_journal::SessionExecutionLeaseError::Conflict { .. })
+        ));
+
+        let matched = interrupt_matching_turn(
+            &*state.lock().await,
+            &serde_json::json!({"threadId": session_id, "turnId": "turn-stalled"}),
+        )
+        .unwrap();
+        assert_eq!(matched.as_deref(), Some("turn-stalled"));
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("interrupted registration must settle promptly")
+            .unwrap();
+        assert!(state.lock().await.active_turn.is_none());
+        let lease =
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
+                .expect("interrupted turn must release the session lease");
+        drop(lease);
+        begin_turn(
+            &mut *state.lock().await,
+            Some(session_id),
+            "turn-after-interrupt",
+            Arc::new(CancellationToken::new()),
+            None,
+        )
+        .expect("the next turn must be admitted");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stalled_edge_registration_has_a_finite_deadline() {
+        let _registry_guard = ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/agents/edge"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let failure = register_edge_before_chat(
+            &api,
+            "test-token",
+            &CancellationToken::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("stalled registration must time out");
+        assert!(failure.message.contains("timed out"));
+        server.verify().await;
+    }
+
+    #[test]
+    fn turn_start_rejects_an_unbound_thread() {
+        let mut state = AppState::default();
+        let failure = begin_turn(
+            &mut state,
+            None,
+            "turn-unbound",
+            Arc::new(CancellationToken::new()),
+            None,
+        )
+        .expect_err("an unbound turn must not invent a local session ID");
+        assert!(failure.message.contains("thread/start"));
+        assert!(state.active_turn.is_none());
     }
 
     #[tokio::test]
@@ -1555,7 +2482,7 @@ mod tests {
                 set_thread_if_idle(
                     &mut guard,
                     method,
-                    Some(format!("thread-rebind-{index}")),
+                    format!("thread-rebind-{index}"),
                     Some(format!("instructions-{index}")),
                 )
             }));
@@ -1585,26 +2512,50 @@ mod tests {
     }
 
     #[test]
-    fn admitted_turn_does_not_publish_requested_thread_before_durable_settlement() {
+    fn turn_start_rejects_mismatched_thread_without_mutating_binding() {
         let mut state = AppState {
             thread_id: Some("thread-before-turn".to_string()),
+            developer_instructions: Some("bound instructions".to_string()),
             ..Default::default()
         };
-        let (execution_thread_id, _) = begin_turn(
+        let failure = begin_turn(
             &mut state,
             Some("thread-requested-for-turn".to_string()),
-            "turn-that-will-fail",
+            "turn-mismatched",
+            Arc::new(CancellationToken::new()),
+            Some("unbound instructions".to_string()),
+        )
+        .expect_err("turn/start must not switch the bound session");
+
+        assert!(failure.message.contains("thread/resume"));
+        assert_eq!(state.thread_id.as_deref(), Some("thread-before-turn"));
+        assert_eq!(
+            state.developer_instructions.as_deref(),
+            Some("bound instructions")
+        );
+        assert!(state.active_turn.is_none());
+
+        let (execution_thread_id, instructions) = begin_turn(
+            &mut state,
+            Some("thread-before-turn".to_string()),
+            "turn-on-bound-thread",
             Arc::new(CancellationToken::new()),
             None,
         )
-        .expect("turn admission");
+        .expect("the matching threadId uses the established binding");
+        assert_eq!(execution_thread_id, "thread-before-turn");
+        assert_eq!(instructions.as_deref(), Some("bound instructions"));
 
-        assert_eq!(execution_thread_id, "thread-requested-for-turn");
-        assert_eq!(
-            state.thread_id.as_deref(),
-            Some("thread-before-turn"),
-            "admission selects execution authority but persistence settlement owns pointer publication"
-        );
+        state.active_turn = None;
+        let (execution_thread_id, _) = begin_turn(
+            &mut state,
+            None,
+            "turn-without-thread-id",
+            Arc::new(CancellationToken::new()),
+            None,
+        )
+        .expect("an omitted threadId also uses the established binding");
+        assert_eq!(execution_thread_id, "thread-before-turn");
     }
 
     #[test]

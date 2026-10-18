@@ -68,6 +68,20 @@ available through a ready bound Edge provider. Capability availability does
 not enable either tool for a user turn; Web and SDK clients must explicitly
 select optional tools separately.
 
+### Outbound HTTPS trust
+
+Astra HTTP clients using the workspace reqwest transport trust both bundled
+public CA roots and the process platform trust store. This supports managed
+private CAs, including certificates used by an HTTPS inspection proxy, while
+retaining certificate-chain and hostname verification and existing proxy routing.
+
+For a process-specific CA configuration, set `SSL_CERT_FILE` to a PEM CA bundle
+and/or `SSL_CERT_DIR` to a directory of PEM CA files before starting Astra. These
+variables select the native-root source instead of platform discovery; bundled
+public roots remain available. Configure them only in the selected CLI, User
+Runner, or Server process environment. They do not transfer a user machine’s
+trust store to the Server. Restart the process after changing its trust settings.
+
 ### Auth secrets (REQUIRED in production)
 
 - `ASTRA_JWT_SECRET`
@@ -155,7 +169,9 @@ process-level selection of their Server execution-round ceilings.
 
 Runtime configuration exposes controls consumed by execution: compression,
 retrieval, tool policy and tracing. The retired `verification`,
-`memory_pressure`, `context_window` and `token_budget` sections are not supported.
+`memory_pressure`, `context_window`, `token_budget` and `budget_policy` sections
+are not supported. Execution capacity uses the admitted limits and canonical
+adaptive renewal; the retired outcome-streak policy never controlled it.
 Execution input budgets belong to RuntimeLimits (`ASTRA_MAX_TURN_INPUT_TOKENS`)
 and the admitted model context window; self budget views report observed budget
 state instead of an inactive configuration cap. Model context
@@ -163,6 +179,16 @@ window metadata and tool verification contracts retain their existing owners.
 
 Unknown top-level runtime fields are rejected by the configuration parser.
 User and project files, environment values and CLI settings apply in that order.
+Local cache and credential-directory overrides do not relocate the canonical
+physical-device identity. Local CLI/Edge execution requires
+`~/.astra/edge-materializations/device.id` and its canonical checkout identity
+files under the default home state root. Initialize Astra on the same device
+with that directory writable before running in a restricted home environment;
+retain the canonical identity files alongside any isolated cache. A writable
+`ASTRA_LOCAL_STATE_ROOT` or credential directory alone is insufficient. The
+existing identity preflight reports this prerequisite before turn admission;
+do not delete identity files or login credentials as a repair step.
+
 The configuration editor saves user defaults under `ASTRA_LOCAL_STATE_ROOT/config/runtime.toml`
 when that root is set, otherwise under `~/.astra/config/runtime.toml`; local versions
 live in the adjacent `versions` directory. Saving defaults retains invocation CLI settings

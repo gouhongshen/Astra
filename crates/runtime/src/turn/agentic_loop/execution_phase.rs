@@ -21,10 +21,7 @@ use super::lifecycle::{
 };
 use super::verification_frontier::VerificationRecoveryError;
 use crate::turn::run_control::{ProviderBoundaryAuthorization, UserIntentAdmissionAuthority};
-use astra_config::user_profile::{
-    MutationCompletionScope, Scenario, TurnIntentDomain, WorkspaceMutationIntent,
-};
-use astra_core::render_compact_status;
+use astra_config::user_profile::{Scenario, WorkspaceMutationIntent};
 use astra_services::{ContextManifestWrite, DatabaseContextManifestStore, SessionArtifactStore};
 use astra_turn_core::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut, AgenticTurnIngestOutcome,
@@ -66,6 +63,7 @@ fn record_direct_child_barrier<H: AgenticLoopHost>(
                 "status": child["status"],
                 "result_sha256": child["result_sha256"],
                 "result_truncated": child["result_truncated"],
+                "result_range": child["result_range"],
             })
         })
         .collect();
@@ -124,6 +122,112 @@ fn record_direct_child_barrier<H: AgenticLoopHost>(
     }
 }
 
+/// Record only result bytes present in the final request of a successful
+/// provider turn. Collection, artifact storage and a completed child alone do
+/// not prove delivery. Reuse the dependency boundary, not a second read ledger.
+pub(crate) fn record_observed_child_reads<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    messages: &[serde_json::Value],
+    started: Instant,
+) {
+    let Some(parent) = state.current_run_id.clone() else {
+        return;
+    };
+    let children = observed_child_read_windows(messages, &parent);
+    if !children.is_empty() {
+        record_direct_child_barrier(
+            host,
+            state,
+            &parent,
+            "results_adopted",
+            &serde_json::Value::Array(children),
+            started,
+            None,
+        );
+    }
+}
+
+fn observed_child_read_windows(
+    messages: &[serde_json::Value],
+    parent: &str,
+) -> Vec<serde_json::Value> {
+    use astra_turn_core::tool_result_storage::{TOOL_RESULT_TOOL_NAME_FIELD, tool_result_run_id};
+    use serde_json::{Value, json};
+    let latest_round = messages
+        .iter()
+        .filter(|message| tool_result_run_id(message) == Some(parent))
+        .filter_map(|message| message["_round_index"].as_u64())
+        .max();
+    let mut children = Vec::new();
+    for message in messages {
+        if message["role"] != "tool"
+            || tool_result_run_id(message) != Some(parent)
+            || message["_round_index"].as_u64() != latest_round
+        {
+            continue;
+        }
+        let Some(name @ ("agent" | "agent_fanout")) = message[TOOL_RESULT_TOOL_NAME_FIELD].as_str()
+        else {
+            continue;
+        };
+        let Some(content) = message["content"].as_str() else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(content) else {
+            continue;
+        };
+        let items = if name == "agent_fanout" {
+            value["results"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        } else {
+            std::slice::from_ref(&value)
+        };
+        for item in items {
+            let result = if name == "agent_fanout" {
+                &item["result"]
+            } else {
+                item
+            };
+            let (Some(agent), Some(run), Some(text)) = (
+                result["agent_id"].as_str(),
+                result["run_id"].as_str(),
+                result["result"].as_str(),
+            ) else {
+                continue;
+            };
+            if result["status"] != "completed" || agent.is_empty() || run.is_empty() {
+                continue;
+            }
+            let range = if name == "agent_fanout" {
+                let (Some(start), Some(end), Some(total)) = (
+                    item["result_start_offset"].as_u64(),
+                    item["result_end_offset"].as_u64(),
+                    item["result_bytes"].as_u64(),
+                ) else {
+                    continue;
+                };
+                if item["agent_id"] != agent
+                    || item["run_id"] != run
+                    || end > total
+                    || end.checked_sub(start) != Some(text.len() as u64)
+                {
+                    continue;
+                }
+                [start, end, total]
+            } else {
+                [0, text.len() as u64, text.len() as u64]
+            };
+            children.push(json!({"agent_id":agent,"run_id":run,"status":"completed",
+                "result_sha256":format!("{:x}",Sha256::digest(text.as_bytes())),
+                "result_range":range,"result_truncated":range[0] != 0 || range[1] < range[2]}));
+        }
+    }
+    children
+}
+
 fn stage_direct_child_results<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -167,7 +271,7 @@ fn stage_direct_child_results<H: AgenticLoopHost>(
     let children: Vec<_> = owner
         .take_completed_direct_children()
         .into_iter()
-        .map(|child| serde_json::to_value(child).expect("direct child must serialize"))
+        .map(|child| serde_json::to_value(child.as_ref()).expect("direct child must serialize"))
         .filter(|child| {
             !retained.contains(&(
                 child["agent_id"].as_str().unwrap_or_default(),
@@ -410,6 +514,17 @@ impl RuntimeActivityOutcome {
     }
 }
 
+fn has_retained_runtime_input(state: &AgenticLoopState) -> bool {
+    state.volatile_pending.iter().any(|injection| {
+        matches!(
+            injection.kind,
+            super::host::VolatileKind::BackgroundTaskNotification
+                | super::host::VolatileKind::Mailbox
+        ) && !injection.attempt_leased
+            && injection.payload["observed_by_provider"] != true
+    })
+}
+
 /// Both synchronization edges use the same input/capacity machinery. An
 /// observation timeout is not permission to finalize or cancel child work.
 pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
@@ -420,11 +535,13 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
     let owner = host.direct_child_completion_owner(state);
     let run_id = state.current_run_id.clone().unwrap_or_default();
     let replies = Arc::clone(&state.messaging.reply_obligations);
+    let retained_runtime_input = has_retained_runtime_input(state);
     if observation_request.is_none()
         && !owner
             .as_ref()
             .is_some_and(|owner| owner.has_pending_direct_children())
         && !replies.has_pending(&run_id)
+        && !retained_runtime_input
     {
         return Ok(RuntimeActivityOutcome::NoPendingWork);
     }
@@ -465,6 +582,12 @@ pub(crate) async fn await_runtime_activity<H: AgenticLoopHost>(
             .is_some_and(|limit| state.llm_rounds_completed as usize >= limit.get());
     let outcome = if no_synthesis_budget {
         "synthesis_budget_exhausted"
+    } else if retained_runtime_input {
+        // A checkpoint can restore a provider-required child result or mailbox
+        // message after its edge notification was consumed. It is already in
+        // the canonical volatile custody lane, so do not park on a stale wait
+        // receipt and wait for a second wake that will never arrive.
+        "runtime_input_ready"
     } else {
         let children = serde_json::json!(
             owner
@@ -815,7 +938,7 @@ async fn direct_child_parent_cancelled(cancellation: &super::host::CancellationS
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderBoundaryGate {
+pub(crate) enum ProviderBoundaryGate {
     Authorized,
     Paused,
 }
@@ -1060,7 +1183,7 @@ async fn continue_after_user_intent_settlement_fence(
     Ok(TurnExecutionControl::ContinueLoop)
 }
 
-async fn authorize_provider_boundary(
+pub(crate) async fn authorize_provider_boundary(
     state: &mut AgenticLoopState,
 ) -> Result<ProviderBoundaryGate, astra_core::ClassifiedError> {
     let (Some(run_control), Some(user_id), Some(run_id)) = (
@@ -1725,7 +1848,6 @@ pub(crate) fn enforce_completion_action_window_before_text_completion(
     if let Some(pending) = pending_action {
         let pending_label = match pending {
             CompletionAction::RequiredWorkspaceMutation => "workspace mutation".to_string(),
-            CompletionAction::RequiredExternalEffect => "external state mutation".to_string(),
             CompletionAction::CompletionTaskAction => "completion task action".to_string(),
             CompletionAction::PostMutationObservation => "post-mutation observation".to_string(),
             CompletionAction::PostMutationRepair => "post-mutation repair".to_string(),
@@ -2322,8 +2444,6 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
         && let Some(next_action) = pending_action.clone()
         && ((matches!(window.action, CompletionAction::RequiredWorkspaceMutation)
             && !matches!(next_action, CompletionAction::RequiredWorkspaceMutation))
-            || (matches!(window.action, CompletionAction::RequiredExternalEffect)
-                && !matches!(next_action, CompletionAction::RequiredExternalEffect))
             || (matches!(window.action, CompletionAction::CompletionTaskAction)
                 && !matches!(next_action, CompletionAction::CompletionTaskAction))
             || (matches!(window.action, CompletionAction::CanonicalWorkRepair)
@@ -2340,41 +2460,6 @@ fn advance_completion_action_window_after_tool_round_for_work_state_from_record_
                 )))
         && completion_action_window_is_batchable(state, &next_action)
     {
-        if matches!(next_action, CompletionAction::RequiredExternalEffect)
-            && external_effect_replay_forbidden(state)
-        {
-            // The workspace half of a Mixed turn may already have matched.
-            // That does not reopen an external write after a pathless Bash
-            // has executed. Leave the consumed workspace window in place.
-            mark_workspace_completion_incomplete(
-                state,
-                "external mutation has no executor-owned receipt and no continuable file observation contract; do not replay the same write",
-                "The external change is unverified: a tool ran, but the executor has no authoritative external receipt and no file observation contract it can continue. Do not repeat the same non-idempotent write.",
-            );
-            // The interruption alone does not stop the tool loop. Close
-            // execution authority so the next provider response cannot run
-            // another upload through the already-consumed window. Leave
-            // `budget_wrapup_injected` unset: when this writer consumed the
-            // last round, prepare_turn_iteration reserves one text-only turn
-            // itself. Setting the flag here skips that reservation and lets
-            // budget exhaustion replace this explanation.
-            state.hooks.completion_settlement.text_only = true;
-            state.hooks.completion_settlement.work_settlement_only = false;
-            state.push_volatile_payload(
-                super::host::VolatileKind::FinalAnswerSettlement,
-                serde_json::json!({
-                    "schema": "completion_settlement.v2",
-                    "signal": "agentic_execution_slice_complete",
-                    "mode": "text_only",
-                    "allowed_action": serde_json::Value::Null,
-                    "attempts_remaining": 0,
-                    "execution_authority": "none",
-                    "instruction": "The external change is unverified. Answer from the evidence already gathered and do not request another tool. Do not repeat the same non-idempotent write.",
-                    "authority": "runtime_bounded_settlement",
-                }),
-            );
-            return;
-        }
         if active_work_attempt
             || matches!(window.action, CompletionAction::PostMutationRepair)
             || matches!(next_action, CompletionAction::PostMutationObservation)
@@ -2655,23 +2740,20 @@ fn enforce_workspace_completion_before_text_completion_with_disposition(
         ));
         return false;
     }
-    if has_unsettled_side_effecting_cancellation(state) {
-        // A cancellation after a side-effect-capable executor crossed its
-        // execution boundary is not equivalent to a harmless failed probe.
-        // In particular, its process may have been interrupted between a
-        // durable external mutation and its own cleanup/verification step.
-        // There is no safe generic way to let later prose or an unrelated
-        // successful command settle that unknown external state. Preserve the
-        // partial and require a resumed run with an executor-owned receipt.
-        // Do not render a pre-existing success claim beside the typed
-        // incomplete disposition; the durable checkpoint retains the partial
-        // trace, while the user-visible terminal must remain truthful.
+    if has_unsettled_side_effecting_outcome(state) {
+        // Interrupted or unacknowledged side effects differ from a known
+        // failed command. Neither later prose nor an unrelated successful
+        // probe establishes whether the operation committed. Preserve the
+        // partial result and require reconciliation by the owning lifecycle.
+        // Supply a fallback when no provider partial exists. Canonical
+        // finalization preserves assistant-authored partial output separately
+        // from this typed incomplete outcome; prose cannot clear it.
         state.final_text_model_item_id = None;
         state.final_text.clear();
         mark_workspace_completion_incomplete(
             state,
-            "a side-effect-capable tool was cancelled after execution started without a trusted settlement receipt",
-            "A side-effecting command was interrupted after it started, so the resulting state is unverified. The partial result is preserved; continue from this checkpoint with an executor-owned verification or recovery action.",
+            "a side-effect-capable invocation has an interrupted or unknown outcome",
+            "A side-effecting operation was interrupted or its outcome could not be confirmed. Its effects remain unverified. The partial result is preserved; reconcile the operation before deciding whether another action is safe.",
         );
         return false;
     }
@@ -2694,67 +2776,6 @@ fn enforce_workspace_completion_before_text_completion_with_disposition(
         // explicit verification/outcome guards still run after this function.
         return false;
     }
-    let external_effect = has_concrete_external_effect(state);
-    let external_owed = requires_external_effect_completion(state) && !external_effect;
-    // A Bash call that already ran without an accepted external file contract
-    // cannot be repaired by reissuing the write. Filesystem recovery stays
-    // available only while the executor still has an accepted, incomplete
-    // `external_state_paths` observation, or while no Bash has executed yet.
-    let unverified_remote_without_file_contract = external_effect_replay_forbidden(state);
-    if external_owed && !unverified_remote_without_file_contract {
-        if state.hooks.completion_settlement.external_effect_retries > 0 {
-            mark_workspace_completion_incomplete(
-                state,
-                "required external state mutation had no executor-owned delta receipt after the bounded recovery",
-                "The requested external state change remains incomplete: no authoritative executor-owned external delta receipt was recorded. The response is preserved as an unverified partial; continue from this checkpoint or report the concrete blocker.",
-            );
-            return false;
-        }
-        state.hooks.completion_settlement.external_effect_retries = 1;
-        state.hooks.completion_settlement.text_only = false;
-        state.hooks.completion_settlement.work_settlement_only = false;
-        state.hooks.completion_settlement.wrapup_origin = None;
-        state.budget_wrapup_injected = false;
-        state.final_text_model_item_id = None;
-        state.final_text.clear();
-        state.max_turns = state.max_turns.saturating_add(1);
-        state.remaining_turns = state.remaining_turns.saturating_add(1);
-        let bound_roots = latest_continuable_external_file_roots(state);
-        state
-            .hooks
-            .completion_settlement
-            .external_effect_recovery_paths = bound_roots.clone();
-        if bound_roots.is_some() {
-            // The one recovery call is admitted only when it repeats this
-            // exact root set. An older, unrelated path declaration must not
-            // authorize a different write.
-            state.hooks.completion_settlement.completion_action_window =
-                Some(super::host::CompletionActionWindow {
-                    action: CompletionAction::RequiredExternalEffect,
-                    attempts_remaining: 1,
-                    mismatch_corrections_remaining: 1,
-                    consumed: false,
-                    matched: false,
-                });
-        }
-        let mut payload = serde_json::json!({
-            "schema": "external_completion_required.v1",
-            "signal": "required_external_effect_missing",
-            "evidence": { "authoritative_external_effect_receipts": 0 },
-            "instruction": if bound_roots.is_some() {
-                "The executor still has one incomplete external file observation. Repeat one foreground Bash whose external_state_paths are exactly bound_external_state_paths, so the executor can compare that same set. A different root does not match. Do not repeat a Bash call that already ran without this path contract. A later read-only probe cannot establish the receipt."
-            } else {
-                "The requested state is outside the bound workspace, but no authoritative external delta was observed. Continue with one foreground action that performs the required external mutation and, on that same Bash call, uses the structured external_state_paths field to list only the smallest absolute external roots that must change. A later read-only probe cannot establish the receipt. The executor, not your prose or the command exit status, will compare their pre/post state. If no safe bounded root can be observed, report that blocker precisely."
-            },
-            "authority": "typed_turn_intent_and_executor_effect_ledger",
-        });
-        if let Some(roots) = bound_roots {
-            payload["bound_external_state_paths"] = serde_json::json!(roots);
-        }
-        state.push_volatile_payload(super::host::VolatileKind::FinalAnswerSettlement, payload);
-        return true;
-    }
-
     let intent_requires_mutation = requires_bound_workspace_completion(state);
     let concrete_mutation = has_concrete_workspace_mutation(state);
     let convergence_state = live_desired_state_convergence_state(state);
@@ -2888,78 +2909,29 @@ fn enforce_workspace_completion_before_text_completion_with_disposition(
         );
     }
 
-    if unverified_remote_without_file_contract && state.interruption.is_none() {
-        // Mixed workspace settlement already ran above. This close does not
-        // grant another external write and does not discard tool-grounded text.
-        mark_workspace_completion_incomplete(
-            state,
-            "external mutation has no executor-owned receipt and no continuable file observation contract; do not replay the same write",
-            "The external change is unverified: a tool ran, but the executor has no authoritative external receipt and no file observation contract it can continue. Do not repeat the same non-idempotent write.",
-        );
-    }
-
     false
 }
 
-/// A started cancellation of a mutating-capable invocation creates an
-/// independent terminal settlement debt. `was_executed` is the durable
-/// boundary fact; a rejected or never-started request cannot have changed
-/// state. A declared external target set can be closed only by a later
-/// executor-owned effect receipt for that exact target set. We intentionally
-/// do not infer recovery from command text, prose, or an unrelated successful
-/// tool call. An unscoped cancellation remains fail-closed because there is
-/// no machine-correlatable state boundary to settle.
-fn has_unsettled_side_effecting_cancellation(state: &AgenticLoopState) -> bool {
-    state
-        .stall
-        .tool_call_records
-        .iter()
-        .enumerate()
-        .any(|(index, record)| {
-            if !record.was_executed()
-                || record.ok
-                || record.error_kind != Some(astra_core::ErrorKind::Cancelled)
-                || !crate::turn::tool_side_effects::tool_call_may_mutate_any_state(
-                    &record.name,
-                    super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
+/// A started cancellation or timeout may have left partial effects. Execution
+/// ownership and the owning lifecycle must reconcile it; unrelated successful tools or
+/// generic state observations cannot establish that the operation succeeded.
+fn has_unsettled_side_effecting_outcome(state: &AgenticLoopState) -> bool {
+    state.stall.tool_call_records.iter().any(|record| {
+        record.was_executed()
+            && !record.ok
+            && matches!(
+                record.error_kind,
+                Some(
+                    astra_core::ErrorKind::Cancelled
+                        | astra_core::ErrorKind::ToolTimeout
+                        | astra_core::ErrorKind::ToolOutcomeUnknown
                 )
-            {
-                return false;
-            }
-            let Some(target_set_digest) = declared_external_target_set_digest(record) else {
-                return true;
-            };
-            !state.stall.tool_call_records[index + 1..]
-                .iter()
-                .any(|later| {
-                    later.was_executed()
-                        && later.ok
-                        && later.external_effect_observed == Some(true)
-                        && declared_external_target_set_digest(later).as_deref()
-                            == Some(target_set_digest.as_str())
-                        && later.external_effect_receipt.as_ref().is_some_and(
-                            |receipt| {
-                                astra_tools::workspace_observation::is_authoritative_external_effect_receipt(receipt)
-                                    && receipt
-                                        .get("target_set_digest")
-                                        .and_then(serde_json::Value::as_str)
-                                        == Some(target_set_digest.as_str())
-                            },
-                        )
-                })
-        })
-}
-
-/// Canonical, model-declared target-set digest for correlating a cancellation
-/// with a later executor-owned external receipt. The receipt itself supplies
-/// the authority; matching its embedded digest prevents a receipt for one
-/// target set from clearing debt created by another. Missing or malformed
-/// declarations remain fail-closed.
-fn declared_external_target_set_digest(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> Option<String> {
-    let args = super::lifecycle::extract_tool_args(record.authoritative_args_full())?;
-    astra_tools::workspace_observation::ExternalEffectFingerprint::declared_target_set_digest_from_args(&args)
+            )
+            && crate::turn::tool_side_effects::tool_call_may_mutate_any_state(
+                &record.name,
+                super::lifecycle::extract_tool_args(record.authoritative_args_full()).as_ref(),
+            )
+    })
 }
 
 /// Convert an exhausted workspace-delivery recovery window into a typed
@@ -3413,6 +3385,17 @@ fn is_llm_provider_admission_error(error: &astra_core::ClassifiedError) -> bool 
     details.get("source").and_then(serde_json::Value::as_str) == Some("llm_provider_admission")
 }
 
+fn exhausted_provider_recovery_action(state: &AgenticLoopState) -> ResumeAction {
+    ResumeAction::RequiresIntervention {
+        description: format!(
+            "{} could not produce a usable response after one recovery. The request remains unfinished. Choose another authorized model, or explicitly retry after the provider recovers; prior conversation and tool evidence remain available.",
+            state
+                .current_model_identity()
+                .unwrap_or("The selected model"),
+        ),
+    }
+}
+
 fn record_direct_llm_error_state(
     state: &mut AgenticLoopState,
     error: &astra_core::ClassifiedError,
@@ -3433,6 +3416,18 @@ fn record_direct_llm_error_state(
     if let Some((kind, action)) =
         astra_turn_core::interruption::interruption_from_error_kind(error.kind)
     {
+        let exhausted_safe_recovery = state.provider_adaptation.safe_recovery_attempted
+            && matches!(
+                error.kind,
+                astra_core::ErrorKind::ProviderDeadline
+                    | astra_core::ErrorKind::StreamIdle
+                    | astra_core::ErrorKind::StreamTransport
+            );
+        let action = if exhausted_safe_recovery {
+            exhausted_provider_recovery_action(state)
+        } else {
+            action
+        };
         state.interruption = Some(InterruptionRecord::new(
             kind,
             action,
@@ -3578,29 +3573,30 @@ fn is_transport_success_empty_completion(details: &serde_json::Value) -> bool {
 fn record_repeated_transport_success_empty_completion(
     state: &mut AgenticLoopState,
     error: &astra_core::ClassifiedError,
-) {
+) -> bool {
     if state.interruption.is_some()
-        || !state.provider_adaptation.action_convergence_attempted
+        || !state.provider_adaptation.safe_recovery_attempted
         || error.kind != astra_core::ErrorKind::ProviderDeadline
     {
-        return;
+        return false;
     }
     let Some(details) = error
         .details_json
         .as_deref()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
     else {
-        return;
+        return false;
     };
     if !is_transport_success_empty_completion(&details) {
-        return;
+        return false;
     }
 
     state.interruption = Some(InterruptionRecord::new(
         InterruptionKind::EmptyCompletion,
-        ResumeAction::ContinueImmediately,
+        exhausted_provider_recovery_action(state),
         interruption_state_summary(state, Some(error.message.clone())),
     ));
+    true
 }
 
 /// Admit one logical recovery round after a provider attempt failed before it
@@ -3621,7 +3617,7 @@ fn schedule_safe_provider_recovery(
         astra_core::ErrorKind::ProviderDeadline
             | astra_core::ErrorKind::StreamTransport
             | astra_core::ErrorKind::StreamIdle
-    ) || state.provider_adaptation.action_convergence_attempted
+    ) || state.provider_adaptation.safe_recovery_attempted
     {
         return false;
     }
@@ -3705,8 +3701,8 @@ fn schedule_safe_provider_recovery(
         state.remaining_turns = 1;
     }
 
-    state.provider_adaptation.action_convergence_attempted = true;
-    state.provider_adaptation.force_next_thinking_off = true;
+    state.provider_adaptation.safe_recovery_attempted = true;
+    state.provider_adaptation.safe_recovery_pending = true;
     let text_only = state.hooks.completion_settlement.text_only;
     let interruption = match error.kind {
         astra_core::ErrorKind::ProviderDeadline => "spent its action window",
@@ -3798,7 +3794,7 @@ pub(crate) fn advance_provider_recovery_epoch_from_new_records(
             .unwrap_or_default(),
     );
     if advanced {
-        state.provider_adaptation.action_convergence_attempted = false;
+        state.provider_adaptation.safe_recovery_attempted = false;
     }
     advanced
 }
@@ -3817,7 +3813,7 @@ pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
 /// normal empty-poll cadence has not elapsed. This is the ownership handoff
 /// that prevents a remotely accepted intent from falling between the final
 /// model response and terminal run settlement.
-async fn inject_polled_user_intents_before_settlement<H: AgenticLoopHost>(
+pub(crate) async fn inject_polled_user_intents_before_settlement<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<bool, astra_core::ClassifiedError> {
@@ -4055,7 +4051,13 @@ async fn inject_polled_user_intents_inner<H: AgenticLoopHost>(
         accepted_for_ack.extend(runtime_notifications.iter().map(|(event, _)| event.clone()));
         let has_new_apply_events = state
             .user_intents
-            .stage_pending_apply_events(&accepted_for_ack);
+            .stage_pending_disposition_events(
+                &accepted_for_ack,
+                astra_turn_types::UserIntentStatus::Applied,
+            )
+            .map_err(|error| {
+                astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, error)
+            })?;
         let release_event_indices = state.user_intents.pending_apply_event_indices();
 
         if release_event_indices.is_empty() {
@@ -4073,114 +4075,51 @@ async fn inject_polled_user_intents_inner<H: AgenticLoopHost>(
                 .note_user_intent_poll_finished(poll_started, USER_INTENT_EMPTY_POLL_INTERVAL);
             return Ok(applied_model_guidance);
         } else {
-            let apply_authority = state
-                .current_run_owner_generation
-                .map(UserIntentAdmissionAuthority::DurableOwnerGeneration)
-                .unwrap_or(UserIntentAdmissionAuthority::ProcessLocal);
-            // Resume retries the same acknowledgement, not the snapshot page:
-            // pause must not spend pagination capacity or advance its cursor.
-            loop {
-                match run_control
-                    .mark_user_intents_applied(
-                        &user_id,
-                        &expected_session_id,
-                        &run_id,
-                        &release_event_indices,
-                        apply_authority,
-                    )
-                    .await
-                {
-                    Ok(crate::turn::run_control::UserIntentApplyAck::Paused) => {
-                        let pause_flag =
-                            state.cancellation.pause_flag.as_ref().ok_or_else(|| {
-                                astra_core::ClassifiedError::new(
-                                    astra_core::ErrorKind::ContractViolation,
-                                    "paused input consumer has no shared execution pause control",
-                                )
-                            })?;
-                        pause_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        if wait_for_pause_clear_or_cancel(host, state).await? {
-                            return Err(astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::Cancelled,
-                                "run cancelled while accepted guidance was awaiting resume",
-                            ));
-                        }
-                        continue;
+            if let Some((ack, model_context_changed)) = apply_pending_user_intents(
+                host,
+                state,
+                run_control.as_ref(),
+                &user_id,
+                &expected_session_id,
+                &run_id,
+                &release_event_indices,
+                Some(observed.next_cursor),
+                force_poll,
+                None,
+            )
+            .await?
+            {
+                applied_model_guidance |= model_context_changed;
+                if ack == crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned {
+                    state.user_intents.note_user_intent_poll_finished(
+                        poll_started,
+                        USER_INTENT_EMPTY_POLL_INTERVAL,
+                    );
+                    tracing::debug!(
+                        run_id = %run_id,
+                        ?release_event_indices,
+                        "terminal run won user intent application race"
+                    );
+                    if force_poll {
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::Cancelled,
+                            "run terminated while applying authoritative user guidance; stale provider actions were discarded",
+                        ));
                     }
-                    Ok(crate::turn::run_control::UserIntentApplyAck::Applied) => {
-                        let acknowledged = state
-                            .user_intents
-                            .acknowledge_apply_events(&release_event_indices);
-                        applied_model_guidance |=
-                            apply_acknowledged_user_intents(host, state, &acknowledged);
-                        for event in &acknowledged {
-                            if crate::turn::run_control::runtime_notification_content(&event.input)
-                                .is_none()
-                            {
-                                host.on_user_intent_applied(event).await;
-                            }
-                        }
-                        state
-                            .user_intents
-                            .commit_observed_cursor(observed.next_cursor);
-                    }
-                    Ok(crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned) => {
-                        let returned = state
-                            .user_intents
-                            .return_pending_apply_events(&release_event_indices);
-                        for event in &returned {
-                            if crate::turn::run_control::runtime_notification_content(&event.input)
-                                .is_none()
-                            {
-                                host.on_user_intent_returned(event).await;
-                            }
-                        }
-                        state
-                            .user_intents
-                            .commit_observed_cursor(observed.next_cursor);
-                        state.user_intents.note_user_intent_poll_finished(
-                            poll_started,
-                            USER_INTENT_EMPTY_POLL_INTERVAL,
-                        );
-                        tracing::debug!(
-                            run_id = %run_id,
-                            ?release_event_indices,
-                            "terminal run won user intent application race"
-                        );
-                        if force_poll {
-                            return Err(astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::Cancelled,
-                                "run terminated while applying authoritative user guidance; stale provider actions were discarded",
-                            ));
-                        }
-                        return Ok(applied_model_guidance);
-                    }
-                    Err(error) => {
-                        state
-                            .user_intents
-                            .note_apply_ack_failure(tokio::time::Instant::now());
-                        state.user_intents.note_user_intent_poll_finished(
-                            poll_started,
-                            USER_INTENT_EMPTY_POLL_INTERVAL,
-                        );
-                        tracing::warn!(
-                            run_id = %run_id,
-                            ?release_event_indices,
-                            error = %error,
-                            "failed to durably acknowledge user intent application"
-                        );
-                        if force_poll {
-                            return Err(astra_core::ClassifiedError::new(
-                                astra_core::ErrorKind::ContractViolation,
-                                format!(
-                                    "authoritative user guidance could not be durably acknowledged before the action boundary: {error}"
-                                ),
-                            ));
-                        }
-                        return Ok(applied_model_guidance);
-                    }
+                    return Ok(applied_model_guidance);
                 }
-                break;
+            } else if force_poll {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    format!(
+                        "authoritative user guidance could not be durably acknowledged before the action boundary for run {run_id}"
+                    ),
+                ));
+            } else {
+                state
+                    .user_intents
+                    .note_user_intent_poll_finished(poll_started, USER_INTENT_EMPTY_POLL_INTERVAL);
+                return Ok(applied_model_guidance);
             }
         }
 
@@ -4193,7 +4132,7 @@ async fn inject_polled_user_intents_inner<H: AgenticLoopHost>(
     }
 }
 
-fn apply_acknowledged_user_intents<H: AgenticLoopHost>(
+pub(crate) fn apply_acknowledged_user_intents<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
     acknowledged: &[crate::turn::run_control::QueuedUserIntent],
@@ -4303,14 +4242,181 @@ fn apply_acknowledged_user_intents<H: AgenticLoopHost>(
     !model_guidance.is_empty()
 }
 
-pub(crate) fn turn_result_tokens_consumed(turn_result: &HostTurnResult) -> u64 {
-    NormalizedPromptCacheUsage::new(
-        turn_result.accum.prompt_tokens,
-        turn_result.accum.cache_read_tokens,
-        turn_result.accum.cache_creation_tokens,
-    )
-    .total_input_tokens()
-    .saturating_add(turn_result.accum.completion_tokens)
+/// Complete the durable acknowledgement for events that have already been
+/// staged by the canonical user-intent owner. This function deliberately does
+/// not poll for new input: a native provider may have rejected or ambiguously
+/// delivered a different event, and that event must not become applied merely
+/// because a settlement boundary was reached.
+pub(crate) async fn apply_pending_user_intents<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    run_control: &dyn RunControlProvider,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    event_indices: &[usize],
+    commit_cursor: Option<usize>,
+    strict: bool,
+    invocation_identity: Option<&astra_turn_types::ToolInvocationIdentity>,
+) -> Result<Option<(crate::turn::run_control::UserIntentApplyAck, bool)>, astra_core::ClassifiedError>
+{
+    loop {
+        let outcome = apply_pending_user_intents_once(
+            host,
+            state,
+            run_control,
+            user_id,
+            session_id,
+            run_id,
+            event_indices,
+            commit_cursor,
+            strict,
+            invocation_identity.map(|identity| {
+                crate::turn::run_control::UserIntentInvocationApplication {
+                    identity,
+                    purpose: astra_services::runs::UserIntentApplyPurpose::ModelBoundary,
+                }
+            }),
+        )
+        .await?;
+        if !matches!(
+            outcome,
+            Some((crate::turn::run_control::UserIntentApplyAck::Paused, _))
+        ) {
+            return Ok(outcome);
+        }
+        if wait_for_pause_clear_or_cancel(host, state).await? {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::Cancelled,
+                "run cancelled while accepted guidance was awaiting resume",
+            ));
+        }
+    }
+}
+
+/// One persistence attempt without waiting for resume. Provider waiters must
+/// keep polling completion and cancellation while an application is paused.
+pub(crate) async fn apply_pending_user_intents_once<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    run_control: &dyn RunControlProvider,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    event_indices: &[usize],
+    commit_cursor: Option<usize>,
+    strict: bool,
+    invocation_identity: Option<crate::turn::run_control::UserIntentInvocationApplication<'_>>,
+) -> Result<Option<(crate::turn::run_control::UserIntentApplyAck, bool)>, astra_core::ClassifiedError>
+{
+    let authority = state
+        .current_run_owner_generation
+        .map(UserIntentAdmissionAuthority::DurableOwnerGeneration)
+        .unwrap_or(UserIntentAdmissionAuthority::ProcessLocal);
+    let disposition = state
+        .user_intents
+        .pending_disposition(event_indices)
+        .map_err(|error| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, error)
+        })?;
+    let invocation_identity = if disposition == astra_turn_types::UserIntentStatus::Returned {
+        Some(
+            invocation_identity
+                .map(|mut application| {
+                    application.purpose = application.purpose.returning();
+                    application
+                })
+                .ok_or_else(|| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "provider rejection requires its exact invocation authority",
+                    )
+                })?,
+        )
+    } else {
+        invocation_identity
+    };
+    match run_control
+        .mark_user_intents_applied(
+            user_id,
+            session_id,
+            run_id,
+            event_indices,
+            authority,
+            invocation_identity,
+        )
+        .await
+    {
+        Ok(crate::turn::run_control::UserIntentApplyAck::Paused) => {
+            let pause_flag = state.cancellation.pause_flag.as_ref().ok_or_else(|| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "paused input consumer has no shared execution pause control",
+                )
+            })?;
+            pause_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            state
+                .user_intents
+                .defer_pending_apply_ack(tokio::time::Instant::now());
+            Ok(Some((
+                crate::turn::run_control::UserIntentApplyAck::Paused,
+                false,
+            )))
+        }
+        Ok(crate::turn::run_control::UserIntentApplyAck::Applied) => {
+            let acknowledged = state.user_intents.acknowledge_apply_events(event_indices);
+            let model_context_changed = apply_acknowledged_user_intents(host, state, &acknowledged);
+            for event in &acknowledged {
+                if crate::turn::run_control::runtime_notification_content(&event.input).is_none() {
+                    host.on_user_intent_applied(event).await;
+                }
+            }
+            if let Some(cursor) = commit_cursor {
+                state.user_intents.commit_observed_cursor(cursor);
+            }
+            Ok(Some((
+                crate::turn::run_control::UserIntentApplyAck::Applied,
+                model_context_changed,
+            )))
+        }
+        Ok(
+            ack @ (crate::turn::run_control::UserIntentApplyAck::Returned
+            | crate::turn::run_control::UserIntentApplyAck::RunTerminalReturned),
+        ) => {
+            let returned = state
+                .user_intents
+                .return_pending_apply_events(event_indices);
+            for event in &returned {
+                if crate::turn::run_control::runtime_notification_content(&event.input).is_none() {
+                    host.on_user_intent_returned(event).await;
+                }
+            }
+            if let Some(cursor) = commit_cursor {
+                state.user_intents.commit_observed_cursor(cursor);
+            }
+            Ok(Some((ack, false)))
+        }
+        Err(error) => {
+            state
+                .user_intents
+                .note_apply_ack_failure(tokio::time::Instant::now());
+            tracing::warn!(
+                run_id,
+                ?event_indices,
+                error = %error,
+                "failed to durably acknowledge user intent application"
+            );
+            if strict {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    format!(
+                        "authoritative user guidance could not be durably acknowledged before the action boundary: {error}"
+                    ),
+                ));
+            }
+            Ok(None)
+        }
+    }
 }
 
 fn runtime_feedback_run_usage(
@@ -4513,51 +4619,32 @@ fn apply_terminal_control_stream_snapshot(
     }
 }
 
-fn route_runtime_policy_evidence(
-    state: &mut AgenticLoopState,
-    facts: &astra_core::observation_journal::JournalFacts,
-    evidence: crate::turn::runtime_policy::RuntimePolicyEvidence,
-) {
-    use crate::turn::runtime_policy::RuntimePolicyEvidence;
-
-    match evidence {
-        RuntimePolicyEvidence::BudgetExpansionSuggested {
-            factor,
-            max_ceiling,
-        } => {
-            tracing::info!(
-                target: "astra::policy",
-                factor,
-                max_ceiling,
-                consecutive_outcomes = facts.streaks.consecutive_rounds_with_outcome,
-                current_max_turns = state.max_turns,
-                remaining_turns = state.remaining_turns,
-                "policy recorded budget-expansion evidence without mutating budget"
-            );
-        }
-        RuntimePolicyEvidence::ContextPressureObserved { urgency } => {
-            let pressure = facts.performance.token_pressure;
-            state.push_volatile_payload(
-                super::host::VolatileKind::ContextPressure,
-                serde_json::json!({
-                    "schema": "runtime_policy_advisory.v1",
-                    "signal": "context_pressure_observed",
-                    "evidence": {
-                        "token_pressure": pressure,
-                        "urgency": urgency.to_string(),
-                    },
-                    "authority": "advisory_evidence_only",
-                }),
-            );
-            tracing::info!(
-                target: "astra::policy",
-                %urgency,
-                token_pressure = pressure,
-                "policy context-pressure evidence recorded"
-            );
-        }
-        RuntimePolicyEvidence::NoAdvisory => {}
-    }
+fn refresh_context_pressure_advisory(state: &mut AgenticLoopState) {
+    use crate::turn::providers::LiveRuntimeProvider;
+    let pressure = crate::turn::local_provider::LocalSessionProvider::new(state).token_pressure();
+    state.clear_volatile(super::host::VolatileKind::ContextPressure);
+    let urgency = if pressure >= 0.90 {
+        "aggressive"
+    } else if pressure >= 0.70 {
+        "normal"
+    } else {
+        return;
+    };
+    state.push_volatile_payload(
+        super::host::VolatileKind::ContextPressure,
+        serde_json::json!({
+            "schema": "runtime_policy_advisory.v1",
+            "signal": "context_pressure_observed",
+            "evidence": {"token_pressure": pressure, "urgency": urgency},
+            "authority": "advisory_evidence_only",
+        }),
+    );
+    tracing::info!(
+        target: "astra::policy",
+        urgency,
+        token_pressure = pressure,
+        "policy context-pressure evidence recorded"
+    );
 }
 
 fn manifest_reason_for_llm_call(state: &AgenticLoopState) -> &'static str {
@@ -4813,73 +4900,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // placement nor generation proves reuse of accumulated history or model
     // adoption.
     let show_policy_feedback_status = host.turn_interaction_mode().shows_policy_feedback_status();
-    // Inject round budget guidance so the model knows to batch or synthesize.
-    // Use llm_rounds_completed (actual LLM call count) not turn_index (step
-    // counter inflated by progressive penalty).
-    // Skip when the host already injects guidance (e.g. server path injects
-    // it into the system prompt in its own execute_turn).
-    //
-    if !host.injects_round_guidance() {
-        // ── Self-Status injection (push-mode observation) ─────────────────
-        // Always inject a compact self-status block so the agent sees its
-        // current health (token pressure, trends, alerts, circuit breaker)
-        // without needing to call `introspect`. This closes the pull→push gap.
-        // Skip when budget is exhausted — the agent should produce final
-        // output, not introspect.
-        if state.remaining_turns > 0
-            && (state.llm_rounds_completed > 0 || !state.observation_journal.is_empty())
-        {
-            // Construct a lightweight provider for live metrics.
-            use crate::turn::providers::{LiveRuntimeProvider, SessionStateProvider};
-            let status_provider = crate::turn::local_provider::LocalSessionProvider::new(state);
-            let cb_state = status_provider.circuit_breaker_state().to_string();
-            let cache_ratio = status_provider.cache_hit_ratio();
-            let token_pressure = status_provider.token_pressure();
-            let alerts: Vec<String> = {
-                let mut a = Vec::new();
-                if state.stall.work_evidence_advisory_emitted {
-                    a.push("work_evidence_sufficiency".to_string());
-                }
-                let recent_tool_failures = state.turn_guard.health.recent_errors(10).len();
-                if recent_tool_failures > 0 {
-                    a.push(format!(
-                        "tool_failures={recent_tool_failures}; tools remain available unless an explicit restricted_tool result appears"
-                    ));
-                }
-                a
-            };
-            let status = render_compact_status(
-                &state.observation_journal,
-                &alerts,
-                &cb_state,
-                token_pressure,
-                cache_ratio,
-                state.llm_rounds_completed,
-            );
-            if !status.is_empty() {
-                state.push_volatile(super::host::VolatileKind::SelfStatus, status);
-            }
-        }
-
-        let mut guidance = crate::prompts::tool_round_guidance_trace(&state.messages).0;
-        if !state.suppress_execution_slice_guidance() {
-            let slice_guidance = crate::prompts::execution_slice_guidance(
-                state.remaining_turns,
-                state.max_turns,
-                super::lifecycle::adaptive_budget_is_renewable(state),
-            );
-            if !slice_guidance.is_empty() {
-                if !guidance.is_empty() {
-                    guidance.push_str("\n\n");
-                }
-                guidance.push_str(&slice_guidance);
-            }
-        }
-        if !guidance.is_empty() {
-            state.push_volatile(super::host::VolatileKind::BudgetAdvisory, guidance);
-        }
-    }
-
     // Resolve from this execution's selected policy without round-local I/O.
     let tool_cfg = &state.admitted_tool_policy;
     let resolved_tool_policy =
@@ -4911,45 +4931,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         }
     }
 
-    // ── Policy-driven evaluation (RuntimePolicy) ───────────────────────
-    // Compute JournalFacts from the current loop state and delegate to
-    // RuntimePolicy::decide(). The policy produces `RuntimePolicyEvidence`
-    // values that complement the guard pipeline above.
-    //
-    // This runs after the guard pipeline so it sees the latest tool-call
-    // records and circuit-breaker state.
-    {
-        use crate::turn::local_provider::LocalSessionProvider;
-        use crate::turn::providers::{LiveRuntimeProvider, ObservationProvider};
-        use astra_core::observation_journal::JournalFacts;
-
-        let provider = LocalSessionProvider::new(state);
-
-        // Extract journal facts from the ObservationProvider trait.
-        let mut facts = provider.extract_facts();
-
-        // Populate session-wide fields from authoritative state.
-        // extract_facts provides streak and budget data from the journal
-        // window; these fields come from the full session state.
-        facts.budget.rounds_completed = state.llm_rounds_completed;
-        facts.performance.total_observation_calls = state.total_observation_tool_calls;
-        facts.performance.total_errors = state.turn_guard.health.recent_errors(10).len() as u32;
-        facts.performance.total_tool_calls = state.total_tool_calls;
-
-        // Stall reason from the unified stall diagnosis.
-        facts.stall.stall_reason = interruption_diagnosis_summary(state);
-
-        // Populate token pressure from the LiveRuntimeProvider.
-        facts.performance.token_pressure = provider.token_pressure();
-
-        let default_policy = crate::turn::runtime_policy::RuntimePolicy::default();
-        let policy = state.budget_policy.as_ref().unwrap_or(&default_policy);
-        let policy_evidence = policy.decide(&facts);
-
-        for evidence in policy_evidence {
-            route_runtime_policy_evidence(state, &facts, evidence);
-        }
-    }
+    refresh_context_pressure_advisory(state);
 
     // ── Circuit breaker observation ──────────────────────────────────────
     // Feed the previous round's signal to the circuit breaker. The runtime
@@ -5328,13 +5310,47 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 tracing::warn!(
                     target: "astra::provider_recovery",
                     error = %error,
-                    "provider attempt ended before executable or visible delivery; scheduling one safe thinking-off recovery round"
+                    "provider attempt ended before executable or visible delivery; scheduling one capability-aware safe recovery round"
                 );
+                host.on_provider_recovery(state, error.kind);
                 state.step_recorder.end_turn(false);
                 return Ok(TurnExecutionControl::ContinueLoop);
             }
-            record_repeated_transport_success_empty_completion(state, &error);
+            // The client reserves inference-ledger settlement inside the run
+            // work slice. Its deadline may therefore leave a whole second of
+            // work while the run's final-answer window is still untouched.
+            // After the one safe recovery, only a dispatch proven to be
+            // run-work-limited can enter that existing terminal boundary.
+            if state.provider_adaptation.safe_recovery_attempted
+                && provider_deadline_has_no_actionable_delivery(&error)
+                && error
+                    .details_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .is_some_and(|details| {
+                        details
+                            .pointer("/deadline/execution_boundary")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("run_work")
+                    })
+                && host
+                    .execution_time_budget_remaining()
+                    .is_some_and(|remaining| remaining.total_remaining > remaining.work_remaining)
+                && super::lifecycle::enter_deadline_budget_settlement(host, state).await
+            {
+                state.step_recorder.end_turn(false);
+                return Ok(TurnExecutionControl::ContinueLoop);
+            }
+            let empty_completion =
+                record_repeated_transport_success_empty_completion(state, &error);
             state.hooks.completion_settlement.text_only = false;
+            if empty_completion {
+                // Affirmative clean non-delivery is an interrupted completion,
+                // not a provider failure. Use the ordinary terminal path so
+                // every surface preserves the producer's EmptyCompletion action.
+                state.step_recorder.end_turn(false);
+                return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
+            }
             record_direct_llm_error_state(state, &error);
             return Err(error);
         }
@@ -5751,13 +5767,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     prep.turn_start_time,
                     Some("rate_limited"),
                 );
-                observe_turn_end_without_tools(
-                    state,
-                    turn_index,
-                    prep.turn_start_time,
-                    turn_result.ttft_ms,
-                    turn_result_tokens_consumed(&turn_result),
-                );
+                observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
                 state.step_recorder.end_turn(false);
                 finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
@@ -5991,13 +6001,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     prep.turn_start_time,
                     Some("interrupted"),
                 );
-                observe_turn_end_without_tools(
-                    state,
-                    turn_index,
-                    prep.turn_start_time,
-                    turn_result.ttft_ms,
-                    turn_result_tokens_consumed(&turn_result),
-                );
+                observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
                 state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);
                 finalize_and_render(host, state).await;
@@ -6081,10 +6085,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         );
                         observe_turn_end_without_tools(
                             state,
-                            turn_index,
                             prep.turn_start_time,
                             turn_result.ttft_ms,
-                            turn_result_tokens_consumed(&turn_result),
                         );
                         state.step_recorder.end_turn(false);
                         try_write_heavy_checkpoint(state);
@@ -6173,10 +6175,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                     observe_turn_end_without_tools(
                         state,
-                        turn_index,
                         prep.turn_start_time,
                         turn_result.ttft_ms,
-                        turn_result_tokens_consumed(&turn_result),
                     );
                     state.step_recorder.end_turn(false);
                     try_write_heavy_checkpoint(state);
@@ -6233,10 +6233,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     );
                     observe_turn_end_without_tools(
                         state,
-                        turn_index,
                         prep.turn_start_time,
                         turn_result.ttft_ms,
-                        turn_result_tokens_consumed(&turn_result),
                     );
                     state.step_recorder.end_turn(false);
                     try_write_heavy_checkpoint(state);
@@ -6302,13 +6300,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         "completion_contract_incomplete"
                     }),
                 );
-                observe_turn_end_without_tools(
-                    state,
-                    turn_index,
-                    prep.turn_start_time,
-                    turn_result.ttft_ms,
-                    turn_result_tokens_consumed(&turn_result),
-                );
+                observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
                 state.step_recorder.end_turn(false);
                 try_write_heavy_checkpoint(state);
                 finalize_and_render(host, state).await;
@@ -6338,13 +6330,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             record_early_exit_llm_round(state, &turn_result, prep.turn_start_time, Some("stop"));
             state.step_recorder.end_turn(true);
 
-            observe_turn_end_without_tools(
-                state,
-                turn_index,
-                prep.turn_start_time,
-                turn_result.ttft_ms,
-                turn_result_tokens_consumed(&turn_result),
-            );
+            observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
 
             finalize_and_render(host, state).await;
             return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
@@ -6369,7 +6355,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     // tools after such a signal is not a protocol violation, so there is no
     // "ignored correction" phase and no synthetic abort here.
     emit_subrun_text_preview(host, state, prep.quiet);
-    if let Some(control) = handle_token_budget(host, state, turn_index, prep, &turn_result).await {
+    if let Some(control) = handle_token_budget(host, state, prep, &turn_result).await {
         return Ok(control);
     }
     record_tool_selection(state, &turn_result, turn_index);
@@ -6736,565 +6722,6 @@ fn live_typed_workspace_observation_evidence(
             &args,
         )?;
     Some((evidence, round, tool_call_id))
-}
-
-pub(crate) fn has_concrete_external_effect(state: &AgenticLoopState) -> bool {
-    state
-        .stall
-        .tool_call_records
-        .iter()
-        .any(|record| record_has_concrete_external_effect(state, record))
-}
-
-fn record_has_concrete_external_effect(
-    state: &AgenticLoopState,
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    if !record.was_executed() || !record.ok {
-        return false;
-    }
-    if record.external_effect_observed != Some(true)
-        || record.external_effect_scope.as_deref()
-            != Some(astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE)
-    {
-        return false;
-    }
-    let Some(receipt) = record.external_effect_receipt.as_ref() else {
-        return false;
-    };
-    if !astra_tools::workspace_observation::is_authoritative_external_effect_receipt(receipt) {
-        return false;
-    }
-    // A typed service receipt must remain bound to the canonical
-    // record and its action.  Do not let an MCP/provider payload or a
-    // copied metadata field satisfy an unrelated external obligation.
-    if receipt.get("source").and_then(serde_json::Value::as_str) == Some("typed_external_tool") {
-        let Some(args) = super::lifecycle::extract_tool_args(record.authoritative_args_full())
-        else {
-            return false;
-        };
-        let expected_digest = format!(
-            "{:x}",
-            Sha256::digest(astra_core::canonical_json_string(&args))
-        );
-        return typed_memory_external_effect_is_in_scope(state)
-            && record.name == "memory"
-            && receipt.get("action").and_then(serde_json::Value::as_str)
-                == args.get("action").and_then(serde_json::Value::as_str)
-            && receipt
-                .get("operation_digest")
-                .and_then(serde_json::Value::as_str)
-                == Some(expected_digest.as_str())
-            && matches!(
-                args.get("action").and_then(serde_json::Value::as_str),
-                Some("remember" | "forget" | "update" | "feedback")
-            );
-    }
-    true
-}
-
-/// Latest executed foreground Bash that declared external roots and still has
-/// no authoritative receipt. An older declaration does not stay active after
-/// a newer one, and a pathless call is not a file contract.
-fn latest_continuable_external_file_roots(state: &AgenticLoopState) -> Option<Vec<String>> {
-    state
-        .stall
-        .tool_call_records
-        .iter()
-        .rev()
-        .find_map(|record| {
-            if record_has_concrete_external_effect(state, record) {
-                return None;
-            }
-            external_effect_scope_from_record(record)
-        })
-}
-
-fn executed_bash_requests_background(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    let Some(raw) = record.authoritative_args_full() else {
-        return false;
-    };
-    let Ok(args) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return false;
-    };
-    args.get("run_in_background")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-}
-
-fn pathless_executed_bash(record: &astra_services::session_journal::ToolCallRecord) -> bool {
-    record.was_executed()
-        && record.name == "bash"
-        && !executed_bash_requests_background(record)
-        && external_effect_scope_from_record(record).is_none()
-        && !executed_external_vehicle_is_proven_read_only(record)
-}
-
-/// The external obligation is still open, and at least one foreground Bash
-/// already ran without an accepted file-path contract and without a classifier
-/// proof that the command is read-only. A listing does not veto the first
-/// external mutation or a later file-contract observation. A background start
-/// is not that foreground write. A different record's unused
-/// `external_state_paths` must not reopen a write for a pathless side-effecting
-/// call. Missing or unparseable arguments stay fail-closed.
-pub(crate) fn external_effect_replay_forbidden(state: &AgenticLoopState) -> bool {
-    requires_external_effect_completion(state)
-        && !has_concrete_external_effect(state)
-        && state
-            .stall
-            .tool_call_records
-            .iter()
-            .any(pathless_executed_bash)
-}
-
-fn normalized_external_roots(paths: &[String]) -> BTreeSet<String> {
-    paths
-        .iter()
-        .map(|path| path.trim().to_string())
-        .filter(|path| !path.is_empty())
-        .collect()
-}
-
-fn external_roots_from_args(args: &serde_json::Value) -> Option<Vec<String>> {
-    let paths = args
-        .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
-        .and_then(serde_json::Value::as_array)?;
-    let paths = paths
-        .iter()
-        .map(serde_json::Value::as_str)
-        .map(|path| path.map(str::trim).filter(|path| !path.is_empty()))
-        .collect::<Option<Vec<_>>>()?;
-    (!paths.is_empty()).then(|| paths.into_iter().map(ToString::to_string).collect())
-}
-
-fn bash_matches_continuable_external_roots(
-    state: &AgenticLoopState,
-    args: &serde_json::Value,
-) -> bool {
-    let Some(expected) = latest_continuable_external_file_roots(state) else {
-        return true;
-    };
-    external_roots_from_args(args).is_some_and(|actual| {
-        normalized_external_roots(&actual) == normalized_external_roots(&expected)
-    })
-}
-
-/// A foreground Bash call that omitted `external_state_paths` matches the
-/// frozen recovery set. The provider record stays unchanged; the executor
-/// inherits the same set later.
-fn omitted_bash_inherits_bound_external_roots(
-    state: &AgenticLoopState,
-    args: &serde_json::Value,
-) -> bool {
-    if args
-        .get("run_in_background")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-        || args
-            .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
-            .is_some()
-    {
-        return false;
-    }
-    let Some(frozen) = external_effect_recovery_scope(state) else {
-        return false;
-    };
-    let Some(expected) = latest_continuable_external_file_roots(state) else {
-        return false;
-    };
-    normalized_external_roots(&frozen) == normalized_external_roots(&expected)
-}
-
-const EXTERNAL_EFFECT_LEDGER_PROJECTION_CAP: usize = 8;
-const EXTERNAL_EFFECT_LEDGER_OMITTED_IDENTITY_CAP: usize = 32;
-
-struct ExternalEffectProjectionRow {
-    /// Lower ranks are kept first: authoritative receipts, then declared
-    /// roots, ambiguous failures, and successful side-effecting calls, then
-    /// proven read-only probes.
-    class_rank: u8,
-    ledger_index: usize,
-    full: serde_json::Value,
-    compact: serde_json::Value,
-}
-
-/// Project external-effect facts from the tool ledger for the next prompt.
-///
-/// Compaction deletes messages and does not read this ledger. The projection
-/// is rebuilt at prompt assembly and is not a second completion authority.
-/// Full rows and omitted identities prefer receipts, then side-effecting or
-/// declared-root calls, then proven read-only probes. A pathless upload is
-/// not dropped to keep an older listing.
-pub(crate) fn external_effect_ledger_projection(
-    state: &AgenticLoopState,
-) -> Option<serde_json::Value> {
-    if !requires_external_effect_completion(state) {
-        return None;
-    }
-    let replay_forbidden = external_effect_replay_forbidden(state);
-    let mut rows = Vec::new();
-    for (ledger_index, record) in state.stall.tool_call_records.iter().enumerate() {
-        let Some(row) =
-            external_effect_projection_row(state, record, ledger_index, replay_forbidden)
-        else {
-            continue;
-        };
-        rows.push(row);
-    }
-    if rows.is_empty() {
-        return None;
-    }
-    let mut selection: Vec<usize> = (0..rows.len()).collect();
-    selection.sort_by_key(|&position| {
-        (
-            rows[position].class_rank,
-            std::cmp::Reverse(rows[position].ledger_index),
-        )
-    });
-    let kept: HashSet<usize> = selection
-        .into_iter()
-        .take(EXTERNAL_EFFECT_LEDGER_PROJECTION_CAP)
-        .collect();
-    let mut calls = Vec::new();
-    for (position, row) in rows.iter().enumerate() {
-        if kept.contains(&position) {
-            calls.push(row.full.clone());
-        }
-    }
-    let mut omitted_positions: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter_map(|(position, _)| (!kept.contains(&position)).then_some(position))
-        .collect();
-    omitted_positions.sort_by_key(|&position| {
-        (
-            rows[position].class_rank,
-            std::cmp::Reverse(rows[position].ledger_index),
-        )
-    });
-    let omitted_not_listed = omitted_positions
-        .len()
-        .saturating_sub(EXTERNAL_EFFECT_LEDGER_OMITTED_IDENTITY_CAP);
-    omitted_positions.truncate(EXTERNAL_EFFECT_LEDGER_OMITTED_IDENTITY_CAP);
-    omitted_positions.sort_by_key(|&position| rows[position].ledger_index);
-    let omitted: Vec<_> = omitted_positions
-        .iter()
-        .map(|&position| rows[position].compact.clone())
-        .collect();
-    Some(serde_json::json!({
-        "schema": "external_effect_ledger_projection.v1",
-        "calls": calls,
-        "coverage": {
-            "matched": rows.len(),
-            "projected": calls.len(),
-            "omitted": rows.len().saturating_sub(calls.len()),
-            "omitted_identities": omitted,
-            "omitted_identities_truncated": omitted_not_listed > 0,
-        },
-        "instruction": external_effect_projection_instruction(external_file_recovery_is_open(
-            state,
-            replay_forbidden,
-        )),
-    }))
-}
-
-fn external_effect_projection_instruction(recovery_open: bool) -> String {
-    let continuable = if recovery_open {
-        "replay=continuable means one foreground repeat of that declared external_state_paths set is still the authorized recovery. "
-    } else {
-        "No declared-root row is continuable; the file-contract recovery is closed, so do not repeat that write. "
-    };
-    format!(
-        "These ledger rows already executed. executed_unconfirmed means the executor recorded no authoritative external receipt; that is not itself a replay decision. replay=forbidden means do not issue that same operation again. {continuable}replay=not_a_write means the effect classifier proved the call read-only. replay=not_foreground means the call started in the background and is not a foreground external write. operation_preview and operation_digest identify the call and are not a receipt. omitted_identities use the same replay field."
-    )
-}
-
-fn record_is_active_external_file_continuation(
-    state: &AgenticLoopState,
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    let Some(roots) = external_effect_scope_from_record(record) else {
-        return false;
-    };
-    let Some(expected) = latest_continuable_external_file_roots(state) else {
-        return false;
-    };
-    normalized_external_roots(&roots) == normalized_external_roots(&expected)
-}
-
-/// The one file-contract recovery is still executable. A consumed window, a
-/// text-only close, a receipt, or a pathless-write veto withdraws it.
-fn external_file_recovery_is_open(state: &AgenticLoopState, replay_forbidden: bool) -> bool {
-    if replay_forbidden
-        || has_concrete_external_effect(state)
-        || state.hooks.completion_settlement.text_only
-    {
-        return false;
-    }
-    state
-        .hooks
-        .completion_settlement
-        .completion_action_window
-        .as_ref()
-        .is_some_and(|window| {
-            matches!(window.action, CompletionAction::RequiredExternalEffect)
-                && !window.consumed
-                && window.attempts_remaining > 0
-        })
-}
-
-/// Prompt replay follows the same admission policy as the completion window.
-/// Missing a receipt is not the same decision as forbidding a repeat. The
-/// continuable label lasts only while that window is still the live authority.
-fn projected_replay_disposition(
-    state: &AgenticLoopState,
-    record: &astra_services::session_journal::ToolCallRecord,
-    confirmed: bool,
-    proven_read_only: bool,
-    replay_forbidden: bool,
-) -> Option<&'static str> {
-    if confirmed {
-        return None;
-    }
-    if external_file_recovery_is_open(state, replay_forbidden)
-        && record_is_active_external_file_continuation(state, record)
-    {
-        return Some("continuable");
-    }
-    if proven_read_only {
-        return Some("not_a_write");
-    }
-    if executed_bash_requests_background(record) {
-        return Some("not_foreground");
-    }
-    Some("forbidden")
-}
-
-fn external_effect_projection_row(
-    state: &AgenticLoopState,
-    record: &astra_services::session_journal::ToolCallRecord,
-    ledger_index: usize,
-    replay_forbidden: bool,
-) -> Option<ExternalEffectProjectionRow> {
-    if !record.was_executed() {
-        return None;
-    }
-    let confirmed = record_has_concrete_external_effect(state, record);
-    let external_vehicle = matches!(record.name.as_str(), "bash" | "memory");
-    // `ok == false` is not a read-only lookup. A foreground upload can reach
-    // the remote service and still exit nonzero. Keep that ambiguous write.
-    // Drop only executions the existing effect classifier proves read-only.
-    let ambiguous_failure =
-        !record.ok && external_vehicle && !executed_external_vehicle_is_proven_read_only(record);
-    let unconfirmed_vehicle = external_vehicle && !confirmed && (record.ok || ambiguous_failure);
-    if !confirmed && !unconfirmed_vehicle {
-        return None;
-    }
-    let roots = external_effect_scope_from_record(record);
-    let proven_read_only = executed_external_vehicle_is_proven_read_only(record);
-    let class_rank = if confirmed {
-        0
-    } else if roots.is_some() || !record.ok || !proven_read_only {
-        1
-    } else {
-        2
-    };
-    let confirmation = if confirmed {
-        "executor_confirmed"
-    } else {
-        "executed_unconfirmed"
-    };
-    let replay =
-        projected_replay_disposition(state, record, confirmed, proven_read_only, replay_forbidden);
-    let (operation_digest, operation_preview) = redacted_operation_identity(record);
-    let mut compact = serde_json::json!({
-        "tool_call_id": record.tool_call_id,
-        "tool": record.name,
-        "executor_confirmation": confirmation,
-    });
-    if let Some(digest) = operation_digest.clone() {
-        compact["operation_digest"] = serde_json::json!(digest);
-    }
-    if let Some(preview) = operation_preview.clone() {
-        compact["operation_preview"] = serde_json::json!(preview);
-    }
-    if let Some(roots) = roots.clone() {
-        compact["declared_external_roots"] = serde_json::json!(roots);
-    }
-    if let Some(replay) = replay {
-        compact["replay"] = serde_json::json!(replay);
-    }
-    let mut full = serde_json::json!({
-        "tool_call_id": record.tool_call_id,
-        "tool": record.name,
-        "executed": true,
-        "ok": record.ok,
-        "authoritative_external_receipt": confirmed,
-        "executor_confirmation": confirmation,
-    });
-    if let Some(digest) = operation_digest {
-        full["operation_digest"] = serde_json::json!(digest);
-    }
-    if let Some(preview) = operation_preview {
-        full["operation_preview"] = serde_json::json!(preview);
-    }
-    if let Some(roots) = roots {
-        full["declared_external_roots"] = serde_json::json!(roots);
-    }
-    if let Some(replay) = replay {
-        full["replay"] = serde_json::json!(replay);
-    }
-    if confirmed && let Some(receipt) = record.external_effect_receipt.as_ref() {
-        let target = external_effect_receipt_target_identifiers(receipt);
-        if target.as_object().is_some_and(|fields| !fields.is_empty()) {
-            full["target"] = target;
-        }
-    }
-    Some(ExternalEffectProjectionRow {
-        class_rank,
-        ledger_index,
-        full,
-        compact,
-    })
-}
-
-/// Display-safe correlation for one executed call. The digest and preview are
-/// not an executor receipt. Durable redacted arguments are preferred over the
-/// live argument copy, which can still hold credentials.
-fn redacted_operation_identity(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> (Option<String>, Option<String>) {
-    let Some(raw) = record
-        .args_full
-        .as_deref()
-        .filter(|args| !args.is_empty())
-        .or(record.runtime_args_full.as_deref())
-    else {
-        return (None, record.args_preview.clone());
-    };
-    let Ok(mut args) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return (None, record.args_preview.clone());
-    };
-    astra_text_utils::credential_redaction::redact_credentials_in_json(&mut args);
-    let digest = format!(
-        "{:x}",
-        Sha256::digest(astra_core::canonical_json_string(&args))
-    );
-    let preview = record.args_preview.clone().or_else(|| {
-        crate::turn::headless_tool_pipeline::record::safe_args_preview(&record.name, &args)
-    });
-    (Some(digest), preview)
-}
-
-fn executed_external_vehicle_is_proven_read_only(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    if !matches!(record.name.as_str(), "bash" | "memory") {
-        return false;
-    }
-    let Some(raw) = record.authoritative_args_full() else {
-        return false;
-    };
-    let Ok(args) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return false;
-    };
-    !crate::turn::tool_side_effects::tool_call_may_mutate_any_state(&record.name, Some(&args))
-}
-
-fn external_effect_receipt_target_identifiers(receipt: &serde_json::Value) -> serde_json::Value {
-    let mut target = serde_json::Map::new();
-    for key in [
-        "target_set_digest",
-        "observed_roots",
-        "tool",
-        "action",
-        "operation_digest",
-    ] {
-        if let Some(value) = receipt.get(key) {
-            target.insert(key.to_string(), value.clone());
-        }
-    }
-    serde_json::Value::Object(target)
-}
-
-/// A memory receipt is authoritative for a memory turn, but it cannot settle
-/// an unrelated external deployment/system mutation.  Memory is available as
-/// a resident housekeeping tool on every turn, so accepting its receipt for
-/// every `External`/`Mixed` scope would let an incidental remember call
-/// masquerade as completion of the requested external state change.
-///
-/// The domain is semantic admission data, not a reconstruction from tool
-/// names or user text.  Missing/other domains fail closed and leave the
-/// external-effect obligation pending for the actual scoped executor action.
-fn typed_memory_external_effect_is_in_scope(state: &AgenticLoopState) -> bool {
-    state.turn_intent.as_ref().and_then(|intent| intent.domain) == Some(TurnIntentDomain::Memory)
-}
-
-/// Read the exact structured external observation scope from one executed
-/// Bash record.  This is deliberately a typed boundary: previews, command
-/// text, exit status, and rejected calls cannot seed recovery authority.
-fn external_effect_scope_from_record(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> Option<Vec<String>> {
-    if record.name != "bash" || !record.was_executed() {
-        return None;
-    }
-    let args = super::lifecycle::extract_tool_args(record.authoritative_args_full())?;
-    if args
-        .get("run_in_background")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-    {
-        return None;
-    }
-    external_roots_from_args(&args)
-}
-
-/// Remember the last executor-admitted external observation scope for the
-/// bounded recovery sequence.  Once a concrete receipt exists, clear the
-/// carry-over so a later ordinary Bash call cannot inherit stale authority.
-pub(crate) fn remember_external_effect_recovery_scope(
-    state: &mut AgenticLoopState,
-    records: &[astra_services::session_journal::ToolCallRecord],
-) {
-    if state.hooks.completion_settlement.external_effect_retries == 0 {
-        return;
-    }
-    if has_concrete_external_effect(state) {
-        state
-            .hooks
-            .completion_settlement
-            .external_effect_recovery_paths = None;
-        return;
-    }
-    if let Some(paths) = records
-        .iter()
-        .rev()
-        .find_map(external_effect_scope_from_record)
-    {
-        state
-            .hooks
-            .completion_settlement
-            .external_effect_recovery_paths = Some(paths);
-    }
-}
-
-/// Snapshot the typed scope before assembling the next tool round.  The
-/// caller owns the returned clone so it can borrow the rest of loop state
-/// mutably while the headless pipeline executes.
-pub(crate) fn external_effect_recovery_scope(state: &AgenticLoopState) -> Option<Vec<String>> {
-    if state.hooks.completion_settlement.external_effect_retries == 0
-        || has_concrete_external_effect(state)
-    {
-        return None;
-    }
-    state
-        .hooks
-        .completion_settlement
-        .external_effect_recovery_paths
-        .clone()
 }
 
 /// Positive mutation shape is retained even when the command failed: the
@@ -7775,9 +7202,6 @@ fn pending_completion_action_with_validation(
         return Ok(None);
     }
     let workspace_completion_evidence = has_bound_workspace_completion_evidence(state);
-    if requires_external_effect_completion(state) && !has_concrete_external_effect(state) {
-        return Ok(Some(CompletionAction::RequiredExternalEffect));
-    }
     if requires_bound_workspace_completion(state) && !workspace_completion_evidence {
         return Ok(Some(
             if live_desired_state_convergence_state(state)
@@ -7848,27 +7272,6 @@ fn requires_bound_workspace_completion(state: &AgenticLoopState) -> bool {
     })
 }
 
-fn mutation_completion_scope(state: &AgenticLoopState) -> MutationCompletionScope {
-    state
-        .turn_intent
-        .as_ref()
-        .filter(|intent| intent.workspace_mutation == WorkspaceMutationIntent::MustMutate)
-        .map(|intent| intent.mutation_completion_scope)
-        .unwrap_or(MutationCompletionScope::Unknown)
-}
-
-/// Whether the typed turn contract requires an executor-owned receipt for a
-/// mutation outside the bound workspace.  This is shared with provider
-/// surface projection: a required completion action must be represented by a
-/// callable schema before the model reaches the terminal recovery boundary.
-pub(crate) fn requires_external_effect_completion(state: &AgenticLoopState) -> bool {
-    workspace_mutation_intent(state) == WorkspaceMutationIntent::MustMutate
-        && matches!(
-            mutation_completion_scope(state),
-            MutationCompletionScope::External | MutationCompletionScope::Mixed
-        )
-}
-
 /// Select the single task-facing action available only at a hard terminal
 /// slice. Unknown/MayMutate intent cannot justify forcing a write, while a
 /// missing concrete mutation cannot justify narrowing the boundary to an
@@ -7915,23 +7318,6 @@ pub(crate) fn completion_action_hint(action: &CompletionAction) -> serde_json::V
         match action {
             CompletionAction::RequiredWorkspaceMutation => {
                 ("workspace_mutation_missing", None, serde_json::Value::Null)
-            }
-            CompletionAction::RequiredExternalEffect => {
-                accepted_action_shapes.push(serde_json::json!({
-                    "tool": "bash",
-                    "constraint": "one foreground action that performs the required external mutation and carries a non-empty structured external_state_paths array on that same call; the executor must observe a delta under authoritative invocation ownership; a later read-only probe cannot establish the receipt",
-                    "evidence_inference_forbidden": ["assistant_text", "tool_name", "command_text", "exit_code"],
-                }));
-                accepted_action_shapes.push(serde_json::json!({
-                    "tool": "memory",
-                    "constraint": "one mutating memory action (remember, forget, update, or feedback); the memory executor must produce an action-bound authoritative external-effect receipt",
-                    "evidence_inference_forbidden": ["assistant_text", "tool_name_alone", "provider_payload_without_executor_receipt"],
-                }));
-                (
-                    "external_effect_receipt_missing",
-                    None,
-                    serde_json::Value::Null,
-                )
             }
             CompletionAction::CompletionTaskAction => {
                 accepted_action_shapes.push(serde_json::json!({
@@ -7996,7 +7382,6 @@ pub(crate) fn completion_action_hint(action: &CompletionAction) -> serde_json::V
         };
     let accepted_action_family = serde_json::json!(match action {
         CompletionAction::RequiredWorkspaceMutation => "workspace_mutation",
-        CompletionAction::RequiredExternalEffect => "external_effect",
         CompletionAction::CompletionTaskAction => "completion_task_action",
         CompletionAction::PostMutationObservation => "workspace_observation",
         CompletionAction::PostMutationRepair => "post_mutation_repair",
@@ -8036,32 +7421,6 @@ pub(crate) fn completion_action_hint_for_state(
     action: &CompletionAction,
 ) -> serde_json::Value {
     let mut hint = completion_action_hint(action);
-    if matches!(action, CompletionAction::RequiredExternalEffect)
-        && let Some(roots) = latest_continuable_external_file_roots(state)
-    {
-        hint["bound_external_state_paths"] = serde_json::json!(roots);
-        if let Some(shapes) = hint["accepted_action_shapes"].as_array_mut()
-            && let Some(bash_shape) = shapes.iter_mut().find(|shape| shape["tool"] == "bash")
-        {
-            *bash_shape = serde_json::json!({
-                "tool": "bash",
-                "external_state_paths": roots,
-                "constraint": "one foreground Bash whose external_state_paths are exactly bound_external_state_paths; the executor compares that same set. A different root does not match and does not authorize another write",
-                "evidence_inference_forbidden": ["assistant_text", "tool_name", "command_text", "exit_code"],
-            });
-        }
-    }
-    if matches!(action, CompletionAction::RequiredExternalEffect)
-        && !typed_memory_external_effect_is_in_scope(state)
-    {
-        // Memory is always resident for session maintenance, but only a
-        // semantically memory-scoped turn may use its typed receipt to settle
-        // an external-effect obligation. Keep the model-facing hint aligned
-        // with the same typed matcher used by admission.
-        if let Some(shapes) = hint["accepted_action_shapes"].as_array_mut() {
-            shapes.retain(|shape| shape["tool"] != "memory");
-        }
-    }
     if completion_action_requires_complete_state_writer(state, action) {
         hint["accepted_action_shapes"] = serde_json::json!([{
             "tool": "write_file",
@@ -8123,43 +7482,29 @@ fn completion_action_mismatch_instruction(
             "Only one complete-state typed write_file call may execute at this boundary. A real change requires an executor mutation receipt; an already-exact no-op requires an executor convergence receipt plus a later separate full read_file of the same target. Bash output, Bash exit status, assistant prose, and server-side stat of a remote workspace are not evidence."
         };
     }
-    let bound_external_roots = matches!(action, CompletionAction::RequiredExternalEffect)
-        && latest_continuable_external_file_roots(state).is_some();
-    match (action, correction_available, bound_external_roots) {
-        (CompletionAction::RequiredExternalEffect, true, true) => {
-            "This request did not match the already declared external_state_paths set and was not executed. Repeat one foreground Bash whose external_state_paths are exactly that set. A different root does not match, and a Bash call that already ran without this contract must not be repeated."
-        }
-        (CompletionAction::RequiredExternalEffect, false, true) => {
-            "Only one foreground Bash whose external_state_paths exactly match the already declared set may execute at this boundary. A different root does not match. A later read-only probe cannot establish the receipt."
-        }
-        (CompletionAction::CanonicalWorkValidation, true, _) => {
+    match (action, correction_available) {
+        (CompletionAction::CanonicalWorkValidation, true) => {
             "This request did not match the typed completion obligation and was not executed. Rerun one direct standard project build/test validation previously recognized in this Work attempt; do not wrap it in a custom inline program. Correct it now with exactly one matching action; another mismatch ends the turn incomplete."
         }
-        (CompletionAction::CanonicalWorkValidation, false, _) => {
+        (CompletionAction::CanonicalWorkValidation, false) => {
             "Only one direct standard project build/test validation matching the typed completion obligation may execute at this boundary; a custom inline program, reader/probe, mutation, or settlement call does not match."
         }
-        (CompletionAction::CanonicalWorkRepair, true, _) => {
+        (CompletionAction::CanonicalWorkRepair, true) => {
             "This request did not match the bounded canonical-validation repair obligation and was not executed. Make exactly one workspace change; the runtime will require canonical revalidation next."
         }
-        (CompletionAction::CanonicalWorkRepair, false, _) => {
+        (CompletionAction::CanonicalWorkRepair, false) => {
             "Only one workspace repair may execute after the failed canonical validation; the next boundary requires canonical revalidation."
         }
-        (CompletionAction::CompletionTaskAction, true, _) => {
+        (CompletionAction::CompletionTaskAction, true) => {
             "This request was not a task-facing tool action and was not executed. Correct it now with exactly one action from the live admitted tool surface; runtime control and self-inspection calls do not match."
         }
-        (CompletionAction::CompletionTaskAction, false, _) => {
+        (CompletionAction::CompletionTaskAction, false) => {
             "Only one task-facing action from the live admitted tool surface may execute at this boundary; runtime control and self-inspection calls do not match."
         }
-        (CompletionAction::RequiredExternalEffect, true, false) => {
-            "This request did not match an observable external-effect contract and was not executed. Correct it with one foreground Bash action that performs the required mutation and, on that same call, names only the smallest absolute external roots that must change; a later read-only probe cannot establish the receipt. Or use one mutating memory action whose executor produces an action-bound authoritative receipt."
-        }
-        (CompletionAction::RequiredExternalEffect, false, false) => {
-            "Only one foreground Bash action that performs the required mutation and carries a valid external_state_paths observation contract on that same call, or one mutating memory action with an executor-owned receipt contract, may execute at this boundary. A later read-only probe cannot establish the receipt."
-        }
-        (_, true, _) => {
+        (_, true) => {
             "This request did not match the typed completion obligation and was not executed. Correct it now with exactly one matching action; another mismatch ends the turn incomplete."
         }
-        (_, false, _) => {
+        (_, false) => {
             "Only tool calls matching the typed completion obligation may execute at this boundary; each declared verification may be attempted at most once."
         }
     }
@@ -8195,44 +7540,6 @@ pub(crate) fn completion_action_match_label(
                 crate::turn::tool_side_effects::tool_call_may_mutate_workspace(name, args.as_ref())
                     .then(|| "required_workspace_mutation".to_string())
             }
-        }
-        CompletionAction::RequiredExternalEffect => {
-            let bash_has_observation_scope = name == "bash"
-                && args.as_ref().is_some_and(|args| {
-                    args.get("run_in_background")
-                        .and_then(serde_json::Value::as_bool)
-                        != Some(true)
-                        && ((args
-                            .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
-                            .and_then(serde_json::Value::as_array)
-                            .is_some_and(|paths| !paths.is_empty())
-                            && bash_matches_continuable_external_roots(state, args))
-                            || omitted_bash_inherits_bound_external_roots(state, args))
-                });
-            let typed_memory_mutation = typed_memory_external_effect_is_in_scope(state)
-                && name == "memory"
-                && args.as_ref().is_some_and(|args| {
-                    astra_tools::memory_tool_contract::memory_action_from_args(args).is_ok_and(
-                        |action| {
-                            matches!(
-                                action,
-                                astra_tools::memory_tool_contract::MemoryAction::Remember
-                                    | astra_tools::memory_tool_contract::MemoryAction::Forget
-                                    | astra_tools::memory_tool_contract::MemoryAction::Update
-                                    | astra_tools::memory_tool_contract::MemoryAction::Feedback
-                            )
-                        },
-                    )
-                });
-            // A provider's mutating policy is not by itself a settlement
-            // receipt.  Only capabilities with a runtime producer for an
-            // action-bound authoritative receipt may spend this one-shot
-            // boundary; today that is Bash's structured observation lease and
-            // the built-in memory handler below.  Unknown/provider payloads
-            // remain fail-closed until their executor contract is wired into
-            // the journal record.
-            (bash_has_observation_scope || typed_memory_mutation)
-                .then(|| "required_external_effect".to_string())
         }
         CompletionAction::CompletionTaskAction => tool_is_terminal_completion_task_action(name)
             .then(|| "completion_task_action".to_string()),
@@ -8450,40 +7757,6 @@ pub(crate) fn apply_completion_action_admission(
     };
 
     if raw_tool_calls.is_empty() {
-        return admission;
-    }
-
-    if matches!(action, CompletionAction::RequiredExternalEffect)
-        && external_effect_replay_forbidden(state)
-    {
-        for call in admission.admitted.drain(..) {
-            admission.rejected.push(RejectedToolCall {
-                invocation: call,
-                result: serde_json::json!({
-                    "status": "rejected",
-                    "error_kind": "external_effect_replay_forbidden",
-                    "retryable": false,
-                    "allowed_action": action.clone(),
-                    "error": "An executed Bash call has no continuable external file contract. Do not issue another external write.",
-                })
-                .to_string(),
-            });
-        }
-        if let Some(window) = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_mut()
-        {
-            window.consumed = true;
-            window.attempts_remaining = 0;
-            window.matched = false;
-        }
-        mark_workspace_completion_incomplete(
-            state,
-            "external mutation has no executor-owned receipt and no continuable file observation contract; do not replay the same write",
-            "The external change is unverified: a tool ran, but the executor has no authoritative external receipt and no file observation contract it can continue. Do not repeat the same non-idempotent write.",
-        );
         return admission;
     }
 
@@ -8778,10 +8051,8 @@ fn update_turn_trace_collector(state: &mut AgenticLoopState, turn_result: &HostT
 
 pub(crate) fn observe_turn_end_without_tools(
     state: &mut AgenticLoopState,
-    _turn_index: usize,
     turn_start_time: Instant,
     ttft_ms: Option<u64>,
-    tokens_consumed: u64,
 ) {
     // ── Telemetry timing ─────────────────────────────────────────
     if let (Some(hub), Some(session)) = (
@@ -8799,15 +8070,6 @@ pub(crate) fn observe_turn_end_without_tools(
         };
         let mut session_guard = astra_core::sync_poison::recover_rwlock_write(session);
         crate::observability::on_turn_end(hub, &mut session_guard, timing);
-    }
-
-    // Tool-less turns still feed the canonical in-memory observation window.
-    {
-        let mut metrics = astra_core::TurnMetrics::default();
-        metrics.rounds_completed = state.llm_rounds_completed;
-        metrics.tokens_consumed = tokens_consumed;
-
-        state.observation_journal.record_turn(&metrics);
     }
 }
 
@@ -8832,7 +8094,6 @@ const MAX_REACTIVE_BUDGET_COMPACTION_ATTEMPTS: u32 = 3;
 async fn handle_token_budget<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
-    turn_index: usize,
     prep: TurnIterationPrep,
     turn_result: &HostTurnResult,
 ) -> Option<TurnExecutionControl> {
@@ -8868,13 +8129,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
             prep.turn_start_time,
             Some("token_budget_exceeded"),
         );
-        observe_turn_end_without_tools(
-            state,
-            turn_index,
-            prep.turn_start_time,
-            turn_result.ttft_ms,
-            turn_result_tokens_consumed(turn_result),
-        );
+        observe_turn_end_without_tools(state, prep.turn_start_time, turn_result.ttft_ms);
         state.step_recorder.end_turn(false);
         finalize_and_render(host, state).await;
         return Some(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
@@ -9061,6 +8316,7 @@ mod tests {
         JournalEventType, ToolCallDisposition, ToolCallRecord, TurnEventBuffer,
     };
     use async_trait::async_trait;
+    use serde_json::Value;
     use tokio::sync::Mutex;
 
     use super::*;
@@ -9338,6 +8594,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_spawn_in_same_batch_does_not_delay_failure_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let context =
+            crate::server::runtime_tool_executor::tests::test_agent_tool_context(dir.path());
+        let mut executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            dir.path().into(),
+            "user".into(),
+            "test-session".into(),
+            None,
+            None,
+        );
+        executor.set_invocation_ledger(
+            crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new(None),
+        );
+        executor.set_agent_tool_context(context);
+
+        let mut state = make_state();
+        state.runtime_tool_executor = Some(Arc::new(executor));
+        state.current_run_id = Some("test-run".into());
+        state.current_session_id = Some("test-session".into());
+        state.context_manifest_user_id = Some("user".into());
+        state.canonical_turn_chain_id = Some("test-chain".into());
+        let provider_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut host = MockHost::new(vec![
+            server_tool_result(
+                vec![
+                    serde_json::json!({
+                        "id":"spawn-call", "type":"function", "function":{
+                            "name":"agent",
+                            "arguments":serde_json::json!({
+                                "action":"spawn",
+                                "description":"missing prompt"
+                            }).to_string(),
+                        },
+                    }),
+                    serde_json::json!({
+                        "id":"wait-call", "type":"function", "function":{
+                            "name":"agent",
+                            "arguments":serde_json::json!({
+                                "action":"wait",
+                                "timeout_ms":30_000
+                            }).to_string(),
+                        },
+                    }),
+                ],
+                vec![],
+                10,
+                5,
+                None,
+            ),
+            text_result("failure observed", 10, 5, None),
+        ])
+        .with_valid_tools(&["agent"]);
+        host.provider_call_counter = Some(Arc::clone(&provider_calls));
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_agentic_loop_with_host(&mut host, &mut state),
+        )
+        .await
+        .expect("failed spawn must not wait for the optional timeout")
+        .unwrap();
+
+        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(state.final_text, "failure observed");
+        assert!(state.stall.tool_call_records.iter().any(|record| {
+            record.name == "agent"
+                && record
+                    .authoritative_args_full()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .and_then(|args| {
+                        args.get("action")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("spawn")
+                && !record.ok
+        }));
+    }
+
+    #[tokio::test]
+    async fn restored_observation_prioritizes_retained_child_result_without_a_second_wake() {
+        let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
+            "parent-run",
+            "child-agent",
+        );
+        owner.set_direct_child_for_test(crate::orchestration::spawner::DirectChildCompletion {
+            applied_user_intents: Vec::new(),
+            agent_id: "child-agent".into(),
+            run_id: "child-run".into(),
+            parent_agent_id: "parent-agent".into(),
+            status: crate::orchestration::AgentStatus::Completed {
+                result: "retained result".into(),
+                finish_reason: None,
+            },
+        });
+
+        let mut host = MockHost::new(vec![]);
+        host.direct_child_owner = Some(Arc::clone(&owner));
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+        assert!(stage_direct_child_results(&mut host, &mut state).unwrap());
+        assert!(!owner.has_pending_direct_children());
+        assert!(state.volatile_pending.iter().any(|entry| {
+            entry.kind == super::super::host::VolatileKind::BackgroundTaskNotification
+        }));
+
+        let checkpoint = super::super::host::OriginalLoopExecutionFacts::capture(&state)
+            .expect("unobserved child result must be checkpointable");
+        let restored: super::super::host::OriginalLoopExecutionFacts =
+            serde_json::from_value(serde_json::to_value(checkpoint).unwrap()).unwrap();
+        let mut state = make_state();
+        state.current_run_id = Some("parent-run".into());
+        state.volatile_pending = restored.pending_context;
+
+        let receipt = astra_tools::agent_tool_contract::AgentWaitReceipt {
+            parent_run_id: "parent-run".into(),
+            tool_call_id: "wait-call".into(),
+            timeout_ms: 30_000,
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            await_runtime_activity(&mut host, &mut state, Some(&receipt)),
+        )
+        .await
+        .expect("retained input must not wait for a lost wake")
+        .unwrap();
+
+        assert_eq!(outcome, RuntimeActivityOutcome::InputReady);
+        assert!(host.executed_messages.is_empty());
+    }
+
+    #[tokio::test]
     async fn paused_child_retains_parent_execution_until_cancelled() {
         let owner = crate::orchestration::FanoutParentAdmission::consumed_direct_child_for_test(
             "parent-run",
@@ -9440,12 +8831,24 @@ mod tests {
                         .unwrap(),
                     RuntimeActivityOutcome::InputReady
                 );
+                // The first input-ready result represents a provider boundary
+                // that adopts the staged child receipt. Keep the settlement
+                // evidence, but prove that an already observed receipt does
+                // not turn the next wait into a busy loop.
+                state
+                    .lease_volatile_pending()
+                    .expect("staged child result must be leasable");
+                state.commit_volatile_attempt_lease();
                 assert_eq!(
                     await_runtime_activity(&mut host, &mut state, observation.as_ref())
                         .await
                         .unwrap(),
                     RuntimeActivityOutcome::InputReady
                 );
+                state
+                    .lease_volatile_pending()
+                    .expect("mailbox and child context must be leasable");
+                state.commit_volatile_attempt_lease();
                 assert_eq!(host.communication_events.len(), 1);
                 observed.notify_one();
                 let result =
@@ -9507,9 +8910,7 @@ mod tests {
             assert!(owner.has_retained_direct_child_result("terminal-child"));
             assert!(owner.has_retained_direct_child_result("paused-child"));
             let payload = serde_json::to_string(&state.volatile_pending).unwrap();
-            assert!(
-                payload.contains("retained sibling result") && payload.contains("resumed result")
-            );
+            assert!(payload.contains("terminal-child") && payload.contains("resumed result"));
         }
     }
 
@@ -9570,6 +8971,11 @@ mod tests {
                 )
                 .await;
                 if matches!(result, Ok(RuntimeActivityOutcome::InputReady)) {
+                    // Model provider adoption of the sibling before waiting again.
+                    state
+                        .lease_volatile_pending()
+                        .expect("staged sibling result must be leasable");
+                    state.commit_volatile_attempt_lease();
                     result = await_runtime_activity(&mut host, &mut state, None).await;
                 }
                 (host, state, result)
@@ -11019,147 +10425,7 @@ mod tests {
             state.interruption.as_ref().map(|record| record.kind),
             Some(InterruptionKind::ExecutionIncomplete)
         ));
-        assert!(state.final_text.contains("interrupted after it started"));
-    }
-
-    #[test]
-    fn scoped_cancellation_debt_requires_matching_executor_recovery_receipt() {
-        let args = serde_json::json!({
-            "command": "deploy target",
-            "external_state_paths": ["/managed/target"],
-        })
-        .to_string();
-        let target_set_digest = astra_tools::workspace_observation::ExternalEffectFingerprint::declared_target_set_digest_from_args(
-            &serde_json::from_str(&args).expect("valid declared target set"),
-        )
-        .expect("declared target set has a digest");
-        let cancelled = ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args.clone()),
-            error_kind: Some(astra_core::ErrorKind::Cancelled),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..ToolCallRecord::default()
-        };
-        let matching_recovery = ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args.clone()),
-            disposition: Some(ToolCallDisposition::Executed),
-            external_effect_observed: Some(true),
-            external_effect_scope: Some(
-                astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE.into(),
-            ),
-            external_effect_receipt: Some(serde_json::json!({
-                "schema": "external_effect_receipt.v1",
-                "source": "post_execution_fingerprint",
-                "scope": astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE,
-                "changed": true,
-                "ownership": astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP,
-                "target_set_digest": target_set_digest.clone(),
-                "observed_roots": 1,
-            })),
-            ..ToolCallRecord::default()
-        };
-
-        let mut unsettled = make_state();
-        unsettled.stall.tool_call_records.push(cancelled.clone());
-        assert!(has_unsettled_side_effecting_cancellation(&unsettled));
-
-        let mut settled = make_state();
-        settled.stall.tool_call_records.push(cancelled);
-        settled.stall.tool_call_records.push(matching_recovery);
-        assert!(!has_unsettled_side_effecting_cancellation(&settled));
-
-        let mut wrong_target = make_state();
-        wrong_target.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args.clone()),
-            error_kind: Some(astra_core::ErrorKind::Cancelled),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..ToolCallRecord::default()
-        });
-        wrong_target.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args.clone()),
-            disposition: Some(ToolCallDisposition::Executed),
-            external_effect_observed: Some(true),
-            external_effect_receipt: Some(serde_json::json!({
-                "schema": "external_effect_receipt.v1",
-                "source": "post_execution_fingerprint",
-                "scope": astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE,
-                "changed": true,
-                "ownership": astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP,
-                "target_set_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-                "observed_roots": 1,
-            })),
-            ..ToolCallRecord::default()
-        });
-        assert!(has_unsettled_side_effecting_cancellation(&wrong_target));
-
-        let mut malformed = make_state();
-        malformed.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args.clone()),
-            error_kind: Some(astra_core::ErrorKind::Cancelled),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..ToolCallRecord::default()
-        });
-        malformed.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args),
-            disposition: Some(ToolCallDisposition::Executed),
-            external_effect_observed: Some(true),
-            external_effect_receipt: Some(serde_json::json!({"schema": "forged"})),
-            ..ToolCallRecord::default()
-        });
-        assert!(has_unsettled_side_effecting_cancellation(&malformed));
-
-        let mut read_only = make_state();
-        read_only.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            args_full: Some(serde_json::json!({"command": "pwd"}).to_string()),
-            runtime_args_full: Some(serde_json::json!({"command": "pwd"}).to_string()),
-            error_kind: Some(astra_core::ErrorKind::Cancelled),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..ToolCallRecord::default()
-        });
-        assert!(!has_unsettled_side_effecting_cancellation(&read_only));
-
-        let mut rejected = make_state();
-        rejected.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            args_full: Some(serde_json::json!({"command": "deploy target"}).to_string()),
-            runtime_args_full: Some(serde_json::json!({"command": "deploy target"}).to_string()),
-            error_kind: Some(astra_core::ErrorKind::Cancelled),
-            disposition: Some(ToolCallDisposition::Rejected),
-            ..ToolCallRecord::default()
-        });
-        assert!(!has_unsettled_side_effecting_cancellation(&rejected));
-
-        let mut external_write = make_state();
-        external_write.stall.tool_call_records.push(ToolCallRecord {
-            name: "github".into(),
-            ok: false,
-            args_full: Some(serde_json::json!({"action": "create_issue"}).to_string()),
-            runtime_args_full: Some(serde_json::json!({"action": "create_issue"}).to_string()),
-            error_kind: Some(astra_core::ErrorKind::Cancelled),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..ToolCallRecord::default()
-        });
-        assert!(has_unsettled_side_effecting_cancellation(&external_write));
+        assert!(state.final_text.contains("effects remain unverified"));
     }
 
     fn attach_llm_progress_receiver(
@@ -11987,7 +11253,7 @@ mod tests {
         missing_receipt.workspace_mutation_receipt = None;
 
         let mut wrong_scope = full_scope_verify_record();
-        wrong_scope.workspace_mutation_scope = Some("declared_external_state".into());
+        wrong_scope.workspace_mutation_scope = Some("outside_workspace".into());
 
         let mut wrong_args = full_scope_verify_record();
         let args = serde_json::json!({
@@ -12786,68 +12052,6 @@ mod tests {
                 .cloned();
         }
         record
-    }
-
-    fn external_effect_record(ownership: &str) -> ToolCallRecord {
-        ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(
-                serde_json::json!({
-                    "command": "opaque external action",
-                    "external_state_paths": ["/managed/state"],
-                })
-                .to_string(),
-            ),
-            disposition: Some(ToolCallDisposition::Executed),
-            external_effect_observed: Some(true),
-            external_effect_scope: Some(
-                astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE.to_string(),
-            ),
-            external_effect_receipt: Some(serde_json::json!({
-                "schema": "external_effect_receipt.v1",
-                "source": "post_execution_fingerprint",
-                "scope": astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE,
-                "changed": true,
-                "ownership": ownership,
-                "target_set_digest": "00".repeat(32),
-                "observed_roots": 1,
-            })),
-            ..Default::default()
-        }
-    }
-
-    fn typed_memory_effect_record() -> ToolCallRecord {
-        let memory_args = serde_json::json!({
-            "action": "remember",
-            "content": "opaque content",
-            "memory_type": "working",
-        });
-        let memory_digest = format!(
-            "{:x}",
-            Sha256::digest(astra_core::canonical_json_string(&memory_args))
-        );
-        ToolCallRecord {
-            name: "memory".into(),
-            ok: true,
-            args_full: Some(memory_args.to_string()),
-            disposition: Some(ToolCallDisposition::Executed),
-            external_effect_observed: Some(true),
-            external_effect_scope: Some(
-                astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE.to_string(),
-            ),
-            external_effect_receipt: Some(serde_json::json!({
-                "schema": "external_effect_receipt.v1",
-                "source": "typed_external_tool",
-                "scope": astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE,
-                "changed": true,
-                "ownership": astra_tools::workspace_observation::TYPED_EXTERNAL_TOOL_OWNERSHIP,
-                "tool": "memory",
-                "action": "remember",
-                "operation_digest": memory_digest,
-            })),
-            ..Default::default()
-        }
     }
 
     fn validation_record(command: &str, result_class: &str) -> ToolCallRecord {
@@ -13877,1139 +13081,6 @@ mod tests {
     }
 
     #[test]
-    fn completion_action_respects_typed_mutation_completion_scope() {
-        use astra_config::user_profile::{MutationCompletionScope, TurnIntent};
-
-        let mut external = make_state();
-        external.task_profile = structured_mutating_profile();
-        external.turn_intent = Some(
-            TurnIntent::default()
-                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                .with_mutation_completion_scope(MutationCompletionScope::External),
-        );
-        assert_eq!(
-            pending_completion_action(&external).unwrap(),
-            Some(CompletionAction::RequiredExternalEffect),
-            "external-only state must fail closed without an executor-owned receipt"
-        );
-
-        external
-            .stall
-            .tool_call_records
-            .push(external_effect_record(
-                astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
-            ));
-        assert_eq!(pending_completion_action(&external).unwrap(), None);
-
-        for scope in [
-            MutationCompletionScope::Unknown,
-            MutationCompletionScope::Workspace,
-        ] {
-            let mut bounded = make_state();
-            bounded.task_profile = structured_mutating_profile();
-            bounded.turn_intent = Some(
-                TurnIntent::default()
-                    .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                    .with_mutation_completion_scope(scope),
-            );
-            assert_eq!(
-                pending_completion_action(&bounded).unwrap(),
-                Some(CompletionAction::RequiredWorkspaceMutation),
-                "{scope:?} must preserve fail-closed workspace completion"
-            );
-        }
-
-        let mut mixed = make_state();
-        mixed.task_profile = structured_mutating_profile();
-        mixed.turn_intent = Some(
-            TurnIntent::default()
-                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                .with_mutation_completion_scope(MutationCompletionScope::Mixed),
-        );
-        assert_eq!(
-            pending_completion_action(&mixed).unwrap(),
-            Some(CompletionAction::RequiredExternalEffect)
-        );
-        mixed.stall.tool_call_records.push(external_effect_record(
-            astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
-        ));
-        assert_eq!(
-            pending_completion_action(&mixed).unwrap(),
-            Some(CompletionAction::RequiredWorkspaceMutation),
-            "a trusted external receipt cannot replace the mixed scope's workspace receipt"
-        );
-        mixed
-            .stall
-            .tool_call_records
-            .push(executed_record("write_file", true, None));
-        assert_eq!(
-            pending_completion_action(&mixed).unwrap(),
-            Some(CompletionAction::PostMutationObservation),
-            "both mutation receipts must advance to the ordinary workspace settlement gate"
-        );
-        mixed
-            .stall
-            .tool_call_records
-            .push(executed_record("read_file", true, None));
-        assert_eq!(pending_completion_action(&mixed).unwrap(), None);
-    }
-
-    #[test]
-    fn external_effect_completion_rejects_untrusted_or_failed_records() {
-        use astra_config::user_profile::{MutationCompletionScope, TurnIntent};
-
-        let mut state = make_state();
-        state.task_profile = structured_mutating_profile();
-        state.turn_intent = Some(
-            TurnIntent::default()
-                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                .with_mutation_completion_scope(MutationCompletionScope::External),
-        );
-
-        state.stall.tool_call_records.push(executed_record(
-            "bash",
-            true,
-            Some(r#"{"command":"exit 0"}"#),
-        ));
-        assert!(!has_concrete_external_effect(&state));
-
-        state
-            .stall
-            .tool_call_records
-            .push(external_effect_record("model_claim"));
-        assert!(!has_concrete_external_effect(&state));
-
-        let mut failed = external_effect_record(
-            astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP,
-        );
-        failed.ok = false;
-        state.stall.tool_call_records.push(failed);
-        assert!(!has_concrete_external_effect(&state));
-        assert_eq!(
-            pending_completion_action(&state).unwrap(),
-            Some(CompletionAction::RequiredExternalEffect)
-        );
-
-        state.stall.tool_call_records.push(external_effect_record(
-            astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP,
-        ));
-        assert!(has_concrete_external_effect(&state));
-        assert_eq!(pending_completion_action(&state).unwrap(), None);
-    }
-
-    fn external_must_mutate(state: &mut AgenticLoopState, scope: MutationCompletionScope) {
-        use astra_config::user_profile::TurnIntent;
-
-        state.task_profile = structured_mutating_profile();
-        state.turn_intent = Some(
-            TurnIntent::default()
-                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                .with_mutation_completion_scope(scope),
-        );
-    }
-
-    fn pathless_upload_bash(call_id: &str) -> ToolCallRecord {
-        ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            tool_call_id: Some(call_id.into()),
-            args_full: Some(r#"{"command":"moi upload"}"#.into()),
-            runtime_args_full: Some(r#"{"command":"moi upload"}"#.into()),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        }
-    }
-
-    fn executed_command_bash(call_id: &str, command: &str, ok: bool) -> ToolCallRecord {
-        let args = serde_json::json!({ "command": command }).to_string();
-        ToolCallRecord {
-            name: "bash".into(),
-            ok,
-            tool_call_id: Some(call_id.into()),
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        }
-    }
-
-    fn executed_background_bash(call_id: &str, command: &str) -> ToolCallRecord {
-        let args = serde_json::json!({
-            "command": command,
-            "run_in_background": true,
-        })
-        .to_string();
-        ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            tool_call_id: Some(call_id.into()),
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn pathless_bash_external_completion_closes_without_replay() {
-        use astra_config::user_profile::MutationCompletionScope;
-
-        let mut state = make_state();
-        external_must_mutate(&mut state, MutationCompletionScope::External);
-        state.final_text = "uploaded file_id=abc".into();
-        state
-            .stall
-            .tool_call_records
-            .push(pathless_upload_bash("upload-1"));
-        let max_turns = state.max_turns;
-        let remaining_turns = state.remaining_turns;
-
-        assert!(!enforce_workspace_completion_before_text_completion(
-            &mut state
-        ));
-        assert_eq!(
-            state.hooks.completion_settlement.external_effect_retries, 0,
-            "a missing file contract must not spend the retry on another write"
-        );
-        assert_eq!(state.max_turns, max_turns);
-        assert_eq!(state.remaining_turns, remaining_turns);
-        assert_eq!(state.stall.tool_call_records.len(), 1);
-        assert_eq!(state.final_text, "uploaded file_id=abc");
-        assert!(
-            state
-                .volatile_pending
-                .iter()
-                .all(|entry| entry.payload["signal"] != "required_external_effect_missing")
-        );
-        assert_eq!(
-            state.interruption.as_ref().map(|record| record.kind),
-            Some(InterruptionKind::ExecutionIncomplete)
-        );
-        assert!(
-            state
-                .interruption
-                .as_ref()
-                .and_then(|record| record.error_detail.as_deref())
-                .is_some_and(|detail| detail.contains("do not replay"))
-        );
-    }
-
-    #[test]
-    fn read_only_probe_does_not_forbid_the_first_external_action() {
-        use astra_config::user_profile::MutationCompletionScope;
-
-        for ok in [true, false] {
-            let mut state = make_state();
-            external_must_mutate(&mut state, MutationCompletionScope::External);
-            state.final_text = "listed the directory".into();
-            state.stall.tool_call_records.push(executed_command_bash(
-                "probe-ls",
-                "ls /etc/app",
-                ok,
-            ));
-
-            assert!(
-                !external_effect_replay_forbidden(&state),
-                "a proven read-only Bash call is not an unverified write"
-            );
-            assert!(enforce_workspace_completion_before_text_completion(
-                &mut state
-            ));
-            assert_eq!(state.hooks.completion_settlement.external_effect_retries, 1);
-            assert!(state.final_text.is_empty());
-            assert!(state.interruption.is_none());
-            assert!(
-                state
-                    .hooks
-                    .completion_settlement
-                    .completion_action_window
-                    .is_none(),
-                "no file contract means the first mutation is not a bound observation"
-            );
-            let payload = state
-                .volatile_pending
-                .iter()
-                .find(|entry| entry.payload["signal"] == "required_external_effect_missing")
-                .expect("the first external mutation is still owed");
-            assert!(payload.payload.get("bound_external_state_paths").is_none());
-            let first_mutation = serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": "bash",
-                    "arguments": r#"{"command":"install-unit","external_state_paths":["/etc/app/config"]}"#
-                }
-            });
-            let replay = serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": "bash",
-                    "arguments": r#"{"command":"moi upload"}"#
-                }
-            });
-            assert!(
-                completion_action_match_label(
-                    &state,
-                    &CompletionAction::RequiredExternalEffect,
-                    &first_mutation,
-                )
-                .is_some()
-            );
-            assert!(
-                !completion_action_match_label(
-                    &state,
-                    &CompletionAction::RequiredExternalEffect,
-                    &replay,
-                )
-                .is_some()
-            );
-        }
-    }
-
-    #[test]
-    fn read_only_probe_before_file_contract_still_requests_one_observation() {
-        use astra_config::user_profile::MutationCompletionScope;
-
-        let mut state = make_state();
-        external_must_mutate(&mut state, MutationCompletionScope::External);
-        state.final_text = "changed the host file".into();
-        state
-            .stall
-            .tool_call_records
-            .push(executed_command_bash("probe-ls", "ls /etc/app", true));
-        let args = serde_json::json!({
-            "command": "install-unit",
-            "external_state_paths": ["/etc/app/config"],
-        })
-        .to_string();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            tool_call_id: Some("file-1".into()),
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-
-        assert!(!external_effect_replay_forbidden(&state));
-        assert!(enforce_workspace_completion_before_text_completion(
-            &mut state
-        ));
-        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 1);
-        let payload = state
-            .volatile_pending
-            .iter()
-            .find(|entry| entry.payload["signal"] == "required_external_effect_missing")
-            .expect("the listing must not block the file contract");
-        assert_eq!(
-            payload.payload["bound_external_state_paths"],
-            serde_json::json!(["/etc/app/config"])
-        );
-        let omitted = serde_json::json!({
-            "id": "file-retry",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"install-unit"}"#
-            }
-        });
-        let admitted = apply_completion_action_admission(
-            &mut state,
-            ToolCallAdmission {
-                admitted: ordinary_admitted([omitted.clone()]),
-                rejected: Vec::new(),
-                completion_action_applied: false,
-            },
-            std::slice::from_ref(&omitted),
-        );
-        assert_eq!(admitted.admitted.len(), 1);
-        crate::turn::agentic::tool_interception::validate_tool_call_admission_partition(
-            std::slice::from_ref(&omitted),
-            &admitted,
-        )
-        .expect("inherited roots must not rewrite the provider call");
-        let mut execution_args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(
-            admitted.admitted[0].logical_target_call(),
-        )
-        .expect("original arguments");
-        assert!(
-            crate::turn::headless_tool_pipeline::inherit_external_effect_recovery_scope(
-                "bash",
-                &mut execution_args,
-                state
-                    .hooks
-                    .completion_settlement
-                    .external_effect_recovery_paths
-                    .as_deref(),
-            )
-        );
-        assert_eq!(
-            execution_args[astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD],
-            serde_json::json!(["/etc/app/config"])
-        );
-    }
-
-    #[test]
-    fn read_only_probe_does_not_excuse_a_later_pathless_upload() {
-        use astra_config::user_profile::MutationCompletionScope;
-
-        let mut state = make_state();
-        external_must_mutate(&mut state, MutationCompletionScope::External);
-        state.final_text = "uploaded file_id=abc".into();
-        state
-            .stall
-            .tool_call_records
-            .push(executed_command_bash("probe-ls", "ls /tmp", true));
-        state
-            .stall
-            .tool_call_records
-            .push(pathless_upload_bash("upload-1"));
-
-        assert!(external_effect_replay_forbidden(&state));
-        assert!(!enforce_workspace_completion_before_text_completion(
-            &mut state
-        ));
-        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 0);
-        assert_eq!(state.final_text, "uploaded file_id=abc");
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn ready_background_bash_does_not_forbid_the_first_external_action() {
-        use astra_config::user_profile::MutationCompletionScope;
-
-        let mut state = make_state();
-        external_must_mutate(&mut state, MutationCompletionScope::External);
-        state.final_text = "helper is up".into();
-        state.stall.tool_call_records.push(executed_background_bash(
-            "helper-1",
-            "python3 -m http.server 8000",
-        ));
-
-        assert!(!external_effect_replay_forbidden(&state));
-        assert!(enforce_workspace_completion_before_text_completion(
-            &mut state
-        ));
-        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 1);
-        assert!(state.interruption.is_none());
-        assert!(
-            state
-                .volatile_pending
-                .iter()
-                .any(|entry| entry.payload["signal"] == "required_external_effect_missing")
-        );
-        let projection = external_effect_ledger_projection(&state).expect("background row");
-        let helper = projection["calls"]
-            .as_array()
-            .and_then(|calls| calls.iter().find(|call| call["tool_call_id"] == "helper-1"))
-            .expect("background helper stays visible");
-        assert_eq!(helper["replay"], "not_foreground");
-        assert_eq!(helper["executor_confirmation"], "executed_unconfirmed");
-    }
-
-    #[test]
-    fn ready_background_bash_does_not_block_a_later_file_contract() {
-        use astra_config::user_profile::MutationCompletionScope;
-
-        let mut state = make_state();
-        external_must_mutate(&mut state, MutationCompletionScope::External);
-        state.final_text = "changed the host file".into();
-        state.stall.tool_call_records.push(executed_background_bash(
-            "helper-1",
-            "python3 -m http.server 8000",
-        ));
-        let args = serde_json::json!({
-            "command": "install-unit",
-            "external_state_paths": ["/etc/app/config"],
-        })
-        .to_string();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            tool_call_id: Some("file-1".into()),
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-
-        assert!(!external_effect_replay_forbidden(&state));
-        assert!(enforce_workspace_completion_before_text_completion(
-            &mut state
-        ));
-        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 1);
-        let payload = state
-            .volatile_pending
-            .iter()
-            .find(|entry| entry.payload["signal"] == "required_external_effect_missing")
-            .expect("the background helper must not block the file contract");
-        assert_eq!(
-            payload.payload["bound_external_state_paths"],
-            serde_json::json!(["/etc/app/config"])
-        );
-        let open = external_effect_ledger_projection(&state).expect("open recovery");
-        let open_file = open["calls"]
-            .as_array()
-            .and_then(|calls| calls.iter().find(|call| call["tool_call_id"] == "file-1"))
-            .expect("file contract");
-        assert_eq!(open_file["replay"], "continuable");
-        let same_roots = serde_json::json!({
-            "id": "file-retry",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"install-unit","external_state_paths":["/etc/app/config"]}"#
-            }
-        });
-        let admitted = apply_completion_action_admission(
-            &mut state,
-            ToolCallAdmission {
-                admitted: ordinary_admitted([same_roots.clone()]),
-                rejected: Vec::new(),
-                completion_action_applied: false,
-            },
-            std::slice::from_ref(&same_roots),
-        );
-        assert_eq!(admitted.admitted.len(), 1);
-        let projection = external_effect_ledger_projection(&state).expect("ledger");
-        let file = projection["calls"]
-            .as_array()
-            .and_then(|calls| calls.iter().find(|call| call["tool_call_id"] == "file-1"))
-            .expect("file contract");
-        assert_eq!(file["replay"], "forbidden");
-        assert_eq!(file["executor_confirmation"], "executed_unconfirmed");
-    }
-
-    #[test]
-    fn ready_background_bash_does_not_excuse_a_later_pathless_upload() {
-        use astra_config::user_profile::MutationCompletionScope;
-
-        let mut state = make_state();
-        external_must_mutate(&mut state, MutationCompletionScope::External);
-        state.final_text = "uploaded file_id=abc".into();
-        state.stall.tool_call_records.push(executed_background_bash(
-            "helper-1",
-            "python3 -m http.server 8000",
-        ));
-        state
-            .stall
-            .tool_call_records
-            .push(pathless_upload_bash("upload-1"));
-
-        assert!(external_effect_replay_forbidden(&state));
-        assert!(!enforce_workspace_completion_before_text_completion(
-            &mut state
-        ));
-        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 0);
-        let projection = external_effect_ledger_projection(&state).expect("ledger");
-        let upload = projection["calls"]
-            .as_array()
-            .and_then(|calls| calls.iter().find(|call| call["tool_call_id"] == "upload-1"))
-            .expect("pathless upload");
-        assert_eq!(upload["replay"], "forbidden");
-    }
-
-    #[test]
-    fn accepted_external_file_contract_still_requests_one_observation() {
-        use astra_config::user_profile::MutationCompletionScope;
-
-        let mut state = make_state();
-        external_must_mutate(&mut state, MutationCompletionScope::External);
-        state.final_text = "changed the host file".into();
-        let args = serde_json::json!({
-            "command": "install-unit",
-            "external_state_paths": ["/etc/app/config"],
-        })
-        .to_string();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            tool_call_id: Some("file-1".into()),
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-
-        assert!(enforce_workspace_completion_before_text_completion(
-            &mut state
-        ));
-        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 1);
-        assert!(state.final_text.is_empty());
-        let payload = state
-            .volatile_pending
-            .iter()
-            .find(|entry| entry.payload["signal"] == "required_external_effect_missing")
-            .expect("bound file-contract recovery");
-        assert_eq!(
-            payload.payload["bound_external_state_paths"],
-            serde_json::json!(["/etc/app/config"])
-        );
-        assert_eq!(
-            state
-                .hooks
-                .completion_settlement
-                .external_effect_recovery_paths
-                .as_deref(),
-            Some(["/etc/app/config".to_string()].as_slice())
-        );
-        let same_roots = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"install-unit","external_state_paths":["/etc/app/config"]}"#
-            }
-        });
-        let other_roots = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"upload","external_state_paths":["/var/lib/other"]}"#
-            }
-        });
-        assert!(
-            completion_action_match_label(
-                &state,
-                &CompletionAction::RequiredExternalEffect,
-                &same_roots,
-            )
-            .is_some()
-        );
-        assert!(
-            !completion_action_match_label(
-                &state,
-                &CompletionAction::RequiredExternalEffect,
-                &other_roots,
-            )
-            .is_some()
-        );
-        let omitted = serde_json::json!({
-            "id": "file-retry",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"install-unit"}"#
-            }
-        });
-        let admitted = apply_completion_action_admission(
-            &mut state,
-            ToolCallAdmission {
-                admitted: ordinary_admitted([omitted.clone()]),
-                rejected: Vec::new(),
-                completion_action_applied: false,
-            },
-            std::slice::from_ref(&omitted),
-        );
-        assert_eq!(admitted.admitted.len(), 1);
-        assert!(admitted.rejected.is_empty());
-        crate::turn::agentic::tool_interception::validate_tool_call_admission_partition(
-            std::slice::from_ref(&omitted),
-            &admitted,
-        )
-        .expect("inherited roots must not rewrite the provider call");
-        assert_eq!(
-            admitted.admitted[0].physical_provider_call(),
-            &omitted,
-            "the original omitted-field request stays the provider record"
-        );
-        let provider_args = astra_turn_core::tool::args::shape::parse_tool_call_arguments(
-            admitted.admitted[0].logical_target_call(),
-        )
-        .expect("original arguments");
-        assert!(
-            provider_args
-                .get(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
-                .is_none()
-        );
-        let mut execution_args = provider_args;
-        assert!(
-            crate::turn::headless_tool_pipeline::inherit_external_effect_recovery_scope(
-                "bash",
-                &mut execution_args,
-                state
-                    .hooks
-                    .completion_settlement
-                    .external_effect_recovery_paths
-                    .as_deref(),
-            )
-        );
-        assert_eq!(
-            execution_args[astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD],
-            serde_json::json!(["/etc/app/config"])
-        );
-    }
-
-    #[test]
-    fn unrelated_file_contract_does_not_reopen_a_pathless_upload() {
-        use astra_config::user_profile::MutationCompletionScope;
-
-        let mut state = make_state();
-        external_must_mutate(&mut state, MutationCompletionScope::External);
-        state.final_text = "uploaded file_id=abc".into();
-        let probe = serde_json::json!({
-            "command": "ls /etc/app",
-            "external_state_paths": ["/etc/app"],
-        })
-        .to_string();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            tool_call_id: Some("probe-1".into()),
-            args_full: Some(probe.clone()),
-            runtime_args_full: Some(probe),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-        state
-            .stall
-            .tool_call_records
-            .push(pathless_upload_bash("upload-1"));
-
-        assert!(!enforce_workspace_completion_before_text_completion(
-            &mut state
-        ));
-        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 0);
-        assert_eq!(state.final_text, "uploaded file_id=abc");
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_none()
-        );
-        assert!(
-            state
-                .volatile_pending
-                .iter()
-                .all(|entry| entry.payload["signal"] != "required_external_effect_missing")
-        );
-        let projection = external_effect_ledger_projection(&state).expect("ledger");
-        let calls = projection["calls"].as_array().expect("calls");
-        assert!(
-            calls.iter().any(|call| {
-                call["tool_call_id"] == "upload-1" && call["replay"] == "forbidden"
-            })
-        );
-        assert!(
-            calls.iter().all(|call| call["replay"] != "continuable"),
-            "a later pathless upload withdraws the older file-contract continuation"
-        );
-    }
-
-    async fn reject_text_only_tool_call(
-        host: &mut MockHost,
-        state: &mut AgenticLoopState,
-        call: serde_json::Value,
-    ) -> Result<super::super::tool_phase::TurnToolPhaseControl, String> {
-        super::super::tool_phase::execute_tool_phase(
-            host,
-            state,
-            1,
-            TurnIterationPrep {
-                quiet: true,
-                turn_start_time: Instant::now(),
-            },
-            TurnExecutionPhase {
-                llm_wall_start: Instant::now(),
-                turn_result: HostTurnResult {
-                    accum: ChatTurnSseAccum {
-                        tool_calls: vec![call],
-                        has_tool_calls: true,
-                        ..ChatTurnSseAccum::default()
-                    },
-                    ttft_ms: None,
-
-                    error_kind: None,
-                },
-            },
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn unverified_remote_does_not_waive_mixed_workspace_receipt() {
-        use astra_config::user_profile::MutationCompletionScope;
-
-        let mut state = make_state();
-        external_must_mutate(&mut state, MutationCompletionScope::Mixed);
-        state.final_text = "uploaded".into();
-        state
-            .stall
-            .tool_call_records
-            .push(pathless_upload_bash("upload-1"));
-
-        assert!(enforce_workspace_completion_before_text_completion(
-            &mut state
-        ));
-        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 0);
-        assert!(state.interruption.is_none());
-        assert!(
-            state
-                .volatile_pending
-                .iter()
-                .any(|entry| { entry.payload["signal"] == "required_workspace_mutation_missing" })
-        );
-        assert!(
-            state
-                .volatile_pending
-                .iter()
-                .all(|entry| entry.payload["signal"] != "required_external_effect_missing")
-        );
-
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("mixed scope still owes the workspace half");
-        assert_eq!(window.action, CompletionAction::RequiredWorkspaceMutation);
-        let writer = serde_json::json!({
-            "id": "workspace-writer",
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "arguments": r#"{"path":"/remote/app/result.txt","content":"done\n"}"#
-            }
-        });
-        let writer_admission = apply_completion_action_admission(
-            &mut state,
-            ToolCallAdmission {
-                admitted: ordinary_admitted([writer.clone()]),
-                rejected: Vec::new(),
-                completion_action_applied: false,
-            },
-            &[writer],
-        );
-        assert_eq!(writer_admission.admitted.len(), 1);
-        let records_before = state.stall.tool_call_records.len();
-        state.stall.tool_call_records.push(executed_record(
-            "write_file",
-            true,
-            Some(r#"{"path":"/remote/app/result.txt","content":"done\n"}"#),
-        ));
-        let turns_before = (state.max_turns, state.remaining_turns);
-        advance_completion_action_window_after_tool_round_from_record_index(
-            &mut state,
-            records_before,
-        );
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("workspace window stays consumed");
-        assert_eq!(window.action, CompletionAction::RequiredWorkspaceMutation);
-        assert!(window.consumed);
-        assert_eq!((state.max_turns, state.remaining_turns), turns_before);
-        assert_eq!(
-            state.interruption.as_ref().map(|record| record.kind),
-            Some(InterruptionKind::ExecutionIncomplete)
-        );
-        assert!(
-            state
-                .volatile_pending
-                .iter()
-                .all(|entry| { entry.payload["allowed_action"] != "required_external_effect" })
-        );
-        assert!(state.hooks.completion_settlement.text_only);
-        assert!(
-            !state.budget_wrapup_injected,
-            "the closer leaves the text reservation to the next prepare step"
-        );
-        let no_replay = |state: &AgenticLoopState| {
-            state.interruption.as_ref().is_some_and(|record| {
-                record.kind == InterruptionKind::ExecutionIncomplete
-                    && record
-                        .error_detail
-                        .as_deref()
-                        .is_some_and(|detail| detail.contains("do not replay"))
-            })
-        };
-        assert!(no_replay(&state));
-        assert!(state.volatile_pending.iter().any(|entry| {
-            entry.payload["signal"] == "agentic_execution_slice_complete"
-                && entry.payload["mode"] == "text_only"
-                && entry.payload["execution_authority"] == "none"
-                && entry.payload["instruction"]
-                    .as_str()
-                    .is_some_and(|instruction| instruction.contains("non-idempotent write"))
-        }));
-
-        state.remaining_turns = 0;
-        let max_turns_before_prepare = state.max_turns;
-        let mut host = MockHost::new(Vec::new()).with_valid_tools(&["bash"]);
-        let prepared = super::super::lifecycle::prepare_turn_iteration(&mut host, &mut state, 1)
-            .await
-            .expect("the exhausted writer round reserves one text-only turn");
-        assert!(
-            matches!(
-                prepared,
-                super::super::lifecycle::PreparedTurnIteration::Ready(_)
-            ),
-            "budget exhaustion must not replace the unverified-write close"
-        );
-        assert_eq!(state.max_turns, max_turns_before_prepare + 1);
-        assert_eq!(
-            state.remaining_turns, 0,
-            "prepare charges the reserved text-only turn"
-        );
-        assert!(state.budget_wrapup_injected);
-        assert!(state.hooks.completion_settlement.text_only);
-        assert!(no_replay(&state));
-        assert_ne!(
-            state.interruption.as_ref().map(|record| record.kind),
-            Some(InterruptionKind::BudgetExhausted)
-        );
-        assert!(state.volatile_pending.iter().any(|entry| {
-            entry.payload["signal"] == "agentic_execution_slice_complete"
-                && entry.payload["instruction"]
-                    .as_str()
-                    .is_some_and(|instruction| instruction.contains("non-idempotent write"))
-        }));
-
-        let records_before_replay = state.stall.tool_call_records.len();
-        state.step_recorder.begin_turn(1);
-        let replay = serde_json::json!({
-            "id": "upload-2",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"moi upload"}"#
-            }
-        });
-        let outcome = reject_text_only_tool_call(&mut host, &mut state, replay)
-            .await
-            .expect("text-only boundary rejects the replay");
-        assert!(matches!(
-            outcome,
-            super::super::tool_phase::TurnToolPhaseControl::ContinueLoop
-        ));
-        assert!(
-            state.stall.tool_call_records[records_before_replay..]
-                .iter()
-                .all(|record| !record.was_executed()),
-            "a later upload must not execute after the external replay was closed"
-        );
-        assert!(state.stall.tool_call_records.iter().any(|record| {
-            record.tool_call_id.as_deref() == Some("upload-2")
-                && record
-                    .result_full
-                    .as_deref()
-                    .is_some_and(|result| result.contains("text_only_settlement_tool_call"))
-        }));
-        assert!(no_replay(&state));
-
-        state.remaining_turns = 0;
-        let max_turns_before_retry = state.max_turns;
-        let retried = super::super::lifecycle::prepare_turn_iteration(&mut host, &mut state, 2)
-            .await
-            .expect("one ignored tool response still does not exhaust the explanation");
-        assert!(matches!(
-            retried,
-            super::super::lifecycle::PreparedTurnIteration::Ready(_)
-        ));
-        assert_eq!(state.max_turns, max_turns_before_retry + 1);
-        assert!(no_replay(&state));
-        assert_ne!(
-            state.interruption.as_ref().map(|record| record.kind),
-            Some(InterruptionKind::BudgetExhausted)
-        );
-        let second = serde_json::json!({
-            "id": "upload-3",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"moi upload"}"#
-            }
-        });
-        let second_outcome = reject_text_only_tool_call(&mut host, &mut state, second)
-            .await
-            .expect("the second tool response ends the turn without executing");
-        assert!(matches!(
-            second_outcome,
-            super::super::tool_phase::TurnToolPhaseControl::Return(_)
-        ));
-        assert!(
-            state
-                .stall
-                .tool_call_records
-                .iter()
-                .all(|record| record.tool_call_id.as_deref() != Some("upload-3")
-                    || !record.was_executed())
-        );
-        assert!(no_replay(&state));
-    }
-
-    #[test]
-    fn rejected_overlapping_external_paths_are_not_an_executed_upload() {
-        use astra_config::user_profile::MutationCompletionScope;
-
-        let mut state = make_state();
-        external_must_mutate(&mut state, MutationCompletionScope::External);
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            args_full: Some(
-                r#"{"command":"upload","external_state_paths":["/workspace/file"]}"#.into(),
-            ),
-            disposition: Some(ToolCallDisposition::Rejected),
-            ..Default::default()
-        });
-
-        assert!(enforce_workspace_completion_before_text_completion(
-            &mut state
-        ));
-        assert_eq!(state.hooks.completion_settlement.external_effect_retries, 1);
-        assert!(
-            state
-                .volatile_pending
-                .iter()
-                .any(|entry| entry.payload["signal"] == "required_external_effect_missing")
-        );
-    }
-
-    #[test]
-    fn external_effect_recovery_scope_carries_only_executed_structured_bash_args() {
-        let paths = vec!["/etc/ssh/sshd_config.d/99-gitlab.conf".to_string()];
-        let args = serde_json::json!({
-            "command": "ls -la /etc/ssh",
-            "external_state_paths": paths.clone(),
-        })
-        .to_string();
-        let mut state = make_state();
-        state.hooks.completion_settlement.external_effect_retries = 1;
-
-        let rejected = ToolCallRecord {
-            name: "bash".into(),
-            args_preview: Some("external_state_paths".into()),
-            disposition: Some(ToolCallDisposition::Rejected),
-            ..Default::default()
-        };
-        remember_external_effect_recovery_scope(&mut state, &[rejected]);
-        assert!(external_effect_recovery_scope(&state).is_none());
-
-        let observed = ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        };
-        remember_external_effect_recovery_scope(&mut state, &[observed]);
-        assert_eq!(
-            external_effect_recovery_scope(&state),
-            Some(paths),
-            "only the executor-visible structured scope may cross the retry"
-        );
-
-        let mut receipt = external_effect_record(
-            astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP,
-        );
-        receipt.args_full = Some(
-            serde_json::json!({
-                "command": "mutate",
-                "external_state_paths": ["/managed/target"],
-            })
-            .to_string(),
-        );
-        receipt.runtime_args_full = receipt.args_full.clone();
-        state.stall.tool_call_records.push(receipt);
-        remember_external_effect_recovery_scope(&mut state, &[]);
-        assert!(external_effect_recovery_scope(&state).is_none());
-    }
-
-    #[test]
-    fn typed_memory_mutation_receipt_is_bound_to_canonical_action() {
-        use astra_config::user_profile::{MutationCompletionScope, TurnIntent, TurnIntentDomain};
-
-        let mut state = make_state();
-        state.task_profile = structured_mutating_profile();
-        state.turn_intent = Some(
-            TurnIntent::default()
-                .with_domain(TurnIntentDomain::Memory)
-                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                .with_mutation_completion_scope(MutationCompletionScope::External),
-        );
-
-        let mut record = typed_memory_effect_record();
-        state.stall.tool_call_records.push(record.clone());
-        assert!(has_concrete_external_effect(&state));
-        assert_eq!(pending_completion_action(&state).unwrap(), None);
-
-        record.external_effect_receipt = Some(serde_json::json!({
-            "schema": "external_effect_receipt.v1",
-            "source": "typed_external_tool",
-            "scope": astra_tools::workspace_observation::DECLARED_EXTERNAL_STATE_SCOPE,
-            "changed": true,
-            "ownership": astra_tools::workspace_observation::TYPED_EXTERNAL_TOOL_OWNERSHIP,
-            "tool": "memory",
-            "action": "forget",
-            "operation_digest": "00".repeat(32),
-        }));
-        state.stall.tool_call_records.clear();
-        state.stall.tool_call_records.push(record);
-        assert!(!has_concrete_external_effect(&state));
-        assert_eq!(
-            pending_completion_action(&state).unwrap(),
-            Some(CompletionAction::RequiredExternalEffect)
-        );
-    }
-
-    #[test]
-    fn incidental_memory_receipt_cannot_settle_non_memory_external_intent() {
-        use astra_config::user_profile::{MutationCompletionScope, TurnIntent, TurnIntentDomain};
-
-        let mut state = make_state();
-        state.task_profile = structured_mutating_profile();
-        state.turn_intent = Some(
-            TurnIntent::default()
-                .with_domain(TurnIntentDomain::System)
-                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                .with_mutation_completion_scope(MutationCompletionScope::External),
-        );
-        state
-            .stall
-            .tool_call_records
-            .push(typed_memory_effect_record());
-
-        assert!(!has_concrete_external_effect(&state));
-        assert_eq!(
-            pending_completion_action(&state).unwrap(),
-            Some(CompletionAction::RequiredExternalEffect)
-        );
-
-        let memory = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "memory",
-                "arguments": "{\"action\":\"remember\",\"content\":\"fact\"}"
-            }
-        });
-        assert!(
-            !completion_action_match_label(
-                &state,
-                &CompletionAction::RequiredExternalEffect,
-                &memory,
-            )
-            .is_some()
-        );
-        let hint =
-            completion_action_hint_for_state(&state, &CompletionAction::RequiredExternalEffect);
-        assert!(
-            hint["accepted_action_shapes"]
-                .as_array()
-                .is_some_and(|shapes| shapes.iter().all(|shape| shape["tool"] != "memory"))
-        );
-    }
-
-    #[test]
     fn terminal_completion_action_preserves_workspace_intent_tristate() {
         let failed_writer = executed_record(
             "write_file",
@@ -15480,17 +13551,6 @@ mod tests {
                 .as_array()
                 .is_some_and(Vec::is_empty)
         );
-    }
-
-    #[test]
-    fn external_effect_hint_requires_mutation_and_scope_on_same_call() {
-        let hint = completion_action_hint(&CompletionAction::RequiredExternalEffect);
-        let constraint = hint["accepted_action_shapes"][0]["constraint"]
-            .as_str()
-            .expect("external-effect Bash constraint");
-        assert!(constraint.contains("performs the required external mutation"));
-        assert!(constraint.contains("on that same call"));
-        assert!(constraint.contains("later read-only probe cannot establish"));
     }
 
     #[test]
@@ -18732,166 +16792,6 @@ mod tests {
         );
     }
 
-    fn external_effect_admission_state(
-        scope: astra_config::user_profile::MutationCompletionScope,
-    ) -> AgenticLoopState {
-        let mut state = make_state();
-        state.task_profile = structured_mutating_profile();
-        state.turn_intent = Some(
-            astra_config::user_profile::TurnIntent::default()
-                .with_workspace_mutation(
-                    astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
-                )
-                .with_mutation_completion_scope(scope),
-        );
-        state
-    }
-
-    #[test]
-    fn external_intent_does_not_preempt_ordinary_bash_admission() {
-        let mut state = external_effect_admission_state(
-            astra_config::user_profile::MutationCompletionScope::Mixed,
-        );
-        let bash = serde_json::json!({
-            "id": "ordinary-bash",
-            "type": "function",
-            "function": {"name": "bash", "arguments": "{\"command\":\"opaque-operation\"}"}
-        });
-        let max_before = state.max_turns;
-        let remaining_before = state.remaining_turns;
-
-        let admission = apply_completion_action_admission(
-            &mut state,
-            ToolCallAdmission {
-                admitted: ordinary_admitted([bash.clone()]),
-                rejected: Vec::new(),
-                completion_action_applied: false,
-            },
-            std::slice::from_ref(&bash),
-        );
-
-        assert_eq!(admitted_logical_calls(&admission), vec![bash]);
-        assert!(admission.rejected.is_empty());
-        assert_eq!(state.max_turns, max_before);
-        assert_eq!(state.remaining_turns, remaining_before);
-    }
-
-    #[test]
-    fn active_external_effect_window_executes_only_typed_external_candidate() {
-        let mut state = external_effect_admission_state(
-            astra_config::user_profile::MutationCompletionScope::Mixed,
-        );
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::RequiredExternalEffect,
-                attempts_remaining: 1,
-                mismatch_corrections_remaining: 1,
-                consumed: false,
-                matched: false,
-            });
-        let memory = serde_json::json!({
-            "id": "typed-memory-write",
-            "type": "function",
-            "function": {"name": "memory", "arguments": "{\"action\":\"remember\",\"content\":\"fact\"}"}
-        });
-        let mcp = serde_json::json!({
-            "id": "unresolved-mcp-write",
-            "type": "function",
-            "function": {"name": "mcp__service__write", "arguments": "{\"value\":\"fact\"}"}
-        });
-        let read = serde_json::json!({
-            "id": "read-sibling",
-            "type": "function",
-            "function": {"name": "read_file", "arguments": "{\"path\":\"/workspace/input\"}"}
-        });
-        let bash = serde_json::json!({
-            "id": "unobservable-shell-write",
-            "type": "function",
-            "function": {"name": "bash", "arguments": "{\"command\":\"opaque-operation\",\"external_state_paths\":[\"/managed/state\"]}"}
-        });
-
-        let admission = apply_completion_action_admission(
-            &mut state,
-            ToolCallAdmission {
-                admitted: ordinary_admitted([
-                    memory.clone(),
-                    mcp.clone(),
-                    read.clone(),
-                    bash.clone(),
-                ]),
-                rejected: Vec::new(),
-                completion_action_applied: false,
-            },
-            &[memory.clone(), mcp, read, bash.clone()],
-        );
-
-        assert_eq!(admitted_logical_calls(&admission), vec![bash]);
-        assert_eq!(admission.rejected.len(), 3);
-        assert!(admission.rejected.iter().all(|rejection| {
-            serde_json::from_str::<serde_json::Value>(&rejection.result)
-                .is_ok_and(|payload| payload["retryable"] == false)
-        }));
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("typed external action remains auditable until its receipt arrives");
-        assert!(window.consumed);
-        assert!(window.matched);
-        assert_eq!(window.mismatch_corrections_remaining, 1);
-    }
-
-    #[test]
-    fn active_external_effect_window_accepts_typed_memory_receipt_capability() {
-        use astra_config::user_profile::TurnIntent;
-
-        let mut state = external_effect_admission_state(
-            astra_config::user_profile::MutationCompletionScope::External,
-        );
-        state.turn_intent = Some(
-            TurnIntent::default()
-                .with_domain(TurnIntentDomain::Memory)
-                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                .with_mutation_completion_scope(
-                    astra_config::user_profile::MutationCompletionScope::External,
-                ),
-        );
-        state.hooks.completion_settlement.completion_action_window =
-            Some(super::super::host::CompletionActionWindow {
-                action: CompletionAction::RequiredExternalEffect,
-                attempts_remaining: 1,
-                mismatch_corrections_remaining: 1,
-                consumed: false,
-                matched: false,
-            });
-        let memory = serde_json::json!({
-            "id": "typed-memory-write",
-            "type": "function",
-            "function": {"name": "memory", "arguments": "{\"action\":\"remember\",\"content\":\"fact\"}"}
-        });
-
-        let admission = apply_completion_action_admission(
-            &mut state,
-            ToolCallAdmission {
-                admitted: ordinary_admitted([memory.clone()]),
-                rejected: Vec::new(),
-                completion_action_applied: false,
-            },
-            std::slice::from_ref(&memory),
-        );
-
-        assert_eq!(admitted_logical_calls(&admission), vec![memory]);
-        assert!(admission.rejected.is_empty());
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("typed action remains auditable until its executor receipt arrives");
-        assert!(window.consumed && window.matched);
-    }
-
     #[test]
     fn non_executed_completion_mismatch_allows_one_idempotent_correction() {
         let mut state = make_state();
@@ -19336,88 +17236,6 @@ mod tests {
                 .and_then(|record| record.error_detail.as_deref())
                 .is_some(),
             "the structured interruption must retain the internal diagnostic"
-        );
-    }
-
-    #[tokio::test]
-    async fn external_only_scope_without_executor_receipt_is_incomplete() {
-        use astra_config::user_profile::{MutationCompletionScope, TurnIntent};
-
-        let mut host = MockHost::new(vec![text_result(
-            "The managed external state is configured and verified.",
-            20,
-            10,
-            Some(30),
-        )]);
-        let mut state = make_state();
-        state.task_profile = structured_mutating_profile();
-        state.turn_intent = Some(
-            TurnIntent::default()
-                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                .with_mutation_completion_scope(MutationCompletionScope::External),
-        );
-        state.stall.tool_call_records.push(executed_record(
-            "bash",
-            true,
-            Some(r#"{"command":"managed-state-action"}"#),
-        ));
-        state.hooks.completion_settlement.external_effect_retries = 1;
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
-            .await
-            .expect("external-only task without an executor receipt must fail closed");
-
-        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
-        assert_eq!(host.turn_count(), 1);
-        assert_eq!(
-            state.interruption.as_ref().map(|record| record.kind),
-            Some(InterruptionKind::ExecutionIncomplete)
-        );
-        assert_eq!(
-            state.final_text,
-            "The managed external state is configured and verified."
-        );
-        assert!(
-            state
-                .interruption
-                .as_ref()
-                .and_then(|record| record.error_detail.as_deref())
-                .is_some(),
-            "the structured interruption must retain the internal diagnostic"
-        );
-    }
-
-    #[tokio::test]
-    async fn external_only_scope_with_executor_receipt_completes_normally() {
-        use astra_config::user_profile::{MutationCompletionScope, TurnIntent};
-
-        let mut host = MockHost::new(vec![text_result(
-            "The managed external state is configured and verified.",
-            20,
-            10,
-            Some(30),
-        )]);
-        let mut state = make_state();
-        state.task_profile = structured_mutating_profile();
-        state.turn_intent = Some(
-            TurnIntent::default()
-                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                .with_mutation_completion_scope(MutationCompletionScope::External),
-        );
-        state.stall.tool_call_records.push(external_effect_record(
-            astra_tools::workspace_observation::INVOCATION_CGROUP_OWNERSHIP,
-        ));
-
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state)
-            .await
-            .expect("executor-owned external receipt should satisfy external completion");
-
-        assert!(matches!(outcome, AgenticLoopOutcome::Completed));
-        assert_eq!(host.turn_count(), 1);
-        assert!(state.interruption.is_none());
-        assert_eq!(
-            state.final_text,
-            "The managed external state is configured and verified."
         );
     }
 
@@ -19975,33 +17793,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_policy_budget_evidence_preserves_budget_and_history() {
-        let mut state = make_state();
-        state.max_turns = 8;
-        state.remaining_turns = 2;
-        let mut facts = astra_core::observation_journal::JournalFacts::default();
-        facts.streaks.consecutive_rounds_with_outcome = 3;
-        let history_before = state.messages.clone();
-
-        route_runtime_policy_evidence(
-            &mut state,
-            &facts,
-            crate::turn::runtime_policy::RuntimePolicyEvidence::BudgetExpansionSuggested {
-                factor: 1.5,
-                max_ceiling: 20,
-            },
-        );
-
-        assert_eq!(state.max_turns, 8);
-        assert_eq!(state.remaining_turns, 2);
-        assert_eq!(state.messages, history_before);
-        assert!(
-            state.take_volatile_pending().is_empty(),
-            "an internal budget recommendation must not influence model completion"
-        );
-    }
-
-    #[test]
     fn context_manifest_turn_intent_ignores_prompt_facing_benchmark_marker() {
         let mut state = make_state();
         state.message = "please compare these results [TASK_ID:bnh]".into();
@@ -20144,6 +17935,7 @@ mod tests {
         error: Option<astra_core::ClassifiedError>,
         valid_tools: HashSet<String>,
         calls: usize,
+        time_remaining: Option<astra_turn_types::ExecutionTimeRemaining>,
     }
 
     struct BoundaryDecisionRunControl {
@@ -20214,6 +18006,9 @@ mod tests {
             _run_id: &str,
             _event_indices: &[usize],
             _authority: UserIntentAdmissionAuthority,
+            _invocation_identity: Option<
+                crate::turn::run_control::UserIntentInvocationApplication<'_>,
+            >,
         ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
             Ok(crate::turn::run_control::UserIntentApplyAck::Applied)
         }
@@ -20225,6 +18020,7 @@ mod tests {
                 error: Some(error),
                 valid_tools: HashSet::new(),
                 calls: 0,
+                time_remaining: None,
             }
         }
 
@@ -20235,6 +18031,11 @@ mod tests {
 
     #[async_trait]
     impl AgenticLoopHost for DirectErrorHost {
+        fn execution_time_budget_remaining(
+            &self,
+        ) -> Option<astra_turn_types::ExecutionTimeRemaining> {
+            self.time_remaining
+        }
         async fn execute_turn(
             &mut self,
             _state: &mut AgenticLoopState,
@@ -20359,6 +18160,9 @@ mod tests {
             _run_id: &str,
             event_indices: &[usize],
             _authority: UserIntentAdmissionAuthority,
+            _invocation_identity: Option<
+                crate::turn::run_control::UserIntentInvocationApplication<'_>,
+            >,
         ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
             if let Some((entered, release)) = &self.apply_gate {
                 entered.notify_one();
@@ -20402,19 +18206,11 @@ mod tests {
         state.telemetry.observability_session = Some(session.clone());
 
         let turn_start_time = Instant::now() - Duration::from_millis(25);
-        observe_turn_end_without_tools(&mut state, 16, turn_start_time, Some(7), 123);
+        observe_turn_end_without_tools(&mut state, turn_start_time, Some(7));
 
         let guard = session.read().unwrap();
         assert_eq!(guard.turn_timings.len(), 1);
         assert_eq!(guard.turn_timings[0].turn, 6);
-        assert_eq!(
-            state
-                .observation_journal
-                .last_entry()
-                .map(|entry| entry.tokens_consumed),
-            Some(123),
-            "tool-less observation must record the current LLM round cost, not cumulative session tokens"
-        );
     }
 
     #[test]
@@ -20731,6 +18527,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_guidance_fence_without_input_closes_the_inner_step() {
+        let mut state = make_state();
+        let error = astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "typed admission fence",
+        )
+        .with_details_json(
+            serde_json::json!({
+                "source": crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
+                "scope_rejection": astra_services::InferenceScopeRejection::GuidancePending,
+            })
+            .to_string(),
+        );
+        let mut host = DirectErrorHost::new(error);
+        let result =
+            super::super::finalization::run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(result.is_err());
+        assert_eq!(host.turn_count(), 1);
+        let step = state
+            .step_recorder
+            .current_step()
+            .expect("actual inner step began");
+        assert!(step.execution.completed_at.is_some());
+        use astra_pipeline::step_protocol::StepEventType;
+        assert_eq!(
+            state
+                .step_recorder
+                .events()
+                .iter()
+                .filter(|event| event.step_id == step.step_id()
+                    && event.event_type == StepEventType::StepIncomplete)
+                .count(),
+            1
+        );
+        assert!(
+            !state
+                .step_recorder
+                .events()
+                .iter()
+                .any(|event| event.step_id == "unknown")
+        );
+    }
+
+    #[tokio::test]
     async fn guidance_admission_fence_reconciles_before_continuing() {
         // The host boundary fails after pre-request polling, as happens when
         // guidance races the final durable provider-attempt admission.
@@ -20840,6 +18680,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exhausted_run_provider_recovery_uses_existing_final_window() {
+        for (boundary, recovery_used, delivery, settlement_active, expected_settlement) in [
+            (Some("run_work"), true, "none", false, true),
+            (Some("run_work"), false, "none", false, false),
+            (None, true, "none", false, false),
+            (Some("run_work"), true, "text", false, false),
+            (Some("run_work"), true, "tool", false, false),
+            (Some("run_work"), true, "malformed", false, false),
+            (Some("run_work"), true, "none", true, false),
+        ] {
+            let mut state = make_state();
+            state.provider_adaptation.safe_recovery_attempted = recovery_used;
+            state.hooks.completion_settlement.text_only = settlement_active;
+            let error = astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ProviderDeadline,
+                "provider work deadline",
+            )
+            .with_details_json(
+                serde_json::json!({
+                    "deadline": {"execution_boundary": boundary},
+                    "partial_full_text": if delivery == "text" { "already delivered" } else { "" },
+                    "partial_reasoning": "provisional reasoning",
+                    "tool_calls": match delivery {
+                        "tool" => serde_json::json!([{"id": "selected-action"}]),
+                        "malformed" => serde_json::Value::Null,
+                        _ => serde_json::json!([]),
+                    },
+                })
+                .to_string(),
+            );
+            let mut host = DirectErrorHost::new(error);
+            host.time_remaining = Some(astra_turn_types::ExecutionTimeRemaining {
+                work_remaining: Duration::from_secs(3),
+                total_remaining: Duration::from_secs(33),
+            });
+            let result = execute_turn_and_ingest_phase(
+                &mut host,
+                &mut state,
+                0,
+                TurnIterationPrep {
+                    quiet: true,
+                    turn_start_time: Instant::now(),
+                },
+            )
+            .await;
+            assert_eq!(host.turn_count(), 1);
+            if expected_settlement {
+                assert!(matches!(result, Ok(TurnExecutionControl::ContinueLoop)));
+                assert!(state.hooks.completion_settlement.text_only);
+                assert!(state.budget_wrapup_injected);
+                assert_eq!(
+                    state.hooks.completion_settlement.wrapup_origin,
+                    Some(super::super::host::BudgetWrapupOrigin::ExecutionDeadline)
+                );
+                assert!(
+                    state
+                        .hooks
+                        .completion_settlement
+                        .completion_action_window
+                        .is_none()
+                );
+            } else if !recovery_used {
+                assert!(matches!(result, Ok(TurnExecutionControl::ContinueLoop)));
+                assert!(state.provider_adaptation.safe_recovery_pending);
+                assert!(!state.budget_wrapup_injected);
+            } else {
+                assert!(result.is_err());
+                assert!(!state.budget_wrapup_injected);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn turn_completed_hook_does_not_fire_when_execute_turn_errors() {
         // An empty MockHost returns BudgetExhausted on execute_turn.
         // The hook must NOT fire in the error path — we only want
@@ -20934,7 +18847,7 @@ mod tests {
 
         assert!(matches!(control, TurnExecutionControl::ContinueLoop));
         assert!(state.hooks.completion_settlement.text_only);
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_pending);
 
         let mut rejected_state = make_state();
         rejected_state.remaining_turns = 3;
@@ -21004,8 +18917,8 @@ mod tests {
         assert_eq!(state.max_turns, 35);
         assert_eq!(state.remaining_turns, 1);
         assert!(state.hooks.completion_settlement.text_only);
-        assert!(state.provider_adaptation.action_convergence_attempted);
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_attempted);
+        assert!(state.provider_adaptation.safe_recovery_pending);
         assert!(state.interruption.is_none());
         let advisory = state
             .volatile_pending
@@ -21020,7 +18933,7 @@ mod tests {
         let mut state = make_state();
         state.remaining_turns = 0;
         state.hooks.completion_settlement.text_only = true;
-        state.provider_adaptation.action_convergence_attempted = true;
+        state.provider_adaptation.safe_recovery_attempted = true;
         let mut host = DirectErrorHost::new(
             astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ProviderDeadline,
@@ -21041,19 +18954,25 @@ mod tests {
             ),
         );
 
-        assert!(
-            execute_turn_and_ingest_phase(
-                &mut host,
-                &mut state,
-                0,
-                TurnIterationPrep {
-                    quiet: true,
-                    turn_start_time: Instant::now(),
-                },
-            )
-            .await
-            .is_err()
-        );
+        let control = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await
+        .expect("clean empty exhaustion uses interrupted completion");
+        assert!(matches!(
+            control,
+            TurnExecutionControl::Return(AgenticLoopOutcome::Completed)
+        ));
+        assert!(matches!(
+            state.interruption.as_ref().unwrap().resume_action,
+            ResumeAction::RequiresIntervention { .. }
+        ));
 
         let interruption = state
             .interruption
@@ -21111,7 +19030,7 @@ mod tests {
             InterruptionKind::ProviderDeadline
         );
         assert_eq!(state.remaining_turns, 0);
-        assert!(!state.provider_adaptation.force_next_thinking_off);
+        assert!(!state.provider_adaptation.safe_recovery_pending);
     }
 
     #[tokio::test]
@@ -21146,8 +19065,8 @@ mod tests {
         .expect("an unambiguous transport interruption must schedule one recovery turn");
 
         assert!(matches!(control, TurnExecutionControl::ContinueLoop));
-        assert!(state.provider_adaptation.action_convergence_attempted);
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_attempted);
+        assert!(state.provider_adaptation.safe_recovery_pending);
         assert!(state.interruption.is_none());
         assert!(state.stall.tool_call_records.is_empty());
     }
@@ -22622,7 +20541,7 @@ mod tests {
     }
 
     #[test]
-    fn safe_provider_recovery_schedules_exactly_one_thinking_off_convergence() {
+    fn safe_provider_recovery_schedules_exactly_one_capability_aware_attempt() {
         let mut state = make_state();
         state.remaining_turns = 3;
         let error = astra_core::ClassifiedError::new(
@@ -22640,8 +20559,8 @@ mod tests {
         );
 
         assert!(schedule_safe_provider_recovery(&mut state, &error));
-        assert!(state.provider_adaptation.action_convergence_attempted);
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_attempted);
+        assert!(state.provider_adaptation.safe_recovery_pending);
         assert!(state.volatile_pending.iter().any(|entry| {
             entry.kind == VolatileKind::BehaviorAdvisory
                 && entry.payload["schema"] == "provider_safe_recovery.v1"
@@ -22779,7 +20698,7 @@ mod tests {
             schedule_safe_provider_recovery(&mut state, &error),
             "a terminal provider completion with no delivery is safe to converge once"
         );
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_pending);
     }
 
     #[test]
@@ -22826,8 +20745,8 @@ mod tests {
             );
             assert_eq!(state.max_turns, 34);
             assert_eq!(state.remaining_turns, 0);
-            assert!(!state.provider_adaptation.action_convergence_attempted);
-            assert!(!state.provider_adaptation.force_next_thinking_off);
+            assert!(!state.provider_adaptation.safe_recovery_attempted);
+            assert!(!state.provider_adaptation.safe_recovery_pending);
         }
     }
 
@@ -22855,8 +20774,8 @@ mod tests {
         assert_eq!(state.max_turns, 35);
         assert_eq!(state.remaining_turns, 1);
         assert!(state.hooks.completion_settlement.text_only);
-        assert!(state.provider_adaptation.action_convergence_attempted);
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_attempted);
+        assert!(state.provider_adaptation.safe_recovery_pending);
     }
 
     #[test]
@@ -23052,7 +20971,7 @@ mod tests {
         );
 
         assert!(schedule_safe_provider_recovery(&mut state, &error));
-        assert!(state.provider_adaptation.action_convergence_attempted);
+        assert!(state.provider_adaptation.safe_recovery_attempted);
         state.stall.tool_call_records.push(ToolCallRecord {
             name: "bash".into(),
             ok: true,
@@ -23092,7 +21011,7 @@ mod tests {
             let mut non_execution_state = make_state();
             non_execution_state
                 .provider_adaptation
-                .action_convergence_attempted = true;
+                .safe_recovery_attempted = true;
             non_execution_state
                 .stall
                 .tool_call_records
@@ -23109,14 +21028,14 @@ mod tests {
             assert!(
                 non_execution_state
                     .provider_adaptation
-                    .action_convergence_attempted
+                    .safe_recovery_attempted
             );
         }
 
         let mut failed_execution_state = make_state();
         failed_execution_state
             .provider_adaptation
-            .action_convergence_attempted = true;
+            .safe_recovery_attempted = true;
         failed_execution_state
             .stall
             .tool_call_records
@@ -23133,7 +21052,7 @@ mod tests {
         assert!(
             !failed_execution_state
                 .provider_adaptation
-                .action_convergence_attempted
+                .safe_recovery_attempted
         );
     }
 
@@ -23161,7 +21080,7 @@ mod tests {
             )
             .with_details_json(details.to_string());
             assert!(!schedule_safe_provider_recovery(&mut state, &error));
-            assert!(!state.provider_adaptation.force_next_thinking_off);
+            assert!(!state.provider_adaptation.safe_recovery_pending);
         }
     }
 
@@ -23192,7 +21111,7 @@ mod tests {
             advisory.payload["evidence"]["error_kind"],
             "stream_transport"
         );
-        assert!(state.provider_adaptation.force_next_thinking_off);
+        assert!(state.provider_adaptation.safe_recovery_pending);
         assert!(
             !schedule_safe_provider_recovery(&mut state, &error),
             "a transport failure has at most one safe logical recovery"
@@ -23217,7 +21136,7 @@ mod tests {
         );
 
         assert!(!schedule_safe_provider_recovery(&mut state, &error));
-        assert!(!state.provider_adaptation.force_next_thinking_off);
+        assert!(!state.provider_adaptation.safe_recovery_pending);
     }
 
     #[test]
@@ -23240,7 +21159,41 @@ mod tests {
             !schedule_safe_provider_recovery(&mut state, &error),
             "a transport recovery requires typed text, reasoning, and tool-call evidence"
         );
-        assert!(!state.provider_adaptation.force_next_thinking_off);
+        assert!(!state.provider_adaptation.safe_recovery_pending);
+    }
+
+    #[tokio::test]
+    async fn artifact_spill_carries_prior_summary_and_recovery_handles() {
+        use astra_turn_core::cloud::history_summary::{
+            history_summary_message, history_summary_text,
+        };
+        let mut host = MockHost::new(Vec::new());
+        host.history_artifact_enabled = true;
+        let mut state = make_state();
+        state.max_turn_input_tokens = 100_000;
+        state.current_session_id = Some("summary-session".into());
+        state.current_run_id = Some("summary-run".into());
+        state.messages = vec![history_summary_message(
+            "ONLY_PRIOR_FACT\nExact transcript: context-history://prior".into(),
+        )];
+        for generation in 0..2 {
+            for index in 0..14 {
+                state.messages.push(serde_json::json!({"role":"assistant", "content":format!("generation {generation} evidence {index}: {}", "detail ".repeat(500))}));
+            }
+            state.messages.push(serde_json::json!({"role":"user", "content":format!("current request {generation}")}));
+            let before = state.messages.clone();
+            let (freed, _) = spill_old_messages_to_artifact(&mut host, &mut state)
+                .await
+                .unwrap();
+            assert!(freed > 0);
+            let summary = history_summary_text(&state.messages[0]).unwrap();
+            assert!(summary.contains("ONLY_PRIOR_FACT"));
+            assert!(summary.contains("context-history://prior"));
+            assert_eq!(state.messages.last(), before.last());
+            let stored: Vec<Value> =
+                serde_json::from_str(&host.history_artifacts[generation].transcript_json).unwrap();
+            assert_eq!(stored, before[..stored.len()]);
+        }
     }
 
     #[tokio::test]
@@ -23312,7 +21265,6 @@ mod tests {
         let control = handle_token_budget(
             &mut host,
             &mut state,
-            0,
             TurnIterationPrep {
                 quiet: true,
                 turn_start_time: Instant::now(),
@@ -23374,7 +21326,6 @@ mod tests {
         let first = handle_token_budget(
             &mut host,
             &mut state,
-            0,
             TurnIterationPrep {
                 quiet: true,
                 turn_start_time: Instant::now(),
@@ -23401,7 +21352,6 @@ mod tests {
         let second = handle_token_budget(
             &mut host,
             &mut state,
-            1,
             TurnIterationPrep {
                 quiet: true,
                 turn_start_time: Instant::now(),
@@ -23428,7 +21378,6 @@ mod tests {
         let third = handle_token_budget(
             &mut host,
             &mut state,
-            2,
             TurnIterationPrep {
                 quiet: true,
                 turn_start_time: Instant::now(),
@@ -23466,7 +21415,6 @@ mod tests {
         let control = handle_token_budget(
             &mut host,
             &mut state,
-            0,
             TurnIterationPrep {
                 quiet: true,
                 turn_start_time: Instant::now(),
@@ -25710,7 +23658,13 @@ mod tests {
             let poll = engine.poll_user_intents("user", "run", 0).await;
             assert_eq!(poll.inputs.len(), 1);
             let source_index = poll.inputs[0].event_index;
-            state.user_intents.stage_pending_apply_events(&poll.inputs);
+            state
+                .user_intents
+                .stage_pending_disposition_events(
+                    &poll.inputs,
+                    astra_turn_types::UserIntentStatus::Applied,
+                )
+                .unwrap();
             if crash_boundary == 0 {
                 state
                     .user_intents
@@ -25723,6 +23677,7 @@ mod tests {
                         "run",
                         &[source_index],
                         UserIntentAdmissionAuthority::DurableOwnerGeneration(0),
+                        None,
                     )
                     .await
                     .unwrap();
@@ -26143,6 +24098,12 @@ mod tests {
                 assert!(host.user_intent_context_indices.is_empty());
                 assert!(host.user_intent_applied_indices.is_empty());
                 assert_eq!(state.user_intents.user_intent_cursor(), 0);
+                assert!(
+                    state
+                        .user_intents
+                        .pending_apply_ack_deadline()
+                        .is_some_and(|deadline| deadline > tokio::time::Instant::now())
+                );
                 assert_eq!(host.turn_count(), 0);
                 continue;
             }
@@ -26470,6 +24431,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_pressure_reaches_provider_without_changing_execution_authority() {
+        for (tokens, expected) in [
+            (69_999, None),
+            (70_000, Some("normal")),
+            (89_999, Some("normal")),
+            (90_000, Some("aggressive")),
+        ] {
+            let mut state = make_state();
+            state.max_turn_input_tokens = 100_000;
+            let base = super::super::host::introspect_estimated_input_tokens(&state);
+            state.pinned_tool_schema_tokens = tokens - base;
+            // A previous observation must disappear once live pressure drops.
+            state.push_volatile_payload(
+                VolatileKind::ContextPressure,
+                serde_json::json!({"old": true}),
+            );
+            let history = state.messages.clone();
+            let budget = (state.max_turns, state.remaining_turns);
+            let restrictions = state.restricted_tools.clone();
+            let mut host = MockHost::new(vec![text_result("done", 10, 5, None)]);
+            execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
+                .await
+                .expect("provider boundary");
+            let delivered = host.executed_volatile[0]
+                .iter()
+                .filter(|entry| entry.kind == VolatileKind::ContextPressure)
+                .collect::<Vec<_>>();
+            assert_eq!(delivered.len(), usize::from(expected.is_some()));
+            if let Some(urgency) = expected {
+                let entry = delivered[0];
+                assert_eq!(entry.payload["evidence"]["urgency"], urgency);
+                assert_eq!(
+                    entry.payload["evidence"]["token_pressure"],
+                    tokens as f64 / 100_000.0
+                );
+                assert_eq!(entry.payload["authority"], "advisory_evidence_only");
+                let edge = super::super::host::volatile_injection_edge_profile(entry);
+                let wire =
+                    crate::turn::wire_assembly::runtime_volatile_preamble_messages(&edge).unwrap();
+                assert!(!wire.is_empty());
+                assert!(wire.iter().all(|message| message["role"] == "system"));
+            }
+            assert_eq!(host.executed_messages[0], history);
+            assert_eq!((state.max_turns, state.remaining_turns), budget);
+            assert_eq!(state.restricted_tools, restrictions);
+        }
+    }
+
+    #[tokio::test]
     async fn converged_policy_reaches_provider() {
         let mut state = make_state();
         state.stall.active_policy_feedback = serde_json::from_value(serde_json::json!({
@@ -26503,92 +24513,6 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("one decisive check or synthesize")
-        );
-    }
-
-    #[tokio::test]
-    async fn local_host_delivers_low_slice_horizon_at_the_model_boundary() {
-        let mut state = make_state();
-        state.max_turns = 40;
-        state.remaining_turns = 4;
-        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))]);
-
-        execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
-            .await
-            .expect("local turn");
-
-        let delivered = host
-            .executed_volatile
-            .first()
-            .expect("volatile model boundary");
-        let advisory = delivered
-            .iter()
-            .find(|injection| injection.kind == VolatileKind::BudgetAdvisory)
-            .expect("low-slice budget advisory");
-        assert!(
-            advisory
-                .payload
-                .to_string()
-                .contains("available_model_boundaries_including_current\\\":5"),
-            "the model must receive the live execution horizon: {advisory:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn renewable_capacity_boundary_does_not_require_completion() {
-        let mut state = make_state();
-        state.max_turns = 32;
-        state.remaining_turns = 0;
-        state.agentic_turn_budget.hard_turn_limit = std::num::NonZeroUsize::new(72);
-        state.agentic_turn_budget.extension_turns = 12;
-        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))]);
-
-        execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
-            .await
-            .expect("renewable review-boundary turn");
-
-        let delivered = host
-            .executed_volatile
-            .first()
-            .expect("volatile model boundary");
-        let advisory = delivered
-            .iter()
-            .find(|injection| injection.kind == VolatileKind::BudgetAdvisory)
-            .expect("renewable review advisory");
-        let text = advisory.payload.to_string();
-        assert!(text.contains("adaptive capacity checkpoint"), "{text}");
-        assert!(
-            text.contains("not evidence of progress or unfinished work"),
-            "{text}"
-        );
-        assert!(!text.contains("Do not call any tool"), "{text}");
-    }
-
-    #[tokio::test]
-    async fn local_host_suppresses_slice_horizon_during_token_rail_wrapup() {
-        let mut state = make_state();
-        state.max_turns = 40;
-        state.remaining_turns = 1;
-        state.budget_wrapup_injected = true;
-        state.hooks.completion_settlement.text_only = false;
-        state.hooks.completion_settlement.work_settlement_only = false;
-        state.hooks.completion_settlement.completion_action_window = None;
-        let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(1))]);
-
-        execute_turn_and_ingest_phase(&mut host, &mut state, 0, prep(false))
-            .await
-            .expect("token-rail wrap-up turn");
-
-        let delivered = host
-            .executed_volatile
-            .first()
-            .expect("volatile model boundary");
-        assert!(
-            delivered.iter().all(|injection| {
-                injection.kind != VolatileKind::BudgetAdvisory
-                    || !injection.payload.to_string().contains("<execution-slice>")
-            }),
-            "token-rail wrap-up must remain the only budget instruction: {delivered:?}"
         );
     }
 
@@ -26785,14 +24709,14 @@ async fn spill_old_messages_to_artifact(
         astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX
     );
     let summary = build_spill_summary(&state.messages[..count]);
-    let reference = serde_json::json!({"role":"system", "content": format!(
+    let reference = astra_turn_core::cloud::history_summary::history_summary_message(format!(
         "[Context compressed — {count} earlier messages]
 
 {summary}
 
 Exact transcript: {handle}
 Use introspect(artifact=\"{handle}\") for earlier details."
-    )});
+    ));
     let candidate = prepare_prefix_summary(
         &state.messages,
         count,
@@ -26841,3 +24765,11 @@ Use introspect(artifact=\"{handle}\") for earlier details."
     state.messages = candidate.messages;
     Some((freed, removed))
 }
+
+#[cfg(test)]
+#[path = "argument_rejection_tests.rs"]
+mod argument_rejection_tests;
+
+#[cfg(test)]
+#[path = "execution_evidence_tests.rs"]
+mod execution_evidence_tests;

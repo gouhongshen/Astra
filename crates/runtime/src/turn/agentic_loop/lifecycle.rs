@@ -232,6 +232,7 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                         "correlation_id": msg.correlation_id,
                         "message_kind": message_kind,
                         "response_request_id": match &msg.payload {
+                            payload if astra_messaging::types::is_non_adoption_response(payload) => None,
                             astra_messaging::types::MessagePayload::Response { request_id, .. } => Some(request_id),
                             _ => None,
                         },
@@ -378,7 +379,7 @@ pub(crate) async fn acknowledge_adopted_mailbox_messages(state: &mut AgenticLoop
         let Some(mailbox) = state.messaging.mailbox.as_mut() else {
             return;
         };
-        mailbox.take_adopted_acknowledgements()
+        mailbox.adopted_acknowledgements()
     };
     if pending.is_empty() {
         return;
@@ -398,7 +399,11 @@ pub(crate) async fn acknowledge_adopted_mailbox_messages(state: &mut AgenticLoop
         );
     }
     if let Some(mailbox) = state.messaging.mailbox.as_mut() {
-        mailbox.restore_adopted_acknowledgements(retry);
+        for message in pending {
+            if !retry.iter().any(|failed| failed.id == message.id) {
+                mailbox.forget_acknowledgement(&message.id);
+            }
+        }
     }
 }
 
@@ -3147,6 +3152,30 @@ fn begin_deadline_budget_settlement(state: &mut AgenticLoopState) -> bool {
     settled
 }
 
+pub(super) async fn enter_deadline_budget_settlement<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) -> bool {
+    if state.hooks.completion_settlement.text_only
+        || state.hooks.completion_settlement.work_settlement_only
+        || state.budget_wrapup_injected
+        || !begin_deadline_budget_settlement(state)
+    {
+        return false;
+    }
+    let _cancelled = cancel_unfinished_child_agents(
+        host,
+        state,
+        "parent execution deadline is reserved for final settlement",
+        CancellationOrigin::Runtime,
+    )
+    .await;
+    state.final_text_model_item_id = None;
+    state.final_text.clear();
+    state.interruption = None;
+    true
+}
+
 fn begin_budget_settlement_for_work_state(
     state: &mut AgenticLoopState,
     active_work_attempt: bool,
@@ -3193,7 +3222,6 @@ fn begin_budget_settlement_for_work_state(
         && allow_completion_action
         && super::execution_phase::completion_action_window_is_batchable(state, &action)
         && !matches!(action, super::host::CompletionAction::CompletionTaskAction)
-        && !super::execution_phase::external_effect_replay_forbidden(state)
     {
         let tool_outcome_evidence = settlement_tool_outcome_evidence(state);
         // Reserve exactly one matching completion action and one closing
@@ -3426,15 +3454,28 @@ pub(crate) async fn run_loop_preamble(state: &mut AgenticLoopState) {
 /// Host-local schema installation is needed for a new executor even when its
 /// logical turn has already completed the side-effecting preamble.
 pub(crate) fn configure_loop_host<H: AgenticLoopHost>(host: &mut H, state: &AgenticLoopState) {
+    for diagnostic in state
+        .skills
+        .tool_event_hooks
+        .take_config_diagnostics()
+        .into_iter()
+        .chain(state.skills.session_event_hooks.take_config_diagnostics())
+    {
+        host.emit_hook_config_diagnostic(&diagnostic);
+    }
+
     if let Some(resolver) = &state.skills.resolver {
-        // Phase-9: `skill_tool_schema_v2` is a byte-stable constant — it
+        // The canonical skill schema is byte-stable — it
         // takes no skill list and advertises `skill_name` as an open
         // string. The catalog is surfaced via `<available_skills>` in the
         // session-cached prompt prefix (see `build_skill_listing_section`),
         // so adding/removing a skill no longer perturbs the tool schema
         // bytes.
         if !resolver.available_skills().is_empty() || resolver.has_dynamic_catalog() {
-            host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema_v2());
+            host.inject_tool_schema(astra_tools::schemas::skill_tool_schema());
+        }
+        if !resolver.available_skills().is_empty() {
+            host.inject_tool_schema(astra_tools::schemas::discover_skills_tool_schema());
         }
     }
 
@@ -3766,18 +3807,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             || state.hooks.completion_settlement.work_settlement_only
             || state.budget_wrapup_injected;
         if !settlement_already_active {
-            if begin_deadline_budget_settlement(state) {
-                let _cancelled = cancel_unfinished_child_agents(
-                    host,
-                    state,
-                    "parent execution deadline is reserved for final settlement",
-                    CancellationOrigin::Runtime,
-                )
-                .await;
-                state.final_text_model_item_id = None;
-                state.final_text.clear();
-                state.interruption = None;
-            } else {
+            if !enter_deadline_budget_settlement(host, state).await {
                 let _cancelled = cancel_unfinished_child_agents(
                     host,
                     state,
@@ -4389,6 +4419,69 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn hook_config_diagnostics_reach_loop_output_once_without_execution() {
+        for (filename, content, field) in [
+            (
+                "hooks.json",
+                r#"{"hooks":[{"event":"unknown-secret","action":{"type":"shell","command":"never execute this"}}]}"#,
+                "hooks[0].event",
+            ),
+            (
+                "hooks.json",
+                r#"{"hooks":[{"event":"pre_tool_use","matchr":"secret","action":{"type":"set_env","key":"UNUSED","value":"env-secret"}}]}"#,
+                "hooks[0]",
+            ),
+            (
+                "hooks.json",
+                r#"{"session_hooks":[{"event":"session_start","action":{"type":"set_env","key":"UNUSED","value":"env-secret","vaule":"secret"}}]}"#,
+                "session_hooks[0].action",
+            ),
+            (
+                "hooks.json",
+                r#"{"session_hooks":[{"event":"turn_end","action":{"type":"set_env","key":"UNUSED","value":"env-secret"}}]}"#,
+                "session_hooks[0].event",
+            ),
+            ("hooks.yaml", "hooks: []\nunknown-secret: secret\n", "($)"),
+            (
+                "hooks.yaml",
+                "session_hooks:\n  - event: session_start\n    action:\n      type: set_env\n      key: UNUSED\n      value: env-secret\n      vaule: secret\n",
+                "session_hooks[0].action",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(".astra")).unwrap();
+            std::fs::write(dir.path().join(".astra").join(filename), content).unwrap();
+            let mut state = make_state();
+            (
+                state.skills.tool_event_hooks,
+                state.skills.session_event_hooks,
+            ) = crate::skills::hooks::load_all_hooks(dir.path());
+            state.skills.tool_event_hooks.disable_execution();
+            state.skills.session_event_hooks.disable_execution();
+            let mut host = MockHost::new(vec![text_result("done", 10, 5, None)]);
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            assert!(outcome.is_ok(), "{outcome:?}");
+            let diagnostics = host
+                .emitted_lines
+                .iter()
+                .filter(|line| line.starts_with("Hook configuration"))
+                .collect::<Vec<_>>();
+            assert_eq!(diagnostics.len(), 1);
+            assert!(diagnostics[0].contains(&format!(".astra/{filename}")));
+            assert!(diagnostics[0].contains(field), "{}", diagnostics[0]);
+            assert!(!diagnostics[0].contains("secret"));
+            configure_loop_host(&mut host, &state);
+            assert_eq!(
+                host.emitted_lines
+                    .iter()
+                    .filter(|line| line.starts_with("Hook configuration"))
+                    .count(),
+                1
+            );
+        }
+    }
 
     #[tokio::test]
     async fn restored_workspace_observation_unavailable_stops_before_provider_with_remaining_budget()
@@ -6221,397 +6314,6 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_budget_still_reserves_an_accepted_external_file_contract() {
-        use astra_services::session_journal::ToolCallDisposition;
-
-        let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
-                true,
-                false,
-                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-            );
-        state.turn_intent = Some(
-            TurnIntent::default()
-                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                .with_mutation_completion_scope(
-                    astra_config::user_profile::MutationCompletionScope::External,
-                ),
-        );
-        state.max_turns = 2;
-        state.remaining_turns = 0;
-        let args = serde_json::json!({
-            "command": "install-unit",
-            "external_state_paths": ["/etc/app/config"],
-        })
-        .to_string();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-
-        assert!(begin_budget_settlement(&mut state));
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("an accepted file contract can still be observed");
-        assert_eq!(
-            window.action,
-            super::super::host::CompletionAction::RequiredExternalEffect
-        );
-        assert_eq!(state.max_turns, 4);
-        assert_eq!(state.remaining_turns, 2);
-        assert!(!state.hooks.completion_settlement.text_only);
-    }
-
-    #[test]
-    fn exhausted_budget_still_opens_external_window_after_read_only_probe() {
-        use astra_services::session_journal::ToolCallDisposition;
-
-        let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
-                true,
-                false,
-                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-            );
-        state.turn_intent = Some(
-            TurnIntent::default()
-                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                .with_mutation_completion_scope(
-                    astra_config::user_profile::MutationCompletionScope::External,
-                ),
-        );
-        state.max_turns = 2;
-        state.remaining_turns = 0;
-        let probe = r#"{"command":"ls /etc/app"}"#;
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            tool_call_id: Some("probe-ls".into()),
-            args_full: Some(probe.into()),
-            runtime_args_full: Some(probe.into()),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-
-        assert!(begin_budget_settlement(&mut state));
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("a read-only probe still owes the first external mutation");
-        assert_eq!(
-            window.action,
-            super::super::host::CompletionAction::RequiredExternalEffect
-        );
-        assert!(!state.hooks.completion_settlement.text_only);
-        let first_mutation = json!({
-            "id": "mutate-1",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"install-unit","external_state_paths":["/etc/app/config"]}"#
-            }
-        });
-        let replay = json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"moi upload"}"#
-            }
-        });
-        assert!(
-            super::super::execution_phase::completion_action_match_label(
-                &state,
-                &super::super::host::CompletionAction::RequiredExternalEffect,
-                &first_mutation,
-            )
-            .is_some()
-        );
-        assert!(
-            !super::super::execution_phase::completion_action_match_label(
-                &state,
-                &super::super::host::CompletionAction::RequiredExternalEffect,
-                &replay,
-            )
-            .is_some()
-        );
-        let admitted = super::super::execution_phase::apply_completion_action_admission(
-            &mut state,
-            super::super::host::ToolCallAdmission {
-                admitted: vec![
-                    astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::ordinary(
-                        first_mutation.clone(),
-                    ),
-                ],
-                rejected: Vec::new(),
-                completion_action_applied: false,
-            },
-            std::slice::from_ref(&first_mutation),
-        );
-        assert_eq!(admitted.admitted.len(), 1);
-        assert!(admitted.rejected.is_empty());
-    }
-
-    #[test]
-    fn exhausted_budget_still_reserves_file_contract_after_read_only_probe() {
-        use astra_services::session_journal::ToolCallDisposition;
-
-        let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
-                true,
-                false,
-                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-            );
-        state.turn_intent = Some(
-            TurnIntent::default()
-                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                .with_mutation_completion_scope(
-                    astra_config::user_profile::MutationCompletionScope::External,
-                ),
-        );
-        state.max_turns = 2;
-        state.remaining_turns = 0;
-        let probe = r#"{"command":"ls /etc/app"}"#;
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: false,
-            tool_call_id: Some("probe-ls".into()),
-            args_full: Some(probe.into()),
-            runtime_args_full: Some(probe.into()),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-        let args = serde_json::json!({
-            "command": "install-unit",
-            "external_state_paths": ["/etc/app/config"],
-        })
-        .to_string();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            tool_call_id: Some("file-1".into()),
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-
-        assert!(begin_budget_settlement(&mut state));
-        let window = state
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("a failed listing must not block the file contract");
-        assert_eq!(
-            window.action,
-            super::super::host::CompletionAction::RequiredExternalEffect
-        );
-        assert!(!state.hooks.completion_settlement.text_only);
-        let same_roots = json!({
-            "id": "file-retry",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"install-unit","external_state_paths":["/etc/app/config"]}"#
-            }
-        });
-        let other_roots = json!({
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"upload","external_state_paths":["/var/lib/other"]}"#
-            }
-        });
-        assert!(
-            super::super::execution_phase::completion_action_match_label(
-                &state,
-                &super::super::host::CompletionAction::RequiredExternalEffect,
-                &same_roots,
-            )
-            .is_some()
-        );
-        assert!(
-            !super::super::execution_phase::completion_action_match_label(
-                &state,
-                &super::super::host::CompletionAction::RequiredExternalEffect,
-                &other_roots,
-            )
-            .is_some()
-        );
-        let admitted = super::super::execution_phase::apply_completion_action_admission(
-            &mut state,
-            super::super::host::ToolCallAdmission {
-                admitted: vec![
-                    astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::ordinary(
-                        same_roots.clone(),
-                    ),
-                ],
-                rejected: Vec::new(),
-                completion_action_applied: false,
-            },
-            std::slice::from_ref(&same_roots),
-        );
-        assert_eq!(admitted.admitted.len(), 1);
-        assert_eq!(admitted.admitted[0].physical_provider_call(), &same_roots);
-    }
-
-    #[test]
-    fn exhausted_budget_still_reserves_external_work_after_ready_background_bash() {
-        use astra_services::session_journal::ToolCallDisposition;
-
-        let external_intent = || {
-            let mut state = make_state();
-            state.task_profile =
-                astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
-                    true,
-                    false,
-                    astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-                );
-            state.turn_intent = Some(
-                TurnIntent::default()
-                    .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                    .with_mutation_completion_scope(
-                        astra_config::user_profile::MutationCompletionScope::External,
-                    ),
-            );
-            state.max_turns = 2;
-            state.remaining_turns = 0;
-            let helper = r#"{"command":"python3 -m http.server 8000","run_in_background":true}"#;
-            state.stall.tool_call_records.push(ToolCallRecord {
-                name: "bash".into(),
-                ok: true,
-                tool_call_id: Some("helper-1".into()),
-                args_full: Some(helper.into()),
-                runtime_args_full: Some(helper.into()),
-                disposition: Some(ToolCallDisposition::Executed),
-                ..Default::default()
-            });
-            state
-        };
-
-        let mut probe_only = external_intent();
-        assert!(begin_budget_settlement(&mut probe_only));
-        let window = probe_only
-            .hooks
-            .completion_settlement
-            .completion_action_window
-            .as_ref()
-            .expect("a ready background helper still owes the first external mutation");
-        assert_eq!(
-            window.action,
-            super::super::host::CompletionAction::RequiredExternalEffect
-        );
-        assert!(!probe_only.hooks.completion_settlement.text_only);
-
-        let mut with_contract = external_intent();
-        let args = serde_json::json!({
-            "command": "install-unit",
-            "external_state_paths": ["/etc/app/config"],
-        })
-        .to_string();
-        with_contract.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            tool_call_id: Some("file-1".into()),
-            args_full: Some(args.clone()),
-            runtime_args_full: Some(args),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-        assert!(begin_budget_settlement(&mut with_contract));
-        assert!(!with_contract.hooks.completion_settlement.text_only);
-        let same_roots = json!({
-            "id": "file-retry",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": r#"{"command":"install-unit","external_state_paths":["/etc/app/config"]}"#
-            }
-        });
-        let admitted = super::super::execution_phase::apply_completion_action_admission(
-            &mut with_contract,
-            super::super::host::ToolCallAdmission {
-                admitted: vec![
-                    astra_turn_core::tool::deferred_activation::CanonicalToolInvocation::ordinary(
-                        same_roots.clone(),
-                    ),
-                ],
-                rejected: Vec::new(),
-                completion_action_applied: false,
-            },
-            std::slice::from_ref(&same_roots),
-        );
-        assert_eq!(admitted.admitted.len(), 1);
-    }
-
-    #[test]
-    fn exhausted_budget_does_not_let_an_old_file_contract_reissue_a_pathless_upload() {
-        use astra_services::session_journal::ToolCallDisposition;
-
-        let mut state = make_state();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
-                true,
-                false,
-                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
-            );
-        state.turn_intent = Some(
-            TurnIntent::default()
-                .with_workspace_mutation(WorkspaceMutationIntent::MustMutate)
-                .with_mutation_completion_scope(
-                    astra_config::user_profile::MutationCompletionScope::External,
-                ),
-        );
-        state.max_turns = 2;
-        state.remaining_turns = 0;
-        let probe = serde_json::json!({
-            "command": "ls /etc/app",
-            "external_state_paths": ["/etc/app"],
-        })
-        .to_string();
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            tool_call_id: Some("probe-1".into()),
-            args_full: Some(probe.clone()),
-            runtime_args_full: Some(probe),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-        state.stall.tool_call_records.push(ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            tool_call_id: Some("upload-1".into()),
-            args_full: Some(r#"{"command":"moi upload"}"#.into()),
-            runtime_args_full: Some(r#"{"command":"moi upload"}"#.into()),
-            disposition: Some(ToolCallDisposition::Executed),
-            ..Default::default()
-        });
-
-        assert!(begin_budget_settlement(&mut state));
-        assert!(
-            state
-                .hooks
-                .completion_settlement
-                .completion_action_window
-                .is_none()
-        );
-        assert!(state.hooks.completion_settlement.text_only);
-        assert_eq!(state.max_turns, 3);
-    }
-
-    #[test]
     fn active_work_boundary_verifies_latest_mutation_before_typed_settlement() {
         let mut state = make_state();
         state.task_profile =
@@ -6760,25 +6462,6 @@ mod tests {
         assert_eq!(state.max_turns, 34);
         assert_eq!(state.remaining_turns, 2);
         assert!(!state.hooks.completion_settlement.work_settlement_only);
-    }
-
-    #[test]
-    fn external_effect_without_work_validation_debt_does_not_gain_revalidation_authority() {
-        let mut state = make_state();
-        state.stall.tool_call_records = vec![ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
-            args_full: Some(r#"{"command":"package-manager install artifact"}"#.into()),
-            runtime_args_full: Some(r#"{"command":"package-manager install artifact"}"#.into()),
-            ..Default::default()
-        }];
-
-        assert_ne!(
-            super::super::execution_phase::pending_completion_action_for_work_state(&state, true)
-                .unwrap(),
-            Some(super::super::host::CompletionAction::CanonicalWorkValidation)
-        );
     }
 
     #[test]
@@ -8473,6 +8156,9 @@ mod tests {
             _run_id: &str,
             _event_indices: &[usize],
             _authority: crate::turn::run_control::UserIntentAdmissionAuthority,
+            _invocation_identity: Option<
+                crate::turn::run_control::UserIntentInvocationApplication<'_>,
+            >,
         ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
             Ok(crate::turn::run_control::UserIntentApplyAck::Applied)
         }
@@ -8514,6 +8200,9 @@ mod tests {
             _run_id: &str,
             _event_indices: &[usize],
             _authority: crate::turn::run_control::UserIntentAdmissionAuthority,
+            _invocation_identity: Option<
+                crate::turn::run_control::UserIntentInvocationApplication<'_>,
+            >,
         ) -> Result<crate::turn::run_control::UserIntentApplyAck, String> {
             Ok(crate::turn::run_control::UserIntentApplyAck::Applied)
         }

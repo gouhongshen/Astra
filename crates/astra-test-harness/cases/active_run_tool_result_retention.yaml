@@ -34,16 +34,15 @@ criteria:
     name: read_file
   - type: text_contains
     needle: "DASHMAP_VERSION: 6.1.0"
-  # Efficiency is part of correctness here: a final correct answer after
-  # path-discovery or re-read loops does not validate context retention.
+  # Exactly eight reads is the retention contract; round count is diagnostic.
   - type: all_of
     criteria:
       - type: tools_count_between
         min: 8
         max: 8
-      - type: turn_rounds_between
-        min: 2
-        max: 15
+  - type: turn_rounds_between
+    min: 2
+    max: 15
   - type: journal_tool_call_count
     name: read_file
     min: 1

@@ -6,6 +6,11 @@ use astra_thin_client::{
 use astra_turn_types::{JudgmentRequest, judgment_messages, normalize_judgment_response};
 use serde_json::{Value, json};
 
+// Answer-envelope sizing is a wire minimum, not the provider's total generation
+// budget. A bounded reserve permits adapters that consume internal reasoning
+// before emitting the typed answer; the Server still enforces its resource cap.
+const MIN_JUDGE_COMPLETION_TOKENS: usize = 2_048;
+
 /// The command's model selector uses the same catalog resolver as chat, with
 /// the typed judgment purpose retained on every catalog page.
 pub(crate) async fn execute_for_model(
@@ -21,7 +26,8 @@ pub(crate) async fn execute_for_model(
         model,
         astra_core::model_wire::purpose::ModelCatalogPurpose::TypedJudgment,
     )
-    .await?;
+    .await
+    .map_err(|error| error.to_string())?;
     Ok(execute(api, token, &selection.offering_id, message, timeout_seconds).await)
 }
 
@@ -41,7 +47,11 @@ pub(crate) async fn execute(
     if let Err(error) = judgment.validate() {
         return json!({"ok":false,"stage":"validate_request","error":error});
     }
-    let max_tokens = match u32::try_from(judgment.output_token_budget()) {
+    let max_tokens = match u32::try_from(
+        judgment
+            .output_token_budget()
+            .max(MIN_JUDGE_COMPLETION_TOKENS),
+    ) {
         Ok(budget) => budget,
         Err(_) => {
             return json!({"ok":false,"stage":"validate_request","error":"judgment output budget exceeds transport limits"});
@@ -250,7 +260,7 @@ mod tests {
         ResponseTemplate::new(200).set_body_json(json!({
             "id": "completion-1", "object": "chat.completion", "offering_id": "offering-1", "model": "judge",
             "judgment_provenance": "discrete_decision",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "{\"answers\":{\"0\":{\"type\":\"discrete_noul\",\"decision\":\"no\"}}}"}, "finish_reason": reason}],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "{\"answers\":{\"0\":\"no\"}}"}, "finish_reason": reason}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
         }))
     }
@@ -305,7 +315,12 @@ mod tests {
         assert_eq!(body["session_id"], SESSION);
         assert_eq!(body["model_selection"]["offering_id"], "offering-1");
         let judgment: JudgmentRequest = serde_json::from_str(&judgment_input()).unwrap();
-        assert_eq!(body["max_tokens"], judgment.output_token_budget());
+        assert_eq!(
+            body["max_tokens"],
+            judgment
+                .output_token_budget()
+                .max(super::MIN_JUDGE_COMPLETION_TOKENS)
+        );
         assert_eq!(body["messages"], json!(judgment_messages(&judgment)));
         assert_eq!(result["provenance"], "discrete_decision");
         assert_eq!(result["judgment"]["answers"]["0"]["decision"], "no");

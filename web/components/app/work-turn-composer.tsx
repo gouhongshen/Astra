@@ -20,6 +20,7 @@ import { ArrowUp, RotateCcw } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { useToast } from "@/components/ui/toast";
 import {
   abortWorkBranchControlAction,
   forceTakeoverWorkBranchAction,
@@ -32,6 +33,7 @@ type LocalMessage = { id: string; role: "user" | "assistant"; text: string };
 type PendingTurn = { requestId: string; message: string };
 type TurnState = "idle" | "connecting" | "working" | "waiting" | "disconnected";
 type PromptQuestion = {
+  id?: string;
   question?: string;
   header?: string;
   options?: PromptOption[];
@@ -162,6 +164,7 @@ export function WorkTurnComposer({
   const refreshedGraphRevision = useRef(0);
   const mounted = useRef(true);
   const router = useRouter();
+  const { addToast } = useToast();
 
   useEffect(() => {
     mounted.current = true;
@@ -218,6 +221,9 @@ export function WorkTurnComposer({
     }
 
     switch (event.type) {
+      case "warning":
+        addToast(event.message, "warning");
+        break;
       case "work_turn_started":
         rootRunId.current = event.run_id;
         activeRunId.current = event.run_id;
@@ -525,6 +531,7 @@ export function WorkTurnComposer({
         return;
       }
       return {
+        ...(question.id !== undefined ? { id: question.id } : {}),
         question: question.question ?? question.header ?? "",
         answers: values,
         multi_select: question.multi_select === true,

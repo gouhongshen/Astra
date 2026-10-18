@@ -34,29 +34,34 @@ export function isHeadersLike(headers: unknown): headers is Headers {
   );
 }
 
-/** Merge `RequestInit.headers` into a plain record. */
+/** Merge headers case-insensitively; later values replace earlier values. */
 export function headersInitToRecord(
   base: Record<string, string>,
   initHeaders?: HeadersInit,
 ): Record<string, string> {
-  if (!initHeaders) {
-    return { ...base };
-  }
+  const out: Record<string, string> = {};
+  const names = new Map<string, string>();
+  const set = (key: string, value: string) => {
+    const name = key.toLowerCase();
+    const previous = names.get(name);
+    if (previous !== undefined) delete out[previous];
+    out[key] = value;
+    names.set(name, key);
+  };
+  Object.entries(base).forEach(([key, value]) => set(key, value));
+  if (!initHeaders) return out;
   if (Array.isArray(initHeaders)) {
-    const out = { ...base };
     for (const [key, value] of initHeaders) {
-      out[key] = value;
+      set(key, value);
     }
     return out;
   }
   if (isHeadersLike(initHeaders)) {
-    const out = { ...base };
-    initHeaders.forEach((value, key) => {
-      out[key] = value;
-    });
+    initHeaders.forEach((value, key) => set(key, value));
     return out;
   }
-  return { ...base, ...(initHeaders as Record<string, string>) };
+  Object.entries(initHeaders).forEach(([key, value]) => set(key, value));
+  return out;
 }
 
 export function methodCanHaveJson(method: string): boolean {

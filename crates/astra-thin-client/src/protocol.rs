@@ -10,6 +10,15 @@ use sha2::{Digest, Sha256};
 pub use astra_turn_types::ExplainAnalyzeEventV1;
 pub use astra_turn_types::{ModelSelection, ModelSelector, RequestedModelPolicy};
 
+/// HTTP 409: a callback attempts to overwrite an immutable payload.
+pub const EDGE_CALLBACK_PAYLOAD_CONFLICT_CODE: &str = "edge_callback_payload_conflict";
+/// HTTP 409: the selected Edge advertises an unsupported capability schema.
+pub const EDGE_CAPABILITY_SCHEMA_UNSUPPORTED_CODE: &str = "edge_capability_schema_unsupported";
+/// HTTP 409: a recorded interaction could not resume its execution authority.
+pub const RUN_INTERACTION_AUTHORITY_LOST_CODE: &str = "run_interaction_authority_lost";
+/// HTTP 409: newer user guidance superseded a recorded interaction.
+pub const RUN_INTERACTION_SUPERSEDED_CODE: &str = "run_interaction_superseded";
+
 /// `POST /chat/stream` body — superset of server `ChatRequest` plus optional edge fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -455,6 +464,19 @@ pub struct ProviderInteractionRespondRequest {
     pub cancelled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
+}
+
+/// Correlation for a native question, not permission or generation authority.
+/// The server derives the origin from the active invocation ledger and binding.
+/// `physical_workspace_id` lets a reconnecting Edge prove that it is the same
+/// checkout without reusing a connection-scoped executor label.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ToolInteractionRequest {
+    pub identity: astra_turn_types::ToolInvocationIdentity,
+    pub edge_agent_id: String,
+    pub physical_workspace_id: String,
+    pub interaction: astra_turn_types::ProviderInteractionRequest,
 }
 
 /// `POST /agents/edge` — matches server `EdgeRegisterRequest` (Phase 3 registry).

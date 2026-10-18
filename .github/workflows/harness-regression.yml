@@ -1,0 +1,44 @@
+name: Harness regression (live)
+
+on:
+  push:
+    branches: [main]
+    paths: ["crates/**", "Cargo.*", "rust-toolchain.toml", ".cargo/**", "Makefile", "scripts/dev/**", "scripts/lib/**", "scripts/harness/**", "scripts/ci/**", ".github/workflows/**", ".github/actions/**", "deployment/all-in-one/**", "fixtures/harness/**"]
+  pull_request_target:
+    branches: [main]
+    paths: ["crates/**", "Cargo.*", "rust-toolchain.toml", ".cargo/**", "Makefile", "scripts/dev/**", "scripts/lib/**", "scripts/harness/**", "scripts/ci/**", ".github/workflows/**", ".github/actions/**", "deployment/all-in-one/**", "fixtures/harness/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    # This gate comes from the trusted base, never the PR's workflow. These
+    # explicitly trusted repositories may execute code with model credentials.
+    # Bind names AND immutable IDs: a lookalike or recreated fork is not trusted.
+    if: >-
+      ${{ github.repository == 'matrixorigin/Astra' &&
+          (github.event_name == 'push' ||
+           (github.actor != 'dependabot[bot]' &&
+            github.event.pull_request.user.login != 'dependabot[bot]' &&
+            ((github.event.pull_request.head.repo.full_name == github.repository &&
+              github.event.pull_request.head.repo.id == github.event.repository.id) ||
+             (github.event.pull_request.head.repo.full_name == 'XuPeng-SH/Astra' &&
+              github.event.pull_request.head.repo.id == 1355430593) ||
+             (github.event.pull_request.head.repo.full_name == 'gouhongshen/Astra' &&
+              github.event.pull_request.head.repo.id == 1355443432) ||
+             (github.event.pull_request.head.repo.full_name == 'loveRhythm1990/Astra' &&
+              github.event.pull_request.head.repo.id == 1355489820)))) }}
+    uses: ./.github/workflows/harness-manual.yml
+    with:
+      repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      profile: regression
+    secrets:
+      HARNESS_GLM_BASE_URL: ${{ secrets.HARNESS_GLM_BASE_URL }}
+      HARNESS_GLM_API_KEY: ${{ secrets.HARNESS_GLM_API_KEY }}
+      HARNESS_ADDITIONAL_MODELS_JSON: ${{ secrets.HARNESS_ADDITIONAL_MODELS_JSON }}

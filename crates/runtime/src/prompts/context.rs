@@ -342,6 +342,10 @@ pub const DEFAULT_PROTOCOL_RESERVE_TOKENS: usize = 300;
 pub enum ContextWindowPolicySource {
     /// Both the raw window and completion limit came from the model catalog.
     ModelCatalog,
+    /// The catalog supplied both limits, but its completion limit is not
+    /// below the raw window, so the documented default output reserve was
+    /// used instead.
+    ImplausibleModelCatalog,
     /// The catalog supplied only part of the limit metadata.
     PartialModelCatalog,
     /// No catalog window was available, so the documented generic fallback
@@ -376,10 +380,17 @@ impl ContextWindowPolicy {
         let raw = catalog_context_window
             .map(|tokens| tokens as usize)
             .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
-        // Catalog metadata is authoritative. The fallback is one fixed
-        // documented reserve, clamped only to keep malformed/tiny windows
-        // arithmetically valid; it never branches on provider/model text.
+        // Catalog metadata is authoritative. A completion limit that is not
+        // below the raw window cannot leave any input budget, so it is
+        // treated as implausible and resolved like missing metadata. The
+        // fallback is one fixed documented reserve, clamped only to keep
+        // malformed/tiny windows arithmetically valid; it never branches on
+        // provider/model text.
+        let implausible_completion = catalog_context_window
+            .zip(catalog_max_completion)
+            .is_some_and(|(window, completion)| completion >= window);
         let output = catalog_max_completion
+            .filter(|_| !implausible_completion)
             .map(|tokens| tokens as usize)
             .unwrap_or_else(|| DEFAULT_OUTPUT_RESERVE_TOKENS.min((raw / 4).max(1)))
             .min(raw.saturating_sub(1));
@@ -396,6 +407,9 @@ impl ContextWindowPolicy {
             .floor()
             .min(usize::MAX as f64) as usize;
         let source = match (catalog_context_window, catalog_max_completion) {
+            (Some(_), Some(_)) if implausible_completion => {
+                ContextWindowPolicySource::ImplausibleModelCatalog
+            }
             (Some(_), Some(_)) => ContextWindowPolicySource::ModelCatalog,
             (Some(_), None) | (None, Some(_)) => ContextWindowPolicySource::PartialModelCatalog,
             (None, None) => ContextWindowPolicySource::GenericFallback,
@@ -603,9 +617,11 @@ pub fn budget_for_model_with_metadata(
 /// Compatibility cap for directly constructed legacy budgets.
 const DEFAULT_OUTPUT_TOKEN_CAP: usize = 16_384;
 
-/// Resolve the outbound cap. Production policies return the exact catalog
-/// completion limit. Direct legacy construction uses one documented fallback
-/// cap rather than inferring a model class from window size.
+/// Resolve the outbound cap. Production policies return the resolved output
+/// reserve: the exact catalog completion limit when it is below the window,
+/// otherwise the documented default reserve. Direct legacy construction uses
+/// one documented fallback cap rather than inferring a model class from window
+/// size.
 pub fn capped_output_tokens(budget: &ContextBudget) -> usize {
     if let Some(policy) = budget.resolved_policy {
         return policy.reserved_output_tokens;
@@ -716,6 +732,77 @@ mod tests {
         assert_eq!(policy.auto_compact_trigger_tokens, 685_623);
         assert_eq!(policy.post_compaction_target_tokens(), 594_207);
         assert_eq!(capped_output_tokens(&budget), 65_536);
+    }
+
+    #[test]
+    fn catalog_completion_at_or_above_window_falls_back_to_default_reserve() {
+        // Issue #981: catalog metadata whose completion ceiling is not below
+        // the window cannot describe a usable input budget. The reserve falls
+        // back to the documented default and the provenance says why.
+        for completion in [1_000_000_u32, 2_000_000] {
+            let budget = budget_for_model_with_metadata(
+                Some("opaque-model-id"),
+                Some(1_000_000),
+                Some(completion),
+            );
+            let policy = budget.window_policy();
+            let expected_reserve = DEFAULT_OUTPUT_RESERVE_TOKENS.min(1_000_000 / 4);
+
+            assert_eq!(
+                policy.source,
+                ContextWindowPolicySource::ImplausibleModelCatalog
+            );
+            assert_eq!(policy.raw_context_window_tokens, 1_000_000);
+            assert_eq!(policy.reserved_output_tokens, expected_reserve);
+            assert_eq!(policy.reserved_protocol_tokens, 300);
+            assert_eq!(
+                policy.hard_input_limit_tokens,
+                1_000_000 - expected_reserve - 300
+            );
+            assert!(policy.usable_input_limit_tokens > 0);
+            assert_eq!(capped_output_tokens(&budget), expected_reserve);
+        }
+    }
+
+    #[test]
+    fn catalog_completion_below_window_keeps_exact_reserve() {
+        // Plausible metadata keeps the exact catalog completion limit as both
+        // the reserve and the outbound cap, including ceilings above half the
+        // window.
+        for (window, completion, expected_usable) in [
+            (1_024_000_u32, 131_000_u32, 872_700_usize),
+            (1_024_000, 384_000, 619_700),
+            (200_000, 150_000, 37_275),
+        ] {
+            let budget = budget_for_model_with_metadata(
+                Some("opaque-model-id"),
+                Some(window),
+                Some(completion),
+            );
+            let policy = budget.window_policy();
+
+            assert_eq!(policy.source, ContextWindowPolicySource::ModelCatalog);
+            assert_eq!(policy.raw_context_window_tokens, window as usize);
+            assert_eq!(policy.reserved_output_tokens, completion as usize);
+            assert_eq!(policy.usable_input_limit_tokens, expected_usable);
+            assert_eq!(capped_output_tokens(&budget), completion as usize);
+        }
+    }
+
+    #[test]
+    fn catalog_completion_above_half_window_admits_fixed_thinking_budget() {
+        // A legitimate ceiling between half and the whole window must keep
+        // admitting a fixed thinking budget below that ceiling.
+        let budget =
+            budget_for_model_with_metadata(Some("opaque-model-id"), Some(200_000), Some(150_000));
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Enabled {
+            budget_tokens: 125_000,
+        };
+
+        assert_eq!(
+            thinking.validate_output_budget(capped_output_tokens(&budget) as u64),
+            Ok(())
+        );
     }
 
     // === effective_input_limit (8→1) ===

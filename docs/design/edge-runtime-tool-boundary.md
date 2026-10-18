@@ -125,6 +125,13 @@ heuristics. Outline signatures are redacted for display and do not establish
 full-file delivery or authorize replacement. A bounded prefix is identified as
 partial content; its measured line count does not describe the unread suffix.
 
+Credential read views preserve assignment syntax and replace only the secret
+value with an opaque reference. Presentation boundaries retain complete,
+canonical non-secret reference envelopes across processes; this does not grant
+edit authority. Only the source executor can authenticate the reference and
+resolve one unchanged, unambiguous source span. Adjacent raw secrets remain
+subject to redaction, and display-only markers cannot authorize edits.
+
 
 ### Server-owned execution
 
@@ -144,6 +151,24 @@ metadata. The separate delivery deadline includes callback settlement time and
 must not extend the command budget. Missing or invalid command authority rejects
 a Bash request. Model arguments remain unchanged for approval, invocation identity
 and journal evidence; runtime controls are never injected into those arguments.
+
+Ordinary shell execution uses the selected provider's permission, sandbox and
+process-coordination boundaries. Optional bounded observation is evidence, not
+an execution prerequisite. The executor records pre-start rejection separately
+from started success, failure or cancellation; unavailable observation cannot
+turn either into a permission denial. A started command deadline carries typed
+`tool_timeout` evidence even after its process scope is settled. Cancellation,
+timeout and lost outcomes can leave partial effects and must not be replayed
+merely to obtain evidence.
+
+Command output can establish a current state, including an already-satisfied
+request or an absent directory, without claiming this invocation changed it.
+Neither a zero exit status nor a generic filesystem delta proves arbitrary task
+correctness. Domain tools and canonical Work retain their own result contracts.
+Inspection and diagnostics omit `mode`. Explicit `mode=verify` adds an unchanged-workspace proof obligation
+after edits. If bounded observation is unavailable, command output is retained
+but the requested verification fails closed; it must not mint a completion or
+no-change receipt. Command text does not select or weaken this contract.
 
 ### Rename authority
 
@@ -232,6 +257,16 @@ Local shell and typed workspace writers must serialize each executor-owned
 pre/execute/post observation window across Astra processes without placing the
 coordination authority inside the tool-writable workspace.
 
+The CLI checks this host prerequisite before submitting a turn that advertises
+locally bound workspace writers or shell tools (including deferred tools).
+Text-only and read-only surfaces do not require it. Unsupported hosts fail with
+an actionable local setup error before model execution; admission also rechecks
+the same trust boundary. Tool-level refusals use the non-retryable
+`workspace_host_unsupported` kind, distinct from a missing workspace binding.
+Rebinding a workspace or changing cache roots cannot repair a host whose
+coordination directory is not trusted; use a supported host or have its
+administrator provision the required root-owned sticky directory.
+
 - Linux uses a root-owned sticky temporary root, a kernel-owned abstract Unix
   socket name for each workspace generation, a per-UID integrity witness, and
   inotify-backed sticky tamper evidence.
@@ -247,6 +282,29 @@ coordination authority inside the tool-writable workspace.
   Concurrent contenders can retreat together, but cannot both be admitted;
   process-diverse jitter restores progress without a machine-global admission
   gate.
+- macOS watcher admission atomically reserves the kqueue descriptor and every
+  duplicated witness or opened binding descriptor before opening any watcher
+  files. The process-wide budget is the minimum of 1,024 descriptors, one
+  quarter of the current `RLIMIT_NOFILE` soft limit, and the soft limit minus
+  64 descriptors of headroom. Watched paths consume that same budget; there is
+  no unbounded path subscription pool. The 1,024 ceiling normally binds on
+  hosts with a soft limit of at least 4,096; the other terms protect low-limit
+  processes. Transient capacity shortage releases admission locks and waits
+  within the caller's remaining monotonic deadline. Exhaustion returns typed
+  `WorkspaceLeaseFailure::WatcherCapacity` facts with active/requested/limit
+  counts, carried into tool result fields as `reason: watcher_capacity` and
+  `watcher_descriptors`. These are the last observed capacity counts. If a retry
+  uses the remaining deadline before reaching watcher admission, expiry retains
+  that observed refusal instead of reclassifying it as workspace contention.
+  A definitive cancellation, binding failure, or ownership failure still wins.
+  It does not instruct the caller to wait for an operation
+  in this same workspace. A zero limit or a watcher larger than the budget
+  rejects immediately with `retryable: false` and a resource repair action.
+  Cancellation, failed registration, and lease drop
+  close descriptors before releasing the reservation. The budget covers
+  watcher-owned descriptors, not all runtime files/sockets; unrelated resource
+  exhaustion still fails closed. Lowering the soft limit does not revoke
+  existing leases, but subsequent admission uses the new limit.
 - Kernel ownership must end automatically when the holder process exits.
   Replacing or unlinking a witness or workspace binding must not admit a second
   generation, and any observed tamper revokes receipt authority permanently
@@ -255,10 +313,40 @@ coordination authority inside the tool-writable workspace.
   closed before launching a local command.
 
 Workspace lease admission uses the asynchronous options APIs with explicit
-cancellation and wait budgets. The unused synchronous acquisition APIs and
+cancellation and wait budgets. Observation, mutation, and opaque writer APIs
+return `Result<_, WorkspaceLeaseFailure>` with typed admission failures. The unused synchronous acquisition APIs and
 no-options observation wrapper are retired from the Rust source API. Process
 coordination, generation watches, diagnostic paths, and guard cleanup remain
 shared; tests exercise the same acquisition paths as executors.
+
+Native collaborator delivery delegates workspace serialization to the CLI tool
+executor. It does not hold a workspace lease while asking for approval or acquire
+the executor's lease a second time. After acquiring the lease, the executor checks
+the current permission attachment, workspace and executable identity before
+dispatch; queueing cannot preserve revoked authority. Lease waits respect the
+invocation deadline and cancellation. The Linux CI composition test drives the
+authenticated WebSocket owner through this executor and the production process
+supervisor, including contention, cancellation, expiry and changed admission.
+
+Native discovery's physical process lifetime covers its complete caller budget;
+handshake/authentication and model-list waits cannot renew that cutoff. A typed
+collaborator uses its admitted whole-stage deadline when present; absence of a
+work deadline does not install a command-timeout fallback. Initialization and
+authentication remain bounded control exchanges, independently of the active
+turn and each command's limit. Physical Edge detach cancels and settles owned
+execution before another attachment serves work; its journal retains results
+for reconnect replay. This is separate from a client UI disconnect, which does
+not revoke the Server's durable execution authority.
+An explicit model request cannot be replaced by a provider default merely because
+discovery is unavailable; only unconstrained or explicitly accepted defaults may
+omit the selector.
+
+Linux runtime authorization remains canonical. The native sparse filesystem
+also exposes a platform bootstrap alias only when its current resolved target
+is in the approved runtime requirements. Sensitive-path rules cover both views;
+Codex's explicit minimal bootstrap preserves the logical loader paths only when
+all existing platform runtime roots are approved. Its additional `/etc` and
+inherited `/proc` views remain denied; filesystem-root read is never granted.
 
 Receipt attribution and execution coordination are independent. A completed
 foreground process group may be too weak to authorize future fingerprint-based
@@ -268,12 +356,11 @@ or prevent the next command. Unsettled execution ownership and a replaced or
 tampered binding still prevent admission. Every receipt-producing path must
 check receipt authority independently of the coordination check used to launch.
 
-Quarantine is retained per observation root for the executor process lifetime,
-not per conversation. Explicit external-state preimage capture reports
-`external_state_observation_quarantined` separately from ordinary unavailable,
-ambiguous or over-bound fingerprints. The command is not launched in this case.
-Quarantine establishment and later refusals log a root digest, not local paths
-or shell input. A new conversation does not clear quarantine; before restarting
+Receipt-attribution quarantine is retained per workspace observation root for
+the executor process lifetime, not per conversation. It prevents new attribution
+receipts, while healthy execution coordination remains independent. Explicit
+verification still fails when the required proof is unavailable. Quarantine
+diagnostics log a root digest, not local paths or shell input. A new conversation does not clear quarantine; before restarting
 the affected Astra or astra-edge process, verify that earlier background work
 has stopped. Restart alone does not stop escaped descendants or prove safety.
 
@@ -284,6 +371,10 @@ workspace and working-directory handles used for execution. Directory acquisitio
 walks each component without following symlinks. Target inspection resolves
 symlinks with bounded traversal and checks directory ancestry by identity; it
 does not assume that an existing `/dev/fd` entry supports child-path lookup.
+On Linux, traversal and identity handles use `O_PATH`, so acquiring the filesystem
+root or workspace ancestors does not require directory-read permission from
+Landlock. Actual file reads and directory enumeration still open separate readable
+handles and remain subject to the selected provider's filesystem allowlist.
 The OS sandbox remains responsible for execution-time filesystem confinement.
 
 Source preimages read retained regular-file handles with a bounded byte budget.

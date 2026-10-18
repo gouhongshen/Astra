@@ -86,6 +86,47 @@ Preserve:
 
 ## Compaction output
 
+Accepted history summaries carry a versioned `_astra_history_summary` marker
+through canonical replacement and continuation restore. They retain their
+existing system storage role, but the shared summary input projection passes
+them as historical evidence: assistant context for inline summaries and an
+explicit prior-summary section for rendered summaries. Inline requests precede
+that assistant evidence with an auxiliary user task preamble, preserving the
+user-first conversation shape required by providers such as Bedrock Nova,
+including after resume and PTL retries. The preamble is never persisted as
+human conversation history. Stable instructions and
+runtime-owned controls never qualify as historical summaries. Resume also
+recognizes the exact pre-marker compaction envelopes already persisted by Astra.
+Both summary paths retain this evidence across PTL retries without applying
+ordinary message excerpt caps. Artifact spills also carry forward prior summary
+evidence and recovery handles; the existing net token reduction check still
+decides whether the candidate can replace history. This is an input continuity
+contract, not a guarantee of a model's semantic fidelity.
+
+Successful request-time summaries also become the loop's canonical working set
+when the summary plus bounded history saves estimated tokens. The existing
+rewrite proof and canonical WAL/terminal commit own this transition; no separate
+summary cache, memory write or checkpoint table is involved. Later pipeline and
+pre-turn pressure measurements therefore see the accepted representation plus
+newly appended history, rather than repeatedly summarizing the original input.
+An unchanged or still-fitting working set performs no further summary inference;
+new history that requires actual compaction can produce the next generation.
+Summary space is reserved only when history exceeds the concrete budget after
+memory costs; reserving a hypothetical next summary cannot create that pressure.
+
+Acceptance requires a valid admitted canonical rewrite permit and input matching
+either the exact canonical source or the shared pipeline's validated
+provider-placement projection. If that projection re-homed append-only
+authority, its active human-anchored suffix must survive unchanged and is restored
+in canonical history. A stale/unrecognized projection, invalid tool pairing,
+non-reducing candidate, failed summary or cancelled in-flight operation cannot
+install a replacement. Request-local mechanical fallback and final wire budget
+enforcement remain available. On the first canonical turn without an admitted
+rewrite proof, a successful summary stays request-local and preserves the
+existing provider WAL prefix. Prior summary generations are consumed as evidence
+and replaced by the accepted summary, not accumulated. Resume uses the ordinary
+canonical continuation path and retains that summary without another inference.
+
 Exact-output deduplication is distinct from deciding that an observation is
 obsolete. A repeated path, tool name or read argument does not prove equal
 content: files can change, ranges can differ and providers can change ownership.

@@ -41,6 +41,11 @@ const run = await client.createRun({
 
 `register(username, password, { email?, displayName? })` sends `email`; if omitted, a placeholder `{username}@users.local.astra` is used so the server’s required field is satisfied.
 
+Custom HTTP headers are merged case-insensitively. The current access token
+replaces a configured Authorization header for REST and SSE requests; explicit
+per-request headers retain their override precedence. SSE POST requests preserve
+a custom Content-Type regardless of its casing.
+
 ### Runs, delegation, and session observability
 
 For HTTP chat streaming, `modelSelection: "auto"` opts into the Server's
@@ -101,6 +106,14 @@ const { edges } = await client.getEdgesStatus();
 Delegation requires a configured **delegation engine** on the server; otherwise the API returns **503** — the SDK forwards errors as `AstraApiError`.
 
 ### Streaming (SSE)
+
+Calling `SSEClient.close()` or aborting its external signal interrupts a pending
+retry delay and settles `connect()` without another fetch attempt. Explicitly
+calling `connect()` again can reopen a closed client if its external signal has
+not been aborted.
+Heartbeat timeouts abort the stalled fetch and use the same bounded retry
+budget as transport failures. Each timeout emits one error whose `retryable`
+flag reflects the remaining budget; user cancellation still interrupts backoff.
 
 `streamChat` uses **`POST /chat/stream`** with a **JSON body** (the Web
 dashboard's typed BFF integration lives in
@@ -271,6 +284,15 @@ Constants and path helpers are exported from `@astra/sdk` (for example `PATH_CHA
 | `approveToolCall` | Tool approval |
 
 ### Utilities
+
+Both live streams and `parseSseDataEvents` accept LF, CRLF, and CR line endings.
+Live parsing preserves events across split line endings and UTF-8 byte chunks;
+multiple `data:` lines are joined with a newline. The SDK retains its tolerance
+for a final JSON event without a trailing blank line.
+The shared parser removes exactly one leading BOM for direct text, buffered
+HTTP, and live streams. Raw-line callbacks include blank event separators.
+Terminal events parsed during the final flush also suppress trailing socket
+errors and reconnect attempts.
 
 | Export | Description |
 |--------|-------------|

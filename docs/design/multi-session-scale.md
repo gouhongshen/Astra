@@ -112,6 +112,24 @@ The existing owner lease and durable Edge dispatch relay own cross-pod
 execution. A new scheduler, sticky-session requirement, or process-local
 parallel state machine must not be introduced to make a scale test pass.
 
+Fresh run-control observations share an on-demand read queue in `RunEngine`.
+Concurrent requests across owners use at most 128 positional lookups per SQL,
+four concurrent queries, and a maximum 25 ms collection window measured from
+admission. Full batches and partial batches whose oldest request has already
+waited that window dispatch without another collection delay.
+The queue admits at most 8,192 outstanding reads and 4,096 per owner, including
+in-flight queries, with bounded identity bytes and owner-rotating dispatch.
+Database equality associates each request with its result; missing or malformed
+rows do not leak into another request. A bound candidate run-ID filter keeps
+unrelated historical runs out of the base-row join work; query-count reduction
+must be validated together with the actual scan plan. Observations are never
+cached, polling intervals and ancestor controls remain unchanged, and no idle
+queue issues SQL.
+Overload and storage failures are explicit; this queue is not execution
+authorization. Lease renewal and provider/action fences retain their owners.
+The collection window is not a total-latency guarantee: query attempts have a
+three-second deadline and callers have a four-second overall read budget.
+
 Direct-child completion waits are a delivery concern, not a new lifecycle
 authority. Local children notify their parent in memory. Remotely owned
 children are observed by one Server-instance coordinator that batches exact
@@ -213,36 +231,68 @@ oldest-backlog age; owner progress; pool-acquire latency; and end-to-end
 ingestion p50/p95/p99. Multi-process or cluster claims require the same evidence
 at that deployment scope.
 
-The first implementation stage aligns local and durable admission configuration
-and records the configuration in the shared gate. The second stage keeps exact
-global and per-owner usage in the durable protocol: normal reserve and release
-mutate those counters in the same gate transaction, while expiry or an explicit
-session cleanup marks them dirty and the next admission rebuilds them from the
-reservation rows. Rust parses the decimal totals as `u64` and rejects negative
-or out-of-range stored rows, so the optimization does not change the capacity
-invariant. The rebuild is a repair path; the steady-state decision is O(1) in
-the number of active reservations.
+## Durable admission partitions
 
-The local controller has one async admission permit because one durable scope
-has one gate row. Requests wait before acquiring a database connection, so a
-burst cannot consume the whole pool while queued behind that row. Renewals and
-releases use the same boundary. The durable gate remains the cross-server
-serialization point; it is therefore a measured throughput boundary for a
-deployment that raises the cluster budget high enough to admit every request.
-Scaling that case further requires a sharded or lease-based capacity protocol,
-not a larger SQL pool or an early rejection cache.
+The existing database controller uses 16 fixed owner partitions, encoded in the
+existing scope key as `canonical_turn_v2_00` through `canonical_turn_v2_15`.
+SHA-256 of the exact owner ID bytes selects the partition; all domains and
+sessions of that owner use it on every pod. Partition identity is not a pod
+assignment or a new routing service. The three admission tables and their
+existing compound keys remain the only authority.
 
-The third stage adds a four-pool, 1000-attempt MatrixOne harness. It proves that
-independent server pools share the same durable global and owner budgets, keeps
-successful permits live until all attempts finish, and checks that release does
-not leak a reservation. The admission latency it prints includes pool and gate
-wait; it is not a full server turn or provider throughput metric. The current
-hot path also reads the gate clock and capacity hash with one locked query,
-removing a redundant round trip without weakening configuration fencing.
+Each gate stores a five-resource allocation, exact charged usage, configuration
+hash and conservative expiry frontier. Allocations sum componentwise to the
+configured global budget, charged usage cannot exceed its partition allocation,
+and each domain/owner retains its original share limit. Initial allocations
+split each resource by quotient and remainder. Credits are durable: a pod crash
+does not destroy or reissue them.
 
-The next stage may introduce sharded/lease-based capacity only after measured
-lock wait, pool wait, or reservation-scan evidence justifies it, with crash and
-expiry tests.
+Ordinary reserve, renewal and release acquire only their owner partition gate.
+A local semaphore per partition queues requests before pool checkout. A missing
+configuration or allocation miss releases that transaction and local permit.
+One local refill semaphore then coalesces credit/configuration work before any
+checkout. A credit miss reads its fresh snapshot only after this queue; a
+configuration miss instead rechecks the owner without a probe. A valid snapshot
+may suggest the target and donors sufficient for the deficit. The controller
+locks only these database gates in ascending order and revalidates real credit.
+A stale suggestion ends its transaction before one full-inventory attempt,
+retaining only the refill semaphore. Refills do not acquire owner-local permits
+or spend capacity from local state. Every attempt uses the
+same transaction implementation, repairs due/dirty partitions and checks exact
+replay and owner/global limits.
+It transfers only unused donor credit and grants atomically. Per deficient
+resource, the transfer targets the greater of the exact deficit and one
+sixteenth of global capacity, capped by available donor credit. Fragmentation
+must not cause a false global-exhaustion decision. No background refill,
+per-pod lease, local capacity cache or singleton fallback exists.
+
+Before local escalation, a credit miss may be rejected by one fresh read-only
+transaction. Its single SQL snapshot must simultaneously prove all 16 gates
+configured, clean, conserved and not due for expiry, and the exact logical
+idempotency identity absent. It may reject or suggest donor locks, never grant
+or transfer credit; the ordered locking protocol remains authoritative. No old locking
+snapshot, separate identity read, cached result or additional pool checkout
+while retaining the original transaction can substitute for this proof.
+
+Configuration initializes or rotates only while no reservation remains across
+the locked partitions. All configuration fingerprints include the partition
+contract. Repair and session deletion affect only the owner's partition;
+multi-gate transactions always acquire gates before reservation/owner rows.
+Renew/replay/TTL decisions sample database time after the final lock, inside the
+original deadline and cancellation-safe transaction. Release needs no clock.
+Exact logical identities and generation UUIDs fence stale renewals and releases.
+
+A future expiry frontier avoids a reservation scan. Due/dirty repair rebuilds
+only the locked partition and parses wide decimal sums without signed overflow.
+Successful cleanup commits even when admission is rejected. Replays remain
+valid at full capacity without a provisional INSERT; changed work is a mismatch.
+
+This removes the common row from the steady-state path, not all contention.
+Same-owner/hash-collision traffic still serializes. Initialization and stale
+donor fallback briefly coordinate all partitions. Physical gate count is fixed at 16; active
+reservation count remains bounded by the configured provider-slot budget.
+Performance claims require matched multi-process measurements; pool count is
+not pod count, and admission throughput is not complete-agent throughput.
 
 ## Required scenarios
 

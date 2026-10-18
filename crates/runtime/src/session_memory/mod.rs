@@ -12,6 +12,7 @@
 //! fans out lifecycle signals the CLI bridges into `StreamEvent`.
 
 pub mod activity;
+pub(crate) mod durable;
 pub mod gate;
 pub mod health;
 pub mod request;

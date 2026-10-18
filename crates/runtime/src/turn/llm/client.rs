@@ -1235,7 +1235,7 @@ impl ControlledProviderAttemptObserver<'_> {
             "terminalization" => "provider_attempt_terminalization",
             _ => "provider_attempt_persistence",
         };
-        let mut details = json!({
+        let details = json!({
             "source": crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
             "deadline": {
                 "scope": "inference_ledger",
@@ -1244,18 +1244,15 @@ impl ControlledProviderAttemptObserver<'_> {
                 "retry_safety": "none"
             }
         });
-        if let Some(terminal) = terminal {
-            details["provider_terminal"] = json!({
-                "status": terminal.status.as_str(),
-                "usage_status": terminal.usage_status.as_str(),
-                "error_kind": terminal.error_kind,
-            });
-        }
-        astra_core::ClassifiedError::new(
+        let error = astra_core::ClassifiedError::new(
             astra_core::ErrorKind::DatabaseError,
             format!("durable inference ledger timed out during provider attempt {stage}"),
         )
-        .with_details_json(details.to_string())
+        .with_details_json(details.to_string());
+        match terminal {
+            Some(terminal) => attach_provider_terminal_evidence(error, terminal),
+            None => error,
+        }
     }
 }
 
@@ -1449,6 +1446,26 @@ pub(crate) fn classify_provider_send_error(
     )
 }
 
+/// A settlement error cannot erase the physical terminal already supplied by
+/// the adapter. Preserve only typed terminal facts, never provider error prose.
+fn attach_provider_terminal_evidence(
+    error: astra_core::ClassifiedError,
+    terminal: &astra_services::InferenceInvocationTerminal,
+) -> astra_core::ClassifiedError {
+    let mut details = error
+        .details_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    details["provider_terminal"] = json!({
+        "status": terminal.status.as_str(),
+        "usage_status": terminal.usage_status.as_str(),
+        "error_kind": terminal.error_kind,
+    });
+    error.with_details_json(details.to_string())
+}
+
 pub(crate) async fn finish_observed_provider_attempt(
     observer: Option<&dyn ProviderAttemptObserver>,
     attempt_index: Option<u32>,
@@ -1457,7 +1474,10 @@ pub(crate) async fn finish_observed_provider_attempt(
     let (Some(observer), Some(attempt_index)) = (observer, attempt_index) else {
         return Ok(());
     };
-    observer.finish_attempt(attempt_index, terminal).await
+    observer
+        .finish_attempt(attempt_index, terminal)
+        .await
+        .map_err(|error| attach_provider_terminal_evidence(error, terminal))
 }
 
 fn note_observed_provider_usage_presence(
@@ -3898,6 +3918,7 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
             object.remove(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD);
             object.remove(astra_turn_types::MODEL_ITEM_ID_FIELD);
             object.remove("_compact_boundary");
+            object.remove(astra_turn_core::cloud::history_summary::HISTORY_SUMMARY_FIELD);
             // These fields are compaction/checkpoint bookkeeping. They are
             // useful in runtime history, but are not part of the provider
             // message contract and only add round-specific bytes to the
@@ -5715,14 +5736,11 @@ async fn call_llm_and_collect_with_total_budget(
             return Err(error);
         }
 
-        // Auth errors: redact the body in logs and return a generic message
-        // so provider-echoed secrets cannot leak through error propagation.
+        // Auth responses can echo arbitrary credentials; do not log the body.
         if status == 401 || status == 403 {
-            let truncated = &text[..text.len().min(80)];
-            let redacted = redact_provider_secrets(truncated);
             tracing::warn!(
                 target: "astra_runtime::llm_client",
-                "LLM auth error ({status}) on {model_key}: {redacted}",
+                "LLM auth error ({status}) on {model_key}",
             );
             let error = astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::Auth,
@@ -5866,6 +5884,19 @@ pub(crate) async fn call_llm_and_collect_with_total_budget_for_test(
 pub(crate) const MAX_STREAM_ACCUMULATION_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum number of tool calls per LLM stream response.
 pub(crate) const MAX_STREAM_TOOL_CALLS: usize = 128;
+
+/// Decode the two supported OpenAI-chat reasoning field spellings once.
+/// Prefer nonempty `reasoning_content` when a provider mirrors both fields.
+fn openai_reasoning_text(message: &Map<String, Value>) -> Option<&str> {
+    ["reasoning_content", "reasoning"]
+        .into_iter()
+        .find_map(|field| {
+            message
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+        })
+}
 
 /// Parse an OpenAI-compatible SSE stream and collect into `LlmCallResult`.
 #[cfg(test)]
@@ -6250,9 +6281,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
         }
 
         // Reasoning
-        if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str)
-            && !r.is_empty()
-        {
+        if let Some(r) = openai_reasoning_text(delta) {
             accumulated_bytes += r.len();
             if accumulated_bytes > MAX_STREAM_ACCUMULATION_BYTES {
                 return Err(StreamCollectError::Transport {
@@ -7501,12 +7530,14 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
         } else {
             astra_core::ErrorKind::Unknown
         };
-        let detail = redact_provider_secrets(&text);
-        let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
-        let error = astra_core::ClassifiedError::new(
-            kind,
-            format!("LLM non-stream request error {status}: {detail}"),
-        );
+        let message = if kind == astra_core::ErrorKind::Auth {
+            "LLM provider authentication failed".to_owned()
+        } else {
+            let detail = redact_provider_secrets(&text);
+            let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
+            format!("LLM non-stream request error {status}: {detail}")
+        };
+        let error = astra_core::ClassifiedError::new(kind, message);
         finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
         return Err(error);
     }
@@ -7765,7 +7796,7 @@ fn parse_openai_compatible_nonstream_response(v: &Value, model_name: &str) -> Ll
         if let Some(content) = msg.get("content").and_then(Value::as_str) {
             full_text = content.to_string();
         }
-        if let Some(r) = msg.get("reasoning_content").and_then(Value::as_str) {
+        if let Some(r) = openai_reasoning_text(msg) {
             reasoning = r.to_string();
         }
         if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
@@ -9549,6 +9580,182 @@ mod tests {
         let r = LlmCallResult::default();
         assert!(r.full_text.is_empty());
         assert!(r.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn openai_reasoning_fields_share_stream_and_nonstream_semantics() {
+        for (message, expected) in [
+            (json!({"reasoning": "think"}), "think"),
+            (json!({"reasoning_content": "think"}), "think"),
+            (
+                json!({"reasoning_content": null, "reasoning": "think"}),
+                "think",
+            ),
+            (
+                json!({"reasoning_content": "", "reasoning": "think"}),
+                "think",
+            ),
+            (
+                json!({"reasoning_content": "think", "reasoning": "think"}),
+                "think",
+            ),
+            (
+                json!({"reasoning_content": "canonical", "reasoning": "alias"}),
+                "canonical",
+            ),
+            (json!({"reasoning": {"text": "not a string"}}), ""),
+        ] {
+            let response = json!({"choices": [{"message": message.clone()}]});
+            let result = parse_nonstream_response_for_provider(&response, "openai", "test-model");
+            assert_eq!(result.reasoning, expected, "{response}");
+            let chunk = json!({"choices": [{"delta": message, "finish_reason": "stop"}]});
+            let source = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(format!(
+                "data: {chunk}\n\ndata: [DONE]\n\n"
+            )))]);
+            let streamed = collect_llm_stream(
+                source,
+                "test-model",
+                Instant::now(),
+                LlmCancel::None,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(1),
+                None,
+            )
+            .await
+            .expect("completed response must decode both reasoning field spellings");
+            assert_eq!(streamed.reasoning, expected, "{chunk}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn openai_reasoning_alias_stream_outlives_semantic_deadline_and_delivers() {
+        for field in ["reasoning", "reasoning_content"] {
+            for tool_delivery in [false, true] {
+                let source = Box::pin(async_stream::stream! {
+                    for _ in 0..5 {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        let chunk = json!({"choices": [{"delta": {field: "thinking"}}]});
+                        let frame = format!("data: {chunk}\n\n");
+                        // Exercise the real SSE parser with fragmented wire bytes.
+                        for part in frame.as_bytes().chunks(17) {
+                            yield Ok::<Bytes, reqwest::Error>(Bytes::copy_from_slice(part));
+                        }
+                    }
+                    let chunk = if tool_delivery {
+                        json!({"choices": [{"delta": {"tool_calls": [{
+                            "index": 0, "id": "call-1", "type": "function",
+                            "function": {"name": "bash", "arguments": "{}"}
+                        }]}, "finish_reason": "tool_calls"}]})
+                    } else {
+                        json!({"choices": [{"delta": {"content": "answer"}, "finish_reason": "stop"}]})
+                    };
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from(format!("data: {chunk}\n\ndata: [DONE]\n\n")));
+                });
+                let mut observed_reasoning = String::new();
+                let mut callback = |update| {
+                    if let LlmStreamUpdate::Reasoning(text) = update {
+                        observed_reasoning.push_str(&text);
+                    }
+                };
+                let authorized = HashSet::from(["bash".to_string()]);
+                let result = collect_llm_stream_with_semantic_progress_deadline_and_surface(
+                    source,
+                    "test-model",
+                    TokioInstant::now().into_std(),
+                    std::time::Duration::from_secs(300),
+                    LlmCancel::None,
+                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(120),
+                    Some(&authorized),
+                    Some(&mut callback),
+                )
+                .await
+                .expect("150 seconds of actual reasoning must refresh the 120-second watchdog");
+                assert_eq!(result.reasoning, "thinking".repeat(5));
+                assert_eq!(observed_reasoning, result.reasoning);
+                assert_eq!(result.tool_calls.len(), usize::from(tool_delivery));
+                assert_eq!(result.full_text, if tool_delivery { "" } else { "answer" });
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn openai_reasoning_alias_keepalives_do_not_refresh_semantic_deadline() {
+        for delta in [
+            json!({}),
+            json!({"reasoning": ""}),
+            json!({"reasoning": " \n\t"}),
+        ] {
+            let frame = format!("data: {}\n\n", json!({"choices": [{"delta": delta}]}));
+            let source = Box::pin(async_stream::stream! {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from(frame.clone()));
+                }
+            });
+            let error = collect_llm_stream_with_semantic_progress_deadline_and_surface(
+                source,
+                "test-model",
+                TokioInstant::now().into_std(),
+                std::time::Duration::from_secs(300),
+                LlmCancel::None,
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(120),
+                None,
+                None,
+            )
+            .await
+            .expect_err("physical keepalives without meaningful reasoning must still time out");
+            assert!(matches!(
+                error,
+                StreamCollectError::SemanticProgressTimeout {
+                    elapsed_ms: 120000,
+                    made_semantic_progress: false,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_reasoning_alias_retains_idle_and_provider_work_deadlines() {
+        for stalled in [true, false] {
+            let source = Box::pin(async_stream::stream! {
+                loop {
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking\"}}]}\n\n",
+                    ));
+                    if stalled {
+                        std::future::pending::<()>().await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            });
+            let error = collect_llm_stream_with_semantic_progress_deadline_and_surface(
+                source,
+                "test-model",
+                Instant::now(),
+                std::time::Duration::from_millis(50),
+                LlmCancel::None,
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_secs(1),
+                None,
+                None,
+            )
+            .await
+            .expect_err("recognized reasoning cannot disable idle or provider-work limits");
+            let partial = match (stalled, error) {
+                (true, StreamCollectError::IdleTimeout { partial, .. })
+                | (false, StreamCollectError::ProviderWorkDeadline { partial, .. }) => partial,
+                (_, other) => panic!("unexpected deadline: {other:?}"),
+            };
+            assert!(partial.reasoning.starts_with("thinking"));
+            assert!(partial.full_text.is_empty());
+            assert!(partial.tool_calls.is_empty());
+        }
     }
 
     #[test]
@@ -11955,6 +12162,62 @@ mod tests {
 
         fn note_dispatch_started(&self, _attempt_index: u32) {
             self.dispatched.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct FailingFinishAttemptObserver(astra_core::ErrorKind);
+
+    #[async_trait]
+    impl ProviderAttemptObserver for FailingFinishAttemptObserver {
+        async fn begin_attempt(
+            &self,
+            _: &ProviderWireRequestIdentity,
+            _: Option<u32>,
+        ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+            Ok(ProviderAttemptAdmission::Admitted(0))
+        }
+        async fn finish_attempt(
+            &self,
+            _: u32,
+            _: &astra_services::InferenceInvocationTerminal,
+        ) -> Result<(), astra_core::ClassifiedError> {
+            Err(
+                astra_core::ClassifiedError::new(self.0, "fixture settlement failure")
+                    .with_details_json(
+                        json!({"source":"inference_execution_ledger", "existing":"retained"})
+                            .to_string(),
+                    ),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn settlement_error_retains_actual_provider_terminal_for_all_error_shapes() {
+        for kind in [
+            astra_core::ErrorKind::DatabaseError,
+            astra_core::ErrorKind::Cancelled,
+        ] {
+            let terminal = astra_services::InferenceInvocationTerminal::succeeded(
+                astra_services::InferenceUsage::default(),
+                Some("provider-response".into()),
+            );
+            let error = finish_observed_provider_attempt(
+                Some(&FailingFinishAttemptObserver(kind)),
+                Some(0),
+                &terminal,
+            )
+            .await
+            .expect_err("runtime must still reject unsettled delivery");
+            assert_eq!(error.kind, kind);
+            let details: Value =
+                serde_json::from_str(error.details_json.as_deref().unwrap()).unwrap();
+            assert_eq!(details["existing"], "retained");
+            assert_eq!(details["provider_terminal"]["status"], "succeeded");
+            assert_eq!(
+                details["provider_terminal"]["usage_status"],
+                "provider_exact"
+            );
+            assert!(details["provider_terminal"].get("error_message").is_none());
         }
     }
 
@@ -15148,14 +15411,6 @@ mod tests {
         );
     }
 
-    /// Mock server that returns 401 Unauthorized.
-    async fn mock_401() -> Response {
-        Response::builder()
-            .status(401)
-            .body(Body::from("Unauthorized"))
-            .unwrap()
-    }
-
     async fn mock_402_moi_model_gateway() -> Response {
         Response::builder()
             .status(402)
@@ -15398,43 +15653,69 @@ mod tests {
     #[tokio::test]
     async fn call_llm_and_collect_returns_auth_error_kind() {
         reset_rate_limit_cooldown_for_tests();
-        let app = Router::new().route("/chat/completions", post(mock_401));
-        let base = spawn_local_http_server(app).await;
-        let messages = vec![json!({"role":"user","content":"x"})];
-        let err = call_llm_and_collect(
-            LlmCall {
-                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-                messages: &messages,
-                tools: &[],
-                cache_capability: None,
-                route: LlmExecutionRoute {
-                    fixed_temperature: None,
-                    thinking_protocol: None,
-                    model_name: "m",
-                    wire_model_name: None,
-                    api_key: "k",
-                    base_url: &base,
-                    provider: "openai",
-                    header_overrides: None,
-                    request_body_overrides: None,
-                    completions_url_override: None,
-                    request_timeout: None,
-                },
-                max_output_tokens: None,
-                temperature: None,
-                thinking: &ThinkingConfig::Off,
-            },
-            LlmCancel::None,
-        )
-        .await
-        .expect_err("should fail with auth");
-        assert_eq!(err.kind, astra_core::ErrorKind::Auth);
-        assert!(
-            !err.message.contains("Unauthorized"),
-            "auth error message must not echo provider body, got: {}",
-            err.message
-        );
-        assert!(err.message.contains("authentication failed"));
+        for status in [401, 403] {
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let captured = hits.clone();
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move || {
+                    let hits = captured.clone();
+                    async move {
+                        hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // UTF-8 crosses byte 80; arbitrary credentials must not be echoed.
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from(format!(
+                                "{}private-credential-without-a-known-prefix",
+                                "余额不足".repeat(20)
+                            )))
+                            .unwrap()
+                    }
+                }),
+            );
+            let base = spawn_local_http_server(app).await;
+            let messages = vec![json!({"role":"user","content":"x"})];
+            for streaming in [true, false] {
+                let call = LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                    messages: &messages,
+                    tools: &[],
+                    cache_capability: None,
+                    route: LlmExecutionRoute {
+                        fixed_temperature: None,
+                        thinking_protocol: None,
+                        model_name: "m",
+                        wire_model_name: None,
+                        api_key: "k",
+                        base_url: &base,
+                        provider: "openai",
+                        header_overrides: None,
+                        request_body_overrides: None,
+                        completions_url_override: None,
+                        request_timeout: None,
+                    },
+                    max_output_tokens: None,
+                    temperature: None,
+                    thinking: &ThinkingConfig::Off,
+                };
+                let err = if streaming {
+                    call_llm_and_collect(call, LlmCancel::None)
+                        .await
+                        .unwrap_err()
+                } else {
+                    call_llm_nonstream(global_llm_client(), call, std::time::Duration::from_secs(5))
+                        .await
+                        .unwrap_err()
+                };
+                assert_eq!(err.kind, astra_core::ErrorKind::Auth);
+                assert_eq!(err.message, "LLM provider authentication failed");
+            }
+            assert_eq!(
+                hits.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "auth errors must not be retried"
+            );
+        }
     }
 
     #[test]
@@ -15597,6 +15878,7 @@ mod tests {
             astra_turn_types::RuntimeMessageDelivery::RequiredContext,
         );
         runtime["_compact_boundary"] = Value::Bool(true);
+        runtime[astra_turn_core::cloud::history_summary::HISTORY_SUMMARY_FIELD] = json!(1);
         runtime[astra_turn_types::USER_TURN_SEMANTICS_FIELD] = json!({
             "schema_version": 1,
             "objective_relation": "continue"
@@ -15642,6 +15924,11 @@ mod tests {
                 .is_none()
         );
         assert!(out[0].get("_compact_boundary").is_none());
+        assert!(
+            out[0]
+                .get(astra_turn_core::cloud::history_summary::HISTORY_SUMMARY_FIELD)
+                .is_none()
+        );
         for key in [
             "_round_index",
             "_tool_name",
@@ -16270,6 +16557,203 @@ mod tests {
         );
         assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["name"], "bash");
         assert_eq!(body["inferenceConfig"]["maxTokens"], 128);
+    }
+
+    #[tokio::test]
+    async fn inline_summary_bedrock_wire_survives_three_generations_and_legacy_resume() {
+        use astra_turn_core::cloud::{
+            history_summary::{
+                HISTORY_SUMMARY_FIELD, history_summary_message, history_summary_text,
+            },
+            summary::{
+                InlineSummaryHistoryProjection, generate_inline_summary,
+                test_support::MockSummaryClient,
+            },
+        };
+
+        const SUMMARY: &str = "### Primary Request\nPRIOR_FACT\n### Pending Tasks\nFinish\n### Current Work\nImplement\n### Current State\nVerified";
+        let seeds = [
+            None,
+            Some(history_summary_message(SUMMARY.into())),
+            Some(
+                json!({"role":"system", "content":format!("[Conversation compacted — 20 messages summarized]\n\n{SUMMARY}")}),
+            ),
+            Some(
+                json!({"role":"system", "content":format!("[Context compressed — 20 earlier messages]\n\n{SUMMARY}")}),
+            ),
+        ];
+        for append_only in [false, true] {
+            let mut stable = json!({
+                "role":"system",
+                "content":format!("STABLE_POLICY\n{}", astra_turn_types::APPEND_ONLY_RUNTIME_AUTHORITY_POLICY),
+            });
+            astra_turn_types::mark_append_only_runtime_authority_policy(&mut stable);
+            for seed in &seeds {
+                let mut previous = seed.clone();
+                for generation in 1..=3 {
+                    let mut history: Vec<Value> = previous.iter().cloned().collect();
+                    history.push(json!({"role":"system", "content":"HISTORY_SIDE_POLICY"}));
+                    for round in 0..3 {
+                        let id = format!("call_{generation}_{round}");
+                        history.extend([
+                            json!({"role":"user", "content":format!("Continue {round}")}),
+                            json!({"role":"assistant", "content":null, "tool_calls":[{"id":id, "type":"function", "function":{"name":"read", "arguments":"{}"}}]}),
+                            json!({"role":"tool", "tool_call_id":id, "name":"read", "content":"observed fact"}),
+                            json!({"role":"assistant", "content":"observed"}),
+                        ]);
+                    }
+                    let mut authority = json!({"role":"user", "content":"RUNTIME_CONTROL"});
+                    astra_turn_types::mark_append_only_required_context(
+                        &mut authority,
+                        "final_answer_settlement",
+                        astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
+                    );
+                    history.push(authority.clone());
+                    let response = format!("{SUMMARY}\nGENERATION_{generation}");
+                    let client = MockSummaryClient::ptl_then_success(&response);
+                    let accepted = generate_inline_summary(
+                        std::slice::from_ref(&stable),
+                        &history,
+                        if append_only {
+                            InlineSummaryHistoryProjection::AppendOnlyRuntimeAuthorityPrefix
+                        } else {
+                            InlineSummaryHistoryProjection::Semantic
+                        },
+                        &client,
+                    )
+                    .await
+                    .expect("valid summary after retry");
+                    let requests = client.recorded_requests();
+                    assert_eq!(requests.len(), 2);
+                    for (attempt, request) in requests.iter().enumerate() {
+                        assert_eq!(request.first(), Some(&stable));
+                        assert_eq!(request.contains(&authority), append_only);
+                        if let Some(previous) = &previous {
+                            let evidence = history_summary_text(previous).unwrap();
+                            assert!(request.iter().any(|message| {
+                                message["role"] == "assistant"
+                                    && message["content"]
+                                        .as_str()
+                                        .is_some_and(|text| text.contains(evidence))
+                            }));
+                        }
+                        // Exercise the canonical production provider builder,
+                        // not a copied projection or the recording client alone.
+                        let body = build_provider_request_body(
+                            request,
+                            &[],
+                            "amazon.nova-pro-v1:0",
+                            "bedrock",
+                            Some(1024),
+                            None,
+                            false,
+                            &ThinkingConfig::Off,
+                        );
+                        assert_eq!(body["system"], json!([{"text":stable["content"]}]));
+                        let wire = body["messages"].as_array().unwrap();
+                        assert_eq!(wire.first().unwrap()["role"], "user");
+                        assert_eq!(wire.last().unwrap()["role"], "user");
+                        assert!(
+                            wire.windows(2)
+                                .all(|pair| pair[0]["role"] != pair[1]["role"])
+                        );
+                        let serialized = serde_json::to_string(&body).unwrap();
+                        assert!(!serialized.contains("HISTORY_SIDE_POLICY"));
+                        assert!(!serialized.contains(HISTORY_SUMMARY_FIELD));
+                        assert_eq!(serialized.contains("RUNTIME_CONTROL"), append_only);
+                        if previous.is_some() {
+                            assert_eq!(wire[1]["role"], "assistant");
+                            assert!(
+                                wire[1]["content"][0]["text"]
+                                    .as_str()
+                                    .unwrap()
+                                    .contains("PRIOR_FACT")
+                            );
+                            assert!(
+                                !serde_json::to_string(&wire[0])
+                                    .unwrap()
+                                    .contains("PRIOR_FACT")
+                            );
+                        }
+                        let mut pending_tools = Vec::new();
+                        let mut paired = 0;
+                        for message in wire {
+                            for block in message["content"].as_array().unwrap() {
+                                if let Some(call) = block.get("toolUse") {
+                                    assert_eq!(message["role"], "assistant");
+                                    pending_tools.push(call["toolUseId"].clone());
+                                }
+                                if let Some(result) = block.get("toolResult") {
+                                    assert_eq!(message["role"], "user");
+                                    assert_eq!(pending_tools.remove(0), result["toolUseId"]);
+                                    paired += 1;
+                                }
+                            }
+                        }
+                        assert!(pending_tools.is_empty());
+                        assert_eq!(paired, 3 - attempt);
+                    }
+                    // Model the accepted storage envelope, then restore from
+                    // serialized history before the next generation.
+                    previous = Some(
+                        serde_json::from_str(
+                            &serde_json::to_string(&history_summary_message(accepted)).unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_summary_bedrock_wire_accepts_summary_without_user_rounds() {
+        use astra_turn_core::cloud::{
+            history_summary::history_summary_message,
+            summary::{
+                InlineSummaryHistoryProjection, generate_inline_summary,
+                test_support::MockSummaryClient,
+            },
+        };
+        let summary = "### Primary Request\nPRIOR_FACT\n### Pending Tasks\nFinish\n### Current Work\nImplement\n### Current State\nVerified";
+        for trailing in [
+            None,
+            Some(json!({"role":"assistant", "content":"orphaned continuation"})),
+        ] {
+            let mut history = vec![history_summary_message(summary.into())];
+            history.extend(trailing);
+            let client = MockSummaryClient::success(summary);
+            assert!(
+                generate_inline_summary(
+                    &[],
+                    &history,
+                    InlineSummaryHistoryProjection::Semantic,
+                    &client
+                )
+                .await
+                .is_some()
+            );
+            let request = client.recorded_requests().pop().unwrap();
+            let body = build_provider_request_body(
+                &request,
+                &[],
+                "amazon.nova-pro-v1:0",
+                "bedrock",
+                Some(1024),
+                None,
+                false,
+                &ThinkingConfig::Off,
+            );
+            assert_eq!(body["messages"][0]["role"], "user");
+            assert_eq!(body["messages"][1]["role"], "assistant");
+            assert_eq!(body["messages"][2]["role"], "user");
+            assert!(
+                body["messages"][1]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("PRIOR_FACT")
+            );
+        }
     }
 
     #[test]
@@ -17289,19 +17773,6 @@ mod tests {
         let out = redact_provider_secrets(input);
         assert!(!out.contains("abcXYZ"), "leaked sk- secret in JSON: {out}");
         assert!(out.contains("[REDACTED]"));
-    }
-
-    #[test]
-    fn redact_provider_secrets_simulates_auth_log_path() {
-        // Simulate what the auth-error path logs: a truncated body containing a key.
-        let body = r#"{"error":{"message":"Incorrect API key sk-abc12345 provided"}}"#;
-        let truncated = &body[..body.len().min(80)];
-        let log_line = format!(
-            "LLM auth error (401): {}",
-            redact_provider_secrets(truncated)
-        );
-        assert!(!log_line.contains("sk-abc12345"));
-        assert!(log_line.contains("[REDACTED]"));
     }
 
     /// audit-C1: global_llm_client must not use .expect() — a TLS backend
@@ -19246,6 +19717,74 @@ mod tests {
             second_wire[2]["reasoning_content"], "first decision",
             "historical reasoning must not be rewritten after a later response"
         );
+    }
+
+    #[test]
+    fn glm_exact_captured_replay_is_shared_by_streaming_nonstreaming_and_cache_projection() {
+        use astra_turn_core::cache_placement::{
+            CacheProtocol, CacheReuseScope, VolatileDeliveryPolicy,
+        };
+        use astra_turn_core::thinking_config::ThinkingEffort;
+        let append_only = CacheCapability {
+            protocol: CacheProtocol::OpenAiAutoPrefix,
+            volatile_placement: VolatilePlacement::AppendOnlyUserTail,
+            volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+            reuse_scope: Some(CacheReuseScope::IntraTurnRounds),
+        };
+        let messages = vec![
+            json!({"role":"user", "content":"request"}),
+            json!({"role":"assistant", "content":"first", "reasoning_content":" original\n\t", "reasoning_signature":"original-signature"}),
+            json!({"role":"assistant", "content":"missing original"}),
+            json!({"role":"assistant", "content":"empty", "reasoning_content":""}),
+            json!({"role":"assistant", "content":"space", "reasoning_content":" \t"}),
+            json!({"role":"assistant", "content":"last", "reasoning_content":"last original"}),
+        ];
+        for streaming in [false, true] {
+            for thinking in [
+                ThinkingConfig::Off,
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::Low,
+                },
+                ThinkingConfig::Adaptive {
+                    effort: ThinkingEffort::Max,
+                },
+            ] {
+                for capability in [None, Some(append_only)] {
+                    let body = build_provider_request_body_with_cache_capability(
+                        &messages,
+                        &[],
+                        "glm-5.3",
+                        "openai",
+                        Some(128),
+                        None,
+                        streaming,
+                        &thinking,
+                        None,
+                        capability,
+                    );
+                    assert_eq!(body["messages"], json!(messages));
+                    assert_eq!(body["stream"], streaming);
+                    let mut extended = messages.clone();
+                    extended.push(json!({"role":"user", "content":"next"}));
+                    let next = build_provider_request_body_with_cache_capability(
+                        &extended,
+                        &[],
+                        "glm-5.3",
+                        "openai",
+                        Some(128),
+                        None,
+                        streaming,
+                        &thinking,
+                        None,
+                        capability,
+                    );
+                    assert_eq!(
+                        &next["messages"].as_array().unwrap()[..messages.len()],
+                        messages.as_slice()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

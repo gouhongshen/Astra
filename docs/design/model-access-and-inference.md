@@ -812,6 +812,46 @@ enum InferenceStreamEvent {
 
 Provider adapters translate the canonical contract to OpenAI, Anthropic, Bedrock, local, or other supported protocols. Adapter differences do not leak into agent state-machine behavior.
 
+OpenAI-compatible response decoding accepts string `reasoning_content` and
+`reasoning` fields in both streamed deltas and non-streaming assistant messages.
+The first nonempty string in that order is used once; mirrored fields are not
+concatenated. Both feed the existing reasoning result and stream event contract.
+Meaningful reasoning refreshes semantic activity but is not an actionable
+answer. Empty/whitespace reasoning does not refresh that deadline; idle,
+provider-work, cancellation and response-size limits remain authoritative.
+
+Primary recovery uses the same admitted thinking-control predicate as auxiliary
+selection: prefer supported suppression, then supported low effort, while
+preserving explicitly exact token budgets and requested thinking when capability
+is unknown or preservation is required. Low effort does not prove a fast
+response. An omitted or unsupported control does not prove thinking is disabled;
+therefore a short suppressed-response budget cannot be inferred from the fact
+that recovery was scheduled. Requested/effective controls and the actual work
+slice are diagnostic facts; the ordinary client and absolute execution budgets
+remain authoritative. Lifecycle reservation and exhaustion belong to
+[runtime lifecycle](runtime-lifecycle.md).
+
+### Captured reasoning replay
+
+The canonical reasoning capability owner distinguishes required field backfill
+(DeepSeek and Kimi) from exact captured replay (the GLM 4.5, 4.6, 4.7 and 5
+interleaved-thinking families). Exact replay is selected by the admitted upstream model identity,
+including maintained vendor namespaces, rather than an offering display alias.
+Both shared wire assembly and its final send-time guard preserve every captured
+reasoning string, including empty and whitespace strings, along with signatures,
+tool identifiers and result order. They do not replace earlier blocks with a
+placeholder or invent missing historical reasoning. Current thinking controls
+and historical replay requirements are independent. The same contract applies
+to streaming, non-streaming and recovery calls; append-only cache projections
+retain their existing exact-prefix protection.
+
+This preserves originals that remain available. It cannot reconstruct history
+already discarded by earlier projections. Signed Anthropic and Bedrock replay
+continues to require its existing protocol and model authority. The upstream
+[GLM thinking contract](https://docs.z.ai/guides/capabilities/thinking-mode)
+requires complete original interleaved reasoning; this is not evidence that
+replay stripping caused a particular provider's latency or deadline.
+
 ## Provider request capability contract
 
 ### Problem and invariant
@@ -1019,9 +1059,12 @@ reasoning tokens. Truncated/malformed output, ignored controls, transport errors
 or unknown protocols cannot become a successful `both` observation. Unknown
 protocols use a baseline request without guessed controls and can establish only
 observed native reasoning (`native_only`), not suppression support. Declared
-effort protocols send low effort and require observable reasoning (including
+effort protocols send high effort within the same bounded probe budget and require observable reasoning (including
 reported reasoning token usage) before reporting `effort_only`. This confirms
 reasoning under the declared protocol, not a measurement of effort effectiveness.
+Bounded summaries and governed completions share one capability-based preference:
+supported suppression, otherwise supported low effort, otherwise the model default.
+Low effort can legitimately produce zero reasoning tokens; it is not an output-budget guarantee.
 BYOK probing retains the
 same pinned public-endpoint transport and owner authorization as inference.
 

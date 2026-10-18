@@ -331,6 +331,7 @@ pub const TOOL_ERROR_KIND_CANCELLED: &str = "cancelled";
 pub const TOOL_ERROR_KIND_WORKSPACE_UNAVAILABLE: &str = "workspace_unavailable";
 pub const TOOL_ERROR_KIND_WORKSPACE_OWNERSHIP_UNSETTLED: &str = "workspace_ownership_unsettled";
 pub const TOOL_ERROR_KIND_WORKSPACE_BINDING_UNAVAILABLE: &str = "workspace_binding_unavailable";
+pub const TOOL_ERROR_KIND_WORKSPACE_HOST_UNSUPPORTED: &str = "workspace_host_unsupported";
 pub const TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNSETTLED: &str = "workspace_effect_unsettled";
 pub const TOOL_ERROR_KIND_WORKSPACE_EFFECT_UNDECLARED: &str = "workspace_effect_undeclared";
 
@@ -378,7 +379,7 @@ pub fn cancelled_tool_result(name: &str, execution_started: bool) -> ToolResult 
     } else {
         format!("Tool '{name}' not executed: run was cancelled")
     };
-    ToolResult {
+    let mut result = ToolResult {
         output: json!({
             "status": "cancelled",
             "error_kind": TOOL_ERROR_KIND_CANCELLED,
@@ -405,7 +406,15 @@ pub fn cancelled_tool_result(name: &str, execution_started: bool) -> ToolResult 
         ])),
         is_error: true,
         exit_semantics: Some(exit_semantics::ExitSemantics::ExecutionError),
+    };
+    let fields = result.metadata.get_or_insert_default();
+    if execution_started {
+        execution_outcome::insert_started_execution_fact(fields);
+    } else {
+        execution_outcome::insert_not_executed_fact(fields);
+        fields.insert("side_effects_maybe".into(), Value::Bool(false));
     }
+    result
 }
 
 /// A workspace lease admission failure is a fact about scheduling, not a
@@ -430,7 +439,19 @@ pub fn workspace_lease_unavailable_tool_result_for_workspace(
     name: &str,
     workspace_root: &Path,
 ) -> ToolResult {
-    match workspace_observation::classify_workspace_lease_failure(workspace_root) {
+    workspace_lease_failure_tool_result(
+        name,
+        workspace_observation::classify_workspace_lease_failure(workspace_root),
+    )
+}
+
+/// Project the failure observed by admission, without inferring it from later
+/// workspace state. Process-wide watcher capacity is distinct from contention.
+pub fn workspace_lease_failure_tool_result(
+    name: &str,
+    failure: workspace_observation::WorkspaceLeaseFailure,
+) -> ToolResult {
+    match failure {
         workspace_observation::WorkspaceLeaseFailure::OwnershipUnsettled => workspace_lease_result(
             TOOL_ERROR_KIND_WORKSPACE_OWNERSHIP_UNSETTLED,
             format!(
@@ -438,6 +459,13 @@ pub fn workspace_lease_unavailable_tool_result_for_workspace(
             ),
             false,
         ),
+        workspace_observation::WorkspaceLeaseFailure::CoordinationHostUnsupported => {
+            workspace_lease_result(
+                TOOL_ERROR_KIND_WORKSPACE_HOST_UNSUPPORTED,
+                format!("Tool '{name}' was not executed. {failure}"),
+                false,
+            )
+        }
         workspace_observation::WorkspaceLeaseFailure::BindingUnavailable => workspace_lease_result(
             TOOL_ERROR_KIND_WORKSPACE_BINDING_UNAVAILABLE,
             format!(
@@ -447,6 +475,56 @@ pub fn workspace_lease_unavailable_tool_result_for_workspace(
         ),
         workspace_observation::WorkspaceLeaseFailure::Contended => {
             workspace_lease_unavailable_tool_result(name)
+        }
+        workspace_observation::WorkspaceLeaseFailure::Cancelled => {
+            cancelled_tool_result(name, false)
+        }
+        workspace_observation::WorkspaceLeaseFailure::WatcherUnavailable => workspace_lease_result(
+            TOOL_ERROR_KIND_WORKSPACE_BINDING_UNAVAILABLE,
+            format!(
+                "Tool '{name}' was not executed because its workspace tamper watcher could not be armed; inspect watcher resources and the workspace binding before continuing"
+            ),
+            false,
+        ),
+        workspace_observation::WorkspaceLeaseFailure::WatcherCapacity {
+            active,
+            requested,
+            limit,
+        } => {
+            let retryable = limit > 0 && requested <= limit;
+            let message = if retryable {
+                format!(
+                    "Tool '{name}' was not executed because its admission wait expired after a process-wide workspace watcher descriptor capacity refusal; wait for other workspace leases to finish before retrying"
+                )
+            } else {
+                format!(
+                    "Tool '{name}' was not executed because this workspace watcher cannot fit the process descriptor budget; increase the process file descriptor limit or reduce watched path depth before continuing"
+                )
+            };
+            let mut result = workspace_lease_result(
+                TOOL_ERROR_KIND_WORKSPACE_UNAVAILABLE,
+                message.clone(),
+                retryable,
+            );
+            let fields = result.metadata.as_mut().expect("workspace lease fields");
+            fields.insert("reason".into(), json!("watcher_capacity"));
+            fields.insert(
+                "watcher_descriptors".into(),
+                json!({"active": active, "requested": requested, "limit": limit}),
+            );
+            fields.insert(
+                "next_action".into(),
+                json!(if retryable {
+                    "wait_for_process_watcher_capacity"
+                } else {
+                    "repair_process_watcher_capacity"
+                }),
+            );
+            let mut output = fields.clone();
+            output.insert("status".into(), json!("rejected"));
+            output.insert("error".into(), json!(message));
+            result.output = Value::Object(output).to_string();
+            result
         }
     }
 }
@@ -1005,6 +1083,60 @@ pub mod porcelain_status_codes {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsupported_host_result_is_terminal_and_actionable() {
+        let result = super::workspace_lease_failure_tool_result(
+            "write_file",
+            super::workspace_observation::WorkspaceLeaseFailure::CoordinationHostUnsupported,
+        );
+        let fields = result.metadata.unwrap();
+        assert_eq!(
+            fields["error_kind"],
+            super::TOOL_ERROR_KIND_WORKSPACE_HOST_UNSUPPORTED
+        );
+        assert_eq!(fields["retryable"], false);
+        assert_eq!(fields["execution_started"], false);
+        assert_eq!(fields["execution_fact"], "not_executed");
+        assert!(result.output.contains("administrator"));
+        assert!(result.output.contains("root-owned"));
+        assert!(!result.output.contains("repair or re-bind"));
+    }
+
+    #[test]
+    fn watcher_capacity_result_preserves_process_scope_and_terminal_limits() {
+        use super::*;
+        use workspace_observation::WorkspaceLeaseFailure;
+        for (active, requested, limit, retryable) in
+            [(64, 23, 64, true), (0, 23, 0, false), (0, 65, 64, false)]
+        {
+            let result = workspace_lease_failure_tool_result(
+                "write_file",
+                WorkspaceLeaseFailure::WatcherCapacity {
+                    active,
+                    requested,
+                    limit,
+                },
+            );
+            let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+            let fields = result.metadata.unwrap();
+            for data in [&output, &serde_json::Value::Object(fields)] {
+                assert_eq!(data["reason"], "watcher_capacity");
+                assert_eq!(
+                    data["watcher_descriptors"],
+                    json!({"active": active, "requested": requested, "limit": limit})
+                );
+                assert_eq!(data["retryable"], retryable);
+                assert_eq!(data["execution_started"], false);
+                assert_eq!(data["execution_fact"], "not_executed");
+            }
+            assert!(
+                !output["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("active workspace operation")
+            );
+        }
+    }
     use super::*;
 
     // ── ToolResult ─────────────────────────────────────────────────────
@@ -1048,9 +1180,16 @@ mod tests {
         let contended_fields = contended.metadata.as_ref().unwrap();
         assert_eq!(
             contended_fields["error_kind"],
-            TOOL_ERROR_KIND_WORKSPACE_UNAVAILABLE
+            if workspace_observation::validate_workspace_coordination_host().is_ok() {
+                TOOL_ERROR_KIND_WORKSPACE_UNAVAILABLE
+            } else {
+                TOOL_ERROR_KIND_WORKSPACE_HOST_UNSUPPORTED
+            }
         );
-        assert_eq!(contended_fields["retryable"], true);
+        assert_eq!(
+            contended_fields["retryable"],
+            workspace_observation::validate_workspace_coordination_host().is_ok()
+        );
     }
 
     #[test]

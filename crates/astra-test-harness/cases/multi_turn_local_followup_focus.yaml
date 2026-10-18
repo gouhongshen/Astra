@@ -7,7 +7,8 @@ description: |
   **Why**: Short follow-ups such as “问题总结？” must summarize the immediately preceding review,
   not whichever older topic occupies more tokens in history or session memory.
   **Pass means**: The local follow-up stays on CURSOR-BETA, while the explicit session-wide recall
-  still recovers LEGACY-ALPHA.
+  still recovers LEGACY-ALPHA. The initial response acknowledges the supplied fact; a brief,
+  truthful clarification of conversational scope is not a claim of durable storage.
   **Fail means**: An older salient topic hijacks the local follow-up, or local-focus protection
   prevents a later explicit broad-scope request.
 prompt: |
@@ -34,23 +35,18 @@ steps:
     criteria:
       - type: text_contains
         needle: CURSOR-BETA
-      - type: text_contains
-        needle: cursor
   - prompt: "问题总结？请用一句话回答，不要使用工具。"
     criteria:
-      - type: text_contains
-        needle: cursor
-      - type: text_contains
-        needle: 负例测试
-      - type: text_not_contains
-        needle: LEGACY-ALPHA
-      - type: judger
+      - type: hard_judger
         question: |
           Is the answer a direct, concise summary of the immediately preceding CURSOR-BETA
           review finding (cursor inconsistency and missing negative test), without drifting to
-          the older LEGACY-ALPHA topic or inventing runtime/tool evidence? Score 1.0 only when
-          all conditions hold, 0.5 for a relevant but unnecessarily broad answer, and 0.0 for
-          stale-topic hijacking or fabricated evidence.
+          the older LEGACY-ALPHA topic or inventing runtime/tool evidence? Both findings must
+          be present. Accept equivalent wording in any language, including translations of
+          cursor and negative tests. Mentioning the old topic solely to contrast it with the
+          current finding is not topic hijacking. Reject a missing finding, actual stale-topic
+          substitution, or fabricated evidence. Judge meaning rather than literal substrings;
+          verbosity alone is not a hard failure. If the evidence is insufficient, answer unknown.
         threshold: 0.8
   - prompt: "现在明确回到整个 session：最早讨论的旧事故代号是什么？只回答代号。"
     criteria:
@@ -67,13 +63,15 @@ criteria:
   - type: hard_judger
     question: |
       Review the complete ordered assistant transcript. In the response to the initial user
-      message, did the assistant concisely acknowledge the newly supplied LEGACY-ALPHA fact for
-      this conversation, without using tools or making any provenance claim? The user asked only
-      for a conversational confirmation. A denial or caveat equivalent to “I cannot confirm”,
-      “there is no history/record”, “I cannot recall”, or an offer/request to look up or persist
-      memory is a failure here, even when phrased as an honest disclaimer: no historical lookup
-      or persistence was requested, and no evidence authorizes those claims. Later correct turns
-      cannot repair an initial violation. Score 1.0 only when the first response directly
-      acknowledges the supplied fact and stays concise; score 0.0 for any such denial, provenance
-      or storage discussion, or tool call.
+      message, did the assistant acknowledge the newly supplied LEGACY-ALPHA fact for this
+      conversation without denying it, substituting another topic, or using tools? The user
+      supplied the fact directly: absent historical records are not a reason to refuse
+      acknowledgment or demand a lookup. Reject unsupported claims of retrieval, persistence,
+      prior history, or a durable-memory promise; a statement that no persistence or tool use
+      occurred does not assert such an action. Accept a brief truthful clarification that the
+      fact is understood within this conversation or was not saved durably, when it does not
+      negate the acknowledgment. Judge meaning, not exact words or formatting. Verbosity alone
+      is not a hard semantic failure. Later correct turns cannot repair a genuine initial
+      violation. If the initial response or the evidence needed to judge it is missing, answer
+      unknown rather than infer it from later correctness.
     threshold: 0.8

@@ -114,6 +114,9 @@ Connection publication follows these invariants:
 - durable registration failure leaves no active in-memory route;
 - reconnect uses a generation-fenced handoff so stale cleanup cannot remove a
   newer connection;
+- native admission reads local and durable registration views behind the
+  existing per-user/Edge registration barrier, after setup commits or rolls
+  back, without extending that lock into inference;
 - heartbeats and disconnect cleanup are scoped to the exact connection
   identity and generation;
 - an Edge is not eligible for unsafe local dispatch until registration and
@@ -131,6 +134,9 @@ Explicit Edge capacity providers may advertise a bounded public provider ID
 and recipient key under `capacity_rpc_v1`. Handshake admission validates and
 preserves this declaration; local endpoints and bearer keys never leave Edge.
 This is generic transport, not a model tool inventory or another agent loop.
+The shared Edge delivery owner handles these connection-scoped frames; a host
+adapter supplies only its explicitly configured local provider. Disconnect
+cancels and joins live calls without adding them to the invocation journal.
 
 With the durable Edge registry configured, each node publishes its own
 operator-configured `ASTRA_EDGE_CAPACITY_RELAY_ORIGIN` (HTTP(S) origin, no path,

@@ -168,6 +168,7 @@ impl MatrixCloudRuntime {
                     ingestion,
                     broker,
                 )
+                .with_durable_store(self.shared_pool.clone())
                 .with_local_event_sink(Arc::new(|event, user_id| {
                     let Some(session_id) = event
                         .session_id

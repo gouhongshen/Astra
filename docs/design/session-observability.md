@@ -59,7 +59,14 @@ Progress should be derived from durable events:
 
 The explicit CLI `journal digest` reads the complete authorized profile and
 attached account journals. Terminal turn usage is the qualified accounting
-source; `LlmRound` tokens are a separate diagnostic observation. The JSON
+source; `LlmRound` tokens are a separate diagnostic observation. Digest, diff,
+and tree's root self totals share the same root `Turn`/`TurnError` accounting;
+neither round replays nor child terminals add to those buckets. Tree still
+rolls separately attributed child completions into its inclusive root total.
+Diff's `prompt` and `completion` are fresh input and output; its `total` is
+their sum, excluding prompt-cache buckets. Known terminal totals do not
+reconstruct missing usage or upgrade a historical last-round snapshot into
+a complete attempt total. The JSON
 `usage_coverage` and round-conflict fields identify unknown buckets and
 excluded contradictions. Root-plus-child observed totals mix sources and are
 never a bill or proof of complete session cost. No journal cursor grants
@@ -68,6 +75,13 @@ attached profile/account source authorization. Each source retains its own turns
 checkpoints, correction timeline and exported owner identity; ingestion metadata
 does not select a storage partition. Debug retains the CLI authentication check
 but does not discover skill catalogs or connect MCP providers.
+
+Legacy `llm_round` records without `session_id` can inherit a file's session
+only when that same authorized source contains an explicit matching session ID
+in the inspected records.
+Every explicit event ID and conversation cursor must still match the requested
+session. A primary file cannot bind an unattributed supplemental source; missing
+IDs on other event types and unanchored round-only fragments remain invalid.
 
 ## Stuck detection
 
@@ -84,6 +98,27 @@ A run may appear stuck because of:
 - task waiting for child run.
 
 The projection should expose the specific reason and next action.
+
+A safe provider recovery publishes its scheduled attempt before waiting again,
+without inventing task progress or adding an assistant-authored history message.
+When recovery is exhausted, live and replayed interruption projections carry the
+same provider cause, factual completed-call/checkpoint counts and explicit next
+action. A zero-tool recovery does not erase preceding tool evidence. Selecting a
+different model still requires ordinary authorization and admission.
+
+Each `LlmRoundStarted` retains the exact durable invocation identity and logical
+attempt index. It is closed by `LlmRoundCompleted` or typed `LlmRoundFailed`,
+including pre-dispatch rejection, streaming interruption and cancellation. A
+known completed provider response stays completed if its durable receipt later
+fails; that separate settlement failure does not authorize its output. Failure
+traces retain safe kind/stage, actual dispatch facts, latency and qualified usage
+when available. Terminal trace usage is qualified from that invocation's canonical
+attempt facts before emission, including pending receipt settlement. Earlier
+logical continuations contribute to turn totals, not this invocation's trace.
+Missing usage stays unknown. They do not store raw provider
+errors, prompts or reasoning. Capture readers recognize failure events in both
+raw and persisted artifact envelopes. Normal `StepIncomplete` on a tool-round
+yield is not a failed task; final run errors close the actual current step.
 
 ## Stream events
 
@@ -111,7 +146,36 @@ distinctions. A shortened preview is not an authoritative receipt; control
 identities remain exact or are explicitly omitted, never shortened into a
 different identity.
 
+Pure single-edit argument validation and invocation normalization author their
+own no-execution fact before target binding or content reads. Invalid, mixed
+single/batch, and identical replacements retain the original error/recovery
+evidence, with `execution_started=false`, `execution_fact=not_executed` and
+`disposition=rejected` through CLI and server execution, durable terminal
+replay, and canonical callback journal recording. Such rejection does not
+replenish provider recovery. A missing target, failed content match, unchanged workspace or
+`ToolInvalidArgs` kind alone cannot establish that execution never began;
+later failures retain their source-owned facts.
+
 Malformed non-critical stream events should be isolated when possible. Identity or cursor corruption should fail closed with structured error and should not corrupt durable run state.
+
+Edge callback HTTP failures are reported independently of tool execution and
+durable run state. A generic HTTP rejection, including a proxy/WAF HTML block
+page, is not evidence of a lifecycle contract violation. HTTP 409 alone, JSON
+shape, and English detail text do not establish an invariant failure. The
+Server projects typed outcomes into stable `error_code` values:
+`edge_callback_payload_conflict` identifies divergent immutable callback
+payloads and retains contract classification; `run_interaction_authority_lost`
+and `run_interaction_superseded` identify recorded interactions that did not
+resume execution and remain ordinary HTTP conflicts (`InvalidRequest`). Unknown
+or uncoded 409 responses also remain ordinary conflicts. Neither recorded
+outcome authorizes local execution; only the existing approval acknowledgement
+gate can do that. CLI diagnostics retain the HTTP
+status and available request ID, omit HTML/markup pages, and bound other response
+previews. Live stderr, returned callback errors, and final detach messages use
+the same API error formatter. Detachment is distinct from confirmed Server run
+cancellation; existing surface-specific settlement and recovery remain
+authoritative. An ambiguous acknowledgement must not be treated as proof of
+rejection or used to justify re-executing a completed tool.
 
 ## Tool results and runtime guidance
 

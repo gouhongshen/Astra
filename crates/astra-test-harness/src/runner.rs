@@ -767,7 +767,7 @@ pub(crate) fn parse_strict_cli_outcome(stdout: &str, model: &str) -> Result<RunO
     let final_state = object["final_state"]
         .as_str()
         .expect("validated final_state string");
-    if !matches!(final_state, "" | "completed" | "interrupted") {
+    if !matches!(final_state, "" | "completed" | "interrupted" | "failed") {
         return Err(format!(
             "terminal outcome final_state has unknown value {final_state:?}"
         ));
@@ -1121,6 +1121,26 @@ mod tests {
         let mut persistence_contradiction = strict_outcome_fixture();
         persistence_contradiction["persistence_error"] = serde_json::json!("write failed");
         assert!(parse_strict_cli_outcome(&persistence_contradiction.to_string(), "m").is_err());
+
+        // The CLI's real fatal envelope uses failed, not interrupted. Retain
+        // its identity and observed output so the failure can be investigated.
+        let mut failed = strict_outcome_fixture();
+        failed["final_state"] = serde_json::json!("failed");
+        failed["success"] = serde_json::json!(false);
+        failed["exit_code"] = serde_json::json!(1);
+        failed["error_kind"] = serde_json::json!("unknown");
+        failed["text"] = serde_json::json!("observed partial answer");
+        let parsed = parse_strict_cli_outcome(&failed.to_string(), "m").unwrap();
+        assert_eq!(parsed.exit_code, 1);
+        assert_eq!(parsed.run_id.as_deref(), Some("run-1"));
+        assert_eq!(
+            parsed.session_id.as_deref(),
+            strict_outcome_fixture()["session_id"].as_str()
+        );
+        assert_eq!(parsed.text, "observed partial answer");
+        failed["exit_code"] = serde_json::json!(0);
+        failed["success"] = serde_json::json!(true);
+        assert!(parse_strict_cli_outcome(&failed.to_string(), "m").is_err());
     }
 
     #[test]
@@ -1153,6 +1173,7 @@ mod tests {
             prompt: "p".into(),
             prompt_variants: vec![],
             models: Some(vec!["opus".into()]),
+            required_models: vec![],
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec![],
@@ -1181,6 +1202,7 @@ mod tests {
             prompt: "p".into(),
             prompt_variants: vec![],
             models: None,
+            required_models: vec![],
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec![],
@@ -1211,6 +1233,7 @@ mod tests {
             prompt: "p".into(),
             prompt_variants: vec![],
             models: None,
+            required_models: vec![],
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec![],
@@ -1239,6 +1262,7 @@ mod tests {
             prompt: "p".into(),
             prompt_variants: vec![],
             models: None,
+            required_models: vec![],
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec![],

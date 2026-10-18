@@ -1,0 +1,322 @@
+name: Harness (live models)
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Trusted source repository (owner/repo); selected code can access the provider key"
+        required: true
+        default: "matrixorigin/astra"
+        type: string
+      ref:
+        description: "Source branch, tag or commit SHA (main resolves to its latest commit at checkout)"
+        required: true
+        default: "main"
+        type: string
+      filter:
+        description: "Case-name glob (* runs all top-level cases; paid provider calls)"
+        required: true
+        default: "*"
+        type: string
+      runs:
+        description: "Repetitions per case"
+        default: "1"
+        type: choice
+        options: ["1", "2", "3"]
+      profile:
+        description: "full uses filter; regression uses the fixed ci-regression.txt list (15-minute execution budget)"
+        default: full
+        type: choice
+        options: [full, regression]
+  workflow_call:
+    inputs:
+      repository:
+        type: string
+        required: true
+      ref:
+        type: string
+        required: true
+      profile:
+        type: string
+        default: regression
+      filter:
+        type: string
+        default: "*"
+      runs:
+        type: string
+        default: "1"
+    secrets:
+      HARNESS_GLM_BASE_URL:
+        required: true
+      HARNESS_GLM_API_KEY:
+        required: true
+      HARNESS_ADDITIONAL_MODELS_JSON:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      SQLX_OFFLINE: "true"
+      ASTRA_CONFIG_SOURCE: explicit-env
+      ASTRA_BUILD_SOURCE_GIT_DIRTY: "false"
+      ASTRA_API_URL: http://127.0.0.1:17001
+      ASTRA_API_HOST: 127.0.0.1
+      ASTRA_API_PORT: "17001"
+      MATRIXONE_HOST: 127.0.0.1
+      MATRIXONE_PORT: "6001"
+      MATRIXONE_USER: root
+      MATRIXONE_PASSWORD: "111"
+      ASTRA_DATABASE: astra_harness
+      ASTRA_AUTO_CREATE_DATABASE: "1"
+      ASTRA_JWT_SECRET: ci-harness-jwt-secret-at-least-32-chars
+      ASTRA_TOKEN_ENCRYPTION_KEY: ci-harness-encryption-key-at-least-32-chars
+      ASTRA_RUNTIME_ROOT_SECRET: ci-harness-runtime-secret-at-least-32-chars
+      ASTRA_BCRYPT_COST: "4"
+      MEMORIA_BASE_URL: http://127.0.0.1:8100
+      MEMORIA_MASTER_KEY: ci-harness-memory-master-key
+      MEMORIA_SELF_HOSTED_MASTER_ACCESS: "1"
+      MEMORIA_EMBEDDING_PROVIDER: mock
+      MEMORIA_EMBEDDING_DIM: "384"
+      NO_PROXY: localhost,127.0.0.1,::1
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+          # The trusted caller's name+ID gate explicitly authorizes these forks
+          # to execute with provider credentials; unlisted forks never reach here.
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
+
+      - name: Record checked-out source identity
+        run: |
+          source_sha=$(git rev-parse HEAD)
+          printf 'ASTRA_EXPECTED_BUILD_GIT_SHA=%s\nASTRA_BUILD_SOURCE_GIT_SHA=%s\n' "$source_sha" "$source_sha" >> "$GITHUB_ENV"
+
+      - name: Validate secrets and prepare private model file
+        env:
+          GLM_BASE_URL: ${{ secrets.HARNESS_GLM_BASE_URL }}
+          GLM_API_KEY: ${{ secrets.HARNESS_GLM_API_KEY }}
+          ADDITIONAL_MODELS_JSON: ${{ secrets.HARNESS_ADDITIONAL_MODELS_JSON }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          url = os.environ["GLM_BASE_URL"].strip()
+          key = os.environ["GLM_API_KEY"].strip()
+          if not url or not key:
+              raise SystemExit("Configure HARNESS_GLM_BASE_URL and HARNESS_GLM_API_KEY repository secrets")
+          parsed = urlsplit(url)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+              raise SystemExit("HARNESS_GLM_BASE_URL must be an HTTPS API base URL without credentials, query or fragment")
+          try:
+              additional = json.loads(os.environ.get("ADDITIONAL_MODELS_JSON", "").strip() or "[]")
+          except ValueError:
+              raise SystemExit("HARNESS_ADDITIONAL_MODELS_JSON must be a JSON array of model entries") from None
+          names = set()
+          if not isinstance(additional, list):
+              raise SystemExit("HARNESS_ADDITIONAL_MODELS_JSON must be a JSON array of model entries")
+          for entry in additional:
+              name = entry.get("name") if isinstance(entry, dict) else None
+              if not isinstance(name, str) or not name or name != name.strip() or name.casefold() in names:
+                  raise SystemExit("Additional models need unique nonempty names")
+              names.add(name.casefold())
+          if "deepseek-v4.1-flash" not in names:
+              additional.append({"name": "deepseek-v4.1-flash", "provider": "openai",
+                  "base_url": url, "api_key": key, "context_window": 128000,
+                  "max_completion_tokens": 84000, "thinking_protocol": "reasoning_effort",
+                  "supported_parameters": ["tools"],
+                  "prompt_cache_capability": {"schema_version": 2,
+                      "protocol": "openai_auto_prefix", "volatile_placement": "append_only_user_tail",
+                      "volatile_delivery": "required_only", "reuse_scope": "conversation_turns"}})
+          root = Path(os.environ["RUNNER_TEMP"]) / "harness"
+          root.mkdir(mode=0o700)
+          # JSON is a YAML subset; use the existing admin model loader without extra dependencies.
+          with open(root / "models.yaml", "x", opener=lambda p, f: os.open(p, f, 0o600)) as out:
+              # Only Flash is configured by default; supplementary models are explicit.
+              json.dump(additional, out)
+          Path(".env").touch()
+          PY
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: ci-harness
+          install-nextest: false
+          use-sccache: false
+          # Only the automatic main push may publish; custom/manual source cannot.
+          save-cache: ${{ github.event_name == 'push' && github.repository == 'matrixorigin/Astra' && inputs.repository == github.repository && inputs.ref == github.sha }}
+
+      - name: Build current Server, CLI and harness
+        run: |
+          cargo build --locked -p astra-runtime --bin astra-server -p astra-cli --bin astra -p astra-test-harness --bin astra-test
+
+      - name: Start disposable dependencies and candidate Server
+        timeout-minutes: 15
+        env:
+          BUILD_MODE: debug
+          SKIP_BUILD: "1"
+          API_START_TIMEOUT_SECONDS: "600"
+        run: |
+          make dev-deps-up dev-deps-wait
+          make dev-api-start-debug
+
+      - name: Register model through the normal admin flow
+        id: seed
+        timeout-minutes: 10
+        run: |
+          ./target/debug/astra admin register --username admin --password 11111111 --email admin@example.test
+          ./target/debug/astra admin login --username admin --password 11111111
+          # Loading already probes connectivity. Keep arbitrary provider diagnostics private;
+          # harness preflight verifies the active model before executing any case.
+          ./target/debug/astra admin model load "$RUNNER_TEMP/harness/models.yaml" --update-existing \
+            > "$RUNNER_TEMP/harness/model-load.log" 2>&1
+          rm -f "$RUNNER_TEMP/harness/models.yaml"
+
+      - name: Run real harness
+        id: harness
+        timeout-minutes: ${{ inputs.profile == 'regression' && 18 || 60 }}
+        env:
+          CASE_FILTER: ${{ inputs.filter }}
+          CASE_RUNS: ${{ inputs.runs }}
+          CASE_PROFILE: ${{ inputs.profile }}
+        run: |
+          run_started=$(date +%s)
+          workspace="$RUNNER_TEMP/harness/workspace"
+          git clone --quiet --no-hardlinks --no-checkout "$GITHUB_WORKSPACE" "$workspace"
+          git for-each-ref --format='%(objectname) %(refname)' refs/remotes/origin/ |
+            while read -r object ref; do
+              git -C "$workspace" update-ref --no-deref "$ref" "$object"
+            done
+          git -C "$workspace" remote set-url origin "$(git remote get-url origin)"
+          git -C "$workspace" checkout --quiet --detach "$ASTRA_BUILD_SOURCE_GIT_SHA"
+          sha256sum target/debug/astra target/debug/astra-server target/debug/astra-test > "$RUNNER_TEMP/harness/binaries.sha256"
+          suite="$GITHUB_WORKSPACE/crates/astra-test-harness/cases"
+          budget=3300
+          if [ "${CASE_PROFILE:-full}" = regression ]; then
+            python3 scripts/ci/select_harness_cases.py --cases "$suite" \
+              --list crates/astra-test-harness/ci-regression.txt \
+              --destination "$RUNNER_TEMP/harness/selected-cases"
+            suite="$RUNNER_TEMP/harness/selected-cases"
+            CASE_FILTER='*'
+            CASE_RUNS=1
+            budget=900
+          elif [ "${CASE_PROFILE:-full}" != full ]; then
+            echo 'Unknown harness profile' >&2
+            exit 1
+          fi
+          python3 scripts/harness/process_supervisor.py run \
+            --owner-pid "$$" --identity "live-harness-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}" -- \
+            python3 scripts/ci/manual_harness.py run \
+            --root "$RUNNER_TEMP/harness" --started-at "$run_started" \
+            --timeout-seconds "$budget" --grace-seconds 120 -- ./target/debug/astra-test \
+            --astra-bin "$GITHUB_WORKSPACE/target/debug/astra" \
+            --suite "$suite" \
+            --working-dir "$RUNNER_TEMP/harness/workspace" \
+            --filter "$CASE_FILTER" --force-model deepseek-v4.1-flash \
+            --judger-model deepseek-v4.1-flash --parallel 1 --runs "$CASE_RUNS" \
+            --report-file "$RUNNER_TEMP/harness/report.json"
+
+      - name: Diagnose failure without exposing provider responses
+        if: ${{ failure() }}
+        timeout-minutes: 2
+        env:
+          MODEL_LOAD_OUTCOME: ${{ steps.seed.outcome }}
+          HARNESS_OUTCOME: ${{ steps.harness.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/harness"
+          health_status=$(curl --noproxy '*' --connect-timeout 2 --max-time 5 \
+            -s -o /dev/null -w '%{http_code}' "$ASTRA_API_URL/ready") || health_status=000
+          model_status=127
+          if [ -x ./target/debug/astra ]; then
+            model_status=0
+            timeout 30 ./target/debug/astra admin model show deepseek-v4.1-flash \
+              > "$RUNNER_TEMP/harness/model-status.json" \
+              2> "$RUNNER_TEMP/harness/model-status.log" || model_status=$?
+          fi
+          export DIAGNOSTIC_HEALTH_STATUS="$health_status" DIAGNOSTIC_MODEL_EXIT="$model_status"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "harness"
+          model = {}
+          try:
+              model = json.loads((root / "model-status.json").read_text())
+          except (OSError, ValueError):
+              pass
+          if not isinstance(model, dict):
+              model = {}
+          preflight = {}
+          try:
+              raw = json.loads((root / "report.preflight.json").read_text())
+              if (raw.get("status") in ("passed", "failed")
+                  and isinstance(raw.get("models"), list) and all(isinstance(m, str) for m in raw["models"])
+                  and (raw.get("unavailable_model") is None or isinstance(raw["unavailable_model"], str))):
+                  preflight = {k: raw.get(k) for k in ("status", "models", "unavailable_model")}
+                  failure = raw.get("failure")
+                  if isinstance(failure, dict) and failure.get("model") in raw["models"]:
+                      stage = failure.get("stage")
+                      if stage in ("execution", "terminal_protocol", "probe_process", "session_cleanup"):
+                          preflight["failure"] = {"model": failure["model"], "stage": stage}
+                          code = failure.get("exit_code")
+                          preflight["failure"]["exit_code"] = code if type(code) is int and -255 <= code <= 255 else None
+                          for key in ("error_kind", "error_code"):
+                              value = failure.get(key)
+                              preflight["failure"][key] = value if (isinstance(value, str) and 0 < len(value) <= 128
+                                  and all(c in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in value)) else None
+          except (OSError, ValueError, AttributeError):
+              pass
+          diagnostic = {"server_readiness_http_status": int(os.environ["DIAGNOSTIC_HEALTH_STATUS"]),
+                        "model_lookup_exit_code": int(os.environ["DIAGNOSTIC_MODEL_EXIT"]),
+                        "model_registered": bool(model["model_id"]) if "model_id" in model else None,
+                        "model_active": model.get("is_active") if isinstance(model.get("is_active"), bool) else None,
+                        "model_load_step": os.environ["MODEL_LOAD_OUTCOME"],
+                        "harness_step": os.environ["HARNESS_OUTCOME"],
+                        "model_lookup_name": "deepseek-v4.1-flash", "preflight": preflight or None}
+          text = json.dumps(diagnostic, indent=2) + "\n"
+          (root / "diagnostic.json").write_text(text)
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as out:
+              out.write("## Safe failure diagnostics\n\n```json\n" + text + "```\n")
+          PY
+
+      - name: Publish safe result summary
+        if: ${{ always() }}
+        env:
+          HARNESS_OUTCOME: ${{ steps.harness.outcome }}
+        run: |
+          python3 scripts/ci/manual_harness.py summary --root "$RUNNER_TEMP/harness"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: ${{ always() }}
+        with:
+          name: harness-live-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/harness/summary.json
+            ${{ runner.temp }}/harness/progress.safe.jsonl
+            ${{ runner.temp }}/harness/binaries.sha256
+            ${{ runner.temp }}/harness/diagnostic.json
+            ${{ runner.temp }}/harness/report.preflight.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Stop owned services and remove private model file
+        if: ${{ always() }}
+        timeout-minutes: 5
+        run: |
+          rm -f "$RUNNER_TEMP/harness/models.yaml"
+          cleanup_status=0
+          make dev-api-stop || cleanup_status=1
+          if [ -f .env ]; then
+            make dev-deps-down || cleanup_status=1
+          fi
+          exit "$cleanup_status"

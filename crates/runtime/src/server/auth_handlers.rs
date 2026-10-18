@@ -427,6 +427,8 @@ async fn memory_proxy_call_for_user(
                 "memory backend violated the requested session scope",
             ));
         }
+        astra_memoria::attest_strict_recall_payload(&mut response, user_id, scope)
+            .map_err(|error| error_response(StatusCode::BAD_GATEWAY, error))?;
     }
 
     Ok(Json(response))

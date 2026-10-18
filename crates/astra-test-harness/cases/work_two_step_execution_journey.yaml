@@ -13,14 +13,21 @@ description: |
   the user to make routine decomposition decisions.
   **Fail means**: Astra returns a prose checklist, leaves a created item unfinished, creates
   duplicate Work, or spins through excessive model/tool rounds.
+  Inputs use an isolated fixture: this measures Work execution, not research
+  across Astra's independently evolving CI lanes.
+  A rejected settlement followed by valid evidence and canonical delivery is
+  recovery, not task failure. Final delivery and ownership remain hard requirements;
+  tool/round budgets separately measure execution churn.
 prompt: |
   Create a durable Work board to track these two tasks separately, execute both now,
   and record their delivery so I can inspect or continue this Work in a later session.
-  Before a release handoff, independently verify two things in this repository:
+  Work only within `target/astra-harness-work-journey`. Before a release handoff,
+  independently verify two things in that repository fixture:
   first, identify the CI command that runs the test suite; second, identify the local
   developer command intended to run the corresponding check. Cite the source paths and
-  report the exact commands you find. Do the verification now and avoid asking me to
-  approve routine decomposition.
+  report the exact commands you find. Use read_file to inspect its
+  `.github/workflows/check.yml` and `Makefile` as the respective source evidence.
+  Do the verification now and avoid asking me to approve routine decomposition.
 models:
   - deepseek-v4-flash
 capability: "custom:work_two_step_execution_journey"
@@ -28,6 +35,17 @@ difficulty: 4
 weight: 3.0
 timeout_seconds: 180
 debug_log: true
+setup_cmd: |
+  set -euC
+  test ! -L target
+  mkdir -p target
+  mkdir target/astra-harness-work-journey
+  cd target/astra-harness-work-journey
+  mkdir -p .github/workflows scripts
+  printf 'name: Fixture check\non: [push]\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: bash scripts/check.sh\n' > .github/workflows/check.yml
+  printf '.PHONY: verify\nverify:\n\tbash scripts/check.sh\n' > Makefile
+  printf '#!/usr/bin/env bash\nset -eu\nprintf "check passed\\n"\n' > scripts/check.sh
+  # Fail rather than overwrite prior files; the isolated workspace owner cleans up.
 criteria:
   - type: exit_code
     code: 0
@@ -71,20 +89,47 @@ criteria:
     name: settle_work_item
     min: 2
     max: 2
-  - type: journal_tool_call_count
-    name: settle_work_item
-    ok: false
-    min: 0
-    max: 0
-  - type: journal_tool_call_count
-    name: settle_work_item
-    min: 2
-    max: 2
     document: result
     path: /task_board_update/schema_version
     equals: 1
   - type: journal_work_item_execution_from_start
     min_distinct_items: 2
+  - type: journal_tool_call_count
+    name: settle_work_item
+    min: 2
+    max: 2
+    ok: true
+    document: result
+    path: /outcome
+    equals: delivered
+  - type: journal_tool_json_contains
+    name: read_file
+    document: result
+    path: ""
+    contains: "- run: bash scripts/check.sh"
+  - type: journal_tool_json_contains
+    name: read_file
+    document: result
+    path: ""
+    contains: ".PHONY: verify"
+  - type: journal_tool_call_count
+    name: read_file
+    ok: true
+    min: 2
+    # Full count representation, not an arbitrary efficiency ceiling.
+    max: 4294967295
+  - type: hard_judger
+    threshold: 0.85
+    question: |
+      Does the final answer accurately report both source-backed fixture checks?
+      The workflow source is .github/workflows/check.yml and its check command is
+      bash scripts/check.sh. The local source is Makefile and its verify target
+      runs that same script. Accept semantically equivalent invocations such as
+      make verify from the fixture directory, make -C <fixture> verify, or a cd
+      followed by make verify. Require both source paths and commands, and a
+      concise completion report. Do not require literal wording or formatting.
+      The durable journal separately proves both Work items were delivered;
+      prose cannot replace that evidence.
   - type: journal_tool_call_count
     name: ask_user
     min: 0

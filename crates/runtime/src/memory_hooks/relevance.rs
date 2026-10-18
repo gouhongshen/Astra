@@ -593,10 +593,7 @@ mod tests {
                 } else {
                     "no"
                 };
-                (
-                    id.clone(),
-                    serde_json::json!({"type":"discrete_noul","decision":decision}),
-                )
+                (id.clone(), serde_json::json!(decision))
             })
             .collect::<std::collections::BTreeMap<_, _>>();
         let canonical = serde_json::json!({"answers":answers}).to_string();

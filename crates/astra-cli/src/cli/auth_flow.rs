@@ -1065,7 +1065,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn browser_identity_services_replace_generation_and_private_skill_cache() {
         use std::sync::Arc;
-        use wiremock::matchers::{body_partial_json, header};
+        use wiremock::matchers::header;
         let _home = crate::test_utils::HomeGuard::temp();
         let _creds = crate::tests::isolate_credentials();
         let _env_token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
@@ -1127,10 +1127,13 @@ mod tests {
             let _modules = super::rebuild_browser_identity_services(&api, None, &mut state).await;
             let memory = state.session_memory_port.as_ref().unwrap();
             Mock::given(method("POST"))
-                .and(path("/memory/retrieve"))
+                .and(path("/sessions/identity-test-session/memory/finalize"))
                 .and(header("authorization", bearer.as_str()))
-                .and(body_partial_json(json!({"user_id": owner})))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"memories": []})))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(
+                        json!({"accepted":true,"session_id":"identity-test-session"}),
+                    ),
+                )
                 .expect(1)
                 .mount(&server)
                 .await;

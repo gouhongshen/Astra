@@ -1516,6 +1516,7 @@ pub(crate) mod tests {
         args: Value,
     ) -> super::super::tool_execution_binding::ToolExecutionRequest {
         super::super::tool_execution_binding::ToolExecutionRequest {
+            provider_stage_dispatch: None,
             user_id: scope.user_id.clone(),
             session_id: scope.session_id.clone(),
             run_id: scope.run_id.clone(),
@@ -1885,6 +1886,30 @@ pub(crate) mod tests {
         assert_eq!(fixture.calls.lock().unwrap().len(), 2);
         assert!(reopened.read_resource(&key, "../secret").await.is_err());
         assert_eq!(fixture.calls.lock().unwrap().len(), 2);
+        let context = crate::turn::skill_tool::SkillContext {
+            current_task: Some("Inspect the selected repository".into()),
+            ..Default::default()
+        };
+        let activation = crate::turn::skill_tool::execute_skill_inline(
+            &reopened,
+            "skill",
+            &json!({"skill_name": key}),
+            &context,
+        )
+        .await;
+        assert!(activation.success, "{}", activation.output);
+        assert!(activation.activation.is_some());
+        let resource = crate::turn::skill_tool::execute_skill_inline(
+            &reopened,
+            "skill",
+            &json!({"skill_name": key, "resource_path": "references/guide.md"}),
+            &context,
+        )
+        .await;
+        assert!(resource.success, "{}", resource.output);
+        assert!(resource.activation.is_none());
+        let resource: Value = serde_json::from_str(&resource.output).unwrap();
+        assert_eq!(resource["resource_path"], "references/guide.md");
         let denied = CapabilitySourceSkillResolver {
             source: reopened.source,
             base: None,
@@ -1902,7 +1927,7 @@ pub(crate) mod tests {
             denied.read_resource(&key, "references/guide.md").await,
             Err(astra_skills::traits::SkillError::PermissionDenied(_))
         ));
-        assert_eq!(fixture.calls.lock().unwrap().len(), 2);
+        assert_eq!(fixture.calls.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

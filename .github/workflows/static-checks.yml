@@ -94,10 +94,6 @@ jobs:
           persist-credentials: false
       - name: Validate repository metadata and documentation
         run: python3 scripts/ci/validate_repository.py
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version: 1.25.5
-          cache: false
       - name: Validate GitHub Actions workflows
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - name: Test CI contracts
@@ -131,7 +127,7 @@ jobs:
       - name: Check formatting
         if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         run: make format-check
-      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+      - uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2
         if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         with:
           tool: cargo-audit@0.22.1

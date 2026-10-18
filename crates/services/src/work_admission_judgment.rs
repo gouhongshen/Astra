@@ -772,7 +772,7 @@ mod tests {
             .iter()
             .map(|(id, question)| {
                 if matches!(question, JudgmentQuestion::Choice { .. }) {
-                    return (id.clone(), json!({"type":"discrete_choice", "option":null}));
+                    return (id.clone(), Value::Null);
                 }
                 let decision = if yes.contains(&id.as_str()) {
                     "yes"
@@ -781,10 +781,7 @@ mod tests {
                 } else {
                     "no"
                 };
-                (
-                    id.clone(),
-                    json!({"type":"discrete_noul","decision":decision}),
-                )
+                (id.clone(), json!(decision))
             })
             .collect::<BTreeMap<_, _>>();
         json!({"answers":answers}).to_string()
@@ -850,7 +847,7 @@ mod tests {
         for (id, option) in choices {
             wire["answers"][*id] = match provenance {
                 JudgmentResponseProvenance::DiscreteDecision => {
-                    json!({"type":"discrete_choice","option":option})
+                    json!(option)
                 }
                 JudgmentResponseProvenance::ProviderProbability => {
                     let JudgmentQuestion::Choice { criteria, .. } = &request.questions[*id] else {
@@ -945,7 +942,7 @@ mod tests {
             for malformed in [
                 Value::Null,
                 json!({"type":"discrete_noul","decision":"yes"}),
-                json!({"type":"discrete_choice","option":"invented"}),
+                json!("invented"),
                 json!({"type":"choice","choice":"correct","probabilities":{},"confidence":1.0}),
             ] {
                 for id in USER_OBSERVATION_IDS {
@@ -1036,7 +1033,7 @@ mod tests {
                 )
                 .is_err()
             );
-            baseline["answers"]["unexpected"] = json!({"type":"discrete_choice","option":null});
+            baseline["answers"]["unexpected"] = Value::Null;
             assert!(
                 parse_work_admission_classification(
                     &request,
@@ -1046,7 +1043,7 @@ mod tests {
                 )
                 .is_err()
             );
-            wire["answers"]["unexpected"] = json!({"type":"discrete_choice","option":null});
+            wire["answers"]["unexpected"] = Value::Null;
             assert!(
                 parse_user_turn_observation(
                     &observation_request,
@@ -1086,8 +1083,7 @@ mod tests {
             assert_eq!(parsed.objective_relation, ObjectiveRelation::Unknown);
             assert_eq!(parsed.feedback.unwrap().target, UserFeedbackTarget::Output);
         }
-        wire["answers"][USER_FEEDBACK_TARGET_ID] =
-            json!({"type":"discrete_choice","option":"output"});
+        wire["answers"][USER_FEEDBACK_TARGET_ID] = json!("output");
         let parsed = parse_work_admission_classification(
             &request,
             &wire.to_string(),
@@ -1096,7 +1092,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.feedback, None, "wrong provenance is not a target");
-        let duplicates = r#"{"answers":{"user.objective_relation":{"type":"discrete_choice","option":"correct"},"user.objective_relation":{"type":"discrete_choice","option":"replace"}}}"#;
+        let duplicates = r#"{"answers":{"user.objective_relation":"correct","user.objective_relation":"replace"}}"#;
         assert!(
             parse_user_turn_observation(
                 &user_turn_observation_request(&Default::default()),

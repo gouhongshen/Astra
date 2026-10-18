@@ -162,13 +162,10 @@ pub(crate) async fn stream_chat_sse(
                     error = %error,
                     "turn failed before SSE stream because model context_window metadata was unavailable"
                 );
-                return Err(crate::TurnFailure {
+                return Err(session_runtime::model_catalog_turn_failure(
                     error,
-                    partial: crate::PartialTurnData {
-                        session_id: p.session_id.map(str::to_string),
-                        ..Default::default()
-                    },
-                });
+                    p.session_id,
+                ));
             }
         }
     }
@@ -438,6 +435,9 @@ pub(crate) async fn stream_chat_sse(
     );
     let mcp_runtime_schemas = all_schemas.1.clone();
     let all_schemas = all_schemas.0;
+    // Native collaborators are internal child execution capacity. A binary
+    // probe does not install an authenticated consumer and must not expose a
+    // standalone root tool that cannot honor canonical child admission.
     executor.set_cli_local_provider_schemas(all_schemas.clone());
     // Install MCP schemas on the edge executor so `tool_search(select:NAME)`
     // can resolve MCP tool schemas by name.
@@ -523,7 +523,7 @@ pub(crate) async fn stream_chat_sse(
         runtime_config: p.runtime_config.clone(),
         api: p.api,
         token: p.token.to_string(),
-        auth_profile: p.auth_profile,
+        auth_owner: p.auth_owner.clone(),
         model: p.model,
         offering_id: p.offering_id.clone(),
         cli_context: p.cli_context,
@@ -1883,3 +1883,6 @@ hooks:
         assert_eq!(s[0].label, "audit");
     }
 }
+
+#[cfg(test)]
+pub(crate) use agentic_loop_turn::WORKSPACE_HOST_VALIDATION_FOR_TEST;

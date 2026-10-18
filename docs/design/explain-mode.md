@@ -469,6 +469,14 @@ A client-local companion is unavailable to a remote model without a shared
 authorized backend. Explain artifacts never grant access to raw prompts,
 chain-of-thought, credentials, tool arguments, tool output or trace payloads.
 
+Native stage observations use the already supplied run events. A snapshot
+retains at most 16 call identities, collapses identical replays, and marks
+conflicting observations unknown. Summary byte budgets explicitly report
+omitted retained observations. Stage input is cumulative within that stage;
+last-request input and model capacity are separate fields, not current context
+occupancy. Internal native tool counts and health are unknown. These observations
+are never added to physical model-attempt cache denominators.
+
 ## Correctness and failure behavior
 
 - Report publication has its own typed `artifact_publication` result, separate
@@ -492,6 +500,13 @@ chain-of-thought, credentials, tool arguments, tool output or trace payloads.
 - Durable append is ordered before event publication. Reconnect replays after
   the last durable index and hands off to live delivery without a missing
   interval or duplicate graph mutation.
+- Server live fanout coalesces pending facts for up to 250 ms from the first
+  queued fact, or until the existing 64-event / 256-KiB flush threshold is
+  reached. Interleaved transient frames share the bounded queue and preserve
+  delivery order without becoming durable rows or forcing their own commit.
+  Approval persistence, explicit drain, and channel close flush immediately;
+  a live-only frame with no pending fact remains immediate. The coalescing
+  interval is not a bound on database commit or client delivery latency.
 - Structural start/terminal facts are emitted before/after their corresponding
   slow work. In the local loopback fixture, measure from runtime creation of a
   structural event through its application by the client graph reducer: p95 is

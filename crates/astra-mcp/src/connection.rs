@@ -6,15 +6,17 @@ use std::time::Instant;
 use rmcp::{
     ClientHandler, Peer, RoleClient,
     model::{
-        ArgumentInfo, CallToolRequestParams, CallToolResult, ClientCapabilities, ClientRequest,
-        CompleteRequestParams, CompleteResult, GetPromptRequestParams, GetPromptResult,
-        Implementation, InitializeRequestParams, ListRootsResult, LoggingLevel, PingRequest,
-        Prompt, ReadResourceRequestParams, Reference, RequestParamsMeta, Resource, Root,
-        RootsCapabilities, SetLevelRequestParams, SubscribeRequestParams, Tool,
-        UnsubscribeRequestParams,
+        ArgumentInfo, CallToolRequestParams, CallToolResult, CancelledNotificationParam,
+        ClientCapabilities, ClientRequest, CompleteRequestParams, CompleteResult,
+        GetPromptRequestParams, GetPromptResult, Implementation, InitializeRequestParams,
+        ListRootsResult, LoggingLevel, PingRequest, Prompt, ReadResourceRequestParams, Reference,
+        RequestParamsMeta, Resource, Root, RootsCapabilities, ServerResult, SetLevelRequestParams,
+        SubscribeRequestParams, Tool, UnsubscribeRequestParams,
     },
     serve_client,
-    service::{NotificationContext, RequestContext, RunningService, ServiceError},
+    service::{
+        NotificationContext, PeerRequestOptions, RequestContext, RunningService, ServiceError,
+    },
     transport::TokioChildProcess,
 };
 use serde::Serialize;
@@ -246,6 +248,18 @@ impl McpConnection {
         arguments: serde_json::Value,
         protocol_metadata: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, ServiceError> {
+        self.call_tool_with_metadata_and_cancel(name, arguments, protocol_metadata, None)
+            .await
+            .map_err(crate::McpToolCallError::into_service_error)
+    }
+
+    pub async fn call_tool_with_metadata_and_cancel(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        protocol_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<CallToolResult, crate::McpToolCallError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
         let start = Instant::now();
 
@@ -267,7 +281,7 @@ impl McpConnection {
         }
         let result = match tokio::time::timeout(
             std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
-            self.peer.call_tool(params),
+            call_tool_with_cancel(&self.peer, params, cancel_token),
         )
         .await
         {
@@ -281,7 +295,8 @@ impl McpConnection {
                 );
                 Err(ServiceError::Timeout {
                     timeout: std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
-                })
+                }
+                .into())
             }
         };
 
@@ -900,11 +915,174 @@ async fn fetch_tools_with_timeout(
     .map_err(McpError::Service)
 }
 
+async fn call_tool_with_cancel(
+    peer: &Peer<RoleClient>,
+    params: CallToolRequestParams,
+    cancel_token: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<CallToolResult, crate::McpToolCallError> {
+    if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        return Err(crate::McpToolCallError::CancelledBeforeDispatch);
+    }
+    let request = peer
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(params)),
+            PeerRequestOptions::no_options(),
+        )
+        .await?;
+    let request_id = request.id.clone();
+    let response = request.await_response();
+    tokio::pin!(response);
+    let result = if let Some(cancel_token) = cancel_token {
+        tokio::select! {
+            biased;
+            result = &mut response => result,
+            () = cancel_token.cancelled() => {
+                // rmcp's typed cancellation notification also removes the
+                // local response slot and synthesizes ServiceError::Cancelled.
+                // Send its standard wire payload through the raw notification
+                // API so only the provider's original result can settle us.
+                let params = CancelledNotificationParam {
+                    request_id,
+                    reason: Some("run cancelled".into()),
+                };
+                let notification = peer.send_notification(
+                    rmcp::model::CustomNotification::new(
+                        "notifications/cancelled",
+                        Some(serde_json::to_value(params).expect("cancellation params serialize")),
+                    ).into(),
+                );
+                tokio::pin!(notification);
+                tokio::select! {
+                    biased;
+                    result = &mut response => result,
+                    notified = &mut notification => {
+                        if notified.is_err() {
+                            tracing::warn!("MCP cancellation notification failed; retaining original invocation");
+                        }
+                        response.await
+                    }
+                }
+            }
+        }
+    } else {
+        response.await
+    }?;
+    match result {
+        ServerResult::CallToolResult(result) => Ok(result),
+        _ => Err(ServiceError::UnexpectedResponse.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use rmcp::model::{CallToolResult, Content};
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
 
-    use super::is_acknowledged_tool_failure;
+    #[tokio::test]
+    async fn cancellation_notifies_exact_request_and_waits_for_original_response() {
+        let (client, server) = tokio::io::duplex(8192);
+        let (started_tx, started) = oneshot::channel();
+        let (notified_tx, notified) = oneshot::channel();
+        let (release, cleanup) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server);
+            let mut lines = BufReader::new(read).lines();
+            let mut started_tx = Some(started_tx);
+            let mut notified_tx = Some(notified_tx);
+            let mut cleanup = Some(cleanup);
+            let mut request_id = Value::Null;
+            let mut calls = 0;
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let message: Value = serde_json::from_str(&line).unwrap();
+                let response = match message["method"].as_str().unwrap() {
+                    "initialize" => Some(json!({
+                        "jsonrpc": "2.0", "id": message["id"],
+                        "result": {
+                            "protocolVersion": message["params"]["protocolVersion"],
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "controlled", "version": "1"}
+                        }
+                    })),
+                    "notifications/initialized" => None,
+                    "tools/call" => {
+                        calls += 1;
+                        request_id = message["id"].clone();
+                        started_tx.take().unwrap().send(()).unwrap();
+                        None
+                    }
+                    "notifications/cancelled" => {
+                        assert_eq!(message["params"]["requestId"], request_id);
+                        assert!(message.get("id").is_none());
+                        notified_tx.take().unwrap().send(()).unwrap();
+                        cleanup.take().unwrap().await.unwrap();
+                        Some(json!({
+                            "jsonrpc": "2.0", "id": request_id,
+                            "result": {"content": [{"type": "text", "text": "cleanup settled"}]}
+                        }))
+                    }
+                    other => panic!("unexpected method {other}"),
+                };
+                if let Some(response) = response {
+                    write
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    write.flush().await.unwrap();
+                }
+            }
+            calls
+        });
+        let client = serve_client((), client).await.unwrap();
+        let token = CancellationToken::new();
+        {
+            let call = call_tool_with_cancel(
+                client.peer(),
+                CallToolRequestParams::new("controlled"),
+                Some(&token),
+            );
+            tokio::pin!(call);
+            tokio::select! {
+                result = &mut call => panic!("call returned before dispatch: {result:?}"),
+                result = tokio::time::timeout(std::time::Duration::from_secs(5), started) => result.unwrap().unwrap(),
+            }
+            token.cancel();
+            tokio::select! {
+                result = &mut call => panic!("notification is not settlement: {result:?}"),
+                result = tokio::time::timeout(std::time::Duration::from_secs(5), notified) => result.unwrap().unwrap(),
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(25), &mut call)
+                    .await
+                    .is_err()
+            );
+            release.send(()).unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut call)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.content[0].as_text().unwrap().text, "cleanup settled");
+        }
+        let pre_cancelled = call_tool_with_cancel(
+            client.peer(),
+            CallToolRequestParams::new("must-not-dispatch"),
+            Some(&token),
+        )
+        .await;
+        assert!(matches!(
+            pre_cancelled,
+            Err(crate::McpToolCallError::CancelledBeforeDispatch)
+        ));
+        client.cancel().await.unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            1,
+            "pre-cancelled calls must not dispatch"
+        );
+    }
 
     #[test]
     fn call_observation_uses_the_typed_mcp_error_flag_only() {

@@ -301,7 +301,14 @@ pub(crate) fn turn_policy_from_payload_edge_tools(
     interaction_mode: TurnInteractionMode,
 ) -> TurnInteractionPolicy {
     let schemas = final_visible_tool_schemas_from_payload(payload);
-    TurnInteractionPolicy::from_tool_schemas(interaction_mode, &schemas)
+    let mut policy = TurnInteractionPolicy::from_tool_schemas(interaction_mode, &schemas);
+    // Pause capability can come from the approval transport even when the
+    // caller has no ask_user channel and has restricted that tool.
+    policy.allow_ask_user &= policy
+        .visible_tool_names
+        .iter()
+        .any(|name| name == astra_turn_core::interaction_types::ASK_USER_TOOL_NAME);
+    policy
 }
 
 pub(crate) fn final_visible_tool_schemas_from_payload(payload: &Value) -> Vec<Value> {
@@ -908,10 +915,15 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         .filter_map(tool_schema_name)
         .map(|name| (name.to_string(), name.to_string()))
         .collect();
+    let mut restricted_tool_names = ctx.restricted_tools.iter().collect::<Vec<_>>();
+    restricted_tool_names.sort();
     merge_edge_profile_extensions(
         &mut payload,
         &json!({
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_TOOL_NATIVE_IDS: native_ids,
+            // Server also owns builtin schemas. Carry the deny set so it
+            // cannot reintroduce a tool whose client channel is unavailable.
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RESTRICTED_TOOL_NAMES: restricted_tool_names,
         }),
     );
     attach_filtered_edge_tools_to_payload(&mut payload, turn_schemas, ctx.restricted_tools);
@@ -1269,7 +1281,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub tool_surface_config: &'a astra_config::runtime_config::ToolSurfaceConfig,
     pub api: &'a astra_thin_client::ThinClient,
     pub token: &'a str,
-    pub auth_profile: Option<&'a str>,
+    pub auth_owner: Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
     pub offering_id: Option<&'a str>,
     pub model: Option<&'a str>,
     pub cli_context: Option<&'a crate::cli::cli_config::cli_context::CliContext>,
@@ -1403,6 +1415,34 @@ struct ChatTurnPostPayloadRequest<'a> {
     prepare: PrepareChatTurnRequest<'a>,
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static WORKSPACE_HOST_VALIDATION_FOR_TEST: Result<(), astra_tools::workspace_observation::WorkspaceLeaseFailure>;
+}
+
+fn validate_workspace_coordination_host()
+-> Result<(), astra_tools::workspace_observation::WorkspaceLeaseFailure> {
+    #[cfg(test)]
+    if let Ok(result) = WORKSPACE_HOST_VALIDATION_FOR_TEST.try_with(|result| *result) {
+        return result;
+    }
+    astra_tools::workspace_observation::validate_workspace_coordination_host()
+}
+
+// Use the resolved, locally bound surface, including activatable tools. A
+// text-only turn or a surface with only read-only tools needs no writer host.
+async fn validate_local_workspace_host_for_tool_surface(
+    executor: &ToolExecutor,
+) -> Result<(), String> {
+    if executor
+        .current_surface_requires_workspace_coordination()
+        .await
+    {
+        validate_workspace_coordination_host().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 async fn chat_turn_post_payload_after_prepare(
     request: ChatTurnPostPayloadRequest<'_>,
 ) -> Result<
@@ -1431,7 +1471,9 @@ async fn chat_turn_post_payload_after_prepare(
     let (current_session_id, session_turn) = (prepare.current_session_id, prepare.session_turn);
     let server_message = prepare.message.to_string();
     let server_explain = prepare.explain.explain_on || prepare.explain.explain_verbose;
+    let executor = Arc::clone(&prepare.executor);
     let prepared = prepare_chat_turn_payload(prepare).await;
+    validate_local_workspace_host_for_tool_surface(&executor).await?;
     let execution_time_budget = execution_time_budget_clock.map(|budget| budget.remaining());
     let server_payload = server_loop_admission_payload_with_execution_time_budget(
         prepared.payload,
@@ -1523,7 +1565,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         tool_surface_config,
         api,
         token,
-        auth_profile,
+        auth_owner,
         offering_id,
         model,
         cli_context,
@@ -1705,7 +1747,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         explain != crate::ExplainMode::Off,
         Some(edge_ctx),
         pre_clear_lines,
-        auth_profile,
+        auth_owner,
         cancel_token,
         stream_json_exchange,
     )
@@ -1746,6 +1788,68 @@ mod tests {
         EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS, EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
         EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS, EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
     };
+
+    #[tokio::test]
+    async fn host_preflight_uses_only_the_resolved_writer_surface() {
+        use super::{
+            WORKSPACE_HOST_VALIDATION_FOR_TEST, validate_local_workspace_host_for_tool_surface,
+        };
+        use astra_tools::workspace_observation::WorkspaceLeaseFailure;
+        use std::collections::HashSet;
+        let root = tempfile::tempdir().unwrap();
+        let executor = crate::edge_tools::ToolExecutor::new(root.path());
+        // Test executors install the full default tool surface. Model an
+        // explicitly resolved no-tool turn before checking its host needs.
+        executor.set_current_tool_surface(&[], HashSet::new());
+        let schema = |name| json!({"type": "function", "function": {"name": name}});
+        WORKSPACE_HOST_VALIDATION_FOR_TEST
+            .scope(
+                Err(WorkspaceLeaseFailure::CoordinationHostUnsupported),
+                async {
+                    assert!(
+                        validate_local_workspace_host_for_tool_surface(&executor)
+                            .await
+                            .is_ok()
+                    );
+                    executor.set_current_visible_tool_schemas(&[schema("read_file")]);
+                    assert!(
+                        validate_local_workspace_host_for_tool_surface(&executor)
+                            .await
+                            .is_ok()
+                    );
+                    executor.set_current_visible_tool_schemas(&[schema("write_file")]);
+                    assert!(
+                        validate_local_workspace_host_for_tool_surface(&executor)
+                            .await
+                            .is_err()
+                    );
+                    executor.set_current_visible_tool_schemas(&[schema("lsp")]);
+                    assert!(
+                        validate_local_workspace_host_for_tool_surface(&executor)
+                            .await
+                            .is_err()
+                    );
+                    executor.set_current_visible_tool_schemas(&[]);
+                    executor
+                        .set_current_activatable_tool_names(HashSet::from(["bash".to_string()]));
+                    assert!(
+                        validate_local_workspace_host_for_tool_surface(&executor)
+                            .await
+                            .is_err()
+                    );
+                },
+            )
+            .await;
+        WORKSPACE_HOST_VALIDATION_FOR_TEST
+            .scope(Ok(()), async {
+                assert!(
+                    validate_local_workspace_host_for_tool_surface(&executor)
+                        .await
+                        .is_ok()
+                );
+            })
+            .await;
+    }
 
     #[test]
     fn typed_edge_skill_catalog_crosses_without_raw_listing_content() {
@@ -2716,6 +2820,16 @@ mod tests {
         );
         assert_eq!(policy.observation_tool_names, vec!["mo_query".to_string()]);
         assert!(policy.allow_ask_user);
+    }
+
+    #[test]
+    fn approval_pause_does_not_enable_an_unavailable_question_tool() {
+        let policy = super::turn_policy_from_payload_edge_tools(
+            &json!({"edge_tools": [schema("write_file")]}),
+            TurnInteractionMode::Prompt,
+        );
+        assert!(policy.can_pause_for_user);
+        assert!(!policy.allow_ask_user);
     }
 
     #[test]

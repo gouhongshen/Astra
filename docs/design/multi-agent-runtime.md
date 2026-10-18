@@ -22,6 +22,9 @@ work, admitting a wait, queuing a message, or listing children does not prove
 that a child completed. An accepted control receipt is neutral coordination:
 it neither creates a failed-child obligation nor supplies positive validation
 evidence. Child results retain their terminal status and output requirements.
+Fanout launch and replay receipts carry the group's canonical work-unit
+observation. Bounded terminal-event projection must preserve its exact control
+identity so presentation compaction cannot leave an accepted tool call open.
 
 Malformed, unknown, rejected, or uncertain-delivery receipts must not gain
 accepted-control authority. Existing run/call ownership checks, child completion
@@ -30,6 +33,15 @@ recovery, and Server result projection consume the same classification; a later
 control receipt cannot erase an unrelated failed verification.
 An observation error does not establish child termination or release ownership.
 Presentation windows preserve the typed child envelope and pagination authority.
+Each Server delegated run initializes its execution chain from its admitted run
+identity. Descendant admission uses that chain and the current execution-owner
+generation while retaining the original human requirement provenance; child
+prompt text cannot replace either authority.
+
+Wait guidance applies while required children remain pending. After their
+terminal outcomes have been observed, the parent uses those outcomes to finish
+the request. Waiting for future input is appropriate only when the request
+requires continued observation, not merely because a child was launched earlier.
 
 Model-authored child sizing (`complexity` and `initial_turns`) selects only an
 initial, renewable execution slice. It is not a user-owned hard limit: a parent
@@ -145,6 +157,13 @@ and the catalog-read contract belong to
 [orchestration model selection](orchestration.md#model-selection).
 
 ## Result integration
+
+Persistent collaborator continuation currently belongs to acknowledged Codex
+conversations on the selected UserRunner. Each stage has a required admitted
+native locator; a new continuation also requires durable native-session proof.
+First-stage admission and exact source replay do not invent that proof.
+Ordinary internal Astra children retain their existing spawn, messaging,
+cancellation and recovery path, without a persistent native collaborator identity.
 
 Fanout cancellation closes admission, but is not proof that an accepted child
 has stopped. The existing cancellation event records the unassigned slot indexes

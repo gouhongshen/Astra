@@ -12,7 +12,7 @@ mod tools;
 mod types;
 
 pub use connection::{CallLogEntry, McpConnection};
-pub use error::McpError;
+pub use error::{McpError, McpToolCallError};
 pub use manager::{
     McpClientManager, McpToolCollision, McpToolCollisionSource, PreparedMcpConnection,
     PreparedMcpToolCall,

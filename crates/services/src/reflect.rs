@@ -769,11 +769,7 @@ impl ModelRequestSummary {
                 identity.offering_id.clone(),
                 identity.provider.clone(),
                 identity.model.clone(),
-                record
-                    .event
-                    .route
-                    .as_ref()
-                    .map(|route| route.upstream_model.clone()),
+                Some(record.event.route.upstream_model.clone()),
                 identity.inference_purpose.clone(),
             );
             let group = groups
@@ -1121,6 +1117,8 @@ struct ExecutionChild {
     result_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_range: Option<[u64; 3]>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1331,6 +1329,12 @@ impl EvidenceEvent {
                             hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
                         }),
                         result_truncated: child.get("result_truncated").and_then(|v| v.as_bool()),
+                        result_range: child
+                            .get("result_range")
+                            .and_then(|range| {
+                                serde_json::from_value::<[u64; 3]>(range.clone()).ok()
+                            })
+                            .filter(|[start, end, total]| start <= end && end <= total),
                     });
                 }
             }
@@ -3420,7 +3424,13 @@ mod tests {
             schema: crate::model_request_context::MODEL_REQUEST_CONTEXT_SCHEMA.into(),
             stage: ModelRequestEventStage::Terminal,
             identity,
-            route: None,
+            route: crate::ModelRequestRoute {
+                route_id: "route-1".into(),
+                invocation_id: "invocation-1".into(),
+                upstream_model: "deepseek-v4-flash".into(),
+                execution_placement: crate::ModelExecutionPlacement::Server,
+                access_kind: crate::ModelAccessKind::SelfHosted,
+            },
             lineage: ModelRequestLineage::default(),
             budget: Default::default(),
             usage: Some(ModelRequestUsage {

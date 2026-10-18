@@ -78,20 +78,19 @@ criteria:
     name: ask_user
     min: 0
     max: 0
-  - type: all_of
-    criteria:
-      - type: tools_count_between
-        min: 3
-        max: 9
-      - type: turn_rounds_between
-        min: 4
-        max: 10
-      - type: tokens_between
-        min: 1000
-        max: 300000
-      - type: duration_between
-        min_ms: 1000
-        max_ms: 45000
+  # Reference budgets are diagnostic, not calibrated performance gates.
+  - type: tools_count_between
+    min: 3
+    max: 9
+  - type: turn_rounds_between
+    min: 4
+    max: 10
+  - type: tokens_between
+    min: 1000
+    max: 300000
+  - type: duration_between
+    min_ms: 1000
+    max_ms: 45000
   - type: hard_judger
     question: |
       Is the final response a concise, user-facing completion report that

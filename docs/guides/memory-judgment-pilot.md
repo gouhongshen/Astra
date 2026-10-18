@@ -6,6 +6,18 @@ registered TypeSafe System One Offering or an ordinary LLM explicitly selected w
 silently reuses the main agent model when this binding is absent or unavailable.
 Tool permissions and execution authority still belong to the runtime.
 
+Ordinary model responses use one `answers` object with scalar values keyed by
+the exact request question IDs: Noul is `"yes"`, `"no"`, or `"unknown"`; Choice
+is a declared option key or `null`; Score is an ordered integer index or `null`.
+The existing request determines each answer's type. The shared normalizer
+validates identities and values and returns the same typed domain results used
+by consumers. Tagged answer objects are not accepted as ordinary model wire;
+there is no old-format parser or correction retry. TypeSafe's native probability
+protocol is unchanged, and only execution provenance chooses the decoder.
+Missing or invalid optional Choice observations are omitted under the existing
+abstention policy, never decoded as an old format or upgraded to acceptance.
+Unknown or unavailable verification is never interpreted as a successful task.
+
 ## Configure
 
 Register one TypeSafe connection and API key. Runtime judgments and
@@ -156,13 +168,14 @@ Requests carry the version-2 structured judgment contract: shared JSON evidence
 and keyed questions. Memory code constructs its Noul relevance/dismissal
 questions; the TypeSafe adapter only encodes the provider protocol and preserves
 native probabilities and model identity, with usage in the existing completion
-envelope. Ordinary LLMs return an explicit typed `answers` map. Their discrete
+envelope. Ordinary LLMs return a request-bound scalar `answers` map. Their discrete
 yes/no/unknown decisions never become probabilities; memory relevance retains
 unknown candidates after clear matches, while dismissal excludes unknowns.
 Memory, request classification, skill selection, and the comparison command
 share the formatter and strict response normalization in `astra-turn-types`.
 Question IDs are exact JSON strings, including numeric-looking keys such as
-`"0"`; duplicate keys, missing/extra IDs, and wrong answer types are rejected.
+`"0"`; duplicate keys, missing required IDs, extra IDs, and invalid required
+answers are rejected.
 Dismissal questions also state their positive and negative criteria explicitly:
 invalidating a lesson is different from postponing an action, changing tasks, or
 making a current-task exception.

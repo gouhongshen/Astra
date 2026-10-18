@@ -34,15 +34,17 @@ use std::sync::LazyLock;
 /// Maximum compact-JSON bytes for the built-in default T1 schema set.
 ///
 /// This is a regression budget, not a runtime truncation rule. Config-pinned
-/// tools may intentionally exceed it. The default must remain below 8 KiB:
+/// tools may intentionally exceed it. The default must remain below 9 KiB:
 /// it is the cacheable prefix sent on every agentic provider request, not a
 /// general catalog. Deferred discovery keeps the complete capability catalog
 /// reachable without quietly turning that repeated prefix back into a second
 /// system prompt. Resident schemas retain their executable types, constraints,
 /// enums, and required fields, while verbose per-parameter prose remains in
-/// the canonical catalog selected through `tool_search`.
+/// the canonical catalog selected through `tool_search`. The extra headroom
+/// covers direct provider-stage and exact collaborator-resume fields; those
+/// are part of the normal spawn contract, not a second discovery path.
 #[cfg(test)]
-pub(crate) const DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET: usize = 8 * 1024;
+pub(crate) const DEFAULT_ALWAYS_LOAD_SCHEMA_BYTE_BUDGET: usize = 9 * 1024;
 
 /// Default T1 always_load candidate tool names, derived from the single
 /// authority [`astra_runtime_env::ToolSpec`] classification.
@@ -67,8 +69,7 @@ pub fn default_always_load_names() -> &'static [String] {
 }
 
 fn canonical_builtin_surface_schema_names() -> std::collections::BTreeSet<String> {
-    let mut schemas = astra_tools::schemas::all_tool_schemas();
-    schemas.push(crate::turn::skill_tool::skill_tool_schema_v2());
+    let schemas = astra_tools::schemas::all_tool_schemas();
     schemas
         .iter()
         .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
@@ -384,13 +385,6 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "mode",
                 "timeout",
                 "force",
-                // This optional observation contract is part of Bash's
-                // stable resident shape. Adding it only while a terminal
-                // obligation is pending changes the provider tool prefix
-                // when that obligation settles and breaks prompt-cache
-                // continuity. Runtime admission still validates the field
-                // independently of this presentation contract.
-                "external_state_paths",
                 // These fields are present only on the CLI edge projection.
                 // The shared/server Bash schema does not declare them, so
                 // retaining them here cannot widen a foreground executor.
@@ -424,6 +418,13 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 // “use high reasoning” cannot produce a valid canonical field
                 // that the model's visible schema rejects.
                 "reasoning",
+                // Provider execution is an optional capability selected by the
+                // runtime. Keep its shape resident so a valid provider-backed
+                // spawn does not require a second schema-discovery round.
+                "execution",
+                // A resumed native collaborator is still the same spawn
+                // contract; the runtime validates the exact identity.
+                "collaborator_id",
                 "max_output_tokens",
                 "agent_id",
                 "timeout_ms",
@@ -432,7 +433,10 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
                 "message_type",
                 "request_id",
             ][..],
-            "No substitution. launch≠done. Wait",
+            concat!(
+                astra_tools::agent_parent_scope_guidance!(),
+                " No substitution. launch≠done. Wait. Mailbox:send_message;provider follow-up:exact collaborator_id."
+            ),
         ),
         "introspect" => (
             &[
@@ -629,7 +633,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
         "description".to_string(),
         Value::String(if managed_background {
             format!(
-                "{description} For services that must survive this call, set run_in_background with an independent ready_check; neither supplies the foreground delta. Select the full contract with tool_search for artifact preservation."
+                "{description} For services that must survive this call, set run_in_background with an independent ready_check; readiness is independent of command completion. Select the full contract with tool_search for artifact preservation."
             )
         } else {
             description

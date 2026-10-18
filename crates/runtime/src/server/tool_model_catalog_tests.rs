@@ -531,7 +531,7 @@ async fn unbound_wrong_owner_and_backend_failures_have_safe_errors() {
 }
 
 #[tokio::test]
-async fn public_executor_pages_fresh_catalog_and_detects_change() {
+async fn public_executor_recovers_from_rejections_and_pages_fresh_catalog() {
     let models = Arc::new(CatalogSpy::default());
     *models.items.lock().unwrap() = (0..20).map(fixture).collect();
     let reader = AuthorizedModelCatalogReader::new(
@@ -560,6 +560,8 @@ async fn public_executor_pages_fresh_catalog_and_detects_change() {
         json!({"source_policy":"cloud_only"}),
         json!({"question":42}),
         json!({"catalog":{}}),
+        json!({"cursor":"next"}),
+        json!({"catalog_revision":format!("sha256:{}", "0".repeat(64))}),
     ] {
         assert!(
             executor
@@ -569,6 +571,33 @@ async fn public_executor_pages_fresh_catalog_and_detects_change() {
         );
     }
     assert_eq!(models.reads.load(Ordering::SeqCst), 0);
+    let malformed = handle_model_catalog(&json!({"cursor":"next"}), "owner", Some(&reader)).await;
+    let evidence: astra_core::ToolFailureEvidence =
+        serde_json::from_value(malformed.metadata.as_ref().unwrap()["recovery_evidence"].clone())
+            .unwrap();
+    assert_eq!(
+        evidence.cause,
+        astra_core::ToolFailureCause::InvalidArguments
+    );
+    assert_eq!(models.reads.load(Ordering::SeqCst), 0);
+    // This executor intentionally has no child capacity. A rejected delegation
+    // must not poison the independent catalog operation on the same executor.
+    // This does not claim that a requested model reached model admission.
+    let rejected = executor
+        .execute_with_metadata(
+            "agent",
+            &json!({
+                "action":"spawn", "description":"Independent child",
+                "prompt":"Report your result",
+                "requested_model_policy":{"mode":"fixed","selector":{
+                    "kind":"configured_name","model_name":"unavailable-fixture-model"}}
+            }),
+        )
+        .await;
+    assert!(
+        rejected.is_error,
+        "no child execution capacity was configured"
+    );
     let first = executor
         .execute_with_metadata("model_catalog", &json!({"limit":16}))
         .await;

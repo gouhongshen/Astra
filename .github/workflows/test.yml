@@ -71,6 +71,17 @@ jobs:
         run: cargo build --locked -p astra-cli --bin mock_mcp_server
       - name: Test complete CLI inventory
         run: cargo nextest run --locked -p astra-cli --lib --bins --profile ci
+      - name: Verify native delivery through the production supervisor
+        run: |
+          cargo build --locked -p astra-cli --bin astra
+          # Build the test target once; nextest gives each exact test its own process.
+          # The strict profile leaves the complete inventory's CI JUnit file intact.
+          ASTRA_NATIVE_HARNESS_SUPERVISOR_BIN="$PWD/target/debug/astra" \
+            cargo nextest run --locked -p astra-cli --lib --profile strict \
+            --run-ignored only --test-threads 1 --retries 0 -- --exact \
+            cli::edge_lifecycle::native_delivery::tests::authenticated_shared_ws_executes_native_provider_through_cli_entrypoint \
+            edge_tools::native_codex::tests::discovery_preserves_the_whole_budget_across_protocol_phases \
+            cli::edge_lifecycle::native_delivery::tests::discovery_publishes_only_the_first_verified_path_client
       - name: Retain CLI test timings
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -350,7 +361,7 @@ jobs:
   # The aggregate requires all selected online jobs, including integration.
   test-online-core:
     name: "Test: online (core)"
-    needs: test-online
+    needs: [test-online, moi-compatibility]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -359,9 +370,57 @@ jobs:
         shell: bash
         env:
           SHARDS_RESULT: ${{ needs.test-online.result }}
+          MOI_RESULT: ${{ needs.moi-compatibility.result }}
         run: |
           set -euo pipefail
           test "$SHARDS_RESULT" = success
+          test "$MOI_RESULT" = success
+
+  # Always exercise the frozen consumer, independently of path classification.
+  # The existing required online aggregate also requires this job to succeed.
+  moi-compatibility:
+    name: "Test: MOI fresh-Astra compatibility"
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      MATRIXONE_HOST: localhost
+      MATRIXONE_PORT: "6001"
+      MATRIXONE_USER: root
+      MATRIXONE_PASSWORD: "111"
+      ASTRA_TEST_DB_IT: "1"
+      ASTRA_JWT_SECRET: ci-jwt-secret-key-at-least-32-chars-long
+      ASTRA_TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
+      ASTRA_RUNTIME_ROOT_SECRET: ci-runtime-root-secret-at-least-32-chars
+      MEMORIA_MASTER_KEY: ci-test-master-key
+      RUST_MIN_STACK: "16777216"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: ci-test
+          install-nextest: "false"
+      - name: Start isolated MatrixOne
+        run: >-
+          docker compose --env-file .env.example
+          -f deployment/all-in-one/docker-compose.deps.yml
+          up -d --wait --wait-timeout 180 matrixone
+      - name: Test historical MOI against fresh Astra
+        timeout-minutes: 25
+        run: |
+          cargo clippy --locked -p astra-runtime --features moi-compat-tests --test moi_fresh_astra -- -D warnings
+          cargo test --locked -p astra-runtime --features moi-compat-tests --test moi_fresh_astra -- --include-ignored --nocapture
+      - name: Dump MatrixOne logs
+        if: failure()
+        run: >-
+          docker compose --env-file .env.example
+          -f deployment/all-in-one/docker-compose.deps.yml logs --tail 200 matrixone
+      - name: Stop isolated dependencies
+        if: always()
+        run: >-
+          docker compose --env-file .env.example
+          -f deployment/all-in-one/docker-compose.deps.yml down -v
 
   # Each online job owns a separate MatrixOne/Memoria stack. Keep tests serial
   # within that stack; parallelism comes from isolated runners, not DB pressure.

@@ -174,6 +174,10 @@ const SESSION_DELETE_DERIVED_PARENT_TABLES: &[SessionDeleteStatement] = &[Sessio
 
 const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
+        label: "agent_session_memory_work",
+        sql: "DELETE FROM agent_session_memory_work WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
         label: "work_branch_creation_operations_origin",
         sql: "DELETE FROM work_branch_creation_operations WHERE origin_session_id = ? AND owner_id = ?",
     },
@@ -490,6 +494,7 @@ const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
 ];
 
 const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
+    ("agent_session_memory_work", "user_id"),
     ("agent_sessions", "user_id"),
     ("agent_session_execution_slots", "user_id"),
     ("session_context_heads", "owner_user_id"),
@@ -1071,15 +1076,21 @@ pub(crate) async fn hard_delete_session_rows(
     // invalidation, the reservation-specific check, and the final fence.
     query(
         "SELECT 1 FROM session_weighted_admission_gates
-         WHERE scope_name = 'canonical_turn_v1' FOR UPDATE",
+         WHERE scope_name = ? FOR UPDATE",
     )
+    .bind(crate::weighted_admission::distributed_admission_scope(
+        crate::weighted_admission::distributed_admission_partition(user_id),
+    ))
     .fetch_one(&mut **tx)
     .await
     .map_err(|source| format!("delete_session.lock_admission_gate: {source}"))?;
     let rows_deleted = query(
         "DELETE FROM session_weighted_admission_reservations
-         WHERE session_id = ? AND owner_user_id = ?",
+         WHERE scope_name = ? AND session_id = ? AND owner_user_id = ?",
     )
+    .bind(crate::weighted_admission::distributed_admission_scope(
+        crate::weighted_admission::distributed_admission_partition(user_id),
+    ))
     .bind(session_id)
     .bind(user_id)
     .execute(&mut **tx)
@@ -1097,8 +1108,11 @@ pub(crate) async fn hard_delete_session_rows(
         query(
             "UPDATE session_weighted_admission_gates
              SET usage_initialized = 0, updated_at = NOW(6)
-             WHERE scope_name = 'canonical_turn_v1'",
+             WHERE scope_name = ?",
         )
+        .bind(crate::weighted_admission::distributed_admission_scope(
+            crate::weighted_admission::distributed_admission_partition(user_id),
+        ))
         .execute(&mut **tx)
         .await
         .map_err(|source| format!("delete_session.invalidate_admission_usage: {source}"))?;

@@ -186,7 +186,7 @@ fn case_cli_arguments(case: &Case, model: &str, events_path: &str) -> Vec<String
     args
 }
 
-fn shell_escape(s: String) -> String {
+pub(crate) fn shell_escape(s: String) -> String {
     // POSIX single-quote escape: wrap in `'…'` and replace any inner
     // `'` with `'\''` (close, escaped-quote, re-open). This produces
     // a string that a POSIX shell ingests byte-for-byte — every other
@@ -1760,6 +1760,7 @@ mod tests {
             prompt: "say 'hello'".into(),
             prompt_variants: vec![],
             models: None,
+            required_models: vec![],
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec!["--verbose".into()],
@@ -2071,9 +2072,9 @@ cat "$TERMINAL_FILE"
         let mut case = simple_case();
         case.criteria = vec![crate::criteria::Criterion::ExecutionChildResultsAdopted {
             children: vec![crate::criteria::ChildExecutionExpectation {
-                expected_result: crate::criteria::ChildResultExpectation::Text(
+                expected_result: Some(crate::criteria::ChildResultExpectation::Text(
                     "observed-value".into(),
-                ),
+                )),
                 model: "test-model".into(),
                 initial_thinking: None,
                 answered_question: false,
@@ -2085,7 +2086,10 @@ cat "$TERMINAL_FILE"
         }];
         for (key, value) in [
             ("PROBE_VALUE", "expected".to_string()),
-            ("EXPECTED_CWD", tmp.path().display().to_string()),
+            (
+                "EXPECTED_CWD",
+                tmp.path().canonicalize().unwrap().display().to_string(),
+            ),
             ("PROBE_LOG", log.display().to_string()),
             ("CAPTURE_FILE", capture_path.display().to_string()),
             ("PENDING_CAPTURE_FILE", pending_path.display().to_string()),
@@ -2101,15 +2105,15 @@ cat "$TERMINAL_FILE"
         let outcome = AstraCliExecutor::new(cfg.clone())
             .execute(&case, "test-model")
             .await;
-        assert_eq!(outcome.exit_code, 0, "{}", outcome.text);
+        assert_eq!(outcome.exit_code, 0, "{outcome:?}");
         let stream = outcome.stream_capture.as_ref().unwrap();
         assert!(stream.identity_verified);
         assert!(crate::criteria::evaluate_deterministic(&case.criteria, &outcome)[0].passed);
         case.criteria = vec![crate::criteria::Criterion::ExecutionChildResultsAdopted {
             children: vec![crate::criteria::ChildExecutionExpectation {
-                expected_result: crate::criteria::ChildResultExpectation::Text(
+                expected_result: Some(crate::criteria::ChildResultExpectation::Text(
                     "wrong-result".into(),
-                ),
+                )),
                 model: "test-model".into(),
                 initial_thinking: None,
                 answered_question: false,
@@ -2345,6 +2349,7 @@ cat "$TERMINAL_FILE"
             prompt: "ignored by the shim — just needs to be non-empty".into(),
             prompt_variants: vec![],
             models: Some(vec!["ignored".into()]),
+            required_models: vec![],
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec![],
@@ -2685,6 +2690,7 @@ cat "$TERMINAL_FILE"
             prompt: "p".into(),
             prompt_variants: vec![],
             models: None,
+            required_models: vec![],
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec![],
@@ -2720,6 +2726,7 @@ cat "$TERMINAL_FILE"
             prompt: "test prompt".into(),
             prompt_variants: vec![],
             models: Some(vec!["m".into()]),
+            required_models: vec![],
             criteria: vec![],
             debug_log: false,
             extra_cli_args: vec![],

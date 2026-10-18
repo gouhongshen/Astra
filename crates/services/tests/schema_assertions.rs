@@ -1673,8 +1673,24 @@ async fn phase1_run_durability_schema_contract() {
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "session_weighted_admission_reservations").await,
+        [
+            "scope_name",
+            "isolation_domain",
+            "owner_user_id",
+            "idempotency_hash"
+        ],
+        "cross-pod admission replay must use the complete logical identity"
+    );
+    assert_eq!(
+        unique_key_columns(
+            &pool,
+            &schema,
+            "session_weighted_admission_reservations",
+            "uq_weighted_admission_reservation"
+        )
+        .await,
         ["scope_name", "reservation_id"],
-        "distributed admission reservations need one cross-pod physical identity"
+        "each admitted generation must retain a unique physical identity"
     );
     let admission_gate_columns =
         column_names(&pool, &schema, "session_weighted_admission_gates").await;
@@ -1686,11 +1702,17 @@ async fn phase1_run_durability_schema_contract() {
     );
     for expected in [
         "usage_initialized",
-        "global_resident_bytes",
-        "global_context_tokens",
-        "global_provider_slots",
-        "global_cpu_units",
-        "global_io_bytes",
+        "earliest_expiry_at",
+        "used_resident_bytes",
+        "used_context_tokens",
+        "used_provider_slots",
+        "used_cpu_units",
+        "used_io_bytes",
+        "allocated_resident_bytes",
+        "allocated_context_tokens",
+        "allocated_provider_slots",
+        "allocated_cpu_units",
+        "allocated_io_bytes",
     ] {
         assert!(
             admission_gate_columns

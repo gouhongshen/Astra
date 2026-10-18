@@ -39,6 +39,17 @@ cargo test --manifest-path Cargo.toml -q
 cargo check --manifest-path Cargo.toml
 ```
 
+On a Linux kernel with Landlock enabled, explicitly run the Bash workdir regression:
+
+```bash
+cargo test -p astra-tools --lib shell_ops::landlock_tests::bash_workdir_under_landlock -- --ignored
+```
+
+It installs a ruleset in an isolated test subprocess, denies reads of the filesystem
+root and workspace ancestors, and checks pinned Bash execution, source inspection,
+and rejection of outside-workspace access. It fails if Landlock is unavailable;
+ordinary offline runs leave this kernel-specific test ignored.
+
 MCP CLI tests launch the prebuilt `mock_mcp_server` beside their test executable.
 `make test-offline` builds this fixture before the workspace tests. For direct
 `cargo test` or `cargo nextest` invocations that include MCP CLI tests, first run
@@ -178,6 +189,97 @@ settlement. Replays of the same execution do not count twice. Its optional
 remained unstarted until the preceding deliveries; a late snapshot alone is not
 proof of deferred cancellation. Natural requests with unspecified cancellation
 targets and requests for an explicit deferred replacement use separate cases.
+
+## MOI consumer compatibility with a fresh Astra database
+
+`Test: MOI fresh-Astra compatibility` starts real MatrixOne and the real Astra
+HTTP router over a newly created, uniquely named database. The existing required
+`Test: online (core)` check requires this job to succeed; cancellation, failure,
+or skipping it cannot produce a green aggregate. It runs independently of path
+classification and needs no repository secrets or external model service.
+
+The consumer fixture in `crates/runtime/tests/moi_fresh_astra.rs` and its
+`normal_chat.rs` module share one baseline: Matrixflow `dev` commit
+`c244138ec330b768e7fb6ff8bbbc97f2d91081aa`, recorded in `MOI_CONTRACT_COMMIT`.
+The source contracts are:
+
+- `moi/pkg/service/agentresource/astra_protocol_astra_runtime_backend.go`
+- `moi/pkg/service/agentresource/astra_runtime_start_recovery.go`
+- `moi/pkg/service/agentresource/astra_runtime_history_recovery.go`
+- `moi/pkg/service/agentresource/astra_protocol_astra_runtime_recovery.go`
+- `moi/pkg/service/agentresource/astra_protocol_astra_runtime_session.go`
+- `moi/pkg/service/agentresource/agent_runtime_binding_reconcile.go`
+- `moi/pkg/components/astrabinding/registrar.go`
+- `moi/pkg/components/astraauth/provider_request.go`
+- `moi/pkg/api/handlers/agent_runtime_gateway.go`
+
+Requests, HMAC signing and response parsing intentionally do not use Astra's
+request/response structs. Missing-resource errors come from the real empty
+database, not a mock. The mock represents retained MOI data and its bounded
+pre-run repair policy: one session repair and one full binding-set repair, only
+for the exact missing-resource codes and identities, never after run allocation.
+Changing Astra's API must not be accompanied by silently updating this frozen
+consumer to make a breaking change pass. CI does not fetch a moving MOI branch.
+To advance the baseline, review the MOI changes from the pinned commit, update
+the shared fixture and affected assertions, and record the new commit here and
+in `MOI_CONTRACT_COMMIT`. A pass applies to that consumer baseline, not an older
+MOI deployment automatically.
+
+The two journeys cover an existing conversation and an existing agent opening
+a new conversation. They verify idempotent session/binding registration,
+foundation plus extension bindings, historical text/file references reaching
+the model, discovery snapshots and callback discovery, authenticated Skill/MCP
+callbacks, successful SSE termination and a subsequent turn reusing context
+without repeating model/tool work. A deterministic loopback model checks its
+actual inputs; canned answer text alone is not accepted as proof of restoration.
+
+The same required job also runs `moi_fresh_astra/normal_chat.rs` through that
+consumer and real router/database. The pinned consumer accepts
+`cancellation_requested`; the test still requires actual `cancelled` settlement
+before reusing the session. It checks:
+
+- reasoning and text arrive before the model finishes (a controlled upstream
+  stream barrier, not timing assumptions), with complete ordered output;
+- Skill/MCP start and result events retain their tool/call identities;
+- successful `run_finished` is followed by authoritative `turn_complete`,
+  agreeing with the streamed answer, before EOF;
+- an active session rejects a concurrent turn with its structured conflict;
+- the signed `DELETE /chat/runs/{run_id}` cancels a live run, preserves an
+  already completed run, and reports `run_not_found` for a lost historical run;
+- the negotiated `x-moi-model-gateway-error-contract: v1` payment rejection
+  preserves the error code, HTTP status, action and retryability in a correlated
+  failure and failed terminal, without a successful answer or provider-body leak;
+- the same session accepts subsequent turns after cancellation and failure.
+
+Scripted providers have a finite response inventory: duplicate inference or an
+unexpected call fails the test rather than receiving a generic mock response.
+
+Buffered and live consumers share the pinned MOI SSE framing rules, including
+LF/CRLF, multiline data, EOF frames and stopping at `[DONE]`. Negative controls
+reject an early `[DONE]` even when a terminal follows it. MCP and Skill callbacks
+use distinct routes and validate JSON-RPC 2.0, route/method admission and the
+runtime grant; invalid callbacks fail the journey even if Astra retries. The
+same CI command includes these parser/admission controls and the database journey.
+
+This is an interaction contract, not an old-Astra-schema migration test, an
+in-flight upgrade test, or an LLM quality benchmark. It protects these concrete
+consumer journeys, not every possible MOI feature.
+
+To run against a **disposable local MatrixOne**, supply the normal explicit
+`MATRIXONE_*`, `ASTRA_JWT_SECRET`, `ASTRA_TOKEN_ENCRYPTION_KEY`,
+`ASTRA_RUNTIME_ROOT_SECRET` and `MEMORIA_MASTER_KEY` test settings, then:
+
+```bash
+ASTRA_TEST_DB_IT=1 RUST_MIN_STACK=16777216 \
+cargo test --locked -p astra-runtime --features moi-compat-tests \
+  --test moi_fresh_astra -- --include-ignored --nocapture
+```
+
+No Memoria process is needed. The test creates and drops only its own
+`astra_test_moi_<uuid>` database. A failed run can leave that diagnostic database
+behind; CI disposes of the entire isolated dependency stack. The dedicated
+feature keeps this test out of generic offline/online lanes, avoiding duplicate
+full-stack execution.
 
 ## Where Tests Live
 
@@ -337,8 +439,15 @@ ASTRA_BACKEND_SERVICE_KEY=test-service-key-e2e \
 ASTRA_LLM_RETRY_BASE_MS=10 ASTRA_DEFAULT_RETRY_AFTER_MS=10 ASTRA_BCRYPT_COST=4 \
 RUST_MIN_STACK=16777216 \
 cargo test -p astra-runtime --test system_matrix_http_e2e --features e2e-hooks -- \
-  --ignored --nocapture
+  --ignored --nocapture --test-threads=1
 ```
+
+Run journeys sharing a database serially: every Server bootstrap performs
+startup recovery and can fence another fixture's live execution under the same
+process owner. Parallel journeys require separate databases, not just distinct
+users or sessions. The Phase-0 production baseline journeys have additional
+exclusive-run configuration; see their dedicated instructions before enabling
+them.
 
 Requires the same environment as `astra-server`: `MATRIXONE_*`,
 `ASTRA_JWT_SECRET`, `ASTRA_TOKEN_ENCRYPTION_KEY`, Memoria, and embedding
@@ -561,6 +670,26 @@ make test-offline
 # 4. With MatrixOne + Memoria up: add online #[ignore] suites (same as the second half of `make test`)
 make test-online
 ```
+
+## Durable session-memory regressions
+
+Use a designated isolated MatrixOne database and the environment described in
+this guide; these tests must not run against QA, production or a populated local
+database. The runtime fixture uses a loopback Memoria backend and synthetic
+identities, with no live model or Memoria credentials.
+
+```bash
+ASTRA_TEST_DB_IT=1 ASTRA_TEST_DATABASE="$ASTRA_DATABASE" \
+  cargo test -p astra-services --test session_memory_lifecycle_db_it -- --ignored --test-threads=1
+ASTRA_TEST_DB_IT=1 ASTRA_TEST_DATABASE="$ASTRA_DATABASE" \
+  cargo test -p astra-runtime --lib session_memory::durable::tests -- --ignored --test-threads=1
+cargo test -p astra-cli --lib cli::session::session_startup::tests::cli_ -- --test-threads=1
+```
+
+The database tests cover canonical-context handoff recovery, shared fencing and
+lease takeover. Runtime tests exercise authenticated exit/close/status HTTP
+routes and partial-stage retry after lost receipts. CLI tests cover distinct
+Astra/Memoria owners and unsuccessful queue acknowledgments without purge.
 
 ## What "done" Means
 

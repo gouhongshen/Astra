@@ -25,7 +25,7 @@ fn basic_chat_context<'a>(
 ) -> BasicCliChatContext<'a> {
     BasicCliChatContext {
         api: &api,
-        auth_profile: None,
+        auth_owner: None,
         message,
         offering_id: None,
         model: Some("test-model"),
@@ -198,7 +198,7 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
     let mut context = BasicCliChatContext {
         mcp_manager: Some(mcp_manager.clone()),
         api: &api,
-        auth_profile: None,
+        auth_owner: None,
         message: "What is still running?",
         offering_id: None,
         model: Some("test-model"),
@@ -343,7 +343,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
     let mut result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
-        auth_profile: None,
+        auth_owner: None,
         message: "hi",
         user_intent: "hi",
         input_runtime_required_texts: &[],
@@ -527,7 +527,7 @@ async fn stream_chat_sse_simple_text_response() {
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
-        auth_profile: None,
+        auth_owner: None,
         message: "hi",
         user_intent: "hi",
         input_runtime_required_texts: &[],
@@ -653,7 +653,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
     let turn = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
-        auth_profile: None,
+        auth_owner: None,
         message: "hi",
         user_intent: "hi",
         input_runtime_required_texts: &[],
@@ -797,7 +797,7 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
         stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
-            auth_profile: None,
+            auth_owner: None,
             message: "delegate this work",
             user_intent: "delegate this work",
             input_runtime_required_texts: &[],
@@ -909,7 +909,7 @@ async fn stream_chat_sse_api_error_propagated() {
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
-        auth_profile: None,
+        auth_owner: None,
         message: "hi",
         user_intent: "hi",
         input_runtime_required_texts: &[],
@@ -1028,7 +1028,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
         let result = stream_chat_sse(ChatTurnParams {
             api: &api,
             token: "fake-token",
-            auth_profile: None,
+            auth_owner: None,
             message: "run echo hi",
             user_intent: "run echo hi",
             input_runtime_required_texts: &[],
@@ -1201,7 +1201,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
-        auth_profile: None,
+        auth_owner: None,
         message: "write inside a transaction",
         user_intent: "write inside a transaction",
         input_runtime_required_texts: &[],
@@ -1370,7 +1370,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
     let result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
-        auth_profile: None,
+        auth_owner: None,
         message: "review local changes",
         user_intent: "review local changes",
         input_runtime_required_texts: &[],
@@ -1537,7 +1537,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
     let failure = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
-        auth_profile: None,
+        auth_owner: None,
         message: "continue after interrupted turn",
         user_intent: "continue after interrupted turn",
         input_runtime_required_texts: &[],
@@ -1727,7 +1727,7 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
         let unified_skill_registry = astra_runtime::skills::empty_unified_registry().clone();
         let context = BasicCliChatContext {
             api: &api,
-            auth_profile: None,
+            auth_owner: None,
             message: "call echo",
             offering_id: None,
             model: Some("test-model"),
@@ -2139,4 +2139,104 @@ async fn stream_chat_sse_stdout_probe() {
     .await
     .unwrap();
     assert_eq!(result.full_text, "terminal publication marker");
+}
+
+#[tokio::test]
+async fn basic_cli_catalog_rejection_preserves_typed_preflight_evidence() {
+    use crate::cli::turn::{execute_basic_cli_turn, turn_facade::BasicCliTurnOptions};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    for status in [401, 403, 429] {
+        for selected in [None, Some("test-model")] {
+            let server = MockServer::start().await;
+            Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                        "detail": "synthetic catalog denial"
+                    })),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let registry = astra_runtime::skills::default_unified_registry();
+            let mut context = basic_chat_context(&api, &registry, "synthetic preflight");
+            context.model = selected;
+            let mut pm = PermissionManager::new(true);
+            let failure = execute_basic_cli_turn(
+                &context,
+                "synthetic-token",
+                None,
+                &mut pm,
+                BasicCliTurnOptions::default(),
+            )
+            .await
+            .expect_err("catalog rejected");
+            assert_eq!(
+                failure
+                    .partial
+                    .error_metadata
+                    .as_ref()
+                    .and_then(|v| v["http_status"].as_u64()),
+                Some(status as u64),
+                "{selected:?}: {failure:?}"
+            );
+            assert_eq!(
+                crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure),
+                status == 401
+            );
+            assert!(failure.partial.run_id.is_none());
+            assert!(failure.partial.tool_call_records.is_empty());
+            server.verify().await;
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn unsupported_workspace_host_rejects_public_turn_before_admission_http() {
+    use crate::cli::chat_stream::WORKSPACE_HOST_VALIDATION_FOR_TEST;
+    use astra_tools::workspace_observation::WorkspaceLeaseFailure;
+    let _home = crate::test_utils::HomeGuard::temp();
+    let _credentials = crate::test_utils::isolate_credentials();
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/models"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(crate::test_utils::mock_model_catalog_json(&["test-model"])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "write a file in this workspace");
+    let mut pm = PermissionManager::new(true);
+    let failure = WORKSPACE_HOST_VALIDATION_FOR_TEST
+        .scope(
+            Err(WorkspaceLeaseFailure::CoordinationHostUnsupported),
+            async {
+                stream_chat_sse(ChatTurnParams::basic_cli(
+                    &context,
+                    "synthetic-token",
+                    None,
+                    &mut pm,
+                ))
+                .await
+            },
+        )
+        .await
+        .expect_err("unsupported local host must reject before Server admission");
+    assert!(failure.error.contains("root-owned"), "{failure:?}");
+    assert!(failure.error.contains("administrator"), "{failure:?}");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "only the read-only model catalog may be requested"
+    );
+    assert_eq!(requests[0].method.as_str(), "GET");
+    assert_eq!(requests[0].url.path(), "/models");
+    assert!(failure.partial.run_id.is_none());
+    assert!(failure.partial.tool_call_records.is_empty());
 }

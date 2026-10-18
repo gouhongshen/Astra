@@ -641,6 +641,7 @@ async fn handle_edge_connection(
         &ws_sink,
         EdgeServerMessage::AuthOk {
             user_id: user_id.clone(),
+            edge_id: edge_id_for_registry.clone(),
             interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
         },
     )
@@ -678,10 +679,89 @@ async fn handle_edge_connection(
         astra_server_types::edge_connection_pool::EDGE_WS_CHANNEL_CAPACITY,
     );
     let ws_sink_fwd = ws_sink.clone();
+    let forward_pool = state.edge_connection_pool.clone();
+    let forward_user = user_id.clone();
+    let forward_edge = edge_agent_id.clone();
+    let (forward_generation_tx, forward_generation_rx) = tokio::sync::oneshot::channel();
     let forward_task = tokio::spawn(async move {
-        while let Some(msg) = pool_rx.recv().await {
-            if send_edge_msg(&ws_sink_fwd, msg).await.is_err() {
+        let Ok(generation) = forward_generation_rx.await else {
+            return;
+        };
+        let Some(cancel_wake) =
+            forward_pool.cancellation_wake(&forward_user, &forward_edge, generation)
+        else {
+            return;
+        };
+        // Reconnect inspects retained cancellation once. Ordinary frames do
+        // not scan every pending invocation on every socket write.
+        cancel_wake.notify_one();
+        loop {
+            let msg = tokio::select! {
+                biased;
+                _ = cancel_wake.notified() => {
+            for (request_id, delivery_generation) in forward_pool
+                .pending_cancellations_for_connection(&forward_user, &forward_edge, generation)
+            {
+                let sent = tokio::time::timeout(
+                    astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT,
+                    send_edge_msg(
+                        &ws_sink_fwd,
+                        EdgeServerMessage::ToolCancel {
+                            request_id: request_id.clone(),
+                            delivery_generation,
+                        },
+                    ),
+                )
+                .await;
+                if !matches!(sent, Ok(Ok(()))) {
+                    return;
+                }
+                forward_pool.cancellation_forwarded(&request_id, delivery_generation, generation);
+            }
+                    continue;
+                },
+                msg = pool_rx.recv() => msg,
+            };
+            let Some(msg) = msg else {
                 break;
+            };
+            let request_delivery = match &msg {
+                EdgeServerMessage::ToolRequest {
+                    request_id,
+                    delivery_generation,
+                    ..
+                } => {
+                    if !forward_pool.queued_request_is_live(
+                        &forward_user,
+                        &forward_edge,
+                        generation,
+                        request_id,
+                        *delivery_generation,
+                    ) {
+                        continue;
+                    }
+                    Some((request_id.clone(), *delivery_generation))
+                }
+                _ => None,
+            };
+            if !matches!(
+                tokio::time::timeout(
+                    astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT,
+                    send_edge_msg(&ws_sink_fwd, msg),
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                break;
+            }
+            if let Some((request_id, delivery_generation)) = request_delivery {
+                forward_pool.request_forwarded(
+                    &forward_user,
+                    &forward_edge,
+                    generation,
+                    &request_id,
+                    delivery_generation,
+                );
             }
         }
     });
@@ -702,9 +782,10 @@ async fn handle_edge_connection(
             workspace_id.clone(),
             Some(registration_lease.current.registry_id.clone()),
             registration_lease.current.materialization_id.clone(),
-            registration_lease.current.edge_id.clone(),
+            Some(edge_id_for_registry.clone()),
             pool_tx,
         );
+    let _ = forward_generation_tx.send(pool_generation);
     // Independently poll publication and its deadline even while a message or
     // heartbeat handler awaits database resources. JoinSet aborts on owner drop;
     // normal teardown also joins cancellation before durable unregister.
@@ -884,7 +965,7 @@ async fn handle_edge_connection(
                                     output,
                                     is_error,
                                     duration_ms,
-                                    mut tool_result_fields,
+                                    tool_result_fields,
                                 }) => {
                                     if request_id != identity.storage_key() {
                                         tracing::warn!(
@@ -896,13 +977,6 @@ async fn handle_edge_connection(
                                         );
                                         continue;
                                     }
-                                    // Edge result fields are client input.  In particular an
-                                    // external-state postimage receipt cannot become durable
-                                    // completion evidence until the protocol carries a
-                                    // server-issued, single-use executor attestation.  Failing
-                                    // closed here prevents forged or replayed JSON from crossing
-                                    // the transport boundary as trusted metadata.
-                                    strip_untrusted_external_effect_fields(&mut tool_result_fields);
                                     let inflight = read_inflight.get(&request_id).await;
                                     let direct_result = EdgeToolResult {
                                         output: output.clone(),
@@ -1037,6 +1111,43 @@ async fn handle_edge_connection(
                                         &user_id, &edge_agent_id, pool_generation, &request_id,
                                         connection_generation, result,
                                     );
+                                }
+                                Ok(EdgeClientMessage::ToolInputAck {
+                                    request_id,
+                                    delivery_generation,
+                                    ack,
+                                }) => {
+                                    if ack.input_id.trim().is_empty()
+                                        || ack.input_id != ack.input_id.trim()
+                                    {
+                                        tracing::warn!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            "Edge WS: rejected provider input acknowledgement with invalid input identity"
+                                        );
+                                        continue;
+                                    }
+                                    let accepted = state
+                                        .edge_connection_pool
+                                        .deliver_provider_stage_input_ack(
+                                            &user_id,
+                                            &edge_agent_id,
+                                            &request_id,
+                                            delivery_generation,
+                                            ack,
+                                        );
+                                    if !accepted {
+                                        tracing::debug!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            delivery_generation,
+                                            "Edge WS: provider input acknowledgement had no matching waiter"
+                                        );
+                                    }
                                 }
                                 Ok(EdgeClientMessage::Ping {}) => {
                                     let _ = send_edge_msg(&ws_sink_write, EdgeServerMessage::Pong {}).await;
@@ -1459,16 +1570,6 @@ async fn fail_inflight_edge_dispatches(
     failed
 }
 
-fn strip_untrusted_external_effect_fields(
-    fields: &mut Option<serde_json::Map<String, serde_json::Value>>,
-) {
-    if let Some(fields) = fields.as_mut() {
-        fields.remove(astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD);
-        fields.remove(astra_tools::workspace_observation::EXTERNAL_EFFECT_SCOPE_FIELD);
-        fields.remove(astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD);
-    }
-}
-
 #[cfg(test)]
 mod inflight_dispatch_tracker_tests {
     use super::*;
@@ -1533,26 +1634,6 @@ mod inflight_dispatch_tracker_tests {
         );
         assert!(tracker.remove("req-1").await.is_some());
     }
-
-    #[test]
-    fn edge_client_cannot_inject_external_completion_receipt() {
-        let mut fields = Some(serde_json::json!({
-            astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD: true,
-            astra_tools::workspace_observation::EXTERNAL_EFFECT_SCOPE_FIELD: "declared_external_state",
-            astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD: {"schema": "external_effect_receipt.v1"},
-            "exit_code": 0,
-        }).as_object().expect("object").clone());
-        strip_untrusted_external_effect_fields(&mut fields);
-        let fields = fields.expect("preserve unrelated fields");
-        assert_eq!(fields.get("exit_code"), Some(&serde_json::json!(0)));
-        assert!(
-            !fields.contains_key(astra_tools::workspace_observation::EXTERNAL_EFFECT_RECEIPT_FIELD)
-        );
-        assert!(
-            !fields
-                .contains_key(astra_tools::workspace_observation::EXTERNAL_EFFECT_OBSERVED_FIELD)
-        );
-    }
 }
 
 async fn fail_claimed_edge_dispatch(
@@ -1610,8 +1691,12 @@ async fn fail_claimed_edge_dispatches(
 /// (a malicious edge could fabricate them) and ensures the executor type
 /// is consistent with an edge connection.
 ///
-/// Returns the sanitized capabilities JSON. Invalid, mismatched, absent, or
-/// unusable advertisements fail the handshake before registration.
+/// Returns the sanitized capabilities JSON. Invalid, mismatched, or absent
+/// advertisements fail the handshake before registration. An authenticated
+/// Edge may advertise no executable capacity: that is the control-only state
+/// used while replaying durable receipts after a local provider disappears.
+/// It cannot receive new tool work because it has neither a builtin tool
+/// surface nor a provider discovery declaration.
 fn validate_edge_capabilities(
     capabilities: Option<serde_json::Value>,
     edge_agent_id: &str,
@@ -1648,22 +1733,8 @@ fn validate_edge_capabilities(
         })
         .transpose()?;
 
-    let mut advert = match serde_json::from_value::<
-        astra_runtime_env::RuntimeEnvironmentAdvertisement,
-    >(capabilities.clone())
-    {
-        Ok(a) => a,
-        Err(error) => return Err(format!("invalid edge capabilities: {error}")),
-    };
-
-    // Reject schema versions we don't understand.
-    if advert.schema_version != astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported edge capability schema version {}; expected {}",
-            advert.schema_version,
-            astra_runtime_env::RuntimeEnvironmentAdvertisement::SCHEMA_VERSION,
-        ));
-    }
+    let mut advert = astra_runtime_env::RuntimeEnvironmentAdvertisement::decode(capabilities)
+        .map_err(|error| error.to_string())?;
 
     // Ensure the executor is actually an edge agent (not a cloud executor
     // or local CLI masquerading as edge).
@@ -1708,10 +1779,6 @@ fn validate_edge_capabilities(
             "edge advertised tools outside edge provider ownership — stripped"
         );
     }
-    if advert.binding.tool_surface.tool_names.is_empty() {
-        return Err("edge capabilities contain no admissible edge tools".to_string());
-    }
-
     let mut sanitized = serde_json::to_value(&advert)
         .map_err(|error| format!("edge capabilities could not be serialized: {error}"))?;
     if let Some(providers) = capacity_providers {
@@ -1847,7 +1914,7 @@ mod tests {
         async fn wait_result(
             &self,
             _identity: &EdgeDispatchIdentity,
-            _timeout: std::time::Duration,
+            _timeout: Option<std::time::Duration>,
         ) -> Result<Option<String>, String> {
             Err("not used".to_string())
         }
@@ -1933,6 +2000,38 @@ mod tests {
         serde_json::to_value(advert).expect("edge advertisement serializes")
     }
 
+    fn provider_only_edge_advertisement() -> serde_json::Value {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let mut advert = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::edge_developer("/workspace", &registry),
+        );
+        let declaration = astra_turn_types::ProviderToolDeclaration {
+            native_tool_id: astra_turn_types::NativeToolId::new("native_codex")
+                .expect("provider tool id"),
+            native_tool_name: "native_codex".to_string(),
+            stable_tool_alias: None,
+            title: Some("Native collaborator".to_string()),
+            description: Some("provider stage".to_string()),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            claims: Default::default(),
+            task_support: astra_turn_types::ProviderTaskSupport::Required,
+            extension_fields: Default::default(),
+        };
+        let snapshot = astra_turn_types::ProviderDiscoverySnapshot::new(
+            astra_turn_types::ProviderIdentity::new("edge-agent").expect("provider identity"),
+            astra_turn_types::ProviderBindingRef::new("edge-binding").expect("binding"),
+            astra_turn_types::ProviderProtocolId::new("cli-local").expect("protocol"),
+            vec![declaration],
+        )
+        .expect("provider discovery snapshot");
+        advert.binding.tool_surface.tool_names.clear();
+        advert.binding.tool_surface.admissions.clear();
+        advert.binding.tool_surface.denials.clear();
+        advert.provider_discovery = vec![snapshot];
+        serde_json::to_value(advert).expect("provider-only edge advertisement serializes")
+    }
+
     fn relay_tool_request(args: serde_json::Value, tool: &str) -> EdgeServerMessage {
         EdgeServerMessage::ToolRequest {
             request_id: "dispatch-request".to_string(),
@@ -1949,9 +2048,13 @@ mod tests {
             delivery_generation: 1,
             tool: tool.to_string(),
             args,
+            execution_ceiling: None,
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,
-            timeout_secs: 30,
+            timeout_secs: Some(30),
+            execution_deadline_unix_ms: None,
+            execution_timeout_ms: None,
+            command_timeout_cap_ms: None,
         }
     }
 
@@ -2061,6 +2164,36 @@ mod tests {
     }
 
     #[test]
+    fn validate_edge_capabilities_accepts_provider_only_edge() {
+        let sanitized = validate_edge_capabilities(
+            Some(provider_only_edge_advertisement()),
+            "edge-agent",
+            "user-1",
+        )
+        .expect("provider-only edge must be admissible");
+        let advert: RuntimeEnvironmentAdvertisement =
+            serde_json::from_value(sanitized).expect("sanitized advertisement");
+
+        assert!(advert.binding.tool_surface.tool_names.is_empty());
+        assert_eq!(advert.provider_discovery.len(), 1);
+        assert_eq!(
+            advert.provider_discovery[0].tool_declarations[0].native_tool_name,
+            "native_codex"
+        );
+    }
+
+    #[test]
+    fn validate_edge_capabilities_accepts_control_only_edge() {
+        let capabilities = edge_advertisement_with_tools(&[]);
+        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1")
+            .expect("an authenticated control-only edge must be able to recover receipts");
+        let advert: RuntimeEnvironmentAdvertisement =
+            serde_json::from_value(sanitized).expect("sanitized advertisement");
+        assert!(advert.binding.tool_surface.tool_names.is_empty());
+        assert!(advert.provider_discovery.is_empty());
+    }
+
+    #[test]
     fn validate_edge_capabilities_preserves_known_protocol_versions_only() {
         let mut capabilities = edge_advertisement_with_tools(&["read_file"]);
         capabilities["protocol_capabilities"] = serde_json::json!({
@@ -2129,11 +2262,29 @@ mod tests {
     }
 
     #[test]
+    fn validate_edge_capabilities_reports_unsupported_capability_schema_before_body() {
+        for version in [1, u64::from(u32::MAX)] {
+            let error = validate_edge_capabilities(
+                Some(serde_json::json!({"schema_version": version})),
+                "edge-agent",
+                "user-1",
+            )
+            .unwrap_err();
+            assert!(error.contains(&format!("schema v{version}")), "{error}");
+            assert!(error.contains("expects v2"), "{error}");
+            assert!(error.contains("upgrade"), "{error}");
+            assert!(!error.contains("missing field"), "{error}");
+        }
+    }
+
+    #[test]
     fn validate_edge_capabilities_rejects_absent_malformed_and_unknown_schema() {
         assert!(validate_edge_capabilities(None, "edge-agent", "user-1").is_err());
         assert!(
             validate_edge_capabilities(
-                Some(serde_json::json!({"schema_version": 1})),
+                Some(serde_json::json!({
+                    "schema_version": RuntimeEnvironmentAdvertisement::SCHEMA_VERSION
+                })),
                 "edge-agent",
                 "user-1"
             )

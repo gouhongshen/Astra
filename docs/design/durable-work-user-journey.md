@@ -2,7 +2,7 @@
 
 > Status: target design contract; current support and verification limits are
 > described in the final section.
-> Last updated: 2026-09-16.
+> Last updated: 2026-10-18.
 
 This document owns the user-visible journey for finding, observing, continuing,
 and changing the execution provider for one durable Work across TUI, Web, and
@@ -181,6 +181,75 @@ The user-visible states are:
 | Provider binding | `Session/workspace + binding generation` | Canonical selection authorizes provider use at Run admission and invocation dispatch |
 | Workspace materialization | persisted `materialization_id` plus authenticated canonical checkout root and repo identity/ref/tree hash | The local Edge state identity survives reconnects and Edge-label changes; independent Sessions may bind it, while the executor's workspace coordination lease serializes physical operations. A matching hash proves committed tree identity, not environment or external effects |
 
+The shared CLI/Edge runtime-env owner persists the canonical checkout identity
+under the default device-state directory, keyed by the canonical checkout path.
+Isolated cache roots mirror that identity and reject conflicting values; they
+cannot create a second identity owner. When a filesystem UUID is available,
+Unix mount device/inode metadata only seed a first registration: a changed mount
+number does not invalidate the published identity. New registrations keep the
+pre-UUID device/path/device-number/inode seed so an older client can read an
+unchanged checkout. The UUID belongs only in the independent witness, not the ID
+seed. Previously published IDs, including UUID-seeded IDs from an earlier
+implementation, remain byte-for-byte unchanged; this does not make those IDs
+readable by older clients. An older client still cannot handle mount-number
+drift because it does not consult the witness. A bounded `.checkout` sidecar records a
+device/path/filesystem-UUID/inode fingerprint without the volatile mount number.
+The filesystem UUID comes from macOS `ATTR_VOL_UUID` or Linux
+`FS_IOC_GETFSUUID`, read through the same open directory as its inode. A changed
+volume is rejected even when its root happens to have the same inode number.
+`st_dev`, mount IDs and `statfs.f_fsid` are not substitutes for this UUID:
+they can depend on mount allocation. Filesystem clones retaining the same UUID
+and inode are outside this discriminator's guarantees.
+
+An unavailable Linux UUID API (`ENOTTY`, `EOPNOTSUPP`, or `ENOSYS`) preserves the
+original strict device-and-inode validation if no UUID witness exists. A valid
+legacy `.id` on an unchanged checkout is retained byte-for-byte; fresh registration
+also works. No inode-only witness is written, and changed devices/inodes remain
+rejected when continuity cannot be established. If a UUID witness already exists,
+an unavailable API does not remove or downgrade it: startup fails explicitly.
+Permission/I/O failures and malformed, missing or zero UUID data are not treated
+as an unavailable API. Once the API becomes available, a witness can be published
+without rotating an existing legacy ID.
+Without UUID evidence, reused device/inode values cannot distinguish filesystem
+replacement; this path preserves the pre-existing checks, not UUID-level guarantees.
+On Unix, a later inode change
+also rejects directory replacement at the same path instead of reusing the old ID;
+it requires explicit identity recovery/re-registration. Legacy `.id` files have
+no inode witness: their first upgraded start binds the current directory, so a
+replacement before that migration cannot be detected. Non-Unix binding checks
+cover device identity and canonical path only, as before.
+Existing canonical default-state identity values are retained. A path-alias file
+is a mirror of an existing canonical owner and must match that owner's ID. If
+there is no canonical owner, alias migration must match the original strict
+device/path/device-number/inode seed before publishing any canonical owner or
+witness. An unchanged legacy alias retains its exact bytes; an alias whose target
+or unprovable mount binding changed fails closed instead of relabelling the old
+target's identity. Restore the original checkout or explicitly back up/remove
+only that unverified alias before registering the current target again. No
+extra alias mapping or state format is introduced. Identity
+files remain bounded regular files with atomic no-replace publication; malformed
+or symlinked state is rejected. A conflicting legacy identity present only in an
+isolated cache is not adopted when the default-state owner is absent; the cache
+is left unchanged and requires explicit recovery. This does not change
+authenticated provider binding, repository attestation, or executor-local
+workspace coordination.
+
+For an **intentional checkout replacement**, stop all Astra/astra-edge processes
+using that checkout. Back up and remove only its canonical
+`edge-materializations/<canonical-path-hash>.id` **and the matching `.checkout`**
+under the default device-state root, together with that checkout's older path
+alias and isolated-cache `.id` mirrors. Removing `.id` alone does not reset the
+checkout guard. Register the replacement checkout again; do not treat this as
+permission to resume the previous checkout's Session/provider binding. Deleting
+the owner and witness is an explicit loss of continuity
+evidence, not proof of a new identity: recycled device/inode values can reproduce
+the legacy seed. Do not use such a reset to authorize an old Session binding. Keep
+`device.id`, login credentials and unrelated checkout state. For a conflicting
+isolated cache/alias only, back up/remove only that conflicting mirror, retaining
+the canonical `.id` and `.checkout`. No automatic deletion or identity repair is
+performed. Failure to verify an already published UUID witness requires restoring
+UUID API support, not deleting that witness to bypass its protection.
+
 Client URLs and normal user-facing controls identify Work and branch. Session
 and Run ids remain available in diagnostics and repair surfaces, not as the
 primary navigation model.
@@ -344,6 +413,16 @@ the only physical-operation serialization boundary.
 - Web chat history imports Server sessions tagged `source=web_v1`; a TUI Session
   is not automatically inserted into the Web chat list. The Work page is the
   current cross-surface entry point.
+- A task assignment is not evidence that its tools executed. Tool invocation
+  decisions freeze the producer Run and exact Work/branch/item revision/attempt
+  before dispatch, and the canonical journal retains that attribution even when
+  completion persistence fails. Harness replacement checks count actual executed
+  invocations, including failed outcomes, rather than treating a claim as a side
+  effect. Missing, conflicting, or stale attribution cannot certify that a
+  cancelled task remained unexecuted; replay uses the original frozen decision.
+  Pipeline-intercepted skill executions freeze the same attribution before
+  execution. Already-loaded skill receipts are suppressed, not executed; a
+  subsequent admission rejection remains rejected.
 - Work now has a durable execution-selection record keyed by isolation domain,
   owner, Session, and branch. Authorized admission pins the canonical Server
   sandbox or records an authenticated Edge placement. A read never creates or

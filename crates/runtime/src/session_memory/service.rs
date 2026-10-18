@@ -150,7 +150,9 @@ impl MemoryInferenceResolver for ConstMemoryInferenceResolver {
 /// Per-process background extraction coordinator. Build once at
 /// server/CLI boot, hold an [`Arc`] on
 /// [`crate::turn::agentic_loop::host::AgenticLoopState`].
+#[derive(Clone)]
 pub struct MemoryExtractionService {
+    durable_store: Option<astra_services::session_memory_lifecycle::SessionMemoryLifecycleStore>,
     inference_resolver: Arc<dyn MemoryInferenceResolver>,
     memoria_client: Arc<dyn MemoriaPort>,
     ingestion: IngestionSender,
@@ -259,6 +261,7 @@ impl MemoryExtractionService {
         broker: Arc<BackgroundActivityBroker>,
     ) -> Self {
         Self {
+            durable_store: None,
             inference_resolver,
             memoria_client,
             ingestion,
@@ -278,6 +281,101 @@ impl MemoryExtractionService {
             require_local_current_snapshot: false,
             extraction_work_timeout: EXTRACTION_WORK_TIMEOUT,
         }
+    }
+
+    pub(crate) fn with_durable_store(mut self, pool: astra_core::SharedPool) -> Self {
+        self.durable_store =
+            Some(astra_services::session_memory_lifecycle::SessionMemoryLifecycleStore::new(pool));
+        self
+    }
+
+    /// Publish canonical inputs before user-visible turn completion. Expensive
+    /// extraction stays detached; only this bounded durable handoff is inline.
+    pub(crate) async fn prepare_request(&self, req: &ExtractionRequest) -> Result<bool, String> {
+        let Some(store) = self.durable_store.as_ref() else {
+            return Ok(true);
+        };
+        if !self.memoria_client.admits_operation(true).await? {
+            return Ok(false);
+        }
+        let owner = self
+            .user_id
+            .as_deref()
+            .ok_or("unbound extraction service")?;
+        use sha2::{Digest, Sha256};
+        let request = serde_json::to_value(req).map_err(|error| error.to_string())?;
+        let fingerprint = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&request).map_err(|error| error.to_string())?)
+        );
+        store
+            .publish(
+                owner,
+                req.session_id().ok_or("missing session identity")?,
+                request,
+                fingerprint,
+            )
+            .await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn run_durable_claim(
+        self: Arc<Self>,
+        claim: astra_services::session_memory_lifecycle::SessionMemoryWorkClaim,
+    ) -> Result<(), String> {
+        let store = self
+            .durable_store
+            .clone()
+            .ok_or("durable extraction storage is unavailable")?;
+        let req: ExtractionRequest = serde_json::from_value(
+            claim
+                .work
+                .active_request
+                .clone()
+                .ok_or("missing claimed extraction input")?,
+        )
+        .map_err(|error| error.to_string())?;
+        let fingerprint = extraction_input_fingerprint(&req);
+        let port = super::durable::DurableMemoriaPort {
+            inner: Arc::clone(&self.memoria_client),
+            store: store.clone(),
+            claim: claim.clone(),
+        };
+        let mut attempt = self.as_ref().clone();
+        attempt.memoria_client = Arc::new(port.clone());
+        attempt.durable_store = None;
+        let attempt = Arc::new(attempt);
+        let result = tokio::time::timeout(self.extraction_work_timeout, async {
+            if let Some(prepared) = claim.work.prepared_working.as_ref() {
+                port.replay_prepared_working(prepared).await?;
+                attempt.mark_session_extracted(
+                    &claim.session_id,
+                    fingerprint,
+                    req.turn_number().ok_or("missing extraction turn")?,
+                );
+            } else {
+                Arc::clone(&attempt)
+                    .run_one_attempt(req.clone(), fingerprint)
+                    .await;
+            }
+            Ok::<bool, String>(attempt.is_request_current(&req))
+        })
+        .await;
+        let success = match result {
+            Ok(Ok(success)) => success,
+            Ok(Err(error)) => {
+                tracing::warn!(session_id = %claim.session_id, %error, "durable extraction failed");
+                false
+            }
+            Err(_) => false,
+        };
+        store
+            .finish_extraction(
+                &claim,
+                success,
+                req.turn_number().ok_or("missing extraction turn")?,
+            )
+            .await
     }
 
     /// Mirror emitted journal events into a caller-owned local sink.
@@ -326,6 +424,7 @@ impl MemoryExtractionService {
         }
 
         let service = Arc::new(Self {
+            durable_store: self.durable_store.clone(),
             inference_resolver: Arc::clone(&self.inference_resolver),
             memoria_client: self.memoria_client.bind_owner(&scope.user_id)?,
             ingestion: self.ingestion.clone(),
@@ -549,6 +648,23 @@ impl MemoryExtractionService {
         facts: &astra_turn_types::session_facts::SessionFacts,
         session_id: &str,
     ) -> Result<crate::turn::cloud::session_end_governance::SessionEndReport, String> {
+        if let Some(store) = self.durable_store.as_ref() {
+            if !self.memoria_client.admits_operation(true).await? {
+                return Err("memory maintenance requires current write consent".into());
+            }
+            store
+                .request_finalization(
+                    self.user_id.as_deref().ok_or("unbound memory owner")?,
+                    session_id,
+                )
+                .await?;
+            return Ok(
+                crate::turn::cloud::session_end_governance::SessionEndReport {
+                    scheduled: true,
+                    ..Default::default()
+                },
+            );
+        }
         crate::turn::cloud::session_end_governance::run_session_end_governance(
             facts,
             session_id,
@@ -816,6 +932,34 @@ impl MemoryExtractionService {
     }
 
     async fn run_one(self: Arc<Self>, req: ExtractionRequest, content_fingerprint: u64) {
+        if let Some(store) = self.durable_store.as_ref() {
+            let Some(owner) = self.user_id.as_deref() else {
+                return;
+            };
+            let Some(session) = req.session_id() else {
+                return;
+            };
+            let result = async {
+                store.request_extraction(owner, session).await?;
+                if let Some(claim) = store.claim(owner, session).await? {
+                    if claim.work.active_request.is_some() {
+                        Arc::clone(&self).run_durable_claim(claim).await?;
+                    } else {
+                        store.release(&claim, true).await?;
+                    }
+                }
+                Ok::<(), String>(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(session_id = session, %error, "durable extraction dispatch failed");
+            }
+            return;
+        }
+        self.run_one_attempt(req, content_fingerprint).await;
+    }
+
+    async fn run_one_attempt(self: Arc<Self>, req: ExtractionRequest, content_fingerprint: u64) {
         // This lightweight admission task must not load snapshots, resolve a
         // model, spend tokens or schedule writes when consent forbids them.
         let Some((session_id, turn)) = req.session_coordinates() else {

@@ -15,6 +15,9 @@ function mockFetch(
     json: () => Promise.resolve(body),
     text: () =>
       Promise.resolve(typeof body === "string" ? body : JSON.stringify(body)),
+    arrayBuffer: () => Promise.resolve(new TextEncoder().encode(
+      typeof body === "string" ? body : JSON.stringify(body),
+    ).buffer),
     headers: new Headers(headers),
   } as unknown as Response);
 }

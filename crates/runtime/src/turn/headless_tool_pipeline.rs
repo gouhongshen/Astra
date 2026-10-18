@@ -154,40 +154,6 @@ impl HeadlessResolvedExecution {
     }
 }
 
-/// Carry an executor-owned external observation scope into the next
-/// foreground Bash invocation when the model omitted the field.  This is a
-/// typed recovery mechanism, not a command classifier: only the exact Bash
-/// tool, an active recovery scope, and an absent structured field qualify.
-pub(crate) fn inherit_external_effect_recovery_scope(
-    tool_name: &str,
-    args: &mut Value,
-    recovery_paths: Option<&[String]>,
-) -> bool {
-    if tool_name != "bash" || recovery_paths.is_none_or(|paths| paths.is_empty()) {
-        return false;
-    }
-    let Some(object) = args.as_object_mut() else {
-        return false;
-    };
-    if object.contains_key(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
-        || object.get("run_in_background").and_then(Value::as_bool) == Some(true)
-    {
-        return false;
-    }
-    object.insert(
-        astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD.to_string(),
-        Value::Array(
-            recovery_paths
-                .expect("checked above")
-                .iter()
-                .cloned()
-                .map(Value::String)
-                .collect(),
-        ),
-    );
-    true
-}
-
 const EDGE_RESULT_RUNTIME_ENVIRONMENT_ADVERTISEMENT_FIELD: &str =
     "runtime_environment_advertisement";
 const EDGE_RESULT_RUNTIME_ENVIRONMENT_FIELD: &str = "runtime_environment";
@@ -364,10 +330,10 @@ pub(crate) struct ExecutedExecution {
 enum SlotSettlement {
     EdgeObserved,
     PendingEdgeValidated {
-        execution: HeadlessResolvedExecution,
+        execution: Box<HeadlessResolvedExecution>,
         idem_key: Option<IdempotencyKey>,
     },
-    PendingEdgePermitted(PermittedExecution),
+    PendingEdgePermitted(Box<PermittedExecution>),
     /// `None` is an internal settled marker for a slot whose canonical
     /// terminal was already emitted elsewhere; it must not be projected by
     /// the shared loop.
@@ -434,10 +400,6 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     /// When present, tools that have no edge match are executed directly by the server.
     pub runtime_tool_executor:
         Option<&'a crate::server::runtime_tool_executor::RuntimeToolExecutor>,
-    /// Executor-owned external observation scope carried across a bounded
-    /// recovery sequence.  It is applied only to a foreground Bash call
-    /// which omitted the structured field; no command-text inference occurs.
-    pub external_effect_recovery_paths: Option<&'a [String]>,
     // ── Observability (Phase 1) ──
     /// Turn start instant for computing start_offset_ms on tool records.
     pub turn_start: Option<std::time::Instant>,
@@ -675,7 +637,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         if permitted.execution.is_edge_tool {
             self.slot_settlements.insert(
                 permitted.execution.id.clone(),
-                SlotSettlement::PendingEdgePermitted(permitted),
+                SlotSettlement::PendingEdgePermitted(Box::new(permitted)),
             );
         }
     }
@@ -821,7 +783,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             if self.has_edge_execution_custody(item) {
                 match self.slot_settlements.remove(&slot.id) {
                     Some(SlotSettlement::PendingEdgePermitted(permitted)) => {
-                        self.record_deferred_edge_execution(permitted).await;
+                        self.record_deferred_edge_execution(*permitted).await;
                     }
                     Some(SlotSettlement::PendingEdgeValidated {
                         execution,
@@ -834,7 +796,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         // was already consumed by resolution.
                         match self
                             .permit_execution(ValidatedExecution {
-                                execution,
+                                execution: *execution,
                                 idem_key,
                             })
                             .await
@@ -1249,56 +1211,6 @@ mod tests {
         IdempotencyKey::new(&identity.storage_key(), 0, "read_file", &args)
     }
 
-    #[test]
-    fn external_effect_recovery_scope_is_injected_only_for_foreground_bash() {
-        let paths = vec!["/etc/ssh/sshd_config.d/99-gitlab.conf".to_string()];
-        let mut args = json!({"command": "printf done"});
-        assert!(inherit_external_effect_recovery_scope(
-            "bash",
-            &mut args,
-            Some(&paths),
-        ));
-        assert_eq!(
-            args[astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD],
-            json!(paths),
-        );
-
-        let mut explicit = json!({
-            "command": "printf done",
-            "external_state_paths": ["/different/root"]
-        });
-        assert!(!inherit_external_effect_recovery_scope(
-            "bash",
-            &mut explicit,
-            Some(&paths),
-        ));
-        assert_eq!(
-            explicit[astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD],
-            json!(["/different/root"]),
-        );
-
-        let mut background = json!({
-            "command": "printf done",
-            "run_in_background": true
-        });
-        assert!(!inherit_external_effect_recovery_scope(
-            "bash",
-            &mut background,
-            Some(&paths),
-        ));
-        assert!(
-            !background
-                .as_object()
-                .expect("background args object")
-                .contains_key(astra_tools::workspace_observation::EXTERNAL_STATE_PATHS_FIELD)
-        );
-        assert!(!inherit_external_effect_recovery_scope(
-            "read_file",
-            &mut args,
-            Some(&paths),
-        ));
-    }
-
     fn edge_runtime_environment_fields() -> Map<String, Value> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
@@ -1376,6 +1288,7 @@ mod tests {
                 tool_calls: vec![json!({"id":"call-grep", "type":"function",
                     "function":{"name":"grep", "arguments":r#"{"pattern":"headless"}"#}})],
                 edge_tool_round: vec![EdgeToolExecResult {
+                    work_attribution: None,
                     execution_completion: None,
                     request_id: "call-grep".into(),
                     tool: "grep".to_string(),
@@ -1515,7 +1428,6 @@ mod tests {
                     progress_emitter: None,
                     effective_permission_timeout: Duration::from_secs(30),
                     runtime_tool_executor,
-                    external_effect_recovery_paths: None,
                     turn_start: None,
                     llm_round: 0,
                     plan_mode_active: false,
@@ -2034,6 +1946,7 @@ mod tests {
         harness.step_recorder =
             StepRecorder::with_persistence_for_run("test-user", &session_id, "test-task", &run_id);
         harness.edge_tool_round.push(EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "call-grep-second".into(),
             tool: "grep".to_string(),
@@ -2302,6 +2215,7 @@ mod tests {
     async fn server_owned_tool_rejects_edge_result_without_server_reroute() {
         let mut harness = PipelineHarness::new();
         harness.edge_tool_round[0] = EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "call-notify".to_string(),
             tool: "notify".to_string(),
@@ -3351,6 +3265,7 @@ mod tests {
         let mut harness = PipelineHarness::new();
         begin_recorded_turn(&mut harness, 3);
         let writer = |id: &str| EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: id.to_string(),
             tool: "write_file".to_string(),
@@ -6289,6 +6204,7 @@ mod tests {
             }
         }));
         harness.edge_tool_round = vec![EdgeToolExecResult {
+            work_attribution: None,
             execution_completion: None,
             request_id: "call-agent-fanout-1".to_string(),
             tool: "agent_fanout".to_string(),

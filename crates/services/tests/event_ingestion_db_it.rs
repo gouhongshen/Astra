@@ -622,6 +622,104 @@ async fn blocked_session_fence_does_not_delay_an_unrelated_session() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn shared_batch_timeout_retries_healthy_heads_without_leaking_capacity() {
+    use astra_services::event_ingestion::measurement::{
+        IngestionDeliveryKey, IngestionMeasurementSink,
+    };
+    use std::time::Duration;
+
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let owner = format!("batch-timeout-{}", Uuid::new_v4());
+    for session in ["blocked", "healthy"] {
+        insert_session_root(&pool, &owner, session).await;
+    }
+    let mut holder = pool.begin().await.unwrap();
+    admit_session_event_write(&mut holder, "blocked", &owner, false)
+        .await
+        .unwrap();
+    let config = IngestionConfig {
+        batch_size: 2,
+        flush_interval_secs: 1,
+        db_attempt_timeout_secs: 1,
+        max_retries: 1,
+        max_concurrent_session_flushes: 2,
+        ..Default::default()
+    };
+    let (sender, shutdown, stats, worker) = EventIngestionWorker::spawn(pool.clone(), config);
+    let (sink, mut reports) = IngestionMeasurementSink::bounded(2);
+    let (blocked, _) = sink.try_start(IngestionDeliveryKey(0)).unwrap();
+    let (healthy, progress) = sink.try_start(IngestionDeliveryKey(1)).unwrap();
+    sender.enqueue_observed(
+        test_event_for_user(&owner, "blocked", "blocked", "user_query"),
+        blocked,
+    );
+    sender.enqueue_observed(
+        test_event_for_user(&owner, "healthy", "healthy", "user_query"),
+        healthy,
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while progress.snapshot().first_dispatched_at.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shared batch dispatched");
+    assert_eq!(
+        event_count(&pool, &owner, "healthy").await,
+        0,
+        "held batch cannot partially commit"
+    );
+    assert!(
+        reports.try_recv().is_err(),
+        "dispatch is not durable acknowledgement"
+    );
+    wait_for_event(
+        &pool,
+        &owner,
+        "healthy",
+        "healthy head commits independently after shared timeout",
+    )
+    .await;
+    assert_eq!(
+        progress.snapshot().attempt_count,
+        2,
+        "one shared attempt and one isolated retry"
+    );
+    assert_eq!(event_count(&pool, &owner, "blocked").await, 0);
+    let _: i64 = tokio::time::timeout(
+        Duration::from_secs(1),
+        sqlx::query_scalar("SELECT 1").fetch_one(&pool),
+    )
+    .await
+    .expect("foreground capacity survives timed-out batch")
+    .unwrap();
+    holder.rollback().await.unwrap();
+    wait_for_event(
+        &pool,
+        &owner,
+        "blocked",
+        "blocked head recovers after fence release",
+    )
+    .await;
+    shutdown.signal();
+    sender.shutdown();
+    worker.await.unwrap();
+    {
+        let stats = stats.lock().unwrap();
+        assert_eq!(stats.resident_events_current, 0);
+        assert_eq!(stats.resident_bytes_current, 0);
+        assert_eq!(stats.db_attempts_current, 0);
+        assert_eq!(stats.events_dropped_permanent, 0);
+        assert_eq!(stats.flush_count, 2, "only two isolated retries committed");
+    }
+    for session in ["blocked", "healthy"] {
+        cleanup_session(&pool, &owner, session).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn late_arriving_session_commits_while_an_earlier_transaction_is_blocked() {
     let shared = common::setup_pool().await;
     let pool = shared.get().clone();
@@ -1132,8 +1230,11 @@ async fn event_ingest_same_event_id_isolated_by_user() {
     insert_session_root(&pool, user_a, &session_a).await;
     insert_session_root(&pool, user_b, &session_b).await;
 
-    let config = IngestionConfig::default();
-    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    let config = IngestionConfig {
+        batch_size: 2,
+        ..Default::default()
+    };
+    let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
     sender.enqueue(test_event_for_user(
         user_a,
         &event_id,
@@ -1146,8 +1247,27 @@ async fn event_ingest_same_event_id_isolated_by_user() {
         &session_b,
         "test_cross_user",
     ));
+    wait_for_event(
+        &pool,
+        user_a,
+        &event_id,
+        "first owner commits in shared batch",
+    )
+    .await;
+    wait_for_event(
+        &pool,
+        user_b,
+        &event_id,
+        "second owner commits in shared batch",
+    )
+    .await;
     shutdown.signal();
     handle.await.unwrap();
+    assert_eq!(
+        stats.lock().unwrap().flush_count,
+        1,
+        "one transaction, distinct owner-scoped identities"
+    );
 
     for (user_id, session_id) in [(user_a, &session_a), (user_b, &session_b)] {
         let count: i64 = sqlx::query_scalar(
@@ -1402,12 +1522,12 @@ async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy
     assert_session_event_count(&pool, TEST_USER_ID, &session_a, 1).await;
 
     let config = IngestionConfig {
-        batch_size: 50,
+        batch_size: 4,
         flush_interval_secs: 300,
         channel_capacity: 8,
         ..Default::default()
     };
-    let (sender, shutdown, _stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
     for event in [
         duplicate_a.clone(),
         unique_a.clone(),
@@ -1416,8 +1536,27 @@ async fn event_ingest_multi_session_batch_uses_per_session_insert_delta_and_lazy
     ] {
         sender.enqueue(event);
     }
+    wait_for_event(
+        &pool,
+        TEST_USER_ID,
+        &unique_a.event_id,
+        "session A delta commits",
+    )
+    .await;
+    wait_for_event(
+        &pool,
+        TEST_USER_ID,
+        &unique_b2.event_id,
+        "session B delta shares commit",
+    )
+    .await;
     shutdown.signal();
     handle.await.unwrap();
+    assert_eq!(
+        stats.lock().unwrap().flush_count,
+        1,
+        "mixed replay and lazy-root effects share one commit"
+    );
 
     assert_session_event_count(&pool, TEST_USER_ID, &session_a, 2).await;
     assert_session_event_count(&pool, TEST_USER_ID, &session_b, 2).await;
@@ -1491,8 +1630,8 @@ async fn rejected_session_configuration_change_cannot_block_a_peer() {
     let shared = common::setup_pool().await;
     let pool = shared.get().clone();
     let user_id = format!("rejected-config-user-{}", Uuid::new_v4().simple());
-    let rejected_session = format!("a-rejected-{}", Uuid::new_v4().simple());
-    let healthy_session = format!("z-healthy-{}", Uuid::new_v4().simple());
+    let rejected_session = format!("z-rejected-{}", Uuid::new_v4().simple());
+    let healthy_session = format!("a-healthy-{}", Uuid::new_v4().simple());
     let version_id = config_version_fixture_id();
     let healthy_event = format!("healthy-event-{}", Uuid::new_v4().simple());
     cleanup_session(&pool, &user_id, &rejected_session).await;
@@ -1507,7 +1646,6 @@ async fn rejected_session_configuration_change_cannot_block_a_peer() {
     .execute(&pool)
     .await
     .expect("seed rejected session fence");
-    insert_session_root(&pool, &user_id, &healthy_session).await;
 
     let journal = astra_services::session_journal::JournalEvent::config_version_change(
         Some(&rejected_session),
@@ -1521,7 +1659,7 @@ async fn rejected_session_configuration_change_cannot_block_a_peer() {
     let rejected_event_id = rejected_config.event_id.clone();
     let healthy = test_event_for_user(&user_id, &healthy_event, &healthy_session, "healthy_peer");
     let config = IngestionConfig {
-        batch_size: 1,
+        batch_size: 2,
         flush_interval_secs: 300,
         channel_capacity: 4,
         ..Default::default()
@@ -1529,6 +1667,13 @@ async fn rejected_session_configuration_change_cannot_block_a_peer() {
     let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
     sender.enqueue(rejected_config);
     sender.enqueue(healthy);
+    wait_for_event(
+        &pool,
+        &user_id,
+        &healthy_event,
+        "healthy lazy root recovers from shared admission rollback",
+    )
+    .await;
     shutdown.signal();
     sender.shutdown();
     handle.await.expect("join mixed rejected ingestion worker");
@@ -1542,6 +1687,10 @@ async fn rejected_session_configuration_change_cannot_block_a_peer() {
         let stats = astra_core::sync_poison::recover_mutex_lock(&stats);
         assert_eq!(stats.events_flushed, 2, "{stats:?}");
         assert_eq!(stats.events_dropped_permanent, 1, "{stats:?}");
+        assert_eq!(
+            stats.flush_count, 1,
+            "only the isolated healthy retry commits"
+        );
     }
 
     cleanup_session(&pool, &user_id, &rejected_session).await;
@@ -1790,7 +1939,7 @@ async fn event_ingest_isolates_same_session_id_across_owners_without_blocking_va
         TEST_USER_ID,
         &foreign_event_id,
         &foreign_session_id,
-        "test_foreign_session_rejected",
+        "test_owner_scoped_session",
     );
     let valid_event = test_event_for_user(
         TEST_USER_ID,
@@ -1843,13 +1992,16 @@ async fn event_ingest_isolates_same_session_id_across_owners_without_blocking_va
             .expect("count valid event");
     assert_eq!(
         valid_event_count, 1,
-        "valid event in the same flush must persist even when another session group is invalid"
+        "both owner-scoped sessions in the same flush must persist"
     );
 
     let stats = stats.lock().expect("stats lock").clone();
     assert_eq!(stats.events_flushed, 2);
     assert_eq!(stats.events_dropped_permanent, 0);
-    assert_eq!(stats.flush_count, 2);
+    assert_eq!(
+        stats.flush_count, 1,
+        "two session heads share a committed batch"
+    );
     assert_eq!(stats.errors, 0);
     assert_eq!(stats.last_error, None);
 
@@ -1946,6 +2098,292 @@ async fn event_ingest_parent_edges_only_for_rows_inserted_in_this_flush() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn large_parent_batch_commits_and_preserves_following_session_progress() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get();
+    let session = Uuid::new_v4().to_string();
+    insert_session_root(pool, TEST_USER_ID, &session).await;
+    let parents = (0..120)
+        .map(|i| format!("parent-{i:03}"))
+        .collect::<Vec<_>>();
+    let events = (0..100)
+        .map(|i| {
+            let mut event = test_event(&format!("{session}-{i}"), &session, "test_edge");
+            event.parent_event_id = Some(parents[0].clone());
+            event.parent_event_ids = parents.clone();
+            event
+        })
+        .collect::<Vec<_>>();
+    let (sender, shutdown, stats, worker) =
+        EventIngestionWorker::spawn(pool.clone(), IngestionConfig::default());
+    for event in &events {
+        sender.enqueue(event.clone());
+    }
+    shutdown.signal();
+    tokio::time::timeout(std::time::Duration::from_secs(30), worker)
+        .await
+        .expect("large batch must settle")
+        .unwrap();
+    assert_eq!(stats.lock().unwrap().errors, 0);
+    assert_eq!(stats.lock().unwrap().flush_count, 1);
+    assert_session_event_count(pool, TEST_USER_ID, &session, 100).await;
+    let ids = events
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<Vec<_>>();
+    let actual = load_agent_event_parent_ids(pool, TEST_USER_ID, &ids)
+        .await
+        .unwrap();
+    assert_eq!(actual.len(), 100);
+    for id in &ids {
+        assert_eq!(actual[id], parents);
+    }
+
+    // Replays and a later same-session event must not duplicate counts or
+    // remain trapped behind an unflushable retry head.
+    let (sender, shutdown, stats, worker) =
+        EventIngestionWorker::spawn(pool.clone(), IngestionConfig::default());
+    for event in events {
+        sender.enqueue(event);
+    }
+    sender.enqueue(test_event(
+        &format!("{session}-following"),
+        &session,
+        "test_edge",
+    ));
+    shutdown.signal();
+    tokio::time::timeout(std::time::Duration::from_secs(30), worker)
+        .await
+        .expect("replay and following event must settle")
+        .unwrap();
+    assert_eq!(stats.lock().unwrap().errors, 0);
+    assert_session_event_count(pool, TEST_USER_ID, &session, 101).await;
+    cleanup_session(pool, TEST_USER_ID, &session).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn parent_edge_chunk_boundary_preserves_order_and_transaction_rollback() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get();
+    let session = Uuid::new_v4().to_string();
+    insert_session_root(pool, TEST_USER_ID, &session).await;
+    let child = format!("{session}-child");
+    let mut parents = (0..10_923)
+        .map(|i| format!("parent-{i:05}"))
+        .collect::<Vec<_>>();
+    parents.push(" ".into());
+    parents.push(parents[0].clone());
+    let mut tx = pool.begin().await.unwrap();
+    insert_agent_event_edges(
+        &mut tx,
+        TEST_USER_ID,
+        &session,
+        &child,
+        Some(&parents[0]),
+        &parents,
+    )
+    .await
+    .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_event_edges WHERE user_id = ? AND child_event_id = ?",
+    )
+    .bind(TEST_USER_ID)
+    .bind(&child)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(count, 10_923, "both chunks executed before rollback");
+    tx.rollback().await.unwrap();
+    assert!(
+        load_agent_event_parent_ids(pool, TEST_USER_ID, std::slice::from_ref(&child))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Only the second statement contains an over-width parent. A failed
+    // chunk must propagate so the owner can roll back the earlier statement.
+    let mut invalid = parents[..10_923].to_vec();
+    invalid[10_922] = "x".repeat(129);
+    let mut tx = pool.begin().await.unwrap();
+    let error = insert_agent_event_edges(&mut tx, TEST_USER_ID, &session, &child, None, &invalid)
+        .await
+        .expect_err("over-width parent must fail in the second chunk");
+    assert!(matches!(error, sqlx::Error::Database(_)), "{error}");
+    let first_chunk: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_event_edges WHERE user_id = ? AND child_event_id = ?",
+    )
+    .bind(TEST_USER_ID)
+    .bind(&child)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        first_chunk, 10_922,
+        "first statement ran before the failure"
+    );
+    tx.rollback().await.unwrap();
+    assert!(
+        load_agent_event_parent_ids(pool, TEST_USER_ID, std::slice::from_ref(&child))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut tx = pool.begin().await.unwrap();
+    insert_agent_event_edges(
+        &mut tx,
+        TEST_USER_ID,
+        &session,
+        &child,
+        Some(&parents[0]),
+        &parents,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let actual = load_agent_event_parent_ids(pool, TEST_USER_ID, std::slice::from_ref(&child))
+        .await
+        .unwrap();
+    assert_eq!(actual[&child], parents[..10_923]);
+    cleanup_session(pool, TEST_USER_ID, &session).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn later_parent_chunk_timeout_rolls_back_and_same_worker_recovers() {
+    use astra_services::event_ingestion::measurement::{
+        IngestionDeliveryKey, IngestionDeliveryTerminal, IngestionMeasurementSink,
+    };
+    use std::time::Duration;
+
+    let shared = common::setup_pool().await;
+    let pool = shared.get();
+    let session = Uuid::new_v4().to_string();
+    let child = format!("{session}-child");
+    insert_session_root(pool, TEST_USER_ID, &session).await;
+    let parents = (0..10_923)
+        .map(|i| format!("parent-{i:05}"))
+        .collect::<Vec<_>>();
+    let last = parents.last().unwrap();
+    let mut seed = pool.begin().await.unwrap();
+    insert_agent_event_edges(&mut seed, TEST_USER_ID, &session, &child, Some(last), &[])
+        .await
+        .unwrap();
+    seed.commit().await.unwrap();
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("UPDATE agent_event_edges SET parent_order = 1 WHERE user_id = ? AND child_event_id = ? AND parent_event_id = ?")
+        .bind(TEST_USER_ID).bind(&child).bind(last).execute(&mut *holder).await.unwrap();
+    let (sender, shutdown, stats, worker) = EventIngestionWorker::spawn(
+        pool.clone(),
+        IngestionConfig {
+            batch_size: 1,
+            db_attempt_timeout_secs: 3,
+            max_retries: 1,
+            ..Default::default()
+        },
+    );
+    let (sink, mut reports) = IngestionMeasurementSink::bounded(1);
+    let (token, progress) = sink.try_start(IngestionDeliveryKey(0)).unwrap();
+    let mut event = test_event(&child, &session, "test_edge");
+    event.parent_event_ids = parents.clone();
+    sender.enqueue_observed(event, token);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let sessions = sqlx::query("SHOW FULL PROCESSLIST")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+            if sessions.iter().any(|row| {
+                let sql = row.get::<Option<String>, _>("info").unwrap_or_default();
+                sql.contains("INSERT INTO agent_event_edges")
+                    && sql.contains(&child)
+                    && sql.contains(last)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("second one-row statement reached the held edge after first chunk completed");
+    assert_eq!(event_count(pool, TEST_USER_ID, &child).await, 0);
+    assert!(
+        reports.try_recv().is_err(),
+        "blocked chunk is not durable delivery"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while stats.lock().unwrap().errors == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("blocked second chunk times out");
+    assert_eq!(event_count(pool, TEST_USER_ID, &child).await, 0);
+    let edges: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_event_edges WHERE user_id = ? AND child_event_id = ?",
+    )
+    .bind(TEST_USER_ID)
+    .bind(&child)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        edges, 1,
+        "timed-out first chunk was not partially committed"
+    );
+    assert!(reports.try_recv().is_err());
+    let _: i64 = tokio::time::timeout(
+        Duration::from_secs(1),
+        sqlx::query_scalar("SELECT 1").fetch_one(pool),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    holder.rollback().await.unwrap();
+    wait_for_event(
+        pool,
+        TEST_USER_ID,
+        &child,
+        "same worker retries after chunk timeout",
+    )
+    .await;
+    sender.enqueue(test_event(
+        &format!("{session}-following"),
+        &session,
+        "test_edge",
+    ));
+    shutdown.signal();
+    sender.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(progress.snapshot().attempt_count >= 2);
+    assert_session_event_count(pool, TEST_USER_ID, &session, 2).await;
+    let actual = load_agent_event_parent_ids(pool, TEST_USER_ID, std::slice::from_ref(&child))
+        .await
+        .unwrap();
+    assert_eq!(actual[&child], parents);
+    let report = reports.try_recv().expect("retry reports durable insertion");
+    assert_eq!(report.key, IngestionDeliveryKey(0));
+    assert_eq!(
+        report.terminal,
+        IngestionDeliveryTerminal::CommittedInserted
+    );
+    assert!(
+        reports.try_recv().is_err(),
+        "one terminal report per delivery"
+    );
+    let stats = stats.lock().unwrap().clone();
+    assert_eq!(stats.events_dropped_permanent, 0);
+    assert_eq!(stats.resident_events_current, 0);
+    assert_eq!(stats.resident_bytes_current, 0);
+    assert_eq!(stats.db_attempts_current, 0);
+    cleanup_session(pool, TEST_USER_ID, &session).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn agent_event_edges_concurrent_inserts_preserve_distinct_parents() {
     let shared = common::setup_pool().await;
     let pool = shared.get().clone();
@@ -1963,15 +2401,17 @@ async fn agent_event_edges_concurrent_inserts_preserve_distinct_parents() {
     let child_a = child_event_id.clone();
     let parent_a_task = parent_a.clone();
     let write_a = tokio::spawn(async move {
+        let mut tx = pool_a.begin().await?;
         insert_agent_event_edges(
-            &pool_a,
+            &mut tx,
             TEST_USER_ID,
             &session_a,
             &child_a,
             Some(&parent_a_task),
             &[],
         )
-        .await
+        .await?;
+        tx.commit().await
     });
 
     let pool_b = pool.clone();
@@ -1979,15 +2419,17 @@ async fn agent_event_edges_concurrent_inserts_preserve_distinct_parents() {
     let child_b = child_event_id.clone();
     let parent_b_task = parent_b.clone();
     let write_b = tokio::spawn(async move {
+        let mut tx = pool_b.begin().await?;
         insert_agent_event_edges(
-            &pool_b,
+            &mut tx,
             TEST_USER_ID,
             &session_b,
             &child_b,
             Some(&parent_b_task),
             &[],
         )
-        .await
+        .await?;
+        tx.commit().await
     });
 
     write_a.await.expect("edge insert task a").expect("edge a");

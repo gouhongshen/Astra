@@ -2,9 +2,7 @@ use crate::cli::arg_render::{
     apply_system_prompt, render_agent_args, render_bug_args, render_debug_args, render_diff_args,
     render_grep_args, render_memory_args, render_permissions_args, render_review_args,
 };
-use crate::cli::auth_flow::{
-    clear_profile_auth, do_login, do_memoria_login_with_key, do_register, is_auth_error,
-};
+use crate::cli::auth_flow::{clear_profile_auth, do_login, do_memoria_login_with_key, do_register};
 use crate::cli::cli_config::cli_args::{
     AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
 };
@@ -93,10 +91,6 @@ async fn settle_one_shot_stream_event_writer(
     result
         .map_err(|error| format!("stream-event writer task failed: {error}"))?
         .map_err(|error| format!("stream-event file write failed: {error}"))
-}
-
-fn durable_run_is_terminal(status: Option<&str>) -> bool {
-    matches!(status, Some("completed" | "failed" | "cancelled"))
 }
 
 /// Inspection only: two existing Server reads under one captured owner and
@@ -1170,6 +1164,13 @@ mod token_refresh_error_tests {
             })))
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "gateway-token-session"
+            })))
+            .mount(&server)
+            .await;
         // Headless chat performs the same explicit Edge admission as the TUI
         // when the registry is enabled. Keep this test focused on gateway
         // auth/model selection by providing that protocol boundary too.
@@ -1743,10 +1744,17 @@ async fn execute_cli_command_impl(
                 &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
             );
 
+            let auth_owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
+                api,
+                profile.as_deref(),
+                &token,
+            )
+            .await;
+
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
                 mcp_manager: Some(_pipeline.mcp_manager.clone()),
                 api,
-                auth_profile: profile.as_deref(),
+                auth_owner,
                 message: &message,
                 model: effective_model.as_deref(),
                 offering_id: effective_offering_id.as_deref(),
@@ -1792,39 +1800,49 @@ async fn execute_cli_command_impl(
                 Err(e) if crate::cli::turn::turn_facade::is_settled_stdout_closure(&e) => {
                     return Ok(ExitCode::Success);
                 }
-                Err(e) if is_auth_error(&e.error) => {
-                    if session_runtime::attempt_token_refresh(api, profile.as_deref()).await {
-                        if let Some(new_token) =
-                            session_runtime::current_access_token(profile.as_deref())
-                        {
-                            eprintln!(
-                                "  {} Token refreshed, retrying…",
-                                crate::cli::theme::icon_ok()
-                            );
-                            match crate::cli::turn::execute_basic_cli_turn(
-                                &chat_ctx,
-                                &new_token,
-                                session_id.as_deref(),
-                                &mut pm,
-                                turn_options.clone(),
-                            )
-                            .await
-                            {
-                                Ok(sr) => sr,
-                                Err(failure)
-                                    if crate::cli::turn::turn_facade::is_settled_stdout_closure(
-                                        &failure,
-                                    ) =>
-                                {
-                                    return Ok(ExitCode::Success);
-                                }
-                                Err(failure) => return Err(failure.error),
-                            }
-                        } else {
-                            return Err(e.error);
-                        }
-                    } else {
+                Err(e)
+                    if crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&e) =>
+                {
+                    let Some(owner) = chat_ctx.auth_owner.as_ref() else {
                         return Err(e.error);
+                    };
+                    if !owner.is_current() {
+                        return Err(e.error);
+                    }
+                    let Some(new_token) = session_runtime::owner_access_token(
+                        &api.clone().without_bearer_provider(),
+                        owner,
+                        Some(&token),
+                    )
+                    .await
+                    else {
+                        return Err(e.error);
+                    };
+                    if !owner.is_current() {
+                        return Err(e.error);
+                    }
+                    eprintln!(
+                        "  {} Token refreshed, retrying…",
+                        crate::cli::theme::icon_ok()
+                    );
+                    match crate::cli::turn::execute_basic_cli_turn(
+                        &chat_ctx,
+                        &new_token,
+                        session_id.as_deref(),
+                        &mut pm,
+                        turn_options.clone(),
+                    )
+                    .await
+                    {
+                        Ok(sr) => sr,
+                        Err(failure)
+                            if crate::cli::turn::turn_facade::is_settled_stdout_closure(
+                                &failure,
+                            ) =>
+                        {
+                            return Ok(ExitCode::Success);
+                        }
+                        Err(failure) => return Err(failure.error),
                     }
                 }
                 Err(e) => return Err(e.error),
@@ -2226,13 +2244,32 @@ async fn execute_cli_command_impl(
             } else {
                 session_routing_future.await?
             };
+            // A headless turn normally lets /chat/stream create its session
+            // lazily. Native capacity must be advertised before the parent
+            // model is admitted, so use the existing session creation owner
+            // when a supported local collaborator is available. Environments
+            // without one keep the ordinary lazy path.
+            let mut created_session_for_native = false;
+            if session_routing.server_session_id.is_none()
+                && !crate::edge_tools::native_codex::native_provider_executable_snapshot()
+                    .is_empty()
+            {
+                let session_id =
+                    crate::cli::slash::slash_state::create_server_session_identity(api, &token)
+                        .await?;
+                session_routing.server_session_id = Some(session_id.clone());
+                session_routing.history_source_session_id = Some(session_id);
+                created_session_for_native = true;
+            }
             let admitted_session_id = session_routing.server_session_id.clone();
             let request_session_execution_lease =
                 crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(
                     admitted_session_id.as_deref(),
                 )
                 .map_err(|failure| failure.message)?;
-            if let Some(session_id) = admitted_session_id.as_deref() {
+            if let Some(session_id) = admitted_session_id.as_deref()
+                && !created_session_for_native
+            {
                 let refresh_future = resolve_one_shot_session_routing(
                     api,
                     profile.as_deref(),
@@ -2286,7 +2323,15 @@ async fn execute_cli_command_impl(
                 false,
             )?;
             let (mut continuation_messages, deferred_tool_activations) =
-                session_routing.continuation_turn_inputs()?;
+                if created_session_for_native {
+                    // The session identity was created for this first turn so
+                    // the native Edge owner can bind before admission. It has
+                    // no durable history or ResumeBundle yet, so it is a new
+                    // session, not a resumable Server session.
+                    (None, Vec::new())
+                } else {
+                    session_routing.continuation_turn_inputs()?
+                };
             let is_tty = terminal::size().is_ok();
             let _pipeline = create_pipeline_modules(api, profile.as_deref()).await;
             let mut pm = {
@@ -2296,6 +2341,32 @@ async fn execute_cli_command_impl(
                     &project_root,
                     &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
                 )
+            };
+            let mut native_delivery = if let (Some(session_id), Some(account_id)) =
+                (session_id.as_deref(), cli_utils::cli_account_id())
+            {
+                // This is the first local permission attachment for a
+                // one-shot session, matching SessionState::set_session_id.
+                // The server remains the authority for the invocation
+                // ceiling; the epoch only prevents stale local policy from
+                // being reused by this process.
+                pm.bind_permission_attachment(session_id, 1);
+                let project_root = std::env::current_dir().unwrap_or_default();
+                let executor = crate::edge_tools::ToolExecutor::new(project_root)
+                    .with_active_session_id(session_id.to_owned())
+                    .with_cloud(api.api_origin(), token.to_owned());
+                crate::cli::edge_lifecycle::native_delivery::start_headless_native_delivery(
+                    api,
+                    &token,
+                    account_id,
+                    session_id,
+                    std::sync::Arc::new(executor),
+                    pm.subscribe_permission_policy(),
+                    one_shot_terminal_deadline,
+                )
+                .await
+            } else {
+                None
             };
             let explain_mode = args.explain.unwrap_or(ExplainMode::Off);
 
@@ -2331,10 +2402,17 @@ async fn execute_cli_command_impl(
             #[cfg(feature = "harness")]
             let harness_sink = astra_harness::InMemorySnapshotSink::arc();
 
+            let auth_owner = crate::cli::session::session_runtime::capture_admitted_auth_owner(
+                api,
+                profile.as_deref(),
+                &token,
+            )
+            .await;
+
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
                 mcp_manager: Some(_pipeline.mcp_manager.clone()),
                 api,
-                auth_profile: profile.as_deref(),
+                auth_owner,
                 message: &message,
                 model: effective_model.as_deref(),
                 offering_id: effective_offering_id.as_deref(),
@@ -2416,76 +2494,13 @@ async fn execute_cli_command_impl(
                                     .checked_sub(WALL_DEADLINE_SERVER_TERMINAL_SETTLE_MARGIN)
                                     .unwrap_or(terminal);
                                 let cancel_deadline = terminal_settle_deadline;
-                                let mut cancellation_accepted = false;
-                                loop {
-                                    let remaining = cancel_deadline
-                                        .saturating_duration_since(tokio::time::Instant::now());
-                                    if remaining.is_zero() {
-                                        return Err(crate::TurnFailure {
-                                            error: format!("request wall deadline cancellation did not settle run {run_id}"),
-                                            partial: Default::default(),
-                                        });
-                                    }
-                                    if !cancellation_accepted {
-                                        match tokio::time::timeout(
-                                            remaining,
-                                            api.cancel_run(Some(&token), &run_id),
-                                        ).await {
-                                            Ok(Ok(response)) if response
-                                                .get("execution_settled")
-                                                .and_then(serde_json::Value::as_bool)
-                                            == Some(true) => {
-                                                wall_deadline_server_terminal_settled = true;
-                                                break;
-                                            }
-                                            Ok(Ok(response)) if response
-                                                .get("status")
-                                                .and_then(serde_json::Value::as_str)
-                                                == Some("cancellation_requested") => {
-                                                    cancellation_accepted = true;
-                                                }
-                                            Ok(Ok(response)) if durable_run_is_terminal(
-                                                response.get("status").and_then(serde_json::Value::as_str),
-                                            ) => {
-                                                wall_deadline_server_terminal_settled = true;
-                                                break;
-                                            }
-                                            Ok(Ok(_)) => {}
-                                            Ok(Err(error)) => return Err(crate::TurnFailure {
-                                                error: format!("request wall deadline could not cancel run {run_id}: {error}"),
-                                                partial: Default::default(),
-                                            }),
-                                            Err(_) => return Err(crate::TurnFailure {
-                                                error: format!("request wall deadline cancellation timed out for run {run_id}"),
-                                                partial: Default::default(),
-                                            }),
-                                        }
-                                    } else {
-                                        match tokio::time::timeout(
-                                            remaining,
-                                            api.get_run(Some(&token), &run_id),
-                                        ).await {
-                                            Ok(Ok(run)) if durable_run_is_terminal(
-                                                run.get("status").and_then(serde_json::Value::as_str),
-                                            ) => {
-                                                wall_deadline_server_terminal_settled = true;
-                                                break;
-                                            }
-                                            Ok(Ok(_)) => {}
-                                            Ok(Err(error)) => return Err(crate::TurnFailure {
-                                                error: format!("request wall deadline could not verify run {run_id} cancellation: {error}"),
-                                                partial: Default::default(),
-                                            }),
-                                            Err(_) => return Err(crate::TurnFailure {
-                                                error: format!("request wall deadline cancellation status check timed out for run {run_id}"),
-                                                partial: Default::default(),
-                                            }),
-                                        }
-                                    }
-                                    tokio::time::sleep(
-                                        remaining.min(std::time::Duration::from_millis(100)),
-                                    ).await;
-                                }
+                                crate::cli::turn::turn_facade::cancel_exact_run_until_settled_with_deadline(
+                                    api, &token, &run_id, chat_ctx.auth_owner.as_ref(), cancel_deadline,
+                                ).await.map_err(|error| crate::TurnFailure {
+                                    error,
+                                    partial: Default::default(),
+                                })?;
+                                wall_deadline_server_terminal_settled = true;
                                 let drain_budget = terminal
                                     .saturating_duration_since(tokio::time::Instant::now())
                                     .min(std::time::Duration::from_secs(20));
@@ -2519,6 +2534,10 @@ async fn execute_cli_command_impl(
                     turn_future.as_mut().await
                 }
             };
+
+            if let Some(handle) = native_delivery.take() {
+                handle.shutdown().await;
+            }
 
             // Flush the completed Server stream before publishing the result.
             drop(chat_ctx);
@@ -3580,10 +3599,14 @@ pub(crate) async fn run_print_mode(
         None
     };
 
+    let auth_owner =
+        crate::cli::session::session_runtime::capture_admitted_auth_owner(api, profile, &token)
+            .await;
+
     let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
         mcp_manager: Some(_pipeline.mcp_manager.clone()),
         api,
-        auth_profile: profile,
+        auth_owner,
         message: &message,
         model: effective_model.as_deref(),
         offering_id: effective_offering_id.as_deref(),
@@ -3897,7 +3920,7 @@ mod exit_code_tests {
     use super::{
         ExitCode, StreamResult, WALL_BUDGET_REQUEST_SAFETY_MARGIN,
         WALL_DEADLINE_SERVER_TERMINAL_SETTLE_MARGIN, apply_wall_deadline_interruption,
-        compute_exit_code, durable_run_is_terminal, settle_one_shot_stream_event_writer,
+        compute_exit_code, settle_one_shot_stream_event_writer,
         stream_result_from_incremental_snapshot,
     };
     use crate::cli::stream::streaming_types::VerdictEvent;
@@ -3932,16 +3955,6 @@ mod exit_code_tests {
                 .and_then(serde_json::Value::as_str),
             Some("request_wall_deadline_reached")
         );
-    }
-
-    #[test]
-    fn cancellation_requested_is_not_a_terminal_durable_run_state() {
-        assert!(!durable_run_is_terminal(Some("cancellation_requested")));
-        assert!(!durable_run_is_terminal(Some("running")));
-        assert!(!durable_run_is_terminal(None));
-        assert!(durable_run_is_terminal(Some("completed")));
-        assert!(durable_run_is_terminal(Some("failed")));
-        assert!(durable_run_is_terminal(Some("cancelled")));
     }
 
     #[tokio::test]

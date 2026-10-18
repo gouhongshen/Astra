@@ -87,14 +87,30 @@ Required check names remain present when their heavy work is skipped, so this
 routing is compatible with branch protection and the merge queue. The routing
 contract and its tests live in [`scripts/ci/`](scripts/ci/).
 
+The frozen MOI consumer compatibility test runs independently of this routing
+on every Test Suite run. The required online core aggregate also requires that
+fresh-database journey to pass; see the testing guide for its exact scope.
+The Terminal-Bench fresh-database contract derives admission gate names and
+cardinality from the source-owned partition count and scope formatter. It
+requires the exact ordered gate inventory; missing, duplicate, legacy or
+unknown rows and unsupported source declarations fail closed.
+
 CLI tests build and run their complete inventory once, after building the
 standalone mock MCP server. Five protected check labels require that same
 completed job; they do not repeat setup, builds, archive downloads, or tests.
 Failed, cancelled, or unexpectedly skipped required execution fails closed.
-Caches retain existing trust boundaries, and fork PRs run without privileged
-access. JUnit timings are retained on success and failure to assess total CI
+Caches retain existing trust boundaries, and ordinary fork PR tests run without
+privileged access. The separate optional live-model regression grants provider
+credentials only to explicitly trusted fork name/ID pairs from its base-owned
+workflow. Trusting a fork also trusts its code writers; see the
+[harness guide](crates/astra-test-harness/README.md#small-automatic-live-regression).
+JUnit timings are retained on success and failure to assess total CI
 cost. Rerunning a failed CLI execution repeats the combined build/test job;
 there is no archived-test fallback or artifact-expiry dependency.
+The three ignored production-supervisor smokes use one additional nextest
+invocation, with exact names and separate serial test processes. They use the
+strict profile without retries, preserving the complete inventory's CI JUnit
+file and avoiding three separate Cargo test builds.
 On macOS, the default terminal-reader lane also runs the CLI Bash regression
 using its existing default-feature test executable. Tools lint and serial
 workspace-coordination tests remain parallel; the protected coordination check
@@ -106,7 +122,7 @@ replacement test run can enter the normal concurrency group. A separate
 trusted-workflow-revision controller cancels active runs for earlier heads
 without waiting for replacement-run approval. The controller never checks out
 or executes pull request code; the
-test workflows remain low-privilege `pull_request` workflows. Normal concurrency
+required test workflows remain low-privilege `pull_request` workflows. Normal concurrency
 groups use the pull request number, so identically named branches in different
 forks remain isolated. Each synchronize event cancels only its exact `before`
 head and is intentionally not coalesced, so rapid pushes cannot make an older

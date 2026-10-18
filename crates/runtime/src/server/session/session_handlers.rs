@@ -476,7 +476,7 @@ pub(crate) async fn create_session_handler(
         };
         return Ok((status, Json(SessionResponse::from(result.session))));
     }
-    let session = super::session_quota::create_session_with_resource_quota(
+    let (session, _) = super::session::session_quota::create_session_with_resource_quota(
         &state,
         principal.user.user_id,
         data,
@@ -1834,84 +1834,83 @@ pub(crate) async fn close_session_handler(
         )
         .await?;
     astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
-    schedule_session_end_governance(&state, owner_id, session_id);
+    // The close transaction durably enqueued memory work; the managed recovery
+    // task owns dispatch and shutdown rather than an untracked detached task.
     Ok(Json(SessionResponse::from(session)))
 }
 
-/// Run destructive session-end memory governance only after the authenticated
-/// session lifecycle has crossed its explicit `closed` boundary.
-///
-/// Normal `/chat` terminal turns intentionally do not call this: a durable
-/// session may receive many follow-up turns and its working memory is part of
-/// that continuity contract. The task is detached from the close response so
-/// Memoria latency cannot make the UI wait, while the existing per-owner,
-/// per-session debouncer prevents duplicate close requests from writing two
-/// episodes or purging twice.
-fn schedule_session_end_governance(state: &AppState, owner_id: String, session_id: String) {
-    let Some(resolver) = state.auth_service.memoria_credentials() else {
-        tracing::debug!(
-            owner_id = %owner_id,
-            session_id = %session_id,
-            "session-end governance skipped because credential storage is unavailable"
-        );
-        return;
-    };
-    let mut memoria_client =
-        crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::new(resolver, owner_id.clone());
+pub(crate) async fn session_memory_status_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .session_service
+        .get_session(session_id.clone(), user.user_id.clone())
+        .await?;
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "durable memory storage is unavailable",
+        )
+    })?;
+    astra_services::session_memory_lifecycle::SessionMemoryLifecycleStore::new(pool)
+        .status(&user.user_id, &session_id)
+        .await
+        .map(Json)
+        .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))
+}
+
+/// Queue maintenance while preserving the CLI's resumable Session.
+pub(crate) async fn finalize_session_memory_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    state
+        .session_service
+        .get_session(session_id.clone(), user.user_id.clone())
+        .await?;
+    let resolver = state.auth_service.memoria_credentials().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "memory authority is unavailable",
+        )
+    })?;
+    let mut port = crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::new(
+        resolver,
+        user.user_id.clone(),
+    );
     if state.memoria_self_hosted_fallback_enabled
-        && let Some(master_key) = state.memoria_master_key.clone()
+        && let Some(key) = state.memoria_master_key.clone()
     {
-        memoria_client =
-            memoria_client.with_self_hosted_fallback(state.memoria_base_url.clone(), master_key);
+        port = port.with_self_hosted_fallback(state.memoria_base_url.clone(), key);
     }
-
-    tokio::spawn(async move {
-        let debouncer = crate::turn::session_end_debounce::global();
-        let Some(governance_permit) = debouncer.try_begin(&owner_id, &session_id) else {
-            tracing::debug!(
-                owner_id = %owner_id,
-                session_id = %session_id,
-                "session-end governance skipped by debounce"
-            );
-            return;
-        };
-
-        let session_facts = astra_turn_types::session_facts::SessionFacts::default();
-        let governance = crate::turn::cloud::session_end_governance::run_session_end_governance(
-            &session_facts,
-            &session_id,
-            &memoria_client,
-        );
-        let result = tokio::time::timeout(std::time::Duration::from_secs(60), governance).await;
-        match result {
-            Ok(Ok(report)) => {
-                tracing::info!(
-                    owner_id = %owner_id,
-                    session_id = %session_id,
-                    purged = report.working_purged,
-                    episode_chars = report.episode_chars,
-                    scenes_stored = report.scenes_stored,
-                    "session-end governance complete"
-                );
-                governance_permit.complete();
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    owner_id = %owner_id,
-                    session_id = %session_id,
-                    error = %error,
-                    "session-end governance failed"
-                );
-            }
-            Err(_) => {
-                tracing::warn!(
-                    owner_id = %owner_id,
-                    session_id = %session_id,
-                    "session-end governance timed out"
-                );
-            }
-        }
-    });
+    if !astra_memoria::MemoriaPort::admits_operation(&port, true)
+        .await
+        .map_err(|error| error_response(StatusCode::SERVICE_UNAVAILABLE, error))?
+    {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "memory write access is not enabled",
+        ));
+    }
+    let pool = state.shared_pool.clone().ok_or_else(|| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "durable memory storage is unavailable",
+        )
+    })?;
+    astra_services::session_memory_lifecycle::SessionMemoryLifecycleStore::new(pool)
+        .request_finalization(&user.user_id, &session_id)
+        .await
+        .map_err(|error| error_response(StatusCode::CONFLICT, error))?;
+    // Recovery polls this durable handoff independently of the CLI process.
+    Ok(Json(
+        serde_json::json!({"accepted":true, "session_id":session_id, "status":"queued"}),
+    ))
 }
 
 #[derive(Deserialize)]

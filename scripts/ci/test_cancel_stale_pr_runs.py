@@ -341,6 +341,7 @@ class WorkflowSecurityContractTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         expected = "${{ github.event.pull_request.number"
         for relative in (
+            ".github/workflows/harness-regression.yml",
             ".github/workflows/pr-title.yml",
             ".github/workflows/static-checks.yml",
             ".github/workflows/test.yml",

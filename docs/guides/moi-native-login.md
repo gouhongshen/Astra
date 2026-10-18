@@ -174,6 +174,14 @@ never an unrestricted Bearer master credential. The deployment key remains on
 the Server; clients do not receive or configure it. Memoria must support this
 owner-scoped scheme (0.5.2 or a verified compatible image). Old images fail
 closed; do not silently retry with the Bearer master scheme.
+Durable session-memory extraction and finalization additionally require Memoria's
+`POST /v1/memories/idempotent` endpoint. Upgrade Memoria before enabling the matched
+Astra image; an older backend preserves working memory and reports failed
+maintenance instead of falling back to an ordinary write.
+This Astra build also requires fresh schema contract `2026-10-14-v102` for its
+recovery journal. The repository rejects older schema markers instead of
+automatically migrating them; coordinate the database rollout before replacing
+an existing deployment image.
 
 Automatic prompt recall shares one 750 ms budget across authorization and
 retrieval. Failure contributes no memory evidence and does not prevent the model

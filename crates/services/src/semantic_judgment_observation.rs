@@ -1587,10 +1587,7 @@ mod tests {
                 } else {
                     "no"
                 };
-                (
-                    id.clone(),
-                    json!({"type":"discrete_noul","decision":decision}),
-                )
+                (id.clone(), json!(decision))
             })
             .collect::<BTreeMap<_, _>>();
         json!({"answers":answers}).to_string()

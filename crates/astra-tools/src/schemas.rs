@@ -19,6 +19,17 @@ pub const SURFACE_DISCOVERY_SUMMARIES_KEY: &str = "x-astra-surface-discovery-sum
 /// project this map after a typed action subset is selected; they never need
 /// to parse the full function description to discover which action remains.
 pub const PER_ACTION_DISCOVERY_SUMMARIES_KEY: &str = "x-astra-per-action-discovery-summaries";
+/// Compact delegation guidance for the single-child and fan-out tools.
+/// Full invocation semantics stay in their function descriptions; the
+/// fan-out summary additionally preserves its cross-field slot invariant.
+const DELEGATION_DISCOVERY_SUMMARY: &str = concat!(
+    crate::agent_parent_scope_guidance!(),
+    " Exact provider/Offering;no config/substitution;launch≠done;wait."
+);
+const FANOUT_DISCOVERY_SUMMARY: &str = concat!(
+    crate::agent_parent_scope_guidance!(),
+    " Exact provider/Offering;slots=target_count;description+prompt;atomic."
+);
 
 /// Producer-owned Bash constraints shared by canonical and resident tool schemas.
 /// Keep this wording within the resident schema budget.
@@ -139,11 +150,141 @@ pub fn action_contract_description(parameters: &Map<String, Value>) -> Option<St
 
 /// Structured failure returned when model-authored arguments do not satisfy
 /// the invocation constraints encoded in the advertised built-in schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationCode {
+    Required,
+    Type,
+    Const,
+    Enum,
+    MinLength,
+    MaxLength,
+    Minimum,
+    Maximum,
+    UniqueItems,
+    MinItems,
+    MaxItems,
+    Union,
+    AdditionalProperties,
+    ActionFields,
+    RequiredAlternative,
+    MalformedJson,
+}
+
+/// One validator fact with a private rendering, not a second validation pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationIssue {
+    pub code: ValidationCode,
+    location: Vec<String>,
+    message: String,
+}
+
+impl ValidationIssue {
+    fn new(code: ValidationCode, location: &[String], message: String) -> Self {
+        Self {
+            code,
+            location: location.to_vec(),
+            message,
+        }
+    }
+}
+
+impl fmt::Display for ValidationIssue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Only this projection may cross the public CI boundary. Private issue text,
+/// submitted keys and dynamic-provider property names are never serialized.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidationDiagnostic {
+    code: ValidationCode,
+    path: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValidationSummary {
+    issues: Vec<ValidationDiagnostic>,
+    omitted: u64,
+}
+
+fn canonical_location(schema: &Value, path: &[String]) -> bool {
+    let Some((head, tail)) = path.split_first() else {
+        return true;
+    };
+    let child = if head == "*" {
+        schema.get("items")
+    } else {
+        schema
+            .get("properties")
+            .and_then(|properties| properties.get(head))
+    };
+    child.is_some_and(|child| canonical_location(child, tail))
+        || ["oneOf", "anyOf"].iter().any(|key| {
+            schema
+                .get(key)
+                .and_then(Value::as_array)
+                .is_some_and(|branches| {
+                    branches
+                        .iter()
+                        .any(|branch| canonical_location(branch, path))
+                })
+        })
+}
+
+fn safe_location(tool: &str, location: &[String]) -> Option<String> {
+    if location.len() > 8 {
+        return None;
+    }
+    let schema = builtin_tool_schema(tool)?
+        .get("function")?
+        .get("parameters")?;
+    if !canonical_location(schema, location) {
+        return None;
+    }
+    let path = location
+        .iter()
+        .map(|part| format!("/{}", part.replace('~', "~0").replace('/', "~1")))
+        .collect::<String>();
+    (path.len() <= 256).then_some(path)
+}
+
+/// Validate untrusted result data against the same public projection contract.
+/// A matching tool name alone never declassifies provider-supplied field names.
+pub fn validated_argument_diagnostic(tool: &str, value: &Value) -> Option<Value> {
+    if serde_json::to_vec(value).ok()?.len() > 4096 {
+        return None;
+    }
+    let summary: ValidationSummary = serde_json::from_value(value.clone()).ok()?;
+    if summary.issues.len() > 8 {
+        return None;
+    }
+    for issue in &summary.issues {
+        if let Some(path) = &issue.path {
+            let location = if path.is_empty() {
+                Vec::new()
+            } else {
+                path.strip_prefix('/')?
+                    .split('/')
+                    .map(|part| part.replace("~1", "/").replace("~0", "~"))
+                    .collect()
+            };
+            if safe_location(tool, &location).as_ref() != Some(path) {
+                return None;
+            }
+        }
+    }
+    serde_json::to_value(summary).ok()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolArgumentValidationError {
     pub tool_name: String,
     pub action: Option<String>,
-    pub issues: Vec<String>,
+    pub issues: Vec<ValidationIssue>,
     malformed_parse_error: Option<Value>,
 }
 
@@ -153,13 +294,45 @@ impl fmt::Display for ToolArgumentValidationError {
         if let Some(action) = self.action.as_deref() {
             write!(formatter, " (action `{action}`)")?;
         }
-        write!(formatter, ": {}", self.issues.join("; "))
+        write!(
+            formatter,
+            ": {}",
+            self.issues
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
     }
 }
 
 impl std::error::Error for ToolArgumentValidationError {}
 
 impl ToolArgumentValidationError {
+    pub fn diagnostic(&self) -> Value {
+        let mut summary = ValidationSummary {
+            issues: self
+                .issues
+                .iter()
+                .take(8)
+                .map(|issue| ValidationDiagnostic {
+                    code: issue.code,
+                    path: safe_location(&self.tool_name, &issue.location),
+                })
+                .collect(),
+            omitted: self.issues.len().saturating_sub(8) as u64,
+        };
+        while serde_json::to_vec(&summary)
+            .expect("diagnostic serializes")
+            .len()
+            > 4096
+        {
+            summary.issues.pop();
+            summary.omitted += 1;
+        }
+        serde_json::to_value(summary).expect("diagnostic serializes")
+    }
+
     #[must_use]
     pub fn output(&self) -> String {
         if let Some(parse_error) = self.malformed_parse_error.as_ref() {
@@ -212,6 +385,7 @@ impl ToolArgumentValidationError {
             "executed": false,
             "error": self.output(),
             "recovery_evidence": evidence,
+            "validation": self.diagnostic(),
         })
     }
 
@@ -228,7 +402,8 @@ impl ToolArgumentValidationError {
     #[must_use]
     pub fn into_tool_result(self) -> crate::ToolResult {
         let evidence = self.failure_evidence();
-        crate::ToolResult::error(self.output()).with_failure_evidence(evidence)
+        crate::ToolResult::error(self.rejection_output().to_string())
+            .with_failure_evidence(evidence)
     }
 }
 
@@ -372,7 +547,8 @@ fn validate_schema_value(
     schema: &Value,
     path: &str,
     check_required: bool,
-    issues: &mut Vec<String>,
+    location: &mut Vec<String>,
+    issues: &mut Vec<ValidationIssue>,
 ) {
     // A shared outer type applies to every alternative. Reject it before
     // evaluating branches so a type error is not reported as an ambiguous
@@ -380,9 +556,13 @@ fn validate_schema_value(
     if let Some(expected) = schema.get("type")
         && !schema_type_matches(value, expected)
     {
-        issues.push(format!(
-            "{path} has type {}, expected {expected}",
-            json_type_name(value)
+        issues.push(ValidationIssue::new(
+            ValidationCode::Type,
+            location,
+            format!(
+                "{path} has type {}, expected {expected}",
+                json_type_name(value)
+            ),
         ));
         return;
     }
@@ -391,7 +571,7 @@ fn validate_schema_value(
             continue;
         };
         let mut matches = 0;
-        let mut best_failure: Option<Vec<String>> = None;
+        let mut best_failure: Option<Vec<ValidationIssue>> = None;
         let has_type_compatible_branch = alternatives.iter().any(|candidate| {
             candidate
                 .get("type")
@@ -406,7 +586,14 @@ fn validate_schema_value(
                 continue;
             }
             let mut candidate_issues = Vec::new();
-            validate_schema_value(value, candidate, path, true, &mut candidate_issues);
+            validate_schema_value(
+                value,
+                candidate,
+                path,
+                true,
+                location,
+                &mut candidate_issues,
+            );
             if candidate_issues.is_empty() {
                 matches += 1;
                 if keyword == "anyOf" {
@@ -420,26 +607,41 @@ fn validate_schema_value(
             }
         }
         if matches == 0 {
-            issues.extend(
-                best_failure
-                    .unwrap_or_else(|| vec![format!("{path} has no matching {keyword} branch")]),
-            );
+            issues.extend(best_failure.unwrap_or_else(|| {
+                vec![ValidationIssue::new(
+                    ValidationCode::Union,
+                    location,
+                    format!("{path} has no matching {keyword} branch"),
+                )]
+            }));
             return;
         }
         if keyword == "oneOf" && matches != 1 {
-            issues.push(format!("{path} must match exactly one advertised branch"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::Union,
+                location,
+                format!("{path} must match exactly one advertised branch"),
+            ));
             return;
         }
     }
     if let Some(expected) = schema.get("const")
         && value != expected
     {
-        issues.push(format!("{path} differs from its advertised constant"));
+        issues.push(ValidationIssue::new(
+            ValidationCode::Const,
+            location,
+            format!("{path} must be {expected}"),
+        ));
     }
     if let Some(allowed) = schema.get("enum").and_then(Value::as_array)
         && !allowed.contains(value)
     {
-        issues.push(format!("{path} is outside its advertised enum"));
+        issues.push(ValidationIssue::new(
+            ValidationCode::Enum,
+            location,
+            format!("{path} is outside its advertised enum"),
+        ));
     }
 
     if let Some(text) = value.as_str() {
@@ -447,12 +649,20 @@ fn validate_schema_value(
         if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64)
             && (length < minimum || (minimum > 0 && text.trim().chars().count() < minimum as usize))
         {
-            issues.push(format!("{path} requires at least {minimum} character(s)"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::MinLength,
+                location,
+                format!("{path} requires at least {minimum} character(s)"),
+            ));
         }
         if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64)
             && length > maximum
         {
-            issues.push(format!("{path} accepts at most {maximum} character(s)"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::MaxLength,
+                location,
+                format!("{path} accepts at most {maximum} character(s)"),
+            ));
         }
     }
 
@@ -460,12 +670,20 @@ fn validate_schema_value(
         if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64)
             && number < minimum
         {
-            issues.push(format!("{path} must be at least {minimum}"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::Minimum,
+                location,
+                format!("{path} must be at least {minimum}"),
+            ));
         }
         if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64)
             && number > maximum
         {
-            issues.push(format!("{path} must be at most {maximum}"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::Maximum,
+                location,
+                format!("{path} must be at most {maximum}"),
+            ));
         }
     }
 
@@ -476,26 +694,44 @@ fn validate_schema_value(
                 .enumerate()
                 .any(|(index, value)| values[..index].contains(value))
         {
-            issues.push(format!("{path} requires unique items"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::UniqueItems,
+                location,
+                format!("{path} requires unique items"),
+            ));
         }
         if let Some(minimum) = schema.get("minItems").and_then(Value::as_u64)
             && values.len() < minimum as usize
         {
-            issues.push(format!("{path} requires at least {minimum} item(s)"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::MinItems,
+                location,
+                format!("{path} requires at least {minimum} item(s)"),
+            ));
         }
         if let Some(maximum) = schema.get("maxItems").and_then(Value::as_u64)
             && values.len() > maximum as usize
         {
-            issues.push(format!("{path} accepts at most {maximum} item(s)"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::MaxItems,
+                location,
+                format!("{path} accepts at most {maximum} item(s)"),
+            ));
         }
         if let Some(item_schema) = schema.get("items") {
+            location.push("*".into());
             for (index, item) in values.iter().enumerate() {
                 let item_path = format!("{path} item {index}");
-                validate_schema_value(item, item_schema, &item_path, true, issues);
+                validate_schema_value(item, item_schema, &item_path, true, location, issues);
                 if item.as_str().is_some_and(|item| item.trim().is_empty()) {
-                    issues.push(format!("{item_path} must be non-empty"));
+                    issues.push(ValidationIssue::new(
+                        ValidationCode::Required,
+                        location,
+                        format!("{item_path} must be non-empty"),
+                    ));
                 }
             }
+            location.pop();
         }
     }
 
@@ -510,9 +746,13 @@ fn validate_schema_value(
                 } else {
                     format!("{path} ")
                 };
-                issues.push(format!(
-                    "{prefix}missing non-empty required field `{field}`"
+                location.push(field.into());
+                issues.push(ValidationIssue::new(
+                    ValidationCode::Required,
+                    location,
+                    format!("{prefix}missing non-empty required field `{field}`"),
                 ));
+                location.pop();
             }
         }
     }
@@ -532,13 +772,26 @@ fn validate_schema_value(
             } else {
                 format!("{path} has unknown field(s)")
             };
-            issues.push(format!("{label}: {}", unknown.join(", ")));
+            issues.push(ValidationIssue::new(
+                ValidationCode::AdditionalProperties,
+                location,
+                format!("{label}: {}", unknown.join(", ")),
+            ));
         }
     }
     if let Some(properties) = properties {
         for (field, child) in object {
             if let Some(child_schema) = properties.get(field) {
-                validate_schema_value(child, child_schema, &field_path(path, field), true, issues);
+                location.push(field.clone());
+                validate_schema_value(
+                    child,
+                    child_schema,
+                    &field_path(path, field),
+                    true,
+                    location,
+                    issues,
+                );
+                location.pop();
             }
         }
     }
@@ -588,9 +841,10 @@ pub fn validate_tool_arguments_against_schema(
         .filter(|action| !action.is_empty());
     let mut issues = Vec::new();
     let Some(arguments) = args.as_object() else {
-        issues.push(format!(
-            "expected an object, received {}",
-            json_type_name(args)
+        issues.push(ValidationIssue::new(
+            ValidationCode::Type,
+            &[],
+            format!("expected an object, received {}", json_type_name(args)),
         ));
         return Err(ToolArgumentValidationError {
             tool_name: tool_name.to_string(),
@@ -607,14 +861,22 @@ pub fn validate_tool_arguments_against_schema(
         return Err(ToolArgumentValidationError {
             tool_name: tool_name.to_string(),
             action: None,
-            issues: vec!["arguments were not valid JSON".to_string()],
+            issues: vec![ValidationIssue::new(
+                ValidationCode::MalformedJson,
+                &[],
+                "arguments were not valid JSON".to_string(),
+            )],
             malformed_parse_error: Some(parse_error.clone()),
         });
     }
 
     for field in collect_required_fields(parameters, action) {
         if !value_is_present(arguments.get(&field)) {
-            issues.push(format!("missing non-empty required field `{field}`"));
+            issues.push(ValidationIssue::new(
+                ValidationCode::Required,
+                std::slice::from_ref(&field),
+                format!("missing non-empty required field `{field}`"),
+            ));
         }
     }
 
@@ -631,7 +893,11 @@ pub fn validate_tool_arguments_against_schema(
             .map(|fields| fields.join(" + "))
             .collect::<Vec<_>>()
             .join(" or ");
-        issues.push(format!("requires one of: {rendered}"));
+        issues.push(ValidationIssue::new(
+            ValidationCode::RequiredAlternative,
+            &[],
+            format!("requires one of: {rendered}"),
+        ));
     }
 
     if let Some(action) = action
@@ -649,14 +915,30 @@ pub fn validate_tool_arguments_against_schema(
             .collect::<Vec<_>>();
         disallowed.sort();
         if !disallowed.is_empty() {
-            issues.push(format!(
-                "field(s) not allowed for action `{action}`: {}",
-                disallowed.join(", ")
+            let location = if disallowed.len() == 1 {
+                disallowed.clone()
+            } else {
+                Vec::new()
+            };
+            issues.push(ValidationIssue::new(
+                ValidationCode::ActionFields,
+                &location,
+                format!(
+                    "field(s) not allowed for action `{action}`: {}",
+                    disallowed.join(", ")
+                ),
             ));
         }
     }
 
-    validate_schema_value(args, parameter_schema, "", false, &mut issues);
+    validate_schema_value(
+        args,
+        parameter_schema,
+        "",
+        false,
+        &mut Vec::new(),
+        &mut issues,
+    );
 
     if issues.is_empty() {
         Ok(())
@@ -1013,8 +1295,77 @@ fn propose_work_criteria_schema() -> Value {
     })
 }
 
+/// Canonical skill activation contract; names do not change schema bytes.
+pub fn skill_tool_schema() -> Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "skill",
+            "description":
+                "Execute a skill from the <available_skills> system listing or a discovered capability-source Skill. \
+                 For catalog skills, call it only when the user's request matches a skill whose \
+                 canonical name or alias appears literally in that listing or a current skill-search result; \
+                 never invent or infer a skill name. For work this agent owns, \
+                 call a matching skill before substantive work on that objective. \
+                 If a child owns the objective, launch it first and let the child \
+                 load its own skills. \
+                 For a capability-source Skill, copy its exact selection_key into skill_name; title is only a display label. \
+                 `skill_name` is the listed canonical name, alias or exact discovered selection_key. `task` is optional \
+                 extra context; omit to use the current conversation. On seeing \
+                 `<skill-loaded name=\"...\"/>` in a tool result, follow that \
+                 skill's instructions — do not re-invoke it. To read a referenced text file from a selected remote Skill package, provide resource_path; this reads content without activating the Skill again.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description":
+                            "Canonical name, alias or exact selection_key of the skill to run."
+                    },
+                    "task": {
+                        "type": "string",
+                        "description":
+                            "Optional task description or extra context for the skill."
+                    },
+                    "resource_path": {
+                        "type": "string",
+                        "description": "Optional package-relative text resource path, such as references/guide.md. Not a local filesystem path or URL."
+                    }
+                },
+                "required": ["skill_name"]
+            }
+        }
+    })
+}
+
+/// OpenAI-style tool schema for `discover_skills`.
+pub fn discover_skills_tool_schema() -> Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "discover_skills",
+            "description": "Search the full skill catalog for additional workflow packs not shown in the current skill listing.\n\n\
+                Call this when you are pivoting, planning a multi-step workflow, or the surfaced skills do not cover your next action. \
+                Results are bounded and drawn only from the current authorized catalog. Repeated searches may return the same skills.\n\n\
+                After a successful discovery, invoke `skill` with one of the returned names.",
+            "parameters": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Concrete description of what you are trying to do next (task, domain, or workflow)."
+                    }
+                }
+            }
+        }
+    })
+}
+
 pub fn all_tool_schemas() -> Vec<Value> {
     let mut schemas = all_tool_schemas_core();
+    schemas.push(skill_tool_schema());
+    schemas.push(discover_skills_tool_schema());
     // run_script is Unix-only (UDS RPC transport). Always exposed on Unix;
     // there is no environment gate for production tools.
     #[cfg(unix)]
@@ -1371,9 +1722,28 @@ fn requested_model_policy_schema() -> Value {
     })
 }
 
+fn provider_child_execution_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Use a currently available provider-owned agent tool when the user names that provider/protocol or when the requested model uniquely matches a model in the current provider directory. Choose the exact tool and, when supplied, exact model selector from that directory; do not inspect workspace configuration or use Bash to discover it. A plain model request that matches an authorized Astra Offering uses requested_model_policy and omits execution. If a request matches neither, or matches multiple capacities, ask once for the missing choice. Omit for normal internal model execution. Do not combine with requested_model_policy.",
+        "properties": {
+            "tool": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Exact tool name from the current capability surface; never a shell command or executable path."},
+            "model": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Optional exact provider selector from the current provider model_catalog. Omit to use that provider's default. Not an Astra Offering or proof of the model actually used."}
+        },
+        "required": ["tool"]
+    })
+}
+
+fn collaborator_identity_schema() -> Value {
+    json!({"type": "string", "minLength": 1, "maxLength": 256,
+    "description": "For a new collaborator, omit this field. For a follow-up, copy the exact runtime-generated collaborator_id returned by an earlier launch to keep its conversation. A completed provider collaborator does not accept send_message; continue it with a new spawn carrying this exact collaborator_id. Never use an agent_id, run_id, mailbox address, third-party session ID, or made-up name. This starts a new independently settled stage, not a replay of its previous result.",
+    })
+}
+
 fn fanout_reasoning_schema() -> Value {
     json!({
-        "description": "Optional reasoning override only for the children the user requests it for; never copy one child's control to another. Shared defaults apply only to requirements common to all slots. Omit to inherit parent thinking for the same Offering; model_default explicitly uses the target default. Different Offerings never inherit parent controls.",
+        "description": "Optional user-requested reasoning override. Effort uses mode=adaptive with effort=low|medium|high|max; native xhigh uses max. Token budgets use mode=enabled with budget_tokens, never effort. Omit to inherit thinking for the same Offering; different Offerings use their own defaults. Apply only to children covered by the user's request.",
         "x-astra-discovery-summary": "Omit outside user-requested scope.",
         "type": "object",
         "required": ["mode"],
@@ -1382,6 +1752,112 @@ fn fanout_reasoning_schema() -> Value {
             {"properties": {"mode": {"const": "enabled"}, "budget_tokens": {"type": "integer", "minimum": 1024, "maximum": 4294967295_u64}}, "required": ["budget_tokens"], "additionalProperties": false},
             {"properties": {"mode": {"const": "adaptive"}, "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]}}, "required": ["effort"], "additionalProperties": false}
         ]
+    })
+}
+
+fn agent_parameters_schema() -> Value {
+    json!({
+        "type": "object",
+        "x-astra-action-surfaces": {
+            "spawn": ["local", "server"],
+            "list": ["local", "server"],
+            "get_result": ["local", "server"],
+            "wait": ["local", "server"],
+            "run_chain": ["local"],
+            "send_message": ["local", "server"]
+        },
+        "x-astra-surface-descriptions": {
+            "server": concat!(crate::agent_parent_scope_guidance!(), "\n", "Server-owned single-agent lifecycle. If visible, call it directly; use the current provider directory for provider-owned capacities and model_catalog only for unknown Astra Offering choices. Actions: spawn, list, get_result, send_message. Omit agent_type for the bounded read-only default; choose a builtin persona when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. send_message addresses active parent/child/peer mailboxes only; a completed provider collaborator is continued by a new spawn with its exact collaborator_id, never by a mailbox address. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. For Astra model requests, propose requested_model_policy with an exact authorized Offering ID or configured name; for provider-owned requests, copy the exact execution tool/model from the current provider directory. Preserve version and source; do not substitute. Task content is not an execution control. Never inspect workspace files, model configuration, or credentials. Use visible start_work for durable Work.")
+        },
+        "x-astra-surface-discovery-summaries": {
+            "server": DELEGATION_DISCOVERY_SUMMARY
+        },
+        "x-astra-per-action-discovery-summaries": {
+            "spawn": DELEGATION_DISCOVERY_SUMMARY,
+            "get_result": "action+returned agent_id; completed result: inline child output, not an artifact handle. Use sufficient output directly; follow only explicit artifact/window references. Use list for status; do not busy-poll",
+            "wait": "action; optional bounded timeout_ms; observe current-run input without polling or model calls; observation timeout does not cancel child execution",
+            "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
+            "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
+            "send_message": "action+to+message; active mailbox only; child asks parent via message_type=question (not ask_user); parent answers request_id; completed provider follow-up uses spawn+exact collaborator_id"
+        },
+        "x-astra-discovery-summary": DELEGATION_DISCOVERY_SUMMARY,
+        "properties": {
+            "action": {"type": "string", "enum": ["spawn","list","get_result","wait","run_chain","send_message"]},
+            "timeout_ms": {"type":"integer", "minimum":1, "maximum":300000, "description":"Observation wait timeout (wait). Default 30000 ms. Does not cancel children."},
+            "steps": {
+                "type": "array",
+                "minItems": 1,
+                "description": "run_chain steps.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "tool": {"type": "string"},
+                        "args": {"type": "object"},
+                        "output_key": {"type": "string"},
+                        "skip_if_prev_contains": {"type": "string"}
+                    },
+                    "required": ["tool", "args"]
+                }
+            },
+            "description": {"type": "string", "description": "Short operation description when required by the selected action."},
+            "prompt": {"type": "string", "description": "A self-contained objective, constraints, conditional mappings and exact output requirements, with bounded evidence locations rather than pasted file contents or prior tool output. The child reads its own evidence. Keep parent-only reporting outside the brief: report execution model and status from runtime receipts, not child self-report. Only choices the child must ask about may remain unresolved. Non-empty; requires description.", "x-astra-discovery-summary": "Exact output; evidence locations, not copied contents; parent uses model/status receipts."},
+            "agent_type": delegation_agent_type_schema(),
+            "requested_model_policy": requested_model_policy_schema(),
+            "reasoning": fanout_reasoning_schema(),
+            "execution": provider_child_execution_schema(),
+            "collaborator_id": collaborator_identity_schema(),
+            "name": {"type": "string", "description": "Action label when accepted by the selected action."},
+            "input": {"type": "object", "description": "Optional run_chain template input."},
+            "rollback_on_failure": {"type": "boolean", "description": "Rollback bounded chain mutations after failure."},
+            "initial_turns": {"type": "integer", "minimum": 1, "description": "Optional first execution slice; renewable while progress continues. This is not a hard limit. When complexity is also present, the smaller initial slice wins."},
+            "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Optional first internal child request output-token ceiling. Current provider-owned native execution cannot honor this limit and rejects it before launch; omit it for that execution, or report that a required limit is unsupported.", "x-astra-discovery-summary": "Internal only; native execution rejects output caps."},
+            "inherit_prefix": {
+                "type": ["object", "null"],
+                "description": "Parent prefix inheritance request. The Server child executor does not support inheritance and rejects explicit requests regardless of required. Omit for a fresh child context.",
+                "properties": {
+                    "from_run_id": {"type": ["string", "null"]},
+                    "required": {"type": "boolean"}
+                },
+                "additionalProperties": false
+            },
+            "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Initial-slice hint: `light`≤10 turns, `normal`=agent default, `deep`=2× default. Prefer normal for scoped review/refactor work; use deep only when this child independently needs broad multi-step investigation. It never expands a smaller initial_turns hint."},
+            "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
+            "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
+            "work_item": {
+                "type": "object",
+                "description": "Optional exact canonical WorkItem revision assigned to this child. Use an item returned by start_work or inspect_work_plan; the server verifies current Work membership and derives the attempt from the child run.",
+                "properties": {
+                    "item_id": {"type": "string", "minLength": 1},
+                    "item_revision": {"type": "integer", "minimum": 1}
+                },
+                "required": ["item_id", "item_revision"],
+                "additionalProperties": false
+            },
+            "agent_id": {"type": "string", "description": "For get_result (required) or list (optional): exact runtime-generated agent_id, not a spawn name. Never prefill this on spawn."},
+            "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
+            "message": {"type":"string", "minLength":1, "maxLength":3000, "description": "REQUIRED for action='send_message'. Concise coordination text; not an object or array. Share an artifact for larger content."},
+            "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"], "description": "Default text. Provider-owned native stages accept text guidance, not structured requests such as question or shutdown_request. Shutdown is cooperative messaging, not runtime cancellation; queued never proves the recipient stopped. Hard cancellation belongs to the authenticated run/session control.", "x-astra-discovery-summary": "Native stages accept text only. Shutdown is cooperative, not cancellation; queued is not stopped."},
+            "request_id": {"type": "string", "description": "Exact incoming question ID; required with message_type=answer. Optional correlation id for other follow-ups."}
+        },
+        "required": ["action"],
+        "additionalProperties": false,
+        "x-astra-per-action-required": {
+            "spawn": ["description", "prompt"],
+            "run_chain": ["name", "description", "steps"],
+            "get_result": ["agent_id"],
+            "list": [],
+            "wait": [],
+            "send_message": ["to", "message"]
+        },
+        "x-astra-per-action-allowed": {
+            "spawn": crate::agent_tool_contract::AGENT_SPAWN_FIELDS,
+            "get_result": ["action", "agent_id"],
+            "list": ["action", "agent_id"],
+            "wait": ["action", "timeout_ms"],
+            "run_chain": ["action", "name", "description", "steps", "input", "rollback_on_failure"],
+            "send_message": ["action", "to", "message", "message_type", "request_id"]
+        }
     })
 }
 
@@ -1415,14 +1891,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-            "description": "Workspace root is default; workdir selects a bounded call directory. source_artifacts preserves them before spawn. Checksum alone is not a backup; no process-persistence guarantee.",
+            "description": "Omit mode for inspection; verify adds a post-edit workspace proof. workdir is call-local. source_artifacts preserves inputs before spawn; no process-persistence guarantee.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
                         "command": {"type": "string", "description": BASH_COMMAND_GUIDANCE},
                         "workdir": {"type": "string", "minLength": 1, "description": "Optional execution directory for this call only. Relative paths resolve from the workspace root; absolute paths must remain inside it. The directory must already exist. Defaults to the workspace root and does not persist. Executors without pinned-subdirectory support reject subdirectories rather than weaken path confinement."},
-                        "mode": {"type": "string", "enum": ["verify"], "description": "Optional explicit workspace verification contract. Omit this field for calculations, read-only probes, diagnostics, tests, and commands whose stdout is the evidence. Use it only for a foreground command that verifies a bound workspace stayed unchanged after edits; it succeeds only when the command exits zero and the executor proves that fact, and it must not be used for commands that write files."},
+                        "mode": {"type": "string", "enum": ["verify"], "description": "Optional explicit workspace verification contract. Omit this field for calculations, read-only probes, diagnostics, tests, and commands whose stdout is the evidence. Use it only for a foreground command that verifies a bound workspace stayed unchanged after edits; it succeeds only when the command exits zero and the executor proves that fact, and it must not be used for commands that write files.", "x-astra-discovery-summary": "Omit for inspection/diagnostics; verify needs unchanged-workspace proof after edits."},
                     "timeout": {"type": "number", "default": crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS, "description": "Outer execution timeout in seconds. Set this field to a larger value for long builds/tests, e.g. cargo build or full test suites. A `timeout ...` program inside command does not extend Astra's outer timeout."},
                         "force": {"type": "boolean", "description": "Bypass the per-session identical-command cache."},
                         "source_artifacts": {
@@ -1431,13 +1907,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "maxItems": crate::source_preimage::MAX_SOURCE_ARTIFACTS,
                             "items": {"type": "string", "minLength": 1},
                             "description": "Optional hard evidence-preservation guarantee. List existing regular files relative to the workspace root before a command may open or transform irreplaceable inputs. Each file is copied and checksum-verified before the shell starts; any invalid path, capture failure, or race prevents execution. This is not a glob and a checksum alone is not a backup."
-                        },
-                        "external_state_paths": {
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": 16,
-                            "items": {"type": "string", "minLength": 1},
-                            "description": "Required when this command may change state outside the bound workspace. List the smallest absolute external roots whose state must change. Astra captures bounded pre/post fingerprints and issues completion evidence only for an observed delta under authoritative process ownership. Paths inside or overlapping the workspace, relative/traversal paths, unobservable roots, background tasks, and unchanged state fail closed. Omit this only for workspace-confined work or an explicit read-only verification; do not use it for workspace files."
                         }
                     },
                     "required": ["command"]
@@ -1922,7 +2391,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agent",
-                "description": "Actions: spawn needs description+prompt (not task/type/agent_id; returns a launched receipt promptly so the parent continues; no background arg); list reads child status; get_result needs the returned agent_id; run_chain needs name+description+steps.\n\n\
+                "description": concat!(crate::agent_parent_scope_guidance!(), "\n", "Actions: spawn needs description+prompt (not task/type/agent_id; returns a launched receipt promptly so the parent continues; no background arg); list reads child status; get_result needs the returned agent_id; run_chain needs name+description+steps.\n\n\
          Multi-agent and local fixed-chain operations. Actions: spawn, list, get_result, wait, run_chain, send_message. wait observes runtime activity without cancelling children on timeout; get_result inspects an outcome, not a polling loop. `run_chain` is a local executor pipeline, not a durable task list. If the user asks for task/Work tracking and `start_work` is visible, call `start_work` directly instead of using `agent`.\n\n\
          ## Required fields per action\n\
          - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `requested_model_policy`, `reasoning`, `initial_turns`, `max_output_tokens`, `complexity`, `isolated`, `allowed_tools`, `name`, `inherit_prefix`.)\n\
@@ -1932,11 +2401,11 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
          - `send_message`: REQUIRES `action`, `to`, `message`; `message_type=answer` also requires the exact `request_id` shown on the incoming question. A child asking its parent uses `to=parent` and `message_type=question`, not `ask_user` (which addresses the human user). The parent answers with `message_type=answer` and that exact request ID. Returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is for `list` and `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Status filters and result calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `list` or `get_result`.\n\n\
-         Model policy is an optional override: omit `requested_model_policy` to inherit the parent Offering. If the user requests another execution model, set this policy using an exact authorized Offering ID or configured name, never a `model` field. If the `agent` tool is visible, call it directly; discover unknown model choices through `model_catalog`, not tool or filesystem exploration. Never guess an Offering ID, inspect configuration, or substitute a different version. Omit reasoning unless requested; task/output names are not model overrides. Omit `agent_type` for the bounded read-only default, or choose a builtin persona when needed.\n\n\
+         Model policy is an optional override: omit `requested_model_policy` to inherit the parent Offering. For an Astra Offering override, use an exact authorized Offering ID or configured name, never a `model` field. For a provider-owned capacity, use the exact `execution.tool` and provider `execution.model` from the current provider directory; the provider selector is not an Astra Offering. Discover unknown Astra Offering choices through `model_catalog`, not tool or filesystem exploration. Never guess, inspect configuration, or substitute a different version. Omit reasoning unless requested; task/output names are not model overrides. Omit `agent_type` for the bounded read-only default, or choose a builtin persona when needed.\n\n\
          ## Spawn example\n\
          `{\"action\":\"spawn\",\"description\":\"Audit auth flow\",\"prompt\":\"Read src/auth/* and report token-handling bugs. Return numbered findings.\"}`\n\n\
          ## Execution mode\n\
-        `spawn` returns a `launched` receipt with a runtime-generated `agent_id` promptly after execution ownership is established, while the child runs and the parent continues independent work. After an accepted launch, when no relevant independent work remains, use agent(wait) for input; proposing a final answer also lets the runtime wait and present the child outcome. Do not use shell sleep or busy-poll status to wait. No background flag or Ctrl+B is needed. The receipt proves launch, not completion; observe the automatically delivered child outcome before relying on it; do not re-fetch an already observed, sufficient result. Normal model admission, tool permissions, execution deadlines, lineage, and cancellation ownership still apply. Launching does not extend the deadline or grant permissions.\n\n\
+        `spawn` returns a `launched` receipt with a runtime-generated `agent_id` promptly after execution ownership is established, while the child runs and the parent continues independent work. While owned children remain pending and no independent work remains, use agent(wait) or propose an answer for runtime completion waiting. After sufficient terminal outcomes arrive, finish the request; wait for future input only when requested. Do not use shell sleep or busy-poll status to wait. No background flag or Ctrl+B is needed. The receipt proves launch, not completion; observe the automatically delivered child outcome before relying on it; do not re-fetch an already observed, sufficient result. Normal model admission, tool permissions, execution deadlines, lineage, and cancellation ownership still apply. Launching does not extend the deadline or grant permissions.\n\n\
          ## Parallel sub-agent fan-out\n\
          For independent parallel tasks, call `agent` with `action=spawn` once per child. Each launch has its own receipt and may succeed or fail independently; report partial outcomes honestly. Do not issue the same child task twice unless the user explicitly asks for independent duplicate runs. Use `agent_fanout` only when the user needs all-child preflight, target-count accounting, or group-wide control. Preflight does not guarantee every child will execute successfully. Do not simulate a group with an `agents:[...]` payload on `agent`. `agent_fanout.start` launches the admitted slots concurrently and returns a launch receipt; the parent-owned completion boundary prevents finalization before terminal child outcomes are staged. Slots may include `id` as a caller-facing label; runtime-generated `agent_id` values come back in the result.\n\
          For plan lifecycle, if `enter_plan_mode` / `exit_plan_mode` are visible in the current tool surface, call them directly; never wrap them in the `agent` `run_chain` action.\n\
@@ -1948,130 +2417,30 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - Shell commands/processes are separate execution tools; do not represent them as sub-agents.
          - When no canonical Work exists and the current turn requires durable task tracking, establish it with `start_work` before delegating. When canonical Work already exists, keep that Work as the durable scope rather than trying to create another one. `agent` and `agent_fanout` do not themselves create or replace a canonical task list.
          - `start_work` may return `initial_task`, and `settle_work_item` may return `next_task`. Each is already the server-selected primary-session assignment: execute it directly. Call `run_next_work_item({})` only when neither response supplied an assignment. Treat an assigned task's expected result as its stop boundary: gather sufficient direct evidence, settle immediately when satisfied, and do not expand into adjacent investigation. Generic `agent` and `agent_fanout` are reserved for real isolation or parallelism boundaries; a WorkItem alone is not a delegation reason.
-         - Background task tools only observe or control execution; they are not a planning system.",
-                "parameters": {
-                    "type": "object",
-                    "x-astra-action-surfaces": {
-                        "spawn": ["local", "server"],
-                        "list": ["local", "server"],
-                        "get_result": ["local", "server"],
-                        "wait": ["local", "server"],
-                        "run_chain": ["local"],
-                        "send_message": ["local", "server"]
-                    },
-                    "x-astra-surface-descriptions": {
-                        "server": "Server-owned single-agent lifecycle. If visible, call it directly; use model_catalog only when model choices are unknown. Actions: spawn, list, get_result, send_message. Omit agent_type for the bounded read-only default; choose a builtin persona when mutation or the full surface is required. Spawn needs description+prompt and returns a launch receipt, not completion; execution deadlines, tool permissions, lineage, and cancellation still apply. list is read-only status of this agent's direct owned children; get_result collects an outcome; wait observes runtime activity instead of polling. The parent-owned completion boundary waits and presents the child result. A child asks its parent with message_type=question, not ask_user, and the parent answers with the exact request_id. Interpret user model requests and propose requested_model_policy with an exact authorized Offering ID or configured name. Preserve version and source; do not substitute. Task content is not an execution control. Never inspect workspace files, model configuration, or credentials. Use visible start_work for durable Work."
-                    },
-                    "x-astra-surface-discovery-summaries": {
-                        "server": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question"
-                    },
-                    "x-astra-per-action-discovery-summaries": {
-                        "spawn": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
-                        "get_result": "action+returned agent_id; collect outcome when needed; may briefly wait or reconcile durable state; use list for status; do not busy-poll",
-                        "wait": "action; optional bounded timeout_ms; observe current-run input without polling or model calls; observation timeout does not cancel child execution",
-                        "list": "action; optional exact agent_id; read-only in-memory status of direct owned children in this session; no database query, terminal wait, or result collection; absent means unknown",
-                        "run_chain": "local fixed pipeline with action+name+description+steps; never a durable task list",
-                        "send_message": "action+to+message; child asks parent via to=parent, message_type=question (not ask_user); parent answers with the exact request_id"
-                    },
-                    "x-astra-discovery-summary": "requested_model_policy:omit unasked;authorized ID/name;model_catalog;no substitution/config reads;hard reqs bind;launched;propose final;runtime waits;no shell sleep;agent question",
-                    "properties": {
-                        "action": {"type": "string", "enum": ["spawn","list","get_result","wait","run_chain","send_message"]},
-                        "timeout_ms": {"type":"integer", "minimum":1, "maximum":300000, "description":"Observation wait timeout (wait). Default 30000 ms. Does not cancel children."},
-                        "steps": {
-                            "type": "array",
-                            "minItems": 1,
-                            "description": "run_chain steps.",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "tool": {"type": "string"},
-                                    "args": {"type": "object"},
-                                    "output_key": {"type": "string"},
-                                    "skip_if_prev_contains": {"type": "string"}
-                                },
-                                "required": ["tool", "args"]
-                            }
-                        },
-                        "description": {"type": "string", "description": "Short operation description when required by the selected action."},
-                        "prompt": {"type": "string", "description": "Full self-contained child brief: preserve constraints, conditional mappings and exact output requirements. Keep parent-only reporting outside the brief: the parent reports execution model and status from runtime receipts, not child self-report. Only choices the child must ask about may remain unresolved. Non-empty; requires description.", "x-astra-discovery-summary": "Exact output; parent uses model/status receipts."},
-                        "agent_type": delegation_agent_type_schema(),
-                        "requested_model_policy": requested_model_policy_schema(),
-                        "reasoning": fanout_reasoning_schema(),
-                        "name": {"type": "string", "description": "Action label when accepted by the selected action."},
-                        "input": {"type": "object", "description": "Optional run_chain template input."},
-                        "rollback_on_failure": {"type": "boolean", "description": "Rollback bounded chain mutations after failure."},
-                        "initial_turns": {"type": "integer", "minimum": 1, "description": "Optional first execution slice; renewable while progress continues. This is not a hard limit. When complexity is also present, the smaller initial slice wins."},
-                        "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Optional first child request output-token ceiling."},
-                        "inherit_prefix": {
-                            "type": ["object", "null"],
-                            "description": "Parent prefix inheritance request. The Server child executor does not support inheritance and rejects explicit requests regardless of required. Omit for a fresh child context.",
-                            "properties": {
-                                "from_run_id": {"type": ["string", "null"]},
-                                "required": {"type": "boolean"}
-                            },
-                            "additionalProperties": false
-                        },
-                        "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Initial-slice hint: `light`≤10 turns, `normal`=agent default, `deep`=2× default. Prefer normal for scoped review/refactor work; use deep only when this child independently needs broad multi-step investigation. It never expands a smaller initial_turns hint."},
-                        "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
-                        "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
-                        "work_item": {
-                            "type": "object",
-                            "description": "Optional exact canonical WorkItem revision assigned to this child. Use an item returned by start_work or inspect_work_plan; the server verifies current Work membership and derives the attempt from the child run.",
-                            "properties": {
-                                "item_id": {"type": "string", "minLength": 1},
-                                "item_revision": {"type": "integer", "minimum": 1}
-                            },
-                            "required": ["item_id", "item_revision"],
-                            "additionalProperties": false
-                        },
-                        "agent_id": {"type": "string", "description": "For get_result (required) or list (optional): exact runtime-generated agent_id, not a spawn name. Never prefill this on spawn."},
-                        "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
-                        "message": {"type":"string", "minLength":1, "maxLength":3000, "description": "REQUIRED for action='send_message'. Concise coordination text; not an object or array. Share an artifact for larger content."},
-                        "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"]},
-                        "request_id": {"type": "string", "description": "Exact incoming question ID; required with message_type=answer. Optional correlation id for other follow-ups."}
-                    },
-                    "required": ["action"],
-                    "additionalProperties": false,
-                    "x-astra-per-action-required": {
-                        "spawn": ["description", "prompt"],
-                        "run_chain": ["name", "description", "steps"],
-                        "get_result": ["agent_id"],
-                        "list": [],
-                        "wait": [],
-                        "send_message": ["to", "message"]
-                    },
-                    "x-astra-per-action-allowed": {
-                        "spawn": ["action", "description", "prompt", "agent_type", "requested_model_policy", "reasoning", "name", "initial_turns", "max_output_tokens", "complexity", "isolated", "allowed_tools", "inherit_prefix", "work_item"],
-                        "get_result": ["action", "agent_id"],
-                        "list": ["action", "agent_id"],
-                        "wait": ["action", "timeout_ms"],
-                        "run_chain": ["action", "name", "description", "steps", "input", "rollback_on_failure"],
-                        "send_message": ["action", "to", "message", "message_type", "request_id"]
-                    }
-                }
+         - Background task tools only observe or control execution; they are not a planning system."),
+                "parameters": agent_parameters_schema()
             }
         }),
         json!({
             "type": "function",
             "function": {
                 "name": "agent_fanout",
-                "description": "Launch one atomic parallel agent group: start requires exactly target_count slots, each with description+prompt, and no brief/agents/background fields. Submit one complete JSON object; do not emit a DSL or a partial object.\n\n\
+                "description": concat!(crate::agent_parent_scope_guidance!(), "\n", "Launch one atomic parallel agent group: start requires exactly target_count slots, each with description+prompt, and no brief/agents/background fields. Submit one complete JSON object; do not emit a DSL or a partial object.\n\n\
          Actions:\n\
          - `start`: requires `action`, `target_count`, and exactly target_count slots. Every slot has description+prompt; optional `id` is only a caller-facing label. Minimal valid start: `{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Review API\",\"prompt\":\"Review the API and report findings.\"},{\"id\":\"ui\",\"description\":\"Review UI\",\"prompt\":\"Review the UI and report findings.\"}]}`. Shared optional configuration belongs in `defaults`; omit it unless needed.\n\
          - `get_results`: requires `action` and returned `group_id`. It takes a short non-blocking snapshot; the parent-owned completion boundary independently stages terminal child outcomes, so do not busy-poll. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
          - `stop_group`: requires `action` and `group_id`; it requests cancellation for every non-terminal child in one group operation.\n\n\
-        Use this for independent parallel work only when the user request or loaded workflow explicitly requires parallelism. Put one concise child brief in each slot. An omitted model policy inherits the parent Offering. Exact authorized Offering and reasoning overrides require atomic admission before any slot starts. Interpret each requested execution model and propose requested_model_policy with an exact authorized Offering ID or configured name. Discover unknown choices using model_catalog. Preserve versions and sources; never substitute or inspect workspace configuration or credentials. Quoted model names in task content are not model selection. Only tools exposed in a child's own tool surface are usable; do not start workspace-dependent slots while the workspace provider is unavailable. Omit `agent_type` for the bounded read-only default, or choose a builtin persona when mutation or the full surface is required. Never paste file contents or prior tool output into a slot prompt. Use `allowed_tools`, not `tools`; do not send `brief`, `agents`, `background`, or generated `agent_id` fields. Start returns a launch receipt, not completion. Continue independent work, then use agent(wait); terminal child outcomes are delivered automatically. Do not re-fetch sufficient observed results. get_results remains available for bounded inspection, missing or truncated output, pagination, and recovery; never busy-poll.",
+        Use this for independent parallel work only when the user request or loaded workflow explicitly requires parallelism. Put one concise child brief in each slot. An omitted model policy inherits the parent Offering. Exact Astra Offering and reasoning overrides require atomic admission before any slot starts. For provider-owned capacities, copy the exact `execution.tool` and provider `execution.model` from the current provider directory; for Astra Offerings, use `requested_model_policy` with an exact authorized Offering ID or configured name. Discover unknown Astra Offering choices through `model_catalog`. Preserve versions and sources; never substitute or inspect workspace configuration or credentials. Quoted model names in task content are not model selection. Only tools exposed in a child's own tool surface are usable; do not start workspace-dependent slots while the workspace provider is unavailable. Omit `agent_type` for the bounded read-only default, or choose a builtin persona when mutation or the full surface is required. Never paste file contents or prior tool output into a slot prompt. Use `allowed_tools`, not `tools`; do not send `brief`, `agents`, `background`, or generated `agent_id` fields. Start returns a launch receipt, not completion. Continue independent work, then use agent(wait); terminal child outcomes are delivered automatically. Do not re-fetch sufficient observed results. get_results remains available for bounded inspection, missing or truncated output, pagination, and recovery; never busy-poll."),
                 "parameters": {
                     "type": "object",
                     "x-astra-per-action-discovery-summaries": {
-                        "start": "requested_model_policy: omit unless user requests override; then authorized ID/name; unknown=model_catalog; no substitution/config reads; hard requirements bind; target_count slots, description+prompt; atomic.",
+                        "start": FANOUT_DISCOVERY_SUMMARY,
                         "get_results": "action+group_id; use bounded result windows and follow next_call",
                         "stop_slot": "action+group_id+slot_index",
                         "stop_group": "action+group_id"
                     },
-                     "x-astra-discovery-summary": "requested_model_policy: omit unless user requests override; then authorized ID/name; unknown=model_catalog; no substitution/config reads; hard requirements bind; target_count slots, description+prompt; atomic.",
+                     "x-astra-discovery-summary": FANOUT_DISCOVERY_SUMMARY,
                     "properties": {
                         "action": {"type": "string", "enum": ["start","get_results","stop_slot","stop_group"]},
                         "group_id": {"type": "string", "description": "Fanout group id. Optional on start; required for get_results, stop_slot, and stop_group."},
@@ -2089,12 +2458,14 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                     "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Preserve user constraints and exact output in each brief. Keep parent-only reporting outside: use runtime model/status receipts, not child self-report. Inherits provider bindings; use only exposed tools. Never paste files, diffs, or prior tool output.", "x-astra-discovery-summary": "Preserve exact child output; parent uses model/status receipts."},
                                     "agent_type": delegation_agent_type_schema(),
                                     "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
-                                    "max_output_tokens": {"type": "integer", "minimum": 1},
+                                    "max_output_tokens": {"type": "integer", "minimum": 1, "description": "First internal child request output-token ceiling; current provider-owned native execution rejects this limit before launch.", "x-astra-discovery-summary": "Internal only; native execution rejects output caps."},
                                     "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                     "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
                                     "allowed_tools": {"type": "array", "items": {"type": "string"}},
                                     "requested_model_policy": requested_model_policy_schema(),
-                                    "reasoning": fanout_reasoning_schema()
+                                    "reasoning": fanout_reasoning_schema(),
+                                    "execution": provider_child_execution_schema(),
+                                    "collaborator_id": collaborator_identity_schema()
                                 },
                                 "required": ["description", "prompt"]
                             }
@@ -2106,12 +2477,13 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "properties": {
                                 "agent_type": delegation_agent_type_schema(),
                                 "initial_turns": {"type": "integer", "minimum": 1, "description": "Renewable first execution slice, not a hard limit."},
-                                "max_output_tokens": {"type": "integer", "minimum": 1},
+                                "max_output_tokens": {"type": "integer", "minimum": 1, "description": "First internal child request output-token ceiling; current provider-owned native execution rejects this limit before launch.", "x-astra-discovery-summary": "Internal only; native execution rejects output caps."},
                                 "complexity": {"type": "string", "enum": ["light","normal","deep"]},
                                 "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (including the default explore persona), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
                                 "allowed_tools": {"type": "array", "items": {"type": "string"}},
                                 "requested_model_policy": requested_model_policy_schema(),
-                                "reasoning": fanout_reasoning_schema()
+                                "reasoning": fanout_reasoning_schema(),
+                                "execution": provider_child_execution_schema()
                             }
                         },
                         "slot_index": {"type": "integer", "minimum": 0, "description": "REQUIRED for stop_slot. Optional for get_results to read one slot result window."},
@@ -2519,6 +2891,157 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validation_receipts_preserve_rules_without_publishing_private_data() {
+        let error = validate_tool_arguments(
+            "agent",
+            &json!({
+                "action":"spawn", "prompt":"private-sentinel", "agent_id":"private-sentinel"
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.issues[0].code, ValidationCode::Required);
+        let receipt = error.rejection_output();
+        assert_eq!(
+            receipt["validation"]["issues"][0],
+            json!({"code":"required","path":"/description"})
+        );
+        assert!(
+            receipt["error"]
+                .as_str()
+                .unwrap()
+                .contains("Correct the named fields")
+        );
+        let result = error.into_tool_result();
+        assert!(result.is_error);
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.output).unwrap(),
+            receipt
+        );
+        assert_eq!(result.metadata.unwrap()["error_kind"], "tool_invalid_args");
+        assert!(
+            !receipt["validation"]
+                .to_string()
+                .contains("private-sentinel")
+        );
+        for (rule, value, expected) in [
+            (json!({"type":"string"}), json!(7), ValidationCode::Type),
+            (
+                json!({"const":"private-sentinel"}),
+                json!("wrong"),
+                ValidationCode::Const,
+            ),
+            (
+                json!({"enum":["private-sentinel"]}),
+                json!("wrong"),
+                ValidationCode::Enum,
+            ),
+            (
+                json!({"minLength":4}),
+                json!("x"),
+                ValidationCode::MinLength,
+            ),
+            (
+                json!({"maxLength":1}),
+                json!("long"),
+                ValidationCode::MaxLength,
+            ),
+            (json!({"minimum":2}), json!(1), ValidationCode::Minimum),
+            (json!({"maximum":1}), json!(2), ValidationCode::Maximum),
+            (
+                json!({"uniqueItems":true}),
+                json!([1, 1]),
+                ValidationCode::UniqueItems,
+            ),
+            (json!({"minItems":1}), json!([]), ValidationCode::MinItems),
+            (
+                json!({"maxItems":1}),
+                json!([1, 2]),
+                ValidationCode::MaxItems,
+            ),
+            (json!({"oneOf":[{},{}]}), json!(1), ValidationCode::Union),
+        ] {
+            let schema = json!({"function":{"parameters":{"type":"object","properties":{
+                "description":rule},"description":"private-sentinel"}}});
+            let error = validate_tool_arguments_against_schema(
+                "agent",
+                &json!({"description":value}),
+                &schema,
+            )
+            .unwrap_err();
+            assert_eq!(error.issues[0].code, expected);
+            let public = error.diagnostic();
+            assert!(validated_argument_diagnostic("agent", &public).is_some());
+            assert!(!public.to_string().contains("private-sentinel"));
+        }
+        let schema = json!({"function":{"parameters":{"type":"object", "properties":{
+            "private-sentinel":{"type":"string"}},"additionalProperties":false}}});
+        for tool in ["agent", "mcp_private"] {
+            let error = validate_tool_arguments_against_schema(
+                tool,
+                &json!({"private-sentinel":7,"another-private-key":1}),
+                &schema,
+            )
+            .unwrap_err();
+            let public = error.diagnostic();
+            assert!(!public.to_string().contains("private"));
+            assert!(
+                public["issues"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|issue| issue["path"].is_null() || issue["path"] == "")
+            );
+        }
+    }
+
+    #[test]
+    fn validation_diagnostics_bound_locations_and_omit_excess_issues() {
+        let error = validate_tool_arguments(
+            "agent_fanout",
+            &json!({
+                "action":"start", "target_count":32, "slots":vec![json!({});32]
+            }),
+        )
+        .unwrap_err();
+        let diagnostic = error.diagnostic();
+        assert_eq!(diagnostic["issues"].as_array().unwrap().len(), 8);
+        assert!(diagnostic["omitted"].as_u64().unwrap() > 0);
+        assert!(diagnostic.to_string().len() <= 4096);
+        assert!(
+            diagnostic["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| issue["path"] == "/slots/*/prompt")
+        );
+        assert_eq!(
+            validated_argument_diagnostic("agent_fanout", &diagnostic),
+            Some(diagnostic)
+        );
+        for value in [
+            json!({"issues":[{"code":"type","path":"/private-sentinel"}],"omitted":0}),
+            json!({"issues":[{"code":"type","path":"/slots/0/prompt"}],"omitted":0}),
+            json!({"issues":[{"code":"private-sentinel","path":null}],"omitted":0}),
+            json!({"issues":vec![json!({"code":"required","path":null});9],"omitted":0}),
+            json!({"issues":[],"omitted":0,"error":"private-sentinel"}),
+        ] {
+            assert!(validated_argument_diagnostic("agent_fanout", &value).is_none());
+        }
+        let issue = ValidationIssue::new(
+            ValidationCode::Type,
+            &vec!["description".into(); 9],
+            "private-sentinel".into(),
+        );
+        let error = ToolArgumentValidationError {
+            tool_name: "agent".into(),
+            action: None,
+            issues: vec![issue],
+            malformed_parse_error: None,
+        };
+        assert!(error.diagnostic()["issues"][0]["path"].is_null());
+    }
+
+    #[test]
     fn built_in_schema_construction_fits_default_tokio_worker_stack() {
         // Call the uncached constructor directly: another schema test may
         // already have initialized the process-global validation index.
@@ -2689,13 +3212,19 @@ mod tests {
             .as_str()
             .expect("agent description");
         assert!(description.contains("`requested_model_policy`, `reasoning`"));
-        assert!(description.contains("Never guess an Offering ID, inspect configuration"));
+        assert!(description.contains("Never guess, inspect configuration"));
         assert!(!description.contains("Optional: `agent_type`, `model`"));
         let properties = &agent["function"]["parameters"]["properties"];
         assert!(properties.get("model").is_none());
         let policy_description = properties["requested_model_policy"]["description"]
             .as_str()
             .expect("requested model policy description");
+        let provider_execution_description = properties["execution"]["description"]
+            .as_str()
+            .expect("provider execution description");
+        assert!(provider_execution_description.contains("requested model uniquely matches"));
+        assert!(provider_execution_description.contains("ask once for the missing choice"));
+        assert!(provider_execution_description.contains("uses requested_model_policy"));
         assert!(policy_description.contains("Optional execution-model override"));
         assert!(policy_description.contains("Omit to inherit the parent Offering"));
         assert!(
@@ -2711,91 +3240,50 @@ mod tests {
     }
 
     #[test]
-    fn deferred_delegation_discovery_preserves_user_model_requirements() {
+    fn deferred_delegation_discovery_preserves_scope_and_model_requirements() {
+        let scope = crate::agent_parent_scope_guidance!();
         for surface in ["server", "local"] {
             let mut schemas = all_tool_schemas();
             project_action_schemas_for_surface(&mut schemas, surface);
-
             for name in ["agent", "agent_fanout"] {
-                let schema = find_schema(&schemas, name).expect("delegation schema must exist");
-                let selection = crate::tool_search::tool_selection_contract(schema)
-                    .expect("delegation schema must have a discovery contract");
-                if surface == "server" {
-                    assert_eq!(
-                        selection["description_truncated"], false,
-                        "load-bearing Server guidance must fit deferred discovery for {name}"
-                    );
-                }
-                let summary = selection["description"]
+                let schema = find_schema(&schemas, name).expect("delegation schema");
+                let description = schema["function"]["description"].as_str().unwrap();
+                assert!(description.starts_with(scope), "{surface}/{name}");
+                assert!(description.contains("model_catalog"), "{surface}/{name}");
+                assert!(description.contains("configuration"), "{surface}/{name}");
+                let manifest = schema["function"]["parameters"]["x-astra-discovery-summary"]
                     .as_str()
-                    .expect("delegation discovery summary");
-                if name == "agent" {
-                    assert!(
-                        summary.contains("requested_model_policy"),
-                        "{surface}: {summary}"
-                    );
-                    assert!(
-                        summary.contains("authorized ID/name"),
-                        "{surface}: {summary}"
-                    );
-                    assert!(
-                        summary.contains("hard requirements bind")
-                            || summary.contains("hard reqs bind"),
-                        "{surface}: {summary}"
-                    );
-                    assert!(
-                        summary.contains("no substitution/config reads"),
-                        "{surface}: {summary}"
-                    );
-                    assert!(summary.contains("launched"), "{surface}: {summary}");
-                    assert!(summary.contains("omit unasked"), "{surface}: {summary}");
-                    assert!(
-                        summary.contains("propose final") || summary.contains("proposes final"),
-                        "{surface}: {summary}"
-                    );
-                    assert!(summary.contains("agent question"), "{surface}: {summary}");
-                    assert!(summary.contains("shell sleep"), "{surface}: {summary}");
-                    assert!(!summary.contains("foreground"), "{surface}: {summary}");
-                } else {
-                    let lower = summary.to_ascii_lowercase();
-                    assert!(lower.contains("omit unless user requests override"));
-                    assert!(
-                        lower.contains("authorized id/name"),
-                        "{surface}/{name}: {summary}"
-                    );
-                    assert!(
-                        lower.contains("model_catalog") && lower.contains("no substitution"),
-                        "{surface}/{name}: {summary}"
-                    );
-                    assert!(
-                        lower.contains("hard requirements bind"),
-                        "{surface}/{name}: {summary}"
-                    );
-                    assert!(
-                        summary.contains("no substitution/config reads"),
-                        "{surface}/{name}: {summary}"
-                    );
+                    .unwrap();
+                let visible: String = manifest.chars().take(180).collect();
+                assert!(visible.contains(scope), "{surface}/{name}: {visible}");
+                if surface == "server" {
+                    assert!(manifest.chars().count() <= 180);
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn agent_manifest_summary_keeps_coordination_cues_within_its_budget() {
-        for surface in ["local", "server"] {
-            let mut schemas = all_tool_schemas();
-            project_action_schemas_for_surface(&mut schemas, surface);
-            let agent = find_schema(&schemas, "agent").unwrap();
-            let summary = agent["function"]["parameters"]["x-astra-discovery-summary"]
-                .as_str()
-                .unwrap();
-            let visible: String = summary.chars().take(180).collect();
-            for cue in ["requested_model_policy", "runtime waits", "no shell sleep"] {
-                assert!(visible.contains(cue), "{surface}: missing {cue}: {visible}");
-            }
-            if surface == "server" {
-                assert!(summary.chars().count() <= 180, "{surface}: {summary}");
-                assert!(visible.contains("agent question"), "{surface}: {visible}");
+                let mut selected = schema.clone();
+                project_action_discovery_summary(
+                    selected["function"]["parameters"].as_object_mut().unwrap(),
+                    &[if name == "agent" { "spawn" } else { "start" }.to_string()],
+                );
+                let selection = crate::tool_search::tool_selection_contract(&selected).unwrap();
+                assert_eq!(
+                    selection["description_truncated"], false,
+                    "{surface}/{name}"
+                );
+                let summary = selection["description"].as_str().unwrap();
+                assert!(summary.contains(scope), "{surface}/{name}: {summary}");
+                assert!(
+                    summary.chars().count() <= 220,
+                    "{surface}/{name}: {summary}"
+                );
+                assert!(
+                    summary.contains("Exact provider/Offering"),
+                    "{surface}/{name}"
+                );
+                if name == "agent_fanout" {
+                    for cue in ["slots=target_count", "description+prompt", "atomic"] {
+                        assert!(summary.contains(cue), "{surface}/{name}: {summary}");
+                    }
+                }
             }
         }
     }
@@ -2815,8 +3303,12 @@ mod tests {
             assert!(description.contains("ask_user"));
             if surface == "server" {
                 assert!(
-                    description.contains("use model_catalog only when model choices are unknown")
+                    description.contains(
+                        "use the current provider directory for provider-owned capacities"
+                    )
                 );
+                assert!(description.contains("active parent/child/peer mailboxes only"));
+                assert!(description.contains("exact collaborator_id"));
                 assert!(description.contains(
                     "propose requested_model_policy with an exact authorized Offering ID or configured name"
                 ));
@@ -2847,13 +3339,13 @@ mod tests {
                     selection["description"]
                         .as_str()
                         .unwrap()
-                        .contains("no shell sleep")
+                        .contains(crate::agent_parent_scope_guidance!())
                 );
                 assert!(
                     selection["description"]
                         .as_str()
                         .unwrap()
-                        .contains("runtime waits")
+                        .contains("launch≠done")
                 );
                 let mut spawn = agent.clone();
                 project_action_discovery_summary(
@@ -2865,7 +3357,7 @@ mod tests {
                     selection["description"]
                         .as_str()
                         .unwrap()
-                        .contains("no shell sleep")
+                        .contains(crate::agent_parent_scope_guidance!())
                 );
                 let mut message = agent.clone();
                 project_action_discovery_summary(
@@ -2874,12 +3366,12 @@ mod tests {
                 );
                 let selection = crate::tool_search::tool_selection_contract(&message).unwrap();
                 assert_eq!(selection["description_truncated"], false);
-                assert!(
-                    selection["description"]
-                        .as_str()
-                        .is_some_and(|text| text.contains("message_type=question")
-                            && text.contains("not ask_user"))
-                );
+                assert!(selection["description"].as_str().is_some_and(|text| {
+                    text.contains("message_type=question")
+                        && text.contains("not ask_user")
+                        && text.contains("active mailbox only")
+                        && text.contains("exact collaborator_id")
+                }));
             }
 
             for (action, guidance) in [
@@ -2887,7 +3379,7 @@ mod tests {
                     "list",
                     "read-only in-memory status of direct owned children",
                 ),
-                ("get_result", "may briefly wait or reconcile durable state"),
+                ("get_result", "inline child output"),
             ] {
                 let mut selected = agent.clone();
                 project_action_discovery_summary(
@@ -3172,7 +3664,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            spawn_with_runtime_id.issues,
+            spawn_with_runtime_id
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec!["field(s) not allowed for action `spawn`: agent_id"]
         );
 
@@ -3217,7 +3713,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            result_with_mailbox_name.issues,
+            result_with_mailbox_name
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec!["field(s) not allowed for action `get_result`: name"]
         );
 
@@ -3932,6 +4432,26 @@ mod tests {
         assert!(properties.contains_key("catalog_revision"));
         assert!(properties.get("facet").is_none());
         assert!(properties.get("format").is_none());
+        let revision = format!("sha256:{}", "0".repeat(64));
+        for (args, valid) in [
+            (json!({}), true),
+            (json!({"limit": 16}), true),
+            (
+                json!({"cursor": "next", "catalog_revision": revision}),
+                true,
+            ),
+            // The provider-safe schema validates field shape. The paired
+            // continuation invariant belongs to ModelCatalogRequest, the
+            // canonical runtime parser, because Anthropic/Bedrock reject a
+            // root oneOf in input_schema.
+            (json!({"cursor": "next"}), true),
+            (json!({"catalog_revision": revision}), true),
+        ] {
+            assert_eq!(
+                validate_tool_arguments_against_schema("model_catalog", &args, catalog).is_ok(),
+                valid
+            );
+        }
     }
 
     #[test]
@@ -4372,8 +4892,7 @@ mod tests {
             .and_then(Value::as_str)
             .expect("bash schema must describe its execution contract");
         assert!(bash_description.contains("source_artifacts"));
-        assert!(bash_description.contains("preserves them before spawn"));
-        assert!(bash_description.contains("Checksum alone is not a backup"));
+        assert!(bash_description.contains("preserves inputs before spawn"));
         assert_eq!(
             bash.pointer("/function/parameters/properties/source_artifacts/minItems")
                 .and_then(Value::as_u64),
@@ -4440,7 +4959,11 @@ mod tests {
 
         assert_eq!(error.action.as_deref(), Some("forget"));
         assert_eq!(
-            error.issues,
+            error
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec!["missing non-empty required field `reason`"]
         );
         assert_eq!(
@@ -4533,7 +5056,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            error.issues,
+            error
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "requires one of: memory_id or memory_ids or selection_id",
                 "field `memory_ids` requires at least 1 item(s)",
@@ -4553,7 +5080,11 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            error.issues,
+            error
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "unknown field(s): legacy_focus",
                 "field `last_n` has type string, expected \"integer\"",
@@ -4579,7 +5110,11 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            error.issues,
+            error
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "field `slots` item 0 missing non-empty required field `prompt`",
                 "field `target_count` must be at least 1",
@@ -4664,7 +5199,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(
-            error.issues,
+            error
+                .issues
+                .iter()
+                .map(|issue| issue.message.as_str())
+                .collect::<Vec<_>>(),
             vec![
                 "field `questions` item 0 field `options` item 0 missing non-empty required field `label`"
             ]

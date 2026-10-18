@@ -358,15 +358,15 @@ mod tests {
         for (question, answer) in [
             (
                 json!({"type":"noul","instructions":"Is this supported?"}),
-                json!({"type":"discrete_noul","decision":"yes"}),
+                json!("yes"),
             ),
             (
                 json!({"type":"choice","instructions":"Which?","criteria":{"a":"A"},"optional":false}),
-                json!({"type":"discrete_choice","option":"a"}),
+                json!("a"),
             ),
             (
                 json!({"type":"score","instructions":"How much?","criteria":["low","high"]}),
-                json!({"type":"discrete_score","level":1}),
+                json!(1),
             ),
         ] {
             let request: JudgmentRequest = serde_json::from_value(json!({"schema_version":JUDGMENT_SCHEMA_VERSION,"state":{"evidence":"bounded"},"questions":{"q":question}})).unwrap();

@@ -4,10 +4,12 @@
 //! extracted from the monolithic runtime crate for better modularity.
 
 mod context_history_artifact;
+mod skill_catalog_identity;
 pub use context_history_artifact::{
     CONTEXT_HISTORY_ARTIFACT_KIND, CONTEXT_HISTORY_ARTIFACT_URI_PREFIX, ContextHistoryArtifactV1,
     MAX_CONTEXT_HISTORY_BYTES,
 };
+pub use skill_catalog_identity::SkillCatalogIdentity;
 
 mod agent_communication;
 mod agent_transcript_evidence;
@@ -144,19 +146,25 @@ pub use provider_canonical_transition::{
     ProviderCanonicalTransitionError, ProviderCanonicalTransitionV2, ProviderCanonicalWalBaseV2,
 };
 pub use provider_contract::{
-    DescriptorVersion, NativeToolId, PROVIDER_INTERACTION_REQUEST_METADATA_KEY,
-    PROVIDER_INTERACTION_RESPONSE_METADATA_KEY, ProviderBindingRef, ProviderCallOutcome,
-    ProviderCallPayload, ProviderClaim, ProviderClaimSource, ProviderClaimTrust,
-    ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity, ProviderInteractionOutcome,
-    ProviderInteractionRequest, ProviderInteractionResponse, ProviderProtocolId, ProviderRejection,
-    ProviderRejectionCode, ProviderResolverVersion, ProviderSemanticCacheContract,
-    ProviderSemanticDiagnostic, ProviderSemanticDiagnosticCode, ProviderTaskSupport,
-    ProviderToolClaims, ProviderToolDeclaration, PublicToolAlias, ResolvedConcurrencyBaseline,
-    ResolvedProviderClaim, ResolvedProviderSnapshot, ResolvedProviderSnapshotRef,
-    ResolvedProviderToolClaims, ResolvedSemanticCacheBaseline, ResolvedToolDescriptor,
-    ResolvedToolDescriptorDraft, ResolvedToolDescriptorRef, ResolvedToolEffect,
-    ResolvedToolIdempotency, ResolvedToolSemantics, STABLE_TOOL_ALIAS_METADATA_KEY,
-    STABLE_TOOL_ALIAS_SCHEMA_KEY, StableToolAlias, ToolIdentity,
+    DescriptorVersion, MAX_PROVIDER_MODEL_CATALOG_BYTES, MAX_PROVIDER_MODEL_CATALOG_ITEMS,
+    MAX_PROVIDER_STAGE_INPUT_BYTES, NATIVE_COLLABORATOR_OBSERVATION_KEY,
+    NativeCollaboratorObservation, NativeStageDispatchState, NativeToolId,
+    PROVIDER_COLLABORATOR_STAGE_KEY, PROVIDER_INTERACTION_REQUEST_METADATA_KEY,
+    PROVIDER_INTERACTION_RESPONSE_METADATA_KEY, PROVIDER_MODEL_CATALOG_KEY,
+    PROVIDER_RUNTIME_REQUIREMENTS_KEY, PROVIDER_STAGE_INPUT_ACK_TIMEOUT, ProviderBindingRef,
+    ProviderCallOutcome, ProviderCallPayload, ProviderClaim, ProviderClaimSource,
+    ProviderClaimTrust, ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity,
+    ProviderInteractionOutcome, ProviderInteractionRequest, ProviderInteractionResponse,
+    ProviderModelCatalog, ProviderModelDescriptor, ProviderProtocolId, ProviderRejection,
+    ProviderRejectionCode, ProviderResolverVersion, ProviderRuntimeRequirements,
+    ProviderSemanticCacheContract, ProviderSemanticDiagnostic, ProviderSemanticDiagnosticCode,
+    ProviderStageInput, ProviderStageInputAck, ProviderTaskSupport, ProviderToolClaims,
+    ProviderToolDeclaration, PublicToolAlias, ResolvedConcurrencyBaseline, ResolvedProviderClaim,
+    ResolvedProviderSnapshot, ResolvedProviderSnapshotRef, ResolvedProviderToolClaims,
+    ResolvedSemanticCacheBaseline, ResolvedToolDescriptor, ResolvedToolDescriptorDraft,
+    ResolvedToolDescriptorRef, ResolvedToolEffect, ResolvedToolIdempotency, ResolvedToolSemantics,
+    STABLE_TOOL_ALIAS_METADATA_KEY, STABLE_TOOL_ALIAS_SCHEMA_KEY, StableToolAlias, ToolIdentity,
+    project_native_collaborator_observation,
 };
 pub use recovery_point::{
     RECOVERY_POINT_MANIFEST_SCHEMA_VERSION, RecoveryPointArtifactReferenceV1,

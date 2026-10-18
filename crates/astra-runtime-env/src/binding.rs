@@ -685,15 +685,53 @@ fn apply_policy_tool_allowlist(policy: &PolicyIntent, tool_surface: &mut Availab
 pub struct RuntimeEnvironmentAdvertisement {
     pub schema_version: u32,
     pub binding: RunBinding,
+    /// Discovery facts produced by this authenticated local runtime. These
+    /// are requirements/capabilities, not permissions. Server admission must
+    /// use the selected registration's snapshot, never chat-request schemas.
+    pub provider_discovery: Vec<astra_turn_types::ProviderDiscoverySnapshot>,
+}
+
+/// Version incompatibility is distinct from malformed current-version data.
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeEnvironmentAdvertisementDecodeError {
+    #[error(
+        "Edge capability schema v{found} is not supported by this server (expects v{expected}); install a matching Astra CLI/astra-edge version (upgrade outdated clients)."
+    )]
+    UnsupportedSchema { found: u64, expected: u32 },
+    #[error("invalid edge capabilities: {0}")]
+    Invalid(#[from] serde_json::Error),
 }
 
 impl RuntimeEnvironmentAdvertisement {
-    pub const SCHEMA_VERSION: u32 = 1;
+    pub const SCHEMA_VERSION: u32 = 2;
+
+    /// Check the version before decoding version-specific required fields.
+    /// This rejects older advertisements explicitly without filling in missing
+    /// capability evidence or treating them as the current schema.
+    pub fn decode(
+        value: serde_json::Value,
+    ) -> Result<Self, RuntimeEnvironmentAdvertisementDecodeError> {
+        #[derive(Deserialize)]
+        struct Version {
+            schema_version: u64,
+        }
+        let version = Version::deserialize(&value)?.schema_version;
+        if version != u64::from(Self::SCHEMA_VERSION) {
+            return Err(
+                RuntimeEnvironmentAdvertisementDecodeError::UnsupportedSchema {
+                    found: version,
+                    expected: Self::SCHEMA_VERSION,
+                },
+            );
+        }
+        Ok(serde_json::from_value(value)?)
+    }
 
     pub fn new(binding: RunBinding) -> Self {
         Self {
             schema_version: Self::SCHEMA_VERSION,
             binding,
+            provider_discovery: Vec::new(),
         }
     }
 }
@@ -701,6 +739,64 @@ impl RuntimeEnvironmentAdvertisement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advertisement_decoder_reports_schema_before_required_body_fields() {
+        for found in [1, 99, u64::from(u32::MAX) + 1] {
+            let error = RuntimeEnvironmentAdvertisement::decode(serde_json::json!({
+                "schema_version": found,
+            }))
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                RuntimeEnvironmentAdvertisementDecodeError::UnsupportedSchema {
+                    found: version,
+                    expected: RuntimeEnvironmentAdvertisement::SCHEMA_VERSION,
+                } if version == found
+            ));
+            assert!(!error.to_string().contains("missing field"));
+        }
+    }
+
+    #[test]
+    fn advertisement_decoder_keeps_current_schema_validation_strict() {
+        let advert = RuntimeEnvironmentAdvertisement::new(RunBinding::edge_developer(
+            "/workspace/project",
+            &ToolRegistry::builtins(),
+        ));
+        let value = serde_json::to_value(&advert).unwrap();
+        let decoded = RuntimeEnvironmentAdvertisement::decode(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+        for field in ["binding", "provider_discovery"] {
+            let mut incomplete = value.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(matches!(
+                RuntimeEnvironmentAdvertisement::decode(incomplete),
+                Err(RuntimeEnvironmentAdvertisementDecodeError::Invalid(_))
+            ));
+        }
+        for schema in [
+            serde_json::Value::Null,
+            serde_json::json!("2"),
+            serde_json::json!(-1),
+        ] {
+            let mut invalid = value.clone();
+            invalid["schema_version"] = schema;
+            assert!(matches!(
+                RuntimeEnvironmentAdvertisement::decode(invalid),
+                Err(RuntimeEnvironmentAdvertisementDecodeError::Invalid(_))
+            ));
+        }
+        let mut missing_version = value;
+        missing_version
+            .as_object_mut()
+            .unwrap()
+            .remove("schema_version");
+        assert!(matches!(
+            RuntimeEnvironmentAdvertisement::decode(missing_version),
+            Err(RuntimeEnvironmentAdvertisementDecodeError::Invalid(_))
+        ));
+    }
 
     #[test]
     fn runtime_environment_advertisement_is_structured_json() {
@@ -722,6 +818,30 @@ mod tests {
             true
         );
         assert!(value["binding"]["tool_surface"]["tool_names"].is_array());
+        assert_eq!(value["provider_discovery"], serde_json::json!([]));
+        let decoded: RuntimeEnvironmentAdvertisement =
+            serde_json::from_value(value.clone()).expect("decode current advertisement");
+        assert_eq!(
+            serde_json::to_value(decoded).expect("serialize decoded advertisement"),
+            value,
+            "wire round-trip preserves serialized facts, not skipped runtime admissions"
+        );
+        for replacement in [None, Some(serde_json::Value::Null)] {
+            let mut incomplete = value.clone();
+            let fields = incomplete.as_object_mut().expect("advertisement object");
+            match replacement {
+                None => {
+                    fields.remove("provider_discovery");
+                }
+                Some(value) => {
+                    fields.insert("provider_discovery".into(), value);
+                }
+            }
+            assert!(
+                serde_json::from_value::<RuntimeEnvironmentAdvertisement>(incomplete).is_err(),
+                "missing discovery evidence must not become an implicit empty capability set"
+            );
+        }
         assert!(
             value["binding"]["tool_surface"].get("admissions").is_none(),
             "selected provider offers are runtime evidence and must not churn prompt/runtime advertisement bytes"

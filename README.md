@@ -568,7 +568,9 @@ astra serve stdio
 ```
 
 HTTP mode exposes the Axum API, SSE, and WebSocket transports. Stdio mode is a
-long-lived newline-delimited JSON-RPC app-server for parent processes. See the
+long-lived newline-delimited JSON-RPC app-server for parent processes. In stdio
+mode, `turn/start.threadId` must match the thread established by `thread/start`
+or `thread/resume`; use `thread/resume` to switch sessions. See the
 [CLI reference](docs/reference/cli-commands.md),
 [HTTP API](docs/reference/api-reference.md), and
 [TypeScript SDK](packages/sdk/README.md) for complete integration contracts.

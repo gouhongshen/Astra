@@ -6,7 +6,7 @@ use astra_turn_types::session_facts::SessionFacts;
 
 /// Inputs for one extraction attempt. Owned so the whole bundle can
 /// cross a `tokio::spawn` boundary without borrowing from turn state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExtractionRequest {
     pub inference_scope: astra_turn_types::InferenceInvocationScope,
     pub messages: Vec<Value>,
