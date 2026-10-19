@@ -29,6 +29,11 @@ owner. This aggregate does not replace append-only physical provider accounting.
 The in-memory store keeps its existing action fence through projection publication
 while releasing the run-map write lock before awaiting that publication.
 
+Run reads hydrate append-only events only through the event watermark captured
+with the run metadata. A completion committed between the metadata and event
+queries belongs to the next read; it cannot be paired with earlier status or
+accounting. Full reads and bounded observations use the same watermark boundary.
+
 New background and streaming requests use the same preparation owner. Exact
 stream replays attach to frozen run facts before mutable model or capability
 admission. A fresh request wins the durable session slot and activates its lease
