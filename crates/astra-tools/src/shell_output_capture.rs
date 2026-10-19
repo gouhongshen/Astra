@@ -535,7 +535,9 @@ async fn stream_receipt(path: PathBuf, pinned: std::fs::File) -> Result<StreamRe
         .map_err(|_| "Error: unable to read Bash capture")?;
     let mut hasher = Sha256::new();
     let mut bytes = 0u64;
-    let mut chunk = [0u8; 8192];
+    // The receipt future is embedded in CLI tool dispatch even for non-Bash
+    // branches. Keep the I/O buffer off those deeply composed future frames.
+    let mut chunk = vec![0u8; 8192].into_boxed_slice();
     loop {
         let read = file
             .read(&mut chunk)
