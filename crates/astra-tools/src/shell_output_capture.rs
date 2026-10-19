@@ -2,7 +2,7 @@
 //! These are ordinary workspace files, not immutable runtime artifacts.
 
 use std::fs::OpenOptions;
-use std::io::{SeekFrom, Write};
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -562,6 +562,7 @@ async fn stream_receipt(path: PathBuf, pinned: std::fs::File) -> Result<StreamRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[tokio::test]
     async fn byte_exact_capture_and_small_cleanup() {
