@@ -179,11 +179,15 @@ async fn load_run_does_not_mix_metadata_with_later_committed_events() {
             }
             if let Some(ready) = self.ready.lock().unwrap().take() {
                 ready.send(()).expect("notify metadata reader barrier");
-                self.release
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(5))
-                    .expect("release metadata reader after concurrent commit");
+                // The synchronous SQLx callback must hand off its Tokio
+                // worker so the notified writer and database I/O can advance.
+                tokio::task::block_in_place(|| {
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("release metadata reader after concurrent commit");
+                });
             }
         }
     }
