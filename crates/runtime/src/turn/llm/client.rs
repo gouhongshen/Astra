@@ -998,6 +998,7 @@ pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
 /// non-secret routing facts.
 pub(crate) struct LlmExecutionRoute<'a> {
     pub fixed_temperature: Option<f64>,
+    pub supported_reasoning_efforts: Option<&'a [String]>,
     pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub model_name: &'a str,
     pub wire_model_name: Option<&'a str>,
@@ -1018,6 +1019,7 @@ impl<'a> LlmExecutionRoute<'a> {
     pub(crate) fn from_admitted(execution: &'a astra_services::AdmittedModelExecution) -> Self {
         Self {
             fixed_temperature: execution.fixed_temperature,
+            supported_reasoning_efforts: execution.supported_reasoning_efforts.as_deref(),
             thinking_protocol: execution.thinking_protocol,
             model_name: &execution.model_name,
             wire_model_name: execution.wire_model_name.as_deref(),
@@ -1050,6 +1052,7 @@ pub(crate) struct OwnedLlmExecutionRoute {
     pub thinking_capability: Option<astra_services::models::ThinkingCapability>,
     /// Mode-independent fixed temperature admitted with the Offering.
     pub fixed_temperature: Option<f64>,
+    pub supported_reasoning_efforts: Option<Vec<String>>,
     pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub header_overrides: HashMap<String, String>,
     pub request_body_overrides: Option<Map<String, Value>>,
@@ -1062,6 +1065,7 @@ impl OwnedLlmExecutionRoute {
     pub fn borrowed(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
             fixed_temperature: self.fixed_temperature,
+            supported_reasoning_efforts: self.supported_reasoning_efforts.as_deref(),
             thinking_protocol: self.thinking_protocol,
             model_name: &self.model_name,
             wire_model_name: self.wire_model_name.as_deref(),
@@ -1118,6 +1122,21 @@ pub(crate) struct LlmCall<'a> {
     pub max_output_tokens: Option<usize>,
     pub temperature: Option<f64>,
     pub thinking: &'a ThinkingConfig,
+}
+
+impl LlmCall<'_> {
+    fn validate_declared_reasoning(&self) -> Result<(), astra_core::ClassifiedError> {
+        if !self
+            .thinking
+            .is_within_declared_efforts(self.route.supported_reasoning_efforts)
+        {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::InvalidRequest,
+                "reasoning effort is not supported by the admitted model gateway",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Admission result for one physical provider request.
@@ -4832,6 +4851,7 @@ async fn call_llm_and_collect_with_total_budget(
             "TypeSafe supports typed nonstream judgments only",
         ));
     }
+    call.validate_declared_reasoning()?;
     let judgment_provenance = discrete_judgment_provenance(&call);
     let logical_total_budget = total_budget;
     let settlement_reserve = llm_mandatory_settlement_reserve(logical_total_budget);
@@ -4860,6 +4880,7 @@ async fn call_llm_and_collect_with_total_budget(
     };
     let LlmExecutionRoute {
         fixed_temperature: _,
+        supported_reasoning_efforts: _,
         thinking_protocol,
         model_name,
         wire_model_name,
@@ -7237,6 +7258,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
     tool_choice: RuntimeToolChoice,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    call.validate_declared_reasoning()?;
     let judgment_provenance = discrete_judgment_provenance(&call);
     let logical_timeout = timeout;
     let timeout = logical_timeout.saturating_sub(llm_mandatory_settlement_reserve(logical_timeout));
@@ -7264,6 +7286,7 @@ async fn call_llm_nonstream_with_attempt_observer_and_tool_choice(
     };
     let LlmExecutionRoute {
         fixed_temperature: _,
+        supported_reasoning_efforts: _,
         thinking_protocol,
         model_name,
         wire_model_name,
@@ -8136,6 +8159,7 @@ mod tests {
                     provider: "openai".into(),
                     thinking_capability: None,
                     fixed_temperature: fixed,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: Some(protocol),
                     header_overrides: HashMap::new(),
                     request_body_overrides: overrides.as_object().cloned(),
@@ -8215,6 +8239,7 @@ mod tests {
                     provider: "openai".into(),
                     thinking_capability: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     header_overrides: HashMap::new(),
                     request_body_overrides: json!({"temperature":invalid}).as_object().cloned(),
@@ -8305,6 +8330,7 @@ mod tests {
             cache_capability: None,
             route: LlmExecutionRoute {
                 fixed_temperature: None,
+                supported_reasoning_efforts: None,
                 thinking_protocol: Some(
                     astra_core::model_wire::thinking::ThinkingProtocol::Moonshot,
                 ),
@@ -8384,6 +8410,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "test-model",
                     wire_model_name: None,
@@ -8558,6 +8585,7 @@ mod tests {
         headers.insert("x-workspace-id".to_string(), "workspace-secret".to_string());
         let route = LlmExecutionRoute {
             fixed_temperature: None,
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             model_name: "model-a",
             wire_model_name: Some("wire-model-a"),
@@ -8636,6 +8664,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -8681,6 +8710,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -8747,6 +8777,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -8806,6 +8837,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -8864,6 +8896,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -8941,6 +8974,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9009,6 +9043,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9074,6 +9109,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9146,6 +9182,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9210,6 +9247,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9253,6 +9291,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9300,6 +9339,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9366,6 +9406,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -9457,6 +9498,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
@@ -9529,6 +9571,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
@@ -11967,6 +12010,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -12024,6 +12068,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -12373,6 +12418,7 @@ mod tests {
             cache_capability: None,
             route: LlmExecutionRoute {
                 fixed_temperature: None,
+                supported_reasoning_efforts: None,
                 thinking_protocol: None,
                 model_name: "retained-pause-test",
                 wire_model_name: None,
@@ -12969,6 +13015,7 @@ mod tests {
                     cache_capability: Some(cache_capability),
                     route: LlmExecutionRoute {
                         fixed_temperature: None,
+                        supported_reasoning_efforts: None,
                         thinking_protocol: None,
                         model_name: "m",
                         wire_model_name: None,
@@ -14720,6 +14767,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -14783,6 +14831,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -14832,6 +14881,7 @@ mod tests {
                     cache_capability: None,
                     route: LlmExecutionRoute {
                         fixed_temperature: None,
+                        supported_reasoning_efforts: None,
                         thinking_protocol: None,
                         model_name: "m",
                         wire_model_name: None,
@@ -14876,6 +14926,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -14917,6 +14968,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -14961,6 +15013,7 @@ mod tests {
                     cache_capability: None,
                     route: LlmExecutionRoute {
                         fixed_temperature: None,
+                        supported_reasoning_efforts: None,
                         thinking_protocol: None,
                         model_name: "m",
                         wire_model_name: None,
@@ -15035,6 +15088,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15066,6 +15120,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15118,6 +15173,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15184,6 +15240,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15232,6 +15289,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15284,6 +15342,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15330,6 +15389,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15376,6 +15436,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "payment-fixture",
                     wire_model_name: None,
@@ -15496,6 +15557,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15540,6 +15602,7 @@ mod tests {
                 cache_capability: None,
                 route: LlmExecutionRoute {
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     model_name: "m",
                     wire_model_name: None,
@@ -15683,6 +15746,7 @@ mod tests {
                     cache_capability: None,
                     route: LlmExecutionRoute {
                         fixed_temperature: None,
+                        supported_reasoning_efforts: None,
                         thinking_protocol: None,
                         model_name: "m",
                         wire_model_name: None,

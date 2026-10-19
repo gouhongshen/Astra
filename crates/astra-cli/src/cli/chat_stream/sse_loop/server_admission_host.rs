@@ -238,6 +238,8 @@ impl Drop for SandboxPolicyGuard<'_> {
 
 /// Client dependencies for one Server execution stream and its local callbacks.
 pub(crate) struct CliServerAdmissionHost<'a> {
+    /// Sticky request-local evidence that admission dispatch may have begun.
+    pub server_admission_dispatched: &'a mut bool,
     pub runtime_config: Arc<astra_config::RuntimeConfig>,
     pub api: &'a astra_thin_client::ThinClient,
     pub token: String,
@@ -1010,6 +1012,7 @@ impl CliServerAdmissionHost<'_> {
         macro_rules! fetch_turn_sse {
             () => {
                 fetch_chat_turn_sse(ChatTurnSseFetchRequest {
+                    server_admission_dispatched: self.server_admission_dispatched,
                     completion_checks: Some(&state.completion_checks),
                     tool_surface_config: &self.runtime_config.tool_surface,
                     api: self.api,

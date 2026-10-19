@@ -1023,6 +1023,208 @@ async fn provider_chat_stream_collect(app: &Router, payload: Value) -> Vec<Value
     parse_sse_events(&body_str)
 }
 
+fn provider_gateway_reasoning_payload(
+    endpoint: &str,
+    message: &str,
+    effort: Option<&str>,
+    control: Option<Value>,
+) -> Value {
+    let mut metadata = json!({});
+    if let Some(control) = control {
+        metadata["reasoning_control"] = control;
+    }
+    let mut payload = json!({
+        "session_id": "provider-gateway-reasoning-session",
+        "message": message,
+        "model_selection": {"offering_id": DEFAULT_MODEL_OFFERING_ID},
+        "resolved_model_selection": {"offering_id": DEFAULT_MODEL_OFFERING_ID, "model_name": "test-model"},
+        "runtime_auth": {"authorization": "Bearer runtime-grant"},
+        "capability_descriptors": {"model_gateway": {
+            "id": "moi-model-gateway", "type": "model_gateway", "transport": "http",
+            "endpoint_url": format!("{endpoint}/v1/chat/completions"),
+            "protocol": "openai_chat_completions", "model_context_window": 128000,
+            "metadata": metadata
+        }},
+        "execution_policy": {"turn_intent": "fixed_default", "skill_auto_route": "disabled"}
+    });
+    if let Some(effort) = effort {
+        payload["context"] = json!({"thinking": {"mode": "adaptive", "effort": effort}});
+    }
+    payload
+}
+
+#[tokio::test]
+async fn provider_gateway_reasoning_efforts_reach_model_and_complete() {
+    init_env();
+    let scripts = ["low", "high", "max"].map(|effort| {
+        let question = format!("Calculate 2 + 3 using {effort} reasoning.");
+        ProviderScript::new(
+            format!("provider gateway {effort}"),
+            move |request| primary_request_for(request, &question),
+            vec![ProviderResponse::OpenAi(json!({
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "5"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 1, "total_tokens": 21}
+            }))],
+        )
+    });
+    let (app, gateway, _inference) = build_native_test_app(scripts.into()).await;
+    for effort in ["low", "high", "max"] {
+        let question = format!("Calculate 2 + 3 using {effort} reasoning.");
+        let events = provider_chat_stream_collect(
+            &app,
+            provider_gateway_reasoning_payload(
+                &gateway.base_url,
+                &question,
+                Some(effort),
+                Some(json!({
+                    "protocol": "reasoning_effort", "supported_efforts": ["low", "high", "max"]
+                })),
+            ),
+        )
+        .await;
+        assert!(
+            find_events(&events, "error").is_empty(),
+            "{effort}: {events:?}"
+        );
+        assert!(
+            find_events(&events, "turn_complete")
+                .iter()
+                .any(|event| { event["assistant_text"] == "5" }),
+            "{effort}: {events:?}"
+        );
+        let requests = gateway.requests.lock().await;
+        let request = requests
+            .iter()
+            .find(|request| primary_request_for(request, &question))
+            .expect("selected reasoning must reach the model");
+        assert_eq!(request.body["reasoning_effort"], effort);
+    }
+    gateway.assert_complete();
+}
+
+#[tokio::test]
+async fn provider_gateway_reasoning_rejects_undeclared_efforts_before_model_io() {
+    init_env();
+    let (app, gateway, _inference) = build_native_test_app(vec![ProviderScript::new(
+        "no provider I/O permitted",
+        |_| true,
+        vec![],
+    )])
+    .await;
+    for (name, control) in [
+        ("no declaration", None),
+        (
+            "unadvertised medium",
+            Some(json!({
+                "protocol": "reasoning_effort", "supported_efforts": ["low", "high", "max"]
+            })),
+        ),
+    ] {
+        let events = provider_chat_stream_collect(
+            &app,
+            provider_gateway_reasoning_payload(
+                &gateway.base_url,
+                "Do not send this unsupported effort.",
+                Some("medium"),
+                control,
+            ),
+        )
+        .await;
+        assert!(
+            find_events(&events, "error")
+                .iter()
+                .any(|event| { event["code"] == "VALIDATION_ERROR" }),
+            "{name}: {events:?}"
+        );
+        assert!(
+            gateway.requests.lock().await.is_empty(),
+            "{name} reached model"
+        );
+    }
+    gateway.assert_complete();
+}
+
+#[tokio::test]
+async fn provider_gateway_reasoning_rejects_malformed_capabilities() {
+    init_env();
+    let (app, gateway, _inference) = build_native_test_app(vec![ProviderScript::new(
+        "no provider I/O permitted",
+        |_| true,
+        vec![],
+    )])
+    .await;
+    for control in [
+        json!({"protocol": "unknown", "supported_efforts": ["high"]}),
+        json!({"protocol": "enable_thinking", "supported_efforts": ["high"]}),
+        json!({"protocol": "reasoning_effort", "supported_efforts": []}),
+        json!({"protocol": "reasoning_effort", "supported_efforts": ["high", "high"]}),
+        json!({"protocol": "reasoning_effort", "supported_efforts": ["extreme"]}),
+        json!({"protocol": "reasoning_effort", "supported_efforts": ["high"], "enabled": true}),
+    ] {
+        let events = provider_chat_stream_collect(
+            &app,
+            provider_gateway_reasoning_payload(
+                &gateway.base_url,
+                "Reject malformed capability.",
+                Some("high"),
+                Some(control.clone()),
+            ),
+        )
+        .await;
+        assert!(
+            find_events(&events, "error").iter().any(|event| {
+                event["code"] == "VALIDATION_ERROR"
+                    && event["error_code"] == "provider_runtime_context_invalid"
+            }),
+            "{control}: {:?}",
+            find_events(&events, "error")
+        );
+        assert!(find_events(&events, "turn_complete").is_empty());
+        assert!(
+            gateway.requests.lock().await.is_empty(),
+            "malformed capability reached model"
+        );
+    }
+    gateway.assert_complete();
+}
+
+#[tokio::test]
+async fn provider_gateway_reasoning_omission_preserves_default_chat() {
+    init_env();
+    let (app, gateway, _inference) = build_native_test_app(vec![ProviderScript::new(
+        "ordinary gateway turn", |request| primary_request_for(request, "Ordinary gateway question."),
+        vec![ProviderResponse::OpenAi(json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Ordinary answer."}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23}
+        }))],
+    )]).await;
+    let events = provider_chat_stream_collect(
+        &app,
+        provider_gateway_reasoning_payload(
+            &gateway.base_url,
+            "Ordinary gateway question.",
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert!(find_events(&events, "error").is_empty(), "{events:?}");
+    assert!(
+        find_events(&events, "turn_complete")
+            .iter()
+            .any(|event| { event["assistant_text"] == "Ordinary answer." }),
+        "{events:?}"
+    );
+    let requests = gateway.requests.lock().await;
+    let request = requests
+        .iter()
+        .find(|request| primary_request_for(request, "Ordinary gateway question."))
+        .expect("ordinary question must reach model");
+    assert!(request.body.get("reasoning_effort").is_none());
+    drop(requests);
+    gateway.assert_complete();
+}
+
 async fn create_e2e_agent_binding(
     service: &InMemoryAgentBindingService,
     binding_name: &str,

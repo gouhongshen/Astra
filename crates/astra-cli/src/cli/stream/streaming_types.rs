@@ -5,6 +5,10 @@
 
 use std::collections::BTreeSet;
 
+/// Total budget for interactive response drain and exact-run cancellation.
+pub(crate) const INTERACTIVE_CANCEL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 /// Re-export of the verdict audit event type for convenience.
 pub(crate) type VerdictEvent = astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 
@@ -430,6 +434,8 @@ pub(crate) struct PartialTurnData {
     pub applied_user_intents: Vec<AppliedStreamUserIntent>,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
+    /// Runtime classification retained across the CLI failure boundary.
+    pub failure_kind: Option<astra_core::ErrorKind>,
     /// Stable server classification for a stream failure.  A rejected
     /// admission may carry this without having created a durable Run.
     pub error_code: Option<String>,
@@ -438,6 +444,9 @@ pub(crate) struct PartialTurnData {
     /// request is not a failed turn and must not be reconciled or journaled as
     /// one.
     pub admission_rejected: bool,
+    /// The CLI admission owner confirms that no Server execution request was
+    /// dispatched. False means unknown, not proof that admission happened.
+    pub server_admission_not_dispatched: bool,
     pub last_heavy_checkpoint: Option<astra_pipeline::step_protocol::StepCheckpoint>,
     /// Partial text the model generated before the turn was interrupted.
     /// Preserved in conversation history so the next turn has context.
@@ -525,6 +534,17 @@ pub(crate) struct TurnFailure {
 }
 
 impl TurnFailure {
+    /// A local cancellation may recover its observed prefix only when no
+    /// harder admission, callback, output or remote-cleanup failure survived.
+    pub(crate) fn is_clean_local_cancel(&self) -> bool {
+        self.partial.failure_kind == Some(astra_core::ErrorKind::Cancelled)
+            && self.partial.error_code.is_none()
+            && !self.partial.remote_cancel_required
+            && !self.partial.admission_rejected
+            && !self.partial.callback_client_detached
+            && self.partial.output_transport_failure.is_none()
+    }
+
     /// Observation of an internal transport failure is not a user request to
     /// cancel the durable run. This only classifies the failure; callers must
     /// still enforce their own identity/lease boundary before releasing it.
@@ -544,6 +564,28 @@ impl TurnFailure {
 #[cfg(test)]
 mod internal_detach_tests {
     use super::{PartialTurnData, TurnFailure};
+
+    #[test]
+    fn settled_cancel_cannot_erase_a_harder_stream_failure() {
+        let mut failure = TurnFailure {
+            error: "display text is not classification authority".into(),
+            partial: PartialTurnData {
+                failure_kind: Some(astra_core::ErrorKind::Cancelled),
+                ..Default::default()
+            },
+        };
+        assert!(failure.is_clean_local_cancel());
+        failure.partial.failure_kind = Some(astra_core::ErrorKind::ContractViolation);
+        assert!(!failure.is_clean_local_cancel());
+        failure.partial.failure_kind = Some(astra_core::ErrorKind::Cancelled);
+        failure.partial.error_code = Some("execution_binding_busy".into());
+        failure.partial.admission_rejected = true;
+        assert!(!failure.is_clean_local_cancel());
+        failure.partial.error_code = None;
+        failure.partial.admission_rejected = false;
+        failure.partial.remote_cancel_required = true;
+        assert!(!failure.is_clean_local_cancel());
+    }
 
     #[test]
     fn only_clean_internal_detach_preserves_run_control() {

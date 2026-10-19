@@ -64,7 +64,10 @@ pub(crate) fn report_admission_rejection(
     let draft_restored =
         !line.trim().is_empty() && ui.restore_input(line, state.session_id.as_deref());
     let metadata = failure.partial.error_metadata.as_ref();
-    if failure.partial.error_code.as_deref() == Some("session_writer_conflict") {
+    if matches!(
+        failure.partial.error_code.as_deref(),
+        Some("session_writer_conflict" | "session_execution_slot_occupied")
+    ) {
         let session_id = metadata
             .and_then(|value| value.get("session_id"))
             .and_then(serde_json::Value::as_str)
@@ -954,6 +957,29 @@ mod tests {
         assert!(shown.contains("do not cancel"));
         assert!(!shown.contains("astra session cancel"));
         assert!(!shown.contains("astra --resume"));
+    }
+
+    #[test]
+    fn occupied_execution_slot_has_the_same_explicit_recovery_as_writer_conflict() {
+        let mut state = SessionState {
+            session_id: Some("session-blocked".into()),
+            ..Default::default()
+        };
+        let failure = crate::TurnFailure {
+            error: "conflict".into(),
+            partial: crate::PartialTurnData {
+                error_code: Some("session_execution_slot_occupied".into()),
+                admission_rejected: true,
+                ..Default::default()
+            },
+        };
+        let mut ui = crate::tests::TestUi::default();
+        report_admission_rejection(&mut state, "synthetic request", &failure, &mut ui);
+        assert_eq!(ui.restored_inputs, vec!["synthetic request"]);
+        let shown = ui.errors.join("\n");
+        assert!(shown.contains("Another run still owns this session"));
+        assert!(shown.contains("astra session cancel session-blocked"));
+        assert!(shown.contains("astra --resume session-blocked"));
     }
 
     #[test]

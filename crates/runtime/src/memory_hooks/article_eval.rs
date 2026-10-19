@@ -35,6 +35,7 @@ impl Model {
     fn route(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
             fixed_temperature: None,
+            supported_reasoning_efforts: None,
             thinking_protocol: Some(
                 astra_core::model_wire::thinking::canonical_thinking_protocol(
                     &self.provider,

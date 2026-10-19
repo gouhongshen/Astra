@@ -4394,6 +4394,16 @@ async fn settle_unexecuted_server_tool_result(
 
 #[async_trait::async_trait]
 impl SseStreamHost for CliSseStreamHost<'_> {
+    fn cancelled_admission_grace(&self) -> std::time::Duration {
+        if self.incremental_state.is_some() {
+            // The interactive owner still enforces its original ten-second
+            // cancellation deadline, including admission and exact-run settle.
+            crate::cli::stream::streaming_types::INTERACTIVE_CANCEL_TIMEOUT
+        } else {
+            std::time::Duration::ZERO
+        }
+    }
+
     fn requires_strict_sse_json(&self) -> bool {
         self.stream_json_exchange.is_some()
     }
@@ -9002,6 +9012,135 @@ mod tests {
         assert!(output.contains("Git command crosses the allowed boundary"));
         assert!(output.contains("Approval is unavailable"));
         assert!(!output.contains("ghp_123456789012345678901234567890123456"));
+    }
+
+    #[tokio::test]
+    async fn interactive_cancel_reconciles_delayed_http_admission_without_local_tools() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        // A terminal completion racing the user's stop is also settled; do not
+        // convert it to a different execution or cancel a newer Session owner.
+        for terminal_status in ["cancelled", "completed"] {
+            let workspace = tempdir().unwrap();
+            let marker = workspace.path().join("must-not-exist");
+            let server = MockServer::start().await;
+            let accepted = Arc::new(tokio::sync::Notify::new());
+            let settled = Arc::new(AtomicBool::new(false));
+            let tool = serde_json::json!({
+                "type": "tool_request", "request_id": "late-tool", "tool": "write_file",
+                "schema_admitted_by_server": true,
+                "args": {"path": marker, "content": "must not execute"}
+            });
+            let wire = format!(
+                "data: {{\"type\":\"session_info\",\"session_id\":\"session-late\",\"run_id\":\"run-late\"}}\n\ndata: {tool}\n\ndata: [DONE]\n\n"
+            );
+            Mock::given(method("GET"))
+                .and(path("/delayed-admission"))
+                .respond_with({
+                    let accepted = accepted.clone();
+                    move |_: &wiremock::Request| {
+                        accepted.notify_one();
+                        ResponseTemplate::new(200)
+                            .set_body_string(wire.clone())
+                            .set_delay(std::time::Duration::from_millis(30))
+                    }
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE")).and(path("/chat/runs/run-late"))
+                .respond_with({
+                    let settled = settled.clone();
+                    move |_: &wiremock::Request| {
+                        settled.store(true, Ordering::SeqCst);
+                        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                            "run_id": "run-late", "status": terminal_status, "execution_settled": true
+                        }))
+                    }
+                }).expect(1).mount(&server).await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let incremental =
+                Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let executor = Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+            let mut permissions = crate::cli::permission_manager::PermissionManager::new(true);
+            let mut cache = EdgeToolCache::new(2);
+            let mut execution = std::pin::pin!(async {
+                let response = reqwest::get(format!("{}/delayed-admission", server.uri()))
+                    .await
+                    .unwrap();
+                let result = super::consume_turn_sse(
+                    super::ChatTurnPrepLineGuard::maybe_start(false, None),
+                    response,
+                    false,
+                    80,
+                    RenderPolicy::Silent,
+                    false,
+                    Some(EdgeSseContext {
+                        api: &api,
+                        token: "synthetic-token",
+                        executor_id: "edge-test",
+                        executor,
+                        render_policy: RenderPolicy::Silent,
+                        perm_manager: Some(&mut permissions),
+                        cancel_token: Some(&cancel),
+                        stream_event_tx: None,
+                        stream_event_sink: None,
+                        approval_request_tx: None,
+                        ask_user_request_tx: None,
+                        skill_resolver: None,
+                        turn_rollback_on_failure: false,
+                        tool_cache: &mut cache,
+                        incremental_state: Some(incremental.clone()),
+                        request_session_execution_lease: None,
+                    }),
+                    0,
+                    None,
+                    Some(&cancel),
+                    None,
+                )
+                .await;
+                assert_eq!(result.core.run_id.as_deref(), Some("run-late"));
+                crate::cli::turn::turn_cancellation::fabricate_user_cancel_failure(
+                    "cancelled",
+                    incremental.clone(),
+                )
+            });
+            tokio::select! {
+                biased;
+                _ = accepted.notified() => {},
+                _ = &mut execution => panic!("the Server must accept before its delayed response arrives"),
+            }
+            assert!(incremental.snapshot().run_id.is_none());
+            cancel.cancel();
+            let failure = crate::cli::turn::turn_stream_runner::settle_interactive_user_cancel(
+                &mut execution,
+                &api,
+                "synthetic-token",
+                None,
+                &incremental,
+                "test",
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(
+                settled.load(Ordering::SeqCst),
+                "wait for the exact-run acknowledgement"
+            );
+            assert!(!failure.partial.remote_cancel_required);
+            assert_eq!(failure.partial.run_id.as_deref(), Some("run-late"));
+            assert!(!marker.exists());
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len(),
+                2,
+                "only original admission and exact-run cancel; no tools, callbacks, Session lookup or replay"
+            );
+        }
     }
 
     #[tokio::test]

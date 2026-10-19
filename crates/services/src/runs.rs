@@ -5925,7 +5925,8 @@ pub trait RunStateStore: Send + Sync {
         requested_session_id: Option<&str>,
     ) -> Result<DurableRunStartClaim, String>;
 
-    /// Load a run owned by a user.
+    /// Load a run owned by a user, with events no newer than the metadata's
+    /// event watermark. Concurrent completion belongs to the next snapshot.
     async fn load_run(
         &self,
         user_id: &str,
@@ -14283,6 +14284,30 @@ impl DatabaseRunStateStore {
             .await
     }
 
+    async fn hydrate_run_events(&self, run: &mut DurableRunRecord) -> Result<(), String> {
+        // Append-only events can advance after the metadata query completes.
+        // Use its cursor just as load_run_observation does, so later terminal
+        // evidence cannot be attached to earlier status or accounting.
+        let rows = sqlx::query(
+            "SELECT payload_json, event_idx FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND event_idx <= ?
+             ORDER BY event_idx ASC",
+        )
+        .bind(&run.user_id)
+        .bind(&run.run_id)
+        .bind(run.last_event_idx)
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| db_error("load_run_events", &run.run_id, source).to_string())?;
+
+        run.events = rows
+            .into_iter()
+            .map(|row| decode_run_event_payload(&row, &run.run_id))
+            .collect::<DbStoreResult<Vec<_>>>()
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     async fn load_run_metadata_with_columns(
         &self,
         user_id: &str,
@@ -19198,25 +19223,7 @@ impl RunStateStore for DatabaseRunStateStore {
             return Ok(None);
         };
 
-        // Events and their metadata frontier advance in the same transaction.
-        // A later event read must not mix a new terminal with old accounting.
-        let rows = sqlx::query(
-            "SELECT payload_json, event_idx FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_idx <= ?
-             ORDER BY event_idx ASC",
-        )
-        .bind(&run.user_id)
-        .bind(run_id)
-        .bind(run.last_event_idx)
-        .fetch_all(self.pool.get())
-        .await
-        .map_err(|source| db_error("load_run_events", run_id, source).to_string())?;
-
-        run.events = rows
-            .into_iter()
-            .map(|row| decode_run_event_payload(&row, run_id))
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|e| e.to_string())?;
+        self.hydrate_run_events(&mut run).await?;
         Ok(Some(run))
     }
 
@@ -43553,6 +43560,7 @@ mod tests {
                 cache_capability: None,
                 thinking_capability: None,
                 fixed_temperature: None,
+                supported_reasoning_efforts: None,
                 thinking_protocol: None,
                 request_body_overrides: None,
                 context_window: Some(128_000),
@@ -48268,6 +48276,93 @@ mod tests {
         assert_eq!(loaded.status, STATUS_RUNNING);
         assert_eq!(loaded.last_event_idx, -1);
         assert!(loaded.events.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_run_event_hydration_preserves_the_metadata_snapshot() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-snapshot-user-{}", Uuid::new_v4());
+        let run_id = format!("runs-it-snapshot-run-{}", Uuid::new_v4());
+        let session_id = format!("runs-it-snapshot-session-{}", Uuid::new_v4());
+        insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let mut record = durable_run_record(&run_id);
+        record.user_id = user_id.clone();
+        record.session_id = session_id.clone();
+        store.insert_run(record).await.unwrap();
+        let before = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+        let mut snapshot = store
+            .load_run_metadata_for_user(&user_id, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Commit the other actor's completion between the two production reads.
+        // The earlier metadata must not acquire this later terminal evidence.
+        assert!(
+            store
+                .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
+                    user_id: &user_id,
+                    expected_session_id: &session_id,
+                    run_id: &run_id,
+                    expected_owner_generation: snapshot.run_generation,
+                    prompt_tokens: 94,
+                    completion_tokens: 18,
+                    tool_calls: 1,
+                })
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    Some(snapshot.run_generation),
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                    &[make_event(
+                        "run_finished",
+                        json!({
+                            "status": "completed", "prompt_tokens": 94, "completion_tokens": 18,
+                        })
+                    )],
+                )
+                .await
+                .unwrap()
+        );
+        store.hydrate_run_events(&mut snapshot).await.unwrap();
+        let after = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+
+        assert_eq!(snapshot.status, STATUS_RUNNING);
+        assert_eq!(
+            (
+                snapshot.total_prompt_tokens,
+                snapshot.total_completion_tokens
+            ),
+            (0, 0)
+        );
+        assert_eq!(snapshot.last_event_idx, before.last_event_idx);
+        assert_eq!(
+            snapshot.events, before.events,
+            "earlier accounting cannot be paired with a later completion event"
+        );
+        assert_eq!(after.status, STATUS_COMPLETED);
+        assert_eq!(
+            (after.total_prompt_tokens, after.total_completion_tokens),
+            (94, 18)
+        );
+        let finished = after
+            .events
+            .iter()
+            .find(|event| event["event_type"] == "run_finished")
+            .expect("the next snapshot includes the committed completion");
+        assert_eq!(finished["data"]["prompt_tokens"], 94);
+        assert_eq!(finished["data"]["completion_tokens"], 18);
     }
 
     #[tokio::test]

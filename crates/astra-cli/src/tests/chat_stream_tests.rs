@@ -55,11 +55,173 @@ fn basic_chat_context<'a>(
 
 // ── chat_stream (SSE agentic loop) ────────────────────────────────────
 
+#[tokio::test]
+async fn server_admission_cancelled_during_bearer_resolution_never_dispatches_a_new_attempt() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct AdmissionBearer {
+        calls: AtomicUsize,
+        blocked_attempt: usize,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl astra_thin_client::client::BearerProvider for AdmissionBearer {
+        fn token(
+            &self,
+        ) -> futures_util::future::BoxFuture<'_, Result<String, astra_thin_client::ThinClientError>>
+        {
+            Box::pin(async move {
+                // The production entrypoint first authenticates GET /models;
+                // block the subsequent admission, not that preflight read.
+                if self.calls.fetch_add(1, Ordering::SeqCst) == self.blocked_attempt + 1 {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                Ok("synthetic-admission-token".into())
+            })
+        }
+    }
+
+    // Also cover a retry: cancelling authentication must not dispatch another
+    // attempt or erase evidence that the first attempt was already sent.
+    for blocked_attempt in [0, 1] {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let observed = dispatches.clone();
+        let app = Router::new().route(
+            "/chat/stream",
+            post(move || {
+                let observed = observed.clone();
+                async move {
+                    let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                    let status = if blocked_attempt == 1 && attempt == 0 {
+                        axum::http::StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    (
+                        status,
+                        [("retry-after", "0")],
+                        "synthetic admission response",
+                    )
+                }
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let bearer = Arc::new(AdmissionBearer {
+            calls: AtomicUsize::new(0),
+            blocked_attempt,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let api = astra_thin_client::ThinClient::new(&base, None)
+            .unwrap()
+            .with_bearer_provider(bearer.clone());
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let context = basic_chat_context(&api, &registry, "synthetic request");
+        let mut pm = PermissionManager::new(true);
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let mut params = ChatTurnParams::basic_cli(&context, "synthetic-token", None, &mut pm);
+        params.cancel_token = Some(cancel.clone());
+        let mut stream = Box::pin(stream_chat_sse(params));
+        tokio::select! {
+            result = &mut stream => panic!("admission finished before bearer release: {result:?}"),
+            entered = tokio::time::timeout(std::time::Duration::from_secs(10), bearer.entered.notified()) => {
+                entered.expect("admission must reach its bearer preparation");
+            }
+        }
+        assert_eq!(dispatches.load(Ordering::SeqCst), blocked_attempt);
+        assert_eq!(bearer.calls.load(Ordering::SeqCst), blocked_attempt + 2);
+        cancel.cancel();
+        bearer.release.notify_one();
+        // Keep polling the same production future, just as interactive
+        // cancellation does while looking for the physical response identity.
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(5), stream)
+            .await
+            .expect("cancelled admission must finish")
+            .unwrap_err();
+        assert_eq!(dispatches.load(Ordering::SeqCst), blocked_attempt);
+        assert_eq!(
+            failure.partial.server_admission_not_dispatched,
+            blocked_attempt == 0
+        );
+        assert!(!failure.partial.admission_rejected);
+    }
+}
+
+#[tokio::test]
+async fn server_admission_dispatch_evidence_comes_from_the_actual_request_boundary() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    for (cancel_before_dispatch, cancel_before_retry) in
+        [(true, false), (false, false), (false, true)]
+    {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let observed = dispatches.clone();
+        let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+        let cancel_at_server = cancel.clone();
+        let app = Router::new().route(
+            "/chat/stream",
+            post(move || {
+                let observed = observed.clone();
+                let cancel = cancel_at_server.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let status = if cancel_before_retry {
+                        cancel.cancel();
+                        axum::http::StatusCode::TOO_MANY_REQUESTS
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    // No identity or typed pre-admission rejection: admission is
+                    // ambiguous even though this response has already finished.
+                    (status, [("retry-after", "0")], "synthetic upstream failure")
+                }
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let context = basic_chat_context(&api, &registry, "synthetic request");
+        let mut pm = PermissionManager::new(true);
+        if cancel_before_dispatch {
+            cancel.cancel();
+        }
+        let mut params = ChatTurnParams::basic_cli(&context, "synthetic-token", None, &mut pm);
+        params.cancel_token = Some(cancel);
+        let failure = stream_chat_sse(params).await.unwrap_err();
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            usize::from(!cancel_before_dispatch)
+        );
+        assert_eq!(
+            failure.partial.server_admission_not_dispatched,
+            cancel_before_dispatch
+        );
+        assert!(!failure.partial.admission_rejected);
+    }
+}
+
 /// Build a canonical SSE response for the mock chat-turn endpoint. Exposed
 /// to sibling test modules (e.g. `resume_tests`) so they don't have to
 /// duplicate the payload literal.
 pub(super) fn sse_text_response(text: &str, session_id: &str) -> String {
-    sse_text_response_with_execution_summary(text, session_id, 0, 0, &[], 1)
+    sse_text_response_with_execution_summary(
+        text,
+        session_id,
+        0,
+        0,
+        &[],
+        1,
+        (&format!("run-{session_id}"), 1),
+    )
 }
 
 fn with_root_communication(body: String, session_id: &str) -> String {
@@ -92,16 +254,18 @@ fn with_root_communication(body: String, session_id: &str) -> String {
     stream + &body
 }
 
-fn sse_text_response_with_execution_summary(
+pub(super) fn sse_text_response_with_execution_summary(
     text: &str,
     session_id: &str,
     tool_calls_count: u32,
     observation_tool_calls_count: u32,
     tools_used: &[&str],
     llm_rounds: u32,
+    server_turn: (&str, u32),
 ) -> String {
+    let (run_id, session_turn) = server_turn;
     let tool_ledger_receipt = astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt::new(
-        format!("run-{session_id}"),
+        run_id,
         1,
         tool_calls_count,
         tool_calls_count,
@@ -115,11 +279,11 @@ fn sse_text_response_with_execution_summary(
         true,
     );
     format!(
-        "data: {{\"type\":\"session_info\",\"session_id\":\"{session_id}\",\"run_id\":\"run-{session_id}\"}}\n\n\
+        "data: {{\"type\":\"session_info\",\"session_id\":\"{session_id}\",\"run_id\":\"{run_id}\"}}\n\n\
              data: {{\"type\":\"text_delta\",\"content\":\"{text}\"}}\n\n\
              data: {{\"type\":\"text_done\",\"full_text\":\"{text}\"}}\n\n\
              data: {{\"type\":\"usage\",\"input_tokens\":10,\"output_tokens\":5}}\n\n\
-             data: {{\"type\":\"run_finished\",\"run_id\":\"run-{session_id}\",\"status\":\"completed\",\"owner_generation\":1}}\n\n\
+             data: {{\"type\":\"run_finished\",\"run_id\":\"{run_id}\",\"status\":\"completed\",\"owner_generation\":1}}\n\n\
              data: {}\n\n\
              data: [DONE]\n\n",
         serde_json::json!({
@@ -135,13 +299,13 @@ fn sse_text_response_with_execution_summary(
                 "schema_version": astra_turn_core::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
                 "identity": {
                     "session_id": session_id,
-                    "run_id": format!("run-{session_id}"),
+                    "run_id": run_id,
                     "agent_id": "root",
                     "model_id": "mock-model",
                     "topology": "cli_server"
                 },
                 "progress": {
-                    "session_turn": 1,
+                    "session_turn": session_turn,
                     "agentic_round_index": llm_rounds.saturating_sub(1),
                     "llm_rounds_completed": llm_rounds,
                     "slice_round_limit": 60,
@@ -378,6 +542,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: Some(request_lease.clone()),
         plan_assemble_line_release: None,
         stream_event_tx: Some(event_tx),
@@ -562,6 +727,7 @@ async fn stream_chat_sse_simple_text_response() {
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -688,6 +854,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: Some(event_tx),
@@ -782,6 +949,7 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
                         2,
                         &["agent", "tool_search"],
                         4,
+                        ("run-sess-server-loop", 1),
                     ),
                 )
             }
@@ -838,6 +1006,7 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
             execution_time_budget: None,
             run_control: None,
             incremental_state: None,
+            executor_observer: None,
             request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: None,
@@ -944,6 +1113,7 @@ async fn stream_chat_sse_api_error_propagated() {
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -1063,6 +1233,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
             execution_time_budget: None,
             run_control: None,
             incremental_state: None,
+            executor_observer: None,
             request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: None,
@@ -1173,7 +1344,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
                                     }
                                 }),
                                 sse_text_response_with_execution_summary(
-                                    "Done!", "sess-tx-e2e", 1, 0, &["bash"], 1,
+                                    "Done!", "sess-tx-e2e", 1, 0, &["bash"], 1, ("run-sess-tx-e2e", 1),
                                 ),
                             );
                         (TEST_SSE_HEADERS, body)
@@ -1236,6 +1407,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -1405,6 +1577,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -1572,6 +1745,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        executor_observer: None,
         request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
@@ -1695,7 +1869,7 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
                     format!(
                         "data: {{\"type\":\"session_info\",\"session_id\":\"sess-mcp\",\"run_id\":\"run-sess-mcp\"}}\n\ndata: {request}\n\n{}",
                         sse_text_response_with_execution_summary(
-                            "MCP done!", "sess-mcp", 1, 1, &[&tn], 1,
+                            "MCP done!", "sess-mcp", 1, 1, &[&tn], 1, ("run-sess-mcp", 1),
                         ),
                     )
                 } else { format!(
@@ -1753,13 +1927,18 @@ async fn stream_chat_sse_mcp_requires_server_owned_callback() {
             #[cfg(feature = "harness")]
             benchmark_profile: None,
         };
-        let result = Box::pin(stream_chat_sse(ChatTurnParams::basic_cli(
+        let stream = stream_chat_sse(ChatTurnParams::basic_cli(
             &context,
             "fake-token",
             None,
             &mut pm,
-        )))
-        .await;
+        ));
+        assert_eq!(
+            std::mem::size_of_val(&stream),
+            std::mem::size_of::<usize>(),
+            "the shared stream entrypoint must bound every caller's embedded future"
+        );
+        let result = stream.await;
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
         let callbacks = callbacks.lock().await;
         if callback_admitted {
@@ -2162,12 +2341,16 @@ async fn basic_cli_catalog_rejection_preserves_typed_preflight_evidence() {
             let mut context = basic_chat_context(&api, &registry, "synthetic preflight");
             context.model = selected;
             let mut pm = PermissionManager::new(true);
+            let observer = crate::cli::chat_stream::CliExecutorObserver::default();
             let failure = execute_basic_cli_turn(
                 &context,
                 "synthetic-token",
                 None,
                 &mut pm,
-                BasicCliTurnOptions::default(),
+                BasicCliTurnOptions {
+                    executor_observer: Some(observer.clone()),
+                    ..Default::default()
+                },
             )
             .await
             .expect_err("catalog rejected");
@@ -2183,6 +2366,10 @@ async fn basic_cli_catalog_rejection_preserves_typed_preflight_evidence() {
             assert_eq!(
                 crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure),
                 status == 401
+            );
+            assert!(
+                observer.get().is_none(),
+                "catalog denial is before the executor factory"
             );
             assert!(failure.partial.run_id.is_none());
             assert!(failure.partial.tool_call_records.is_empty());
@@ -2239,4 +2426,123 @@ async fn unsupported_workspace_host_rejects_public_turn_before_admission_http() 
     assert_eq!(requests[0].url.path(), "/models");
     assert!(failure.partial.run_id.is_none());
     assert!(failure.partial.tool_call_records.is_empty());
+}
+
+#[tokio::test]
+async fn basic_cli_catalog_auth_retry_observes_only_the_successful_factory() {
+    use crate::cli::turn::{execute_basic_cli_turn, turn_facade::BasicCliTurnOptions};
+    use axum::response::IntoResponse as _;
+    use axum::routing::get;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let catalogs = Arc::new(AtomicUsize::new(0));
+    let catalog_count = catalogs.clone();
+    let chats = Arc::new(AtomicUsize::new(0));
+    let chat_count = chats.clone();
+    let app = Router::new()
+        .route(
+            "/models",
+            get(move || {
+                let count = catalog_count.clone();
+                async move {
+                    if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            "synthetic expired token",
+                        )
+                            .into_response()
+                    } else {
+                        axum::Json(crate::test_utils::mock_model_catalog_json(&["test-model"]))
+                            .into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/chat/stream",
+            post(move || {
+                let count = chat_count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    (
+                        TEST_SSE_HEADERS,
+                        sse_text_response("retry result", "sess-observer-retry"),
+                    )
+                }
+            }),
+        );
+    let base = super::spawn_mock_app(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "synthetic retry");
+    let mut pm = PermissionManager::new(true);
+    let observer = crate::cli::chat_stream::CliExecutorObserver::default();
+    let options = BasicCliTurnOptions {
+        executor_observer: Some(observer.clone()),
+        ..Default::default()
+    };
+    // Utility/child constructors have no observer unless the outer request explicitly supplies it.
+    assert!(
+        ChatTurnParams::basic_cli(&context, "synthetic", None, &mut pm)
+            .executor_observer
+            .is_none()
+    );
+    let failure = execute_basic_cli_turn(
+        &context,
+        "synthetic-expired",
+        None,
+        &mut pm,
+        options.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure));
+    assert!(observer.get().is_none());
+    // The same cloned options used by auth refresh must still publish the real successful factory.
+    let result = execute_basic_cli_turn(&context, "synthetic-refreshed", None, &mut pm, options)
+        .await
+        .unwrap();
+    assert_eq!(result.full_text, "retry result");
+    assert!(observer.get().is_some());
+    assert_eq!(chats.load(Ordering::SeqCst), 1);
+    assert_eq!(catalogs.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn basic_cli_post_catalog_auth_failure_never_authorizes_replay() {
+    use crate::cli::turn::{execute_basic_cli_turn, turn_facade::BasicCliTurnOptions};
+    let app = Router::new().route(
+        "/chat/stream",
+        post(|| async {
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "synthetic post-catalog auth denial",
+            )
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = astra_runtime::skills::empty_unified_registry();
+    let context = basic_chat_context(&api, &registry, "no replay");
+    let observer = crate::cli::chat_stream::CliExecutorObserver::default();
+    let mut pm = PermissionManager::new(true);
+    let failure = execute_basic_cli_turn(
+        &context,
+        "synthetic",
+        None,
+        &mut pm,
+        BasicCliTurnOptions {
+            executor_observer: Some(observer.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        observer.get().is_some(),
+        "this failure occurs after executor creation"
+    );
+    assert!(!crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure));
 }

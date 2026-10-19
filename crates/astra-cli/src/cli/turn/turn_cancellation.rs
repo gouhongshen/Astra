@@ -10,7 +10,7 @@ use crate::cli::session::session_state::SessionState;
 use crossterm::style::Stylize;
 
 #[allow(clippy::result_large_err)]
-fn fabricate_user_cancel_failure(
+pub(crate) fn fabricate_user_cancel_failure(
     reason: &str,
     incremental_state: Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>,
 ) -> Result<StreamResult, crate::TurnFailure> {
@@ -88,7 +88,7 @@ pub(crate) async fn apply_user_cancelled_turn(
     line: &str,
     result: Result<StreamResult, crate::TurnFailure>,
     turn_start: Instant,
-    _ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
+    ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
     post_commit_tx: Option<&tokio::sync::mpsc::Sender<super::turn_post_commit::TurnPostCommitJob>>,
 ) {
     state.last_turn_interrupted = true;
@@ -109,6 +109,19 @@ pub(crate) async fn apply_user_cancelled_turn(
         }
         Err(mut failure) => {
             failure.error = "[cancelled] user_interrupted (Ctrl+C)".to_string();
+            if failure.partial.remote_cancel_required {
+                let notice =
+                    crate::cli::stream::streaming_types::headless_unconfirmed_cancel_notice(
+                        failure
+                            .partial
+                            .session_id
+                            .as_deref()
+                            .or(state.session_id.as_deref()),
+                    );
+                failure.error.push(' ');
+                failure.error.push_str(&notice);
+                ui.show_warning(&notice);
+            }
             reconcile_and_report_turn_failure(
                 state,
                 api,
@@ -141,6 +154,50 @@ mod tests {
     use astra_services::session_journal;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn user_cancelled_turn_reports_unconfirmed_remote_execution() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("unconfirmed-cancel-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState {
+            session_id: Some(sid.clone()),
+            ..Default::default()
+        };
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut ui = crate::tests::TestUi::default();
+        let failure = crate::TurnFailure {
+            error: "cancelled".into(),
+            partial: crate::PartialTurnData {
+                session_id: Some(sid.clone()),
+                remote_cancel_required: true,
+                ..Default::default()
+            },
+        };
+        apply_user_cancelled_turn(
+            &mut state,
+            &api,
+            None,
+            "synthetic request",
+            Err(failure),
+            Instant::now(),
+            &mut ui,
+            None,
+        )
+        .await;
+        let warning = ui.warnings.join("\n");
+        assert!(warning.contains("could not be confirmed"));
+        assert!(warning.contains("may still be active"));
+        assert!(warning.contains(&format!("astra session cancel {sid}")));
+        assert!(
+            state
+                .last_turn_event
+                .unwrap()
+                .error
+                .unwrap()
+                .contains("could not be confirmed")
+        );
+    }
 
     #[serial_test::serial]
     #[tokio::test]

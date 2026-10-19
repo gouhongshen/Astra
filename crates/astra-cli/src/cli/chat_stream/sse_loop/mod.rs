@@ -99,8 +99,50 @@ async fn refresh_root_permission_context(
     }
 }
 
-pub(crate) async fn stream_chat_sse(
+/// Arc-wrap the fully configured canonical executor and publish that same
+/// instance before admission. A reused observation slot must never hide a
+/// different executor behind an earlier reference.
+#[allow(clippy::result_large_err)]
+pub(crate) fn retain_cli_executor(
+    executor: edge_tools::ToolExecutor,
+    observer: Option<&crate::cli::chat_stream::CliExecutorObserver>,
+) -> Result<Arc<edge_tools::ToolExecutor>, crate::TurnFailure> {
+    let executor = Arc::new(executor);
+    if observer.is_some_and(|observer| observer.set(executor.clone()).is_err()) {
+        return Err(crate::TurnFailure {
+            error: "ordinary SSE executor observer was reused for another executor".into(),
+            partial: crate::PartialTurnData {
+                failure_kind: Some(astra_core::ErrorKind::ContractViolation),
+                ..Default::default()
+            },
+        });
+    }
+    Ok(executor)
+}
+
+/// Keep stream state on the heap at the shared entrypoint. Embedding it in
+/// callers compounds their poll stack before a local tool callback can run.
+pub(crate) fn stream_chat_sse<'a>(
+    p: ChatTurnParams<'a>,
+) -> impl std::future::Future<Output = Result<StreamResult, crate::TurnFailure>> + 'a {
+    Box::pin(async move {
+        // Owned by this physical request, not inferred from an error string or
+        // absence of a run header. Keep it sticky across admission retries.
+        let mut server_admission_dispatched = false;
+        // Boxing only this wrapper still embeds the large execution future in
+        // its poll frame. Pin execution independently so cold local callbacks
+        // keep their stack headroom, including after a Server session restore.
+        let mut result = Box::pin(stream_chat_sse_inner(p, &mut server_admission_dispatched)).await;
+        if let Err(failure) = &mut result {
+            failure.partial.server_admission_not_dispatched = !server_admission_dispatched;
+        }
+        result
+    })
+}
+
+async fn stream_chat_sse_inner(
     mut p: ChatTurnParams<'_>,
+    server_admission_dispatched: &mut bool,
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
     p.model = normalize_turn_model(p.model);
@@ -520,6 +562,7 @@ pub(crate) async fn stream_chat_sse(
 
     // ─── Build host + state ──────────────────────────────────────────────
     let mut host = CliServerAdmissionHost {
+        server_admission_dispatched,
         runtime_config: p.runtime_config.clone(),
         api: p.api,
         token: p.token.to_string(),
@@ -540,7 +583,7 @@ pub(crate) async fn stream_chat_sse(
         history: p.history,
         recent_tools: p.recent_tools,
         project_root: project_root.clone(),
-        executor: std::sync::Arc::new(executor),
+        executor: retain_cli_executor(executor, p.executor_observer.as_ref())?,
         registry,
         all_schemas,
         perm_manager: p.perm_manager,
@@ -580,6 +623,16 @@ pub(crate) async fn stream_chat_sse(
         last_error_metadata: None,
         output_transport_failure: None,
     };
+
+    #[cfg(test)]
+    if let Some(observer) = p.executor_observer.as_ref() {
+        // Public-entry loopback tests verify the actual admission host too,
+        // rather than only the reference returned by the isolated factory.
+        assert!(Arc::ptr_eq(
+            &host.executor,
+            observer.get().expect("published executor")
+        ));
+    }
 
     let completion_checks =
         load_completion_check_declarations(&project_root).map_err(|error| crate::TurnFailure {
@@ -741,6 +794,7 @@ pub(crate) async fn stream_chat_sse(
         s.stop_clear();
     }
     let loop_result = consume_remote_turn(&mut host, &mut state).await;
+    let failure_kind = loop_result.as_ref().err().map(|error| error.kind);
     let loop_failure = match loop_result {
         Err(error) => Some(error.to_string()),
         Ok(_) => host
@@ -846,6 +900,7 @@ pub(crate) async fn stream_chat_sse(
                 session_id: state.current_session_id.clone(),
                 // Only the verified physical Server owner crosses settlement.
                 run_id: host.last_physical_run_id.clone(),
+                failure_kind,
                 error_code: host.last_error_code.clone(),
                 error_metadata: host.last_error_metadata.clone(),
                 admission_rejected: is_pre_admission_rejection(
@@ -853,6 +908,7 @@ pub(crate) async fn stream_chat_sse(
                     host.last_error_metadata.as_ref(),
                     host.last_physical_run_id.as_deref(),
                 ),
+                server_admission_not_dispatched: false,
                 last_heavy_checkpoint: state.stall.last_heavy_checkpoint.take(),
                 partial_text: std::mem::take(&mut state.final_text),
                 run_transcript_messages: state.take_run_transcript_capture(),
@@ -1117,6 +1173,30 @@ fn load_turn_messages(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_executor_observer_rejects_a_second_factory_before_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let observer = crate::cli::chat_stream::CliExecutorObserver::default();
+        let first = super::retain_cli_executor(
+            crate::edge_tools::ToolExecutor::new(root.path()),
+            Some(&observer),
+        )
+        .unwrap();
+        let failure = super::retain_cli_executor(
+            crate::edge_tools::ToolExecutor::new(root.path()),
+            Some(&observer),
+        )
+        .err()
+        .expect("a different executor cannot replace the observed owner");
+        assert_eq!(
+            failure.partial.failure_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert!(std::sync::Arc::ptr_eq(&first, observer.get().unwrap()));
+        assert!(failure.partial.run_id.is_none());
+        assert!(!crate::cli::turn::turn_auth_retry::should_retry_after_auth_refresh(&failure));
+    }
+
     use super::{
         TurnMessageLoadError, load_turn_messages, missing_model_selection_journal_event,
         missing_model_selection_turn_failure, non_tty_output_failure, normalize_turn_model,

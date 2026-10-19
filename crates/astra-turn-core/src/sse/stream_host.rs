@@ -453,6 +453,13 @@ pub type SseAbortReason = astra_core::ErrorKind;
 /// tool execution via edge callback ledger.
 #[async_trait]
 pub trait SseStreamHost: Send {
+    /// A cancelling attached client may still need the first Server run identity
+    /// to cancel that exact execution. Opt in to a bounded identity-only drain;
+    /// no tool or approval may execute during it. Other hosts stop immediately.
+    fn cancelled_admission_grace(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
     /// Whether this host requires every non-empty `data:` payload to be valid
     /// JSON. The default remains permissive for UI clients that predate the
     /// machine observation stream; strict machine consumers opt in.
@@ -659,6 +666,8 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     let mut reported_session_id: Option<String> = None;
     let mut terminal_probe = DurableTerminalProbe::default();
     let mut read_ahead = EdgeExecutionReadAhead::default();
+    let admission_grace = host.cancelled_admission_grace();
+    let mut cancelled_admission_deadline: Option<tokio::time::Instant> = None;
 
     host.on_before_sse_read_loop();
 
@@ -684,7 +693,16 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             }
             let mut elapsed = std::time::Duration::ZERO;
             loop {
-                let remaining = idle.saturating_sub(elapsed);
+                let mut remaining = idle.saturating_sub(elapsed);
+                if let Some(deadline) = cancelled_admission_deadline {
+                    let grace_remaining =
+                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if grace_remaining.is_zero() {
+                        abort = Some(astra_core::ErrorKind::Cancelled);
+                        break 'wait None;
+                    }
+                    remaining = remaining.min(grace_remaining);
+                }
                 if remaining.is_zero() {
                     break 'wait None; // idle timeout
                 }
@@ -692,7 +710,11 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 let r = if let Some(token) = cancel_token {
                     tokio::select! {
                         biased;
-                        _ = token.cancelled() => {
+                        _ = token.cancelled(), if cancelled_admission_deadline.is_none() => {
+                            if accum.run_id.is_none() && !admission_grace.is_zero() {
+                                cancelled_admission_deadline = Some(tokio::time::Instant::now() + admission_grace);
+                                continue;
+                            }
                             abort = Some(astra_core::ErrorKind::Cancelled);
                             break 'wait None;
                         }
@@ -776,6 +798,17 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             if let Err(error) = processed {
                 abort = Some(astra_core::ErrorKind::StreamTransport);
                 abort_message = Some(format!("Error: invalid SSE protocol: {error}"));
+                break;
+            }
+            // Capture only the accepted identity needed by explicit-cancel
+            // settlement. Never consume another event or flush an approval/tool
+            // from the same chunk once that identity arrives.
+            if !admission_grace.is_zero()
+                && stop_at_terminal.is_none()
+                && cancel_token.is_some_and(|token| token.is_cancelled())
+                && (accum.run_id.is_some() || !pending.is_empty() || accum.stream_complete)
+            {
+                abort.get_or_insert(astra_core::ErrorKind::Cancelled);
                 break;
             }
             if stop_at_terminal.as_deref().is_some_and(|run_id| {
@@ -1852,6 +1885,8 @@ impl SseStreamHost for NoopSseStreamHost {
 /// A test host that records all render effects and returns canned results.
 #[cfg(test)]
 struct RecordingSseStreamHost {
+    cancelled_admission_grace: std::time::Duration,
+    cancel_after_accepted_event: Option<tokio_util::sync::CancellationToken>,
     render_effects: Vec<SseRenderEffect>,
     tool_outputs: std::collections::HashMap<String, String>,
     approval_kinds: Vec<ApprovalKind>,
@@ -1877,6 +1912,8 @@ struct RecordingSseStreamHost {
 impl RecordingSseStreamHost {
     fn new() -> Self {
         Self {
+            cancelled_admission_grace: std::time::Duration::ZERO,
+            cancel_after_accepted_event: None,
             render_effects: Vec::new(),
             tool_outputs: std::collections::HashMap::new(),
             approval_kinds: Vec::new(),
@@ -1921,6 +1958,10 @@ impl RecordingSseStreamHost {
 #[cfg(test)]
 #[async_trait]
 impl SseStreamHost for RecordingSseStreamHost {
+    fn cancelled_admission_grace(&self) -> std::time::Duration {
+        self.cancelled_admission_grace
+    }
+
     fn requires_strict_sse_json(&self) -> bool {
         self.strict_sse_json
     }
@@ -1931,6 +1972,9 @@ impl SseStreamHost for RecordingSseStreamHost {
 
     async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
         self.accepted_sse_events.push(event.clone());
+        if let Some(cancel) = &self.cancel_after_accepted_event {
+            cancel.cancel();
+        }
         Ok(())
     }
 
@@ -3673,6 +3717,98 @@ mod tests {
                 .unwrap_or("")
                 .contains("Cancelled")
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_per_event_stop_requires_host_opt_in() {
+        for opted_in in [false, true] {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut chunks = stream::iter(vec![Ok(concat!(
+                "data: {\"type\":\"session_info\",\"session_id\":\"session\",\"run_id\":\"run\"}\n\n",
+                "data: {\"type\":\"text_delta\",\"content\":\"same chunk\"}\n\n",
+                "data: [DONE]\n\n"
+            ).as_bytes().to_vec())]);
+            let mut host = RecordingSseStreamHost::new();
+            host.cancel_after_accepted_event = Some(cancel.clone());
+            if opted_in {
+                host.cancelled_admission_grace = std::time::Duration::from_secs(1);
+            }
+            let (result, _) = consume_sse_stream_cancellable(
+                &mut chunks,
+                &mut host,
+                std::time::Duration::from_secs(60),
+                Some(&cancel),
+                None,
+            )
+            .await;
+            assert_eq!(
+                result.accum.full_text,
+                if opted_in { "" } else { "same chunk" }
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_admission_captures_delayed_run_without_executing_same_chunk_tools() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let mut chunks = Box::pin(stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Ok(concat!(
+                "data: {\"type\":\"session_info\",\"session_id\":\"session-late\",\"run_id\":\"run-late\"}\n\n",
+                "data: {\"type\":\"approval_required\",\"request_id\":\"approval-late\",\"tool\":\"bash\"}\n\n",
+                "data: {\"type\":\"tool_request\",\"request_id\":\"call-late\",\"tool\":\"bash\",\"args\":{\"command\":\"must-not-run\"},\"schema_admitted_by_server\":true}\n\n"
+            ).as_bytes().to_vec())
+        }));
+        let mut host = RecordingSseStreamHost::new();
+        host.cancelled_admission_grace = std::time::Duration::from_millis(100);
+
+        let (result, abort) = consume_sse_stream_cancellable(
+            &mut chunks,
+            &mut host,
+            std::time::Duration::from_secs(60),
+            Some(&cancel),
+            None,
+        )
+        .await;
+
+        assert_eq!(abort, Some(astra_core::ErrorKind::Cancelled));
+        assert_eq!(result.accum.session_id.as_deref(), Some("session-late"));
+        assert_eq!(result.accum.run_id.as_deref(), Some("run-late"));
+        assert!(result.tool_results.is_empty());
+        assert!(result.approval_results.is_empty());
+        assert!(host.approval_kinds.is_empty());
+        assert_eq!(
+            host.accepted_sse_events.len(),
+            1,
+            "stop at the identity boundary"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_admission_grace_is_absolute_even_with_keepalives() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let mut chunks = Box::pin(stream::unfold((), |()| async {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            Some((Ok(b": keepalive\n\n".to_vec()), ()))
+        }));
+        let mut host = RecordingSseStreamHost::new();
+        host.cancelled_admission_grace = std::time::Duration::from_millis(40);
+        let started = tokio::time::Instant::now();
+        let (result, abort) = consume_sse_stream_cancellable(
+            &mut chunks,
+            &mut host,
+            std::time::Duration::from_secs(60),
+            Some(&cancel),
+            None,
+        )
+        .await;
+
+        assert_eq!(abort, Some(astra_core::ErrorKind::Cancelled));
+        assert!(result.accum.run_id.is_none());
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(40));
+        assert!(result.tool_results.is_empty());
     }
 
     // ── Edge SSE resilience: transport error, malformed frames, pings ────────

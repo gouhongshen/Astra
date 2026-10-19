@@ -5228,6 +5228,7 @@ mod tests {
             cache_capability: None,
             thinking_capability: None,
             fixed_temperature: None,
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             request_body_overrides: None,
             context_window: Some(8_192),
@@ -5622,6 +5623,7 @@ mod tests {
             cache_capability: None,
             route: crate::turn::llm::client::LlmExecutionRoute {
                 fixed_temperature: None,
+                supported_reasoning_efforts: None,
                 thinking_protocol: None,
                 model_name: "model-test",
                 wire_model_name: None,

@@ -254,6 +254,24 @@ before reusing the session. It checks:
 Scripted providers have a finite response inventory: duplicate inference or an
 unexpected call fails the test rather than receiving a generic mock response.
 
+The same fresh-database journey also exercises the additive reasoning-level
+contract in `moi_fresh_astra/reasoning.rs`, pinned separately to Matrixflow
+`2403ed2b49e450146465a09a931515c4b772d8f6`. That producer freezes the selected
+catalog model's supported efforts into
+`capability_descriptors.model_gateway.metadata.reasoning_control`, independently
+of the requested `context.thinking`. The historical consumer baseline above is
+unchanged. This module reuses its independent HMAC signer and SSE parser, without
+using Astra request types or fetching a moving MOI branch. It checks:
+
+- `low`, `medium`, `high`, and `max` arrive unchanged in the actual model request
+  and each turn completes on the same persisted session;
+- a subsequent ordinary turn omits `reasoning_effort` rather than retaining the
+  preceding explicit level;
+- an undeclared effort, missing capability, or malformed declaration is rejected
+  before run allocation or model I/O, with stable SSE error classification;
+- a valid turn still completes on that session after the rejected requests,
+  without duplicate inference.
+
 Buffered and live consumers share the pinned MOI SSE framing rules, including
 LF/CRLF, multiline data, EOF frames and stopping at `[DONE]`. Negative controls
 reject an early `[DONE]` even when a terminal follows it. MCP and Skill callbacks

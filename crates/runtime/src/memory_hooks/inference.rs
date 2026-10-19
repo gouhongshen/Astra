@@ -95,6 +95,7 @@ impl DirectMemoryInferenceClient {
     fn execution_route(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
             fixed_temperature: self.fixed_temperature,
+            supported_reasoning_efforts: None,
             thinking_protocol: self.thinking_protocol,
             model_name: &self.model_name,
             wire_model_name: self.wire_model_name.as_deref(),

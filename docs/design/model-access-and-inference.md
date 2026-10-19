@@ -886,6 +886,26 @@ token budget. Explicit effort and budget requests are rejected when unsupported,
 never silently converted to a toggle. An unsuffixed model preserves its default;
 `(thinking:on)` and `(thinking:off)` retain explicit intent across surfaces.
 
+An authenticated provider using `capability_descriptors.model_gateway` can
+supply an exact gateway-wire declaration in `metadata.reasoning_control`:
+
+```json
+{"protocol":"reasoning_effort","supported_efforts":["low","high","max"]}
+```
+
+The provider must derive this declaration from the selected model's catalog,
+not from the turn's requested effort. Astra accepts it only at the existing
+provider-authorized gateway admission boundary. The protocol must be
+`reasoning_effort`, and efforts must be a nonempty, unique subset of
+`low`, `medium`, `high`, and `max`. Malformed declarations fail admission.
+Omission leaves gateway reasoning capability unknown; it does not enable an
+explicit effort. The admitted execution retains the exact inventory through
+primary and auxiliary routes, delegation validation, and final provider calls.
+An explicit adaptive effort must be a member and is emitted unchanged. The
+bounded auxiliary policy may select low only if low is declared. This contract
+is additive inside the existing metadata map and does not alter ordinary
+catalog Offering admission or require a reasoning declaration for default chat.
+
 The unconnected per-turn complexity dampener (`TurnComplexitySignals`,
 `scale_for_turn`, and `capped_at`) is retired from the source API; requested
 thinking controls, Offering admission and provider emission keep their existing

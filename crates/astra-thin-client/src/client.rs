@@ -1599,6 +1599,18 @@ impl ThinClient {
         token: &str,
         payload: &Value,
     ) -> Result<Response, ThinClientError> {
+        self.post_developer_loop_with_payload(token, &mut || Ok(payload.clone()))
+            .await
+    }
+
+    async fn post_developer_loop_with_payload<F>(
+        &self,
+        token: &str,
+        payload_for_attempt: &mut F,
+    ) -> Result<Response, ThinClientError>
+    where
+        F: FnMut() -> Result<Value, ThinClientError>,
+    {
         let url = self.url(paths::CHAT_STREAM)?;
         tracing::debug!(
             target: "astra_cli::http_proxy",
@@ -1610,11 +1622,16 @@ impl ThinClient {
             header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),
         );
+        // Credential preparation can wait for a refresh or owner lock. Check
+        // the caller's admission guard and publish dispatch evidence only
+        // after that wait, with no intervening await before sending. Once
+        // sending begins, retain this same response for exact-run recovery.
+        let payload = payload_for_attempt()?;
         let response = self
             .http_stream
             .post(url)
             .headers(headers)
-            .json(payload)
+            .json(&payload)
             .send()
             .await?;
         if response.status().is_success() {
@@ -1651,7 +1668,9 @@ impl ThinClient {
         .await
     }
 
-    /// Retry admission with a fresh payload at every physical attempt.
+    /// Retry admission with a fresh payload at every physical attempt, after
+    /// asynchronous credential preparation and immediately before dispatch.
+    /// The factory may reject admission and record sticky dispatch evidence.
     /// Callers with an absolute execution deadline use this to publish a
     /// monotonically shrinking budget after 429 or transport waits.
     pub async fn post_developer_loop_retry_429_with_payload<F>(
@@ -1666,8 +1685,10 @@ impl ThinClient {
     {
         let mut last_err: Option<ThinClientError> = None;
         for attempt in 0..max_attempts {
-            let payload = payload_for_attempt()?;
-            match self.post_developer_loop(token, &payload).await {
+            match self
+                .post_developer_loop_with_payload(token, &mut payload_for_attempt)
+                .await
+            {
                 Ok(resp) => {
                     if resp.status().as_u16() == 429 && attempt + 1 < max_attempts {
                         let delay_secs =

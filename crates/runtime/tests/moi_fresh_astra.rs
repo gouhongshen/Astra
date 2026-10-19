@@ -29,6 +29,8 @@ use uuid::Uuid;
 
 #[path = "moi_fresh_astra/normal_chat.rs"]
 mod normal_chat;
+#[path = "moi_fresh_astra/reasoning.rs"]
+mod reasoning;
 #[path = "moi_fresh_astra/sse.rs"]
 mod sse;
 
@@ -758,6 +760,7 @@ async fn historical_moi_works_with_fresh_astra() {
         );
     }
     normal_chat::exercise(&app, &endpoint, gateway_state.clone()).await;
+    reasoning::exercise(&app, &endpoint, gateway_state.clone()).await;
     assert!(
         state.drain_background_runs(Duration::from_secs(10)).await,
         "runs must settle"

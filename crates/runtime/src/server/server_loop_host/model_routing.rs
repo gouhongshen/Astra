@@ -43,6 +43,7 @@ fn preserves_contract(
         && baseline.provider == candidate.provider
         && baseline.thinking_capability == candidate.thinking_capability
         && baseline.thinking_protocol == candidate.thinking_protocol
+        && baseline.supported_reasoning_efforts == candidate.supported_reasoning_efforts
         && baseline.fixed_temperature == candidate.fixed_temperature
         && baseline.request_body_overrides == candidate.request_body_overrides
         && baseline.cache_capability == candidate.cache_capability
