@@ -146,6 +146,106 @@ async fn insert_run_fixture(
     store.insert_run(record).await.expect("insert run fixture");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn load_run_does_not_mix_metadata_with_later_committed_events() {
+    // Pause after SQLx has received the metadata row, but before load_run
+    // reads its events. The independent writer can then commit a later event
+    // deterministically, without sleeps or production test hooks.
+    struct MetadataReadBarrier {
+        ready: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MetadataReadBarrier {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "sqlx::query" {
+                return;
+            }
+            let mut queries = Queries::default();
+            event.record(&mut queries);
+            if !queries
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|sql| sql.contains("FROM agent_runs WHERE user_id = ? AND run_id = ?"))
+            {
+                return;
+            }
+            if let Some(ready) = self.ready.lock().unwrap().take() {
+                ready.send(()).expect("notify metadata reader barrier");
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release metadata reader after concurrent commit");
+            }
+        }
+    }
+
+    let (pool, store) = setup().await;
+    let user_id = common::id("run-read-user");
+    let session_id = common::id("run-read-session");
+    let run_id = common::id("run-read-run");
+    insert_run_fixture(
+        &pool,
+        store.as_ref(),
+        durable_run_record(run_id.clone(), user_id.clone(), session_id.clone()),
+    )
+    .await;
+    let before = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let subscriber = tracing_subscriber::registry().with(MetadataReadBarrier {
+        ready: std::sync::Mutex::new(Some(ready_tx)),
+        release: std::sync::Mutex::new(release_rx),
+    });
+    let reader = {
+        let store = Arc::clone(&store);
+        let user_id = user_id.clone();
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            store
+                .load_run(&user_id, &run_id)
+                .with_subscriber(subscriber)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), ready_rx)
+        .await
+        .expect("reader reaches metadata boundary")
+        .expect("metadata boundary remains observable");
+    let later_event = make_event("tool_result", json!({"output": "committed after metadata"}));
+    let append = tokio::time::timeout(
+        Duration::from_secs(5),
+        store.append_event(&user_id, &session_id, &run_id, later_event.clone()),
+    )
+    .await;
+    release_tx.send(()).expect("release paused reader");
+    append
+        .expect("independent writer can commit while reader is paused")
+        .expect("append concurrent event");
+    let snapshot = reader.await.unwrap().unwrap().unwrap();
+    assert_eq!(snapshot.last_event_idx, before.last_event_idx);
+    assert_eq!(
+        snapshot.events, before.events,
+        "events must belong to the metadata frontier, not a later commit"
+    );
+    let current = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
+    assert!(current.last_event_idx > snapshot.last_event_idx);
+    assert_eq!(current.events.last().unwrap()["id"], later_event["id"]);
+    assert_eq!(
+        current.events.last().unwrap()["index"],
+        current.last_event_idx
+    );
+    common::cleanup_work_owner(&pool, &user_id).await;
+}
+
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
 async fn cancellation_intent_is_independent_from_a_locked_session_row() {

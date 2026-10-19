@@ -19198,13 +19198,16 @@ impl RunStateStore for DatabaseRunStateStore {
             return Ok(None);
         };
 
+        // Events and their metadata frontier advance in the same transaction.
+        // A later event read must not mix a new terminal with old accounting.
         let rows = sqlx::query(
             "SELECT payload_json, event_idx FROM agent_run_events
-             WHERE user_id = ? AND run_id = ?
+             WHERE user_id = ? AND run_id = ? AND event_idx <= ?
              ORDER BY event_idx ASC",
         )
         .bind(&run.user_id)
         .bind(run_id)
+        .bind(run.last_event_idx)
         .fetch_all(self.pool.get())
         .await
         .map_err(|source| db_error("load_run_events", run_id, source).to_string())?;
