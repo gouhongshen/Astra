@@ -1536,17 +1536,12 @@ async fn execute_bash_inner(
     let output_limit = per_tool_output_limit("bash");
     let raw_stdout_limit = output_limit.saturating_mul(2).max(16_384);
     let raw_stderr_limit = output_limit.clamp(8_192, 32_768);
-    // Leave room for stderr labels, exit notes, and redaction markers in the
-    // bounded inline view before deciding that the raw bytes need no file.
     // The model presents at most this many characters. Use the same value as
     // a conservative byte threshold so Bash never deletes the only directly
     // readable copy of output that a later model boundary may omit.
     let capture_inline_threshold =
         output_limit.min(astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS);
-    let capture = match BashOutputCapture::start(
-        workspace_root,
-        capture_inline_threshold.saturating_sub(1024),
-    ) {
+    let capture = match BashOutputCapture::start(workspace_root, capture_inline_threshold) {
         Ok(capture) => capture,
         Err(error) => return attach_source_preimage(ToolResult::error(error), source_preimages),
     };
@@ -1589,9 +1584,14 @@ async fn execute_bash_inner(
     // partial value in stdout/stderr for a later pass to miss.
     result = astra_text_utils::credential_redaction::redact_credentials_for_display(&result).0;
 
+    let exit_note = (output.exit_code != 0 && !output.timed_out && !output.cancelled)
+        .then(|| format!("[exit code: {}]", output.exit_code));
+    let terminal_bytes = exit_note
+        .as_ref()
+        .map_or(0, |note| note.len() + if result.is_empty() { 0 } else { 2 });
     let retain_for_preview = output.stdout_capped
         || output.stderr_capped
-        || result.len().saturating_add(1024) > capture_inline_threshold;
+        || result.len().saturating_add(terminal_bytes) > capture_inline_threshold;
     let capture = finish_capture(output.capture.take(), retain_for_preview).await;
 
     if let Some(Ok(receipt)) = capture.as_ref() {
@@ -1659,11 +1659,11 @@ async fn execute_bash_inner(
         ));
     }
 
-    if output.exit_code != 0 && !output.timed_out && !output.cancelled {
+    if let Some(exit_note) = exit_note {
         if !result.is_empty() {
             result.push_str("\n\n");
         }
-        result.push_str(&format!("[exit code: {}]", output.exit_code));
+        result.push_str(&exit_note);
     }
 
     if output.timed_out {
@@ -6861,6 +6861,64 @@ printf 'probe.txt:1:needle\n'
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn foreground_bash_low_budget_preserves_small_output() {
+        const CHILD: &str = "ASTRA_BASH_LOW_BUDGET_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "shell_ops::tests::foreground_bash_low_budget_preserves_small_output",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("ASTRA_TOOL_OUTPUT_LIMIT", "64")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            assert_eq!(per_tool_output_limit("bash"), 64);
+            let dir = tempdir().unwrap();
+            let ctx = crate::ToolContext::test(dir.path());
+            for (command, expected) in [
+                ("printf SMALL", "SMALL".to_string()),
+                ("printf ERROR >&2", "stderr:\nERROR".to_string()),
+                ("printf '%064d' 0", "0".repeat(64)),
+            ] {
+                let result = execute_bash(&ctx, &serde_json::json!({"command": command})).await;
+                assert!(!result.is_error, "{}", result.output);
+                assert_eq!(result.output, expected);
+                assert!(
+                    result
+                        .metadata
+                        .as_ref()
+                        .unwrap()
+                        .get("bash_output_capture")
+                        .is_none()
+                );
+            }
+            let failed =
+                execute_bash(&ctx, &serde_json::json!({"command":"printf SMALL; exit 1"})).await;
+            assert_eq!(failed.output, "SMALL\n\n[exit code: 1]");
+            assert_eq!(failed.metadata.as_ref().unwrap()["exit_code"], 1);
+            assert!(
+                failed
+                    .metadata
+                    .as_ref()
+                    .unwrap()
+                    .get("bash_output_capture")
+                    .is_none()
+            );
+        });
     }
 
     #[test]

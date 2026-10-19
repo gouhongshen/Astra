@@ -1535,6 +1535,15 @@ impl AgentBindingMcpRuntime {
         config: super::capability_source::CapabilitySourceConfig,
     ) -> Result<Self, String> {
         config.validate().map_err(|error| error.to_string())?;
+        if self
+            .tool_names_by_public_name
+            .keys()
+            .any(|name| super::capability_source::valid_selection_key(name))
+        {
+            return Err(
+                "registered MCP alias conflicts with a reserved capability selection key".into(),
+            );
+        }
         if config.discovery_tools.iter().any(|name| {
             !self.resolved_snapshot.descriptors.iter().any(|descriptor| {
                 &descriptor.native_tool_name == name
@@ -1571,6 +1580,7 @@ impl AgentBindingMcpRuntime {
         method: &str,
         params: Value,
         effectful: bool,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<Value, AgentBindingMcpRpcError> {
         let risk = if effectful {
             AgentBindingMcpRpcRisk::ToolInvocation
@@ -1582,9 +1592,8 @@ impl AgentBindingMcpRuntime {
             "url": self.endpoint_url,
             "credentials": params.pointer("/capability/reference"),
         });
-        post_agent_binding_mcp_rpc_with_risk(&self.endpoint_url, &self.authorization,
-            json!({"jsonrpc": "2.0", "id": "astra-capability-source", "method": method, "params": params}),
-            Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS), risk).await
+        self.rpc_with_cancel(method, params, risk, cancel_token)
+            .await
             .map_err(|error| error.redacted(&secrets))
     }
 
@@ -1662,11 +1671,6 @@ impl AgentBindingMcpRuntime {
         provider_interaction_response: Option<&astra_turn_types::ProviderInteractionResponse>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<McpToolCallResult, AgentBindingMcpRpcError> {
-        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-            let mut error = agent_binding_mcp_rpc_error("MCP tool cancelled before dispatch");
-            error.cancelled_before_dispatch = true;
-            return Err(error);
-        }
         if tool_call_id.trim().is_empty() {
             return Err(agent_binding_mcp_rpc_error(
                 "Agent Binding MCP tool call identity is required",
@@ -1698,13 +1702,41 @@ impl AgentBindingMcpRuntime {
         if !protocol_metadata.is_empty() {
             params["_meta"] = Value::Object(protocol_metadata);
         }
+        let result = self
+            .rpc_with_cancel(
+                "tools/call",
+                params,
+                AgentBindingMcpRpcRisk::ToolInvocation,
+                cancel_token,
+            )
+            .await?;
+        extract_agent_binding_mcp_tool_result(&result).map_err(|error| {
+            error.redacted(&json!({
+                "authorization": &self.authorization,
+                "url": &self.endpoint_url,
+            }))
+        })
+    }
+
+    async fn rpc_with_cancel(
+        &self,
+        method: &str,
+        params: Value,
+        risk: AgentBindingMcpRpcRisk,
+        cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Value, AgentBindingMcpRpcError> {
+        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            let mut error = agent_binding_mcp_rpc_error("MCP request cancelled before dispatch");
+            error.cancelled_before_dispatch = true;
+            return Err(error);
+        }
         // The business call id survives interaction rounds; a protocol request
         // id identifies only this exchange and must never cancel another round.
         let request_id = uuid::Uuid::new_v4().to_string();
         let payload = json!({
             "jsonrpc": "2.0",
             "id": request_id,
-            "method": "tools/call",
+            "method": method,
             "params": params,
         });
         let execution = post_agent_binding_mcp_rpc_with_risk(
@@ -1712,10 +1744,10 @@ impl AgentBindingMcpRuntime {
             &self.authorization,
             payload,
             Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS),
-            AgentBindingMcpRpcRisk::ToolInvocation,
+            risk,
         );
         tokio::pin!(execution);
-        let result = if let Some(cancel_token) = cancel_token {
+        if let Some(cancel_token) = cancel_token {
             tokio::select! {
                 biased;
                 result = &mut execution => result,
@@ -1749,12 +1781,6 @@ impl AgentBindingMcpRuntime {
             execution.await
         }
         .map_err(|error| {
-            error.redacted(&json!({
-                "authorization": &self.authorization,
-                "url": &self.endpoint_url,
-            }))
-        })?;
-        extract_agent_binding_mcp_tool_result(&result).map_err(|error| {
             error.redacted(&json!({
                 "authorization": &self.authorization,
                 "url": &self.endpoint_url,
@@ -2404,6 +2430,7 @@ mod tests {
                             method,
                             json!({"capability":{"reference":reference}, "raw_error":raw_error}),
                             effectful,
+                            None,
                         )
                         .await
                         .unwrap_err();
@@ -2441,6 +2468,33 @@ mod tests {
             );
             assert_eq!(result.is_ok(), effect == Some("read"));
         }
+    }
+
+    #[test]
+    fn capability_source_rejects_registered_alias_that_is_a_complete_selection_key() {
+        let native_name = "search__0123456789abcdef";
+        let bundle = prepare_agent_binding_mcp_bundle_from_snapshot(
+            "cap",
+            "https://provider.example/mcp",
+            "Bearer test",
+            None,
+            &[json!({"name": native_name, "side_effect_class": "read", "inputSchema": {"type": "object"}})],
+        )
+        .unwrap();
+        let error = bundle
+            .agent_binding_mcp
+            .unwrap()
+            .with_capability_source(super::super::capability_source::CapabilitySourceConfig {
+                contract_version: super::super::capability_source::CONTRACT_VERSION.into(),
+                discovery_tools: std::collections::BTreeSet::from([native_name.into()]),
+                selection_authorization: "discovery_scope".into(),
+            })
+            .err()
+            .expect("an alias cannot own both a registered descriptor and a selection key");
+        assert_eq!(
+            error,
+            "registered MCP alias conflicts with a reserved capability selection key"
+        );
     }
 
     #[test]

@@ -1387,7 +1387,7 @@ impl RuntimeToolExecutor {
         let mut expired = Vec::new();
         for activation in activations
             .iter()
-            .filter(|activation| source.custody.owns_selection_shape(&activation.name))
+            .filter(|activation| source.owns_selection_shape(&activation.name))
         {
             // Restore only indexed descriptors already committed by this run.
             // Neither checkpoint text nor a matching hash can mint custody.
@@ -1447,7 +1447,7 @@ impl RuntimeToolExecutor {
             .1
             .split(',')
             .map(str::trim)
-            .filter(|name| source.custody.owns_selection_shape(name))
+            .filter(|name| source.owns_selection_shape(name))
             .filter(|name| seen_source_names.insert(*name))
             .collect();
         if source_names.is_empty() {
@@ -1496,7 +1496,7 @@ impl RuntimeToolExecutor {
                 .filter(|schema| {
                     tool_schema_name(schema).is_some_and(|name| {
                         names.iter().any(|selected| {
-                            if source.custody.owns_selection_shape(selected) {
+                            if source.owns_selection_shape(selected) {
                                 selected == name
                             } else {
                                 selected.eq_ignore_ascii_case(name)
@@ -1908,7 +1908,7 @@ impl RuntimeToolExecutor {
                 let result = if let Some(source) = self
                     .capability_source
                     .as_ref()
-                    .filter(|source| source.custody.owns_selection_shape(name))
+                    .filter(|source| source.owns_selection_shape(name))
                 {
                     match source.invoke(request, interaction_response.as_ref(), cancel_token).await {
                         Ok(result) => Ok(result),

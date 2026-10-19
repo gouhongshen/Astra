@@ -90,9 +90,11 @@ its bounded status probe, so retained outputs do not consume the mutation
 observer's byte or entry budget. This is a tap after the top-level Bash
 process, so shell pipelines and explicit redirection keep their normal
 behavior. The file-retention threshold is the lesser of the configured
-per-tool byte limit and the shared 8,000-character model inline budget, minus
-1,024 bytes reserved for status text; stream-preview capping also retains the
-files. Byte counting is conservative for UTF-8. Retained results return both
+per-tool byte limit and the shared 8,000-character model inline budget. The
+formatted, redacted output plus its actual exit note determines retention;
+small results remain inline even with a low configured budget. Stream-preview
+capping also retains the files. Byte counting is conservative for UTF-8.
+Retained results return both
 file paths, byte counts and SHA-256 digests. The redacted preview uses space
 remaining after the receipt and terminal facts in a 4,000-byte presentation
 target; an exceptionally long workspace path can make the mandatory receipt

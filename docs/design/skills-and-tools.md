@@ -167,8 +167,17 @@ A Tool selection enters through
 resolve the selection against runtime custody and policy before reading or
 executing the capability. A stable name is not a grant: each run still needs its
 own discovered receipt, with unchanged identity, generation, snapshot and
-current-use checks. Malformed names in the reserved capability namespace fail
-at that owner, without local-name lookup or fuzzy matching.
+current-use checks. Registered Agent Binding MCP aliases such as
+`mcp__cap__search` retain their descriptor-owned route. A source configuration
+that registers an alias matching a complete reserved selection key is rejected
+at binding admission. Unregistered malformed names in the reserved capability
+namespace fail at that owner, without local-name lookup or fuzzy matching.
+
+Selected source invocations use the ordinary Agent Binding MCP cancellation
+owner: each exchange has a unique request ID, cancellation sends
+`notifications/cancelled`, and the original correlated response retains
+settlement authority. A cancellation notification alone cannot release an
+in-flight invocation or its workspace ownership.
 
 For a selected source Skill, `skill(resource_path=...)` reads a package-relative
 text resource through the same custody and policy checks, with a 64 KiB content

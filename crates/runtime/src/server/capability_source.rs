@@ -43,7 +43,7 @@ fn selection_label(native_id: &str) -> String {
     label
 }
 
-fn valid_selection_key(key: &str) -> bool {
+pub(super) fn valid_selection_key(key: &str) -> bool {
     ["mcp__cap__", "skill__cap__"].iter().any(|prefix| {
         key.strip_prefix(prefix)
             .and_then(|suffix| suffix.rsplit_once("__"))
@@ -598,6 +598,12 @@ pub(crate) struct CapabilitySourceRuntime {
 }
 
 impl CapabilitySourceRuntime {
+    /// Registered descriptors own their exact aliases; the reserved namespace
+    /// rejects only otherwise-unbound selections, including malformed keys.
+    pub(crate) fn owns_selection_shape(&self, name: &str) -> bool {
+        self.custody.owns_selection_shape(name) && !self.transport.owns_public_tool_name(name)
+    }
+
     pub(crate) fn new(
         transport: Arc<super::runtime_mcp::AgentBindingMcpRuntime>,
         store: Arc<dyn RunStateStore>,
@@ -714,6 +720,7 @@ impl CapabilitySourceRuntime {
                         "astra/capabilities/describe",
                         json!({"capability": candidate.capability, "discovery_tool": receipt.discovery_tool}),
                         false,
+                        None,
                     )
                     .await
                     .map_err(|error| transport_failure(scope, "describe", &error))?;
@@ -843,6 +850,7 @@ impl CapabilitySourceRuntime {
                     "call_id": request.tool_call_id, "interaction_response": interaction,
                 }),
                 true,
+                cancel_token,
             )
             .await?;
         super::runtime_mcp::extract_capability_source_result(&response).map_err(Into::into)
@@ -893,6 +901,7 @@ impl CapabilitySourceRuntime {
                         "astra/capabilities/read_skill",
                         json!({"capability": candidate.capability, "discovery_tool": receipt.discovery_tool}),
                         false,
+                        None,
                     )
                     .await
                     .map_err(|error| transport_failure(scope, "read_skill", &error))?;
@@ -958,7 +967,7 @@ impl CapabilitySourceRuntime {
         }
         let response = self.transport.capability_rpc("astra/capabilities/read_skill", json!({
             "capability": receipt.candidate.capability, "discovery_tool": receipt.discovery_tool, "path": path
-        }), false).await.map_err(|error| transport_failure(scope, "read_skill_resource", &error))?;
+        }), false, None).await.map_err(|error| transport_failure(scope, "read_skill_resource", &error))?;
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Resource {
@@ -1005,7 +1014,7 @@ impl astra_skills::traits::SkillResolver for CapabilitySourceSkillResolver {
         &self,
         name: &str,
     ) -> Result<astra_skills::traits::ResolvedSkill, astra_skills::traits::SkillError> {
-        if self.source.custody.owns_selection_shape(name) {
+        if self.source.owns_selection_shape(name) {
             return Err(astra_skills::traits::SkillError::LoadFailed(
                 "capability_source_requires_async_resolution".into(),
             ));
@@ -1020,7 +1029,7 @@ impl astra_skills::traits::SkillResolver for CapabilitySourceSkillResolver {
         &self,
         name: &str,
     ) -> Result<astra_skills::traits::ResolvedSkill, astra_skills::traits::SkillError> {
-        if !self.source.custody.owns_selection_shape(name) {
+        if !self.source.owns_selection_shape(name) {
             return self
                 .base
                 .as_ref()
@@ -1052,7 +1061,7 @@ impl astra_skills::traits::SkillResolver for CapabilitySourceSkillResolver {
         path: &str,
     ) -> Result<astra_skills::traits::SkillResource, astra_skills::traits::SkillError> {
         self.resolve_for_execution(name).await?;
-        if !self.source.custody.owns_selection_shape(name) {
+        if !self.source.owns_selection_shape(name) {
             return self
                 .base
                 .as_ref()
@@ -1388,6 +1397,7 @@ pub(crate) mod tests {
         method: &'static str,
         started: tokio::sync::Notify,
         release: tokio::sync::Notify,
+        cancelled: tokio::sync::Notify,
     }
 
     impl RpcGate {
@@ -1396,6 +1406,7 @@ pub(crate) mod tests {
                 method,
                 started: Default::default(),
                 release: Default::default(),
+                cancelled: Default::default(),
             }
         }
     }
@@ -1405,6 +1416,16 @@ pub(crate) mod tests {
         size: usize,
         distinct_bindings: bool,
         rpc_gate: Option<Arc<RpcGate>>,
+    ) -> HttpFixture {
+        http_fixture_for_source(skill, size, distinct_bindings, rpc_gate, "source").await
+    }
+
+    async fn http_fixture_for_source(
+        skill: bool,
+        size: usize,
+        distinct_bindings: bool,
+        rpc_gate: Option<Arc<RpcGate>>,
+        source_id: &str,
     ) -> HttpFixture {
         assert!(size > 0);
         let (store, scope) = fixture().await;
@@ -1442,6 +1463,10 @@ pub(crate) mod tests {
              headers: axum::http::HeaderMap, axum::Json(request): axum::Json<Value>| async move {
                 assert_eq!(headers.get("authorization").unwrap(), "Bearer test");
                 calls.lock().unwrap().push(request.clone());
+                if request["method"] == "notifications/cancelled" {
+                    gate.as_ref().expect("cancellable invocation").cancelled.notify_one();
+                    return axum::Json(json!({}));
+                }
                 if let Some(gate) = gate && request["method"] == gate.method {
                     gate.started.notify_one();
                     gate.release.notified().await;
@@ -1486,7 +1511,7 @@ pub(crate) mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let bundle = super::super::runtime_mcp::prepare_agent_binding_mcp_bundle_from_snapshot(
-            "source", &endpoint, "Bearer test", None, &[json!({"name":"search", "description":"Find capabilities", "side_effect_class":"read", "inputSchema":{"type":"object"}})]
+            source_id, &endpoint, "Bearer test", None, &[json!({"name":"search", "description":"Find capabilities", "side_effect_class":"read", "inputSchema":{"type":"object"}})]
         ).unwrap();
         let transport = Arc::new(
             bundle
@@ -1713,6 +1738,12 @@ pub(crate) mod tests {
             futures_util::poll!(&mut execution).is_pending(),
             "an in-flight invocation must not be dropped on cancellation"
         );
+        tokio::select! {
+            _ = gate.cancelled.notified() => {},
+            result = &mut execution => panic!("notification must not settle original invocation: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => panic!("provider did not receive cancellation"),
+        }
+        assert!(futures_util::poll!(&mut execution).is_pending());
         gate.release.notify_one();
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
             .await
@@ -1720,8 +1751,162 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(result.output, "account-read-complete");
         let calls = fixture.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
         assert_eq!(calls[1]["method"], "astra/capabilities/invoke");
+        assert_eq!(calls[2]["method"], "notifications/cancelled");
+        assert_eq!(calls[2]["params"]["requestId"], calls[1]["id"]);
+        assert_ne!(calls[1]["id"], calls[0]["id"]);
+    }
+
+    #[tokio::test]
+    async fn source_registered_discovery_alias_reaches_its_admitted_provider() {
+        use super::super::runtime_tool_executor::RuntimeToolExecutor;
+        use super::super::tool_local_transport::ServerLocalToolTransport;
+        for source_id in ["cap", "CAP", "cap__nested"] {
+            let fixture = http_fixture_for_source(false, 1, false, None, source_id).await;
+            let source = fixture.source();
+            source.bind_scope(fixture.scope.clone()).unwrap();
+            let alias = fixture.transport.public_tool_name("search").unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let mut executor = RuntimeToolExecutor::new(
+                workspace.path().into(),
+                fixture.scope.user_id.clone(),
+                fixture.scope.session_id.clone(),
+                None,
+                None,
+            );
+            executor.set_provider_policy_index(fixture.bundle.provider_policy_index.clone());
+            executor.set_agent_binding_mcp(fixture.transport.clone());
+            executor.set_capability_source(Some(source));
+            assert!(
+                executor.tool_runtime_ready(alias),
+                "registered descriptor must be ready"
+            );
+            assert_eq!(
+                fixture
+                    .bundle
+                    .provider_policy_index
+                    .resolve(alias)
+                    .unwrap()
+                    .effect,
+                astra_turn_types::ResolvedToolEffect::ReadOnly
+            );
+            let result = executor
+                .execute_server_local_tool(&request(&fixture.scope, alias, json!({})), None)
+                .await
+                .result;
+            assert!(!result.is_error, "{source_id}: {}", result.output);
+            let discovered: Value = serde_json::from_str(&result.output).unwrap();
+            assert!(
+                discovered["capabilities"][0]["selection_key"]
+                    .as_str()
+                    .is_some_and(valid_selection_key)
+            );
+            let calls = fixture.calls.lock().unwrap();
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call["method"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["tools/call"]
+            );
+            assert_eq!(calls[0]["params"]["name"], "search");
+        }
+    }
+
+    #[tokio::test]
+    async fn source_invocation_cancel_settles_outer_workspace_owner() {
+        use super::super::runtime_tool_executor::RuntimeToolExecutor;
+        use super::super::tool_execution_binding::{
+            ExecutorBinding, ToolTransportKind, WorkspaceBinding,
+        };
+        use super::super::tool_local_transport::{
+            ServerLocalToolTransport, execute_local_transport,
+        };
+
+        let gate = Arc::new(RpcGate::new("astra/capabilities/invoke"));
+        let fixture = http_fixture_with_scope_inventory(false, 1, false, Some(gate.clone())).await;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut executor = RuntimeToolExecutor::new(
+            workspace.path().into(),
+            fixture.scope.user_id.clone(),
+            fixture.scope.session_id.clone(),
+            None,
+            None,
+        );
+        executor.set_execution_bindings(
+            WorkspaceBinding::server_sandbox(workspace.path()),
+            ExecutorBinding::server_local(),
+        );
+        executor.set_provider_policy_index(fixture.bundle.provider_policy_index.clone());
+        executor.set_agent_binding_mcp(fixture.transport.clone());
+        let source = fixture.source();
+        let key = register_fixture_candidate(&source, &fixture).await;
+        executor.set_capability_source(Some(source));
+        let selected = executor
+            .execute_server_local_tool(
+                &request(
+                    &fixture.scope,
+                    "tool_search",
+                    json!({"query":format!("select:{key}")}),
+                ),
+                None,
+            )
+            .await
+            .result;
+        assert!(!selected.is_error, "{}", selected.output);
+        let mut invocation = request(&fixture.scope, &key, json!({}));
+        invocation.workspace = WorkspaceBinding::server_sandbox(workspace.path());
+        let binding = astra_runtime_env::RunBinding::resolve(
+            astra_runtime_env::WorkspaceBinding::server_sandbox(&fixture.scope.session_id),
+            astra_runtime_env::ExecutorBinding::local_cli(),
+            astra_runtime_env::RuntimeBinding::host_process("test-host"),
+            astra_runtime_env::PolicyIntent::local_developer(),
+            &astra_runtime_env::ToolRegistry::default(),
+        );
+        let cancel = CancellationToken::new();
+        let execution = execute_local_transport(
+            &invocation,
+            &binding,
+            &invocation.workspace,
+            &invocation.executor,
+            ToolTransportKind::ServerLocal,
+            &executor,
+            Some(cancel.clone()),
+        );
+        tokio::pin!(execution);
+        tokio::select! {
+            _ = gate.started.notified() => {},
+            _ = &mut execution => panic!("invocation must remain owned"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => panic!("invoke did not start"),
+        }
+        cancel.cancel();
+        tokio::select! {
+            _ = gate.cancelled.notified() => {},
+            result = &mut execution => panic!("provider cancellation must precede outer settlement: {:?}", result.result),
+        }
+        assert!(
+            futures_util::poll!(&mut execution).is_pending(),
+            "notification is not an acknowledgement"
+        );
+        gate.release.notify_one();
+        let result = execution.await.result;
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output, "account-read-complete");
+        assert_ne!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_observation_quarantined")),
+            Some(&Value::Bool(true))
+        );
+        let owner = astra_tools::workspace_observation::begin_workspace_writer_with_options(
+            workspace.path(),
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("next writer must be admitted after provider settlement");
+        drop(owner);
     }
 
     // Predict the scripted model's selection without registering any authority.
