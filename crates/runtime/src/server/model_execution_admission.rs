@@ -286,7 +286,8 @@ pub(crate) fn validate_reasoning_control(
         &execution.provider,
         capability.map(|capability| capability.as_str()),
         protocol,
-    );
+    ) && thinking
+        .is_within_declared_efforts(execution.supported_reasoning_efforts.as_deref());
     if supported {
         Ok(())
     } else {
@@ -367,6 +368,27 @@ pub(crate) async fn admit_model_execution(
                 .expect("validated model_gateway capability must carry a positive context window"),
         );
         execution.source_identity = resolved.source_identity.clone();
+        if let Some(value) = gateway.metadata.get("reasoning_control") {
+            let control: astra_services::models::RuntimeModelReasoningControl =
+                serde_json::from_value(value.clone()).map_err(|_| {
+                    error_response_coded(
+                        StatusCode::BAD_REQUEST,
+                        "model gateway reasoning control declaration is malformed",
+                        "provider_runtime_context_invalid",
+                    )
+                })?;
+            control.validate().map_err(|detail| {
+                error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    detail,
+                    "provider_runtime_context_invalid",
+                )
+            })?;
+            execution.thinking_capability =
+                Some(astra_services::models::ThinkingCapability::EffortOnly);
+            execution.thinking_protocol = Some(control.protocol);
+            execution.supported_reasoning_efforts = Some(control.supported_efforts);
+        }
         // This execution material exists only after the provider-authorized
         // model_gateway descriptor and runtime identity have both been
         // validated above. Negotiate MOI's safe structured error envelope at
@@ -979,7 +1001,7 @@ mod tests {
 
 pub(crate) fn model_execution_contract_root(execution: &AdmittedModelExecution) -> String {
     use sha2::{Digest, Sha256};
-    let contract = serde_json::json!({
+    let mut contract = serde_json::json!({
         "offering": execution.offering_id, "model": execution.model_name,
         "wire_model": execution.wire_model_name, "provider": execution.provider,
         "access": execution.access_kind, "placement": execution.execution_placement,
@@ -990,6 +1012,9 @@ pub(crate) fn model_execution_contract_root(execution: &AdmittedModelExecution) 
         "endpoint": execution.completions_url_override.as_deref().unwrap_or(&execution.base_url),
         "headers": execution.header_overrides.iter().filter(|(key, _)| !matches!(key.to_ascii_lowercase().as_str(), "authorization" | "x-api-key" | "api-key")).collect::<std::collections::BTreeMap<_, _>>(),
     });
+    if let Some(efforts) = &execution.supported_reasoning_efforts {
+        contract["supported_reasoning_efforts"] = serde_json::json!(efforts);
+    }
     format!(
         "{:x}",
         Sha256::digest(astra_core::canonical_json_string(&contract).as_bytes())

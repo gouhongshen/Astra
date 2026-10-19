@@ -233,6 +233,7 @@ impl RuntimeSummaryClient {
                 .thinking_capability
                 .map(|capability| capability.as_str()),
             protocol,
+            route.supported_reasoning_efforts.as_deref(),
         )
     }
 
@@ -727,6 +728,7 @@ mod tests {
             cache_capability: None,
             thinking_capability: None,
             fixed_temperature: None,
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             request_body_overrides: None,
             context_window: Some(8_192),
@@ -746,6 +748,7 @@ mod tests {
             provider: execution.provider.clone(),
             thinking_capability: None,
             fixed_temperature: execution.fixed_temperature,
+            supported_reasoning_efforts: execution.supported_reasoning_efforts.clone(),
             thinking_protocol: execution.thinking_protocol,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
@@ -929,6 +932,7 @@ mod tests {
             provider: "openai".to_string(),
             thinking_capability,
             fixed_temperature: None,
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
@@ -1680,6 +1684,7 @@ mod tests {
             cache_capability: None,
             thinking_capability: None,
             fixed_temperature: None,
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             request_body_overrides: None,
             context_window: Some(8_192),
@@ -1716,6 +1721,7 @@ mod tests {
                 provider: execution.provider.clone(),
                 thinking_capability: None,
                 fixed_temperature: None,
+                supported_reasoning_efforts: None,
                 thinking_protocol: None,
                 header_overrides: HashMap::new(),
                 request_body_overrides: None,

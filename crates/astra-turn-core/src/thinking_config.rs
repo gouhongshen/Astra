@@ -101,6 +101,7 @@ impl ThinkingConfig {
         provider: &str,
         capability: Option<&str>,
         protocol: astra_core::model_wire::thinking::ThinkingProtocol,
+        supported_efforts: Option<&[String]>,
     ) -> Self {
         [
             Self::Off,
@@ -110,8 +111,22 @@ impl ThinkingConfig {
             Self::ModelDefault,
         ]
         .into_iter()
-        .find(|config| config.is_supported_by(provider, capability, protocol))
+        .find(|config| {
+            config.is_supported_by(provider, capability, protocol)
+                && config.is_within_declared_efforts(supported_efforts)
+        })
         .expect("model default is always admissible")
+    }
+
+    /// A gateway's exact effort inventory narrows its general protocol capability.
+    /// An absent inventory preserves the existing catalog/probe contract.
+    pub fn is_within_declared_efforts(&self, supported_efforts: Option<&[String]>) -> bool {
+        match (self, supported_efforts) {
+            (Self::Adaptive { effort }, Some(allowed)) => {
+                allowed.iter().any(|value| value == effort_str(*effort))
+            }
+            _ => true,
+        }
     }
 
     /// One exact control contract for selection and execution admission.
@@ -696,6 +711,44 @@ pub fn strip_think_tags(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auxiliary_reasoning_respects_exact_gateway_effort_inventory() {
+        use astra_core::model_wire::thinking::ThinkingProtocol;
+        let high_only = vec!["high".to_string()];
+        assert!(
+            !super::ThinkingConfig::Adaptive {
+                effort: super::ThinkingEffort::Low
+            }
+            .is_within_declared_efforts(Some(&high_only))
+        );
+        assert!(
+            super::ThinkingConfig::Adaptive {
+                effort: super::ThinkingEffort::High
+            }
+            .is_within_declared_efforts(Some(&high_only))
+        );
+        assert_eq!(
+            super::ThinkingConfig::bounded_auxiliary(
+                "openai",
+                Some("effort_only"),
+                ThinkingProtocol::ReasoningEffort,
+                Some(&high_only),
+            ),
+            super::ThinkingConfig::ModelDefault
+        );
+        assert_eq!(
+            super::ThinkingConfig::bounded_auxiliary(
+                "openai",
+                Some("effort_only"),
+                ThinkingProtocol::ReasoningEffort,
+                Some(&["low".to_string(), "high".to_string()]),
+            ),
+            super::ThinkingConfig::Adaptive {
+                effort: super::ThinkingEffort::Low
+            }
+        );
+    }
+
     #[test]
     fn exact_budget_must_fit_without_adjustment() {
         let thinking = super::ThinkingConfig::Enabled {

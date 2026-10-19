@@ -312,6 +312,7 @@ mod tests {
                     cache_capability: None,
                     thinking_capability: None,
                     fixed_temperature: None,
+                    supported_reasoning_efforts: None,
                     thinking_protocol: None,
                     request_body_overrides: None,
                     context_window: None,

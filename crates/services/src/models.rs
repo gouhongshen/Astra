@@ -901,6 +901,35 @@ impl ModelExecutionPlacement {
     }
 }
 
+/// Exact effort controls declared by an authenticated model gateway owner.
+/// This contract describes the gateway wire, not its downstream provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeModelReasoningControl {
+    pub protocol: ThinkingProtocol,
+    pub supported_efforts: Vec<String>,
+}
+
+impl RuntimeModelReasoningControl {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.protocol != ThinkingProtocol::ReasoningEffort || self.supported_efforts.is_empty() {
+            return Err(
+                "model gateway reasoning control requires an effort protocol and supported efforts",
+            );
+        }
+        for (index, effort) in self.supported_efforts.iter().enumerate() {
+            if !matches!(effort.as_str(), "low" | "medium" | "high" | "max")
+                || self.supported_efforts[..index].contains(effort)
+            {
+                return Err(
+                    "model gateway supported reasoning efforts must be unique low/medium/high/max values",
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Non-serializable execution material produced once at the trusted model
 /// admission boundary and consumed by every inference surface.
 ///
@@ -926,6 +955,8 @@ pub struct AdmittedModelExecution {
     pub thinking_capability: Option<ThinkingCapability>,
     /// Mode-independent fixed temperature carried from Offering admission.
     pub fixed_temperature: Option<f64>,
+    /// Exact gateway-declared effort inventory, when the route supplies one.
+    pub supported_reasoning_efforts: Option<Vec<String>>,
     pub thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     pub request_body_overrides: Option<Map<String, Value>>,
     pub context_window: Option<u32>,
@@ -977,6 +1008,7 @@ impl AdmittedModelExecution {
             cache_capability: offering.model.prompt_cache_capability,
             thinking_capability: offering.model.thinking_capability,
             fixed_temperature: offering.model.fixed_temperature,
+            supported_reasoning_efforts: None,
             thinking_protocol: offering.model.thinking_protocol,
             request_body_overrides: offering.model.request_body_overrides,
             context_window: offering.model.context_window,
@@ -1010,6 +1042,7 @@ impl AdmittedModelExecution {
             cache_capability: None,
             thinking_capability: None,
             fixed_temperature: None,
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             request_body_overrides: None,
             context_window: Some(context_window),
@@ -2098,6 +2131,7 @@ fn admitted_user_model_from_row(
         cache_capability: None,
         thinking_capability,
         fixed_temperature: None,
+        supported_reasoning_efforts: None,
         thinking_protocol: Some(protocol),
         request_body_overrides: None,
         context_window: Some(context_window),

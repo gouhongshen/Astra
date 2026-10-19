@@ -977,6 +977,7 @@ fn primary_thinking_for_attempt(
                 .thinking_capability
                 .map(|capability| capability.as_str()),
             config.thinking_protocol.unwrap_or_default(),
+            config.supported_reasoning_efforts.as_deref(),
         );
         if bounded != ThinkingConfig::ModelDefault {
             return bounded;
@@ -2007,6 +2008,7 @@ struct ResolvedTurnLlmConfig {
     thinking_capability: Option<astra_services::models::ThinkingCapability>,
     /// Mode-independent fixed temperature resolved at model admission.
     fixed_temperature: Option<f64>,
+    supported_reasoning_efforts: Option<Vec<String>>,
     thinking_protocol: Option<astra_core::model_wire::thinking::ThinkingProtocol>,
     header_overrides: HashMap<String, String>,
     request_body_overrides: Option<Map<String, Value>>,
@@ -2030,6 +2032,7 @@ impl ResolvedTurnLlmConfig {
             provider: self.provider.clone(),
             thinking_capability: self.thinking_capability,
             fixed_temperature: self.fixed_temperature,
+            supported_reasoning_efforts: self.supported_reasoning_efforts.clone(),
             thinking_protocol: self.thinking_protocol,
             header_overrides: self.header_overrides.clone(),
             request_body_overrides: self.request_body_overrides.clone(),
@@ -3137,6 +3140,7 @@ fn resolve_llm_model_for_turn(
         ),
         thinking_capability: execution.thinking_capability,
         fixed_temperature: execution.fixed_temperature,
+        supported_reasoning_efforts: execution.supported_reasoning_efforts.clone(),
         thinking_protocol: execution.thinking_protocol,
         header_overrides: execution.header_overrides.clone(),
         request_body_overrides: execution.request_body_overrides.clone(),
@@ -29375,6 +29379,7 @@ mod tests {
             cache_capability: None,
             thinking_capability: None,
             fixed_temperature: None,
+            supported_reasoning_efforts: None,
             thinking_protocol: None,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
@@ -52246,6 +52251,7 @@ mod tests {
                 provider: "openai".to_string(),
                 thinking_capability: None,
                 fixed_temperature: None,
+                supported_reasoning_efforts: None,
                 thinking_protocol: None,
                 header_overrides: forwarded,
                 request_body_overrides: None,

@@ -250,6 +250,7 @@ pub(super) async fn completions_handler(
                     .unwrap_or(&admitted.model_name),
             )
         }),
+        admitted.supported_reasoning_efforts.as_deref(),
     );
     let parsed = durable_ledger
         .execute_nonstream(
