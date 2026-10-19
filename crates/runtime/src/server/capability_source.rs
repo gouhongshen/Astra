@@ -593,6 +593,7 @@ pub(crate) struct CapabilitySourceRuntime {
     pub custody: CapabilitySourceCustody,
     transport: Arc<super::runtime_mcp::AgentBindingMcpRuntime>,
     scope: std::sync::OnceLock<SourceScope>,
+    cancel: std::sync::OnceLock<CancellationToken>,
     materialized: std::sync::RwLock<BTreeMap<String, MaterializedCapability>>,
     resolution: tokio::sync::Mutex<()>,
 }
@@ -613,22 +614,31 @@ impl CapabilitySourceRuntime {
             custody: CapabilitySourceCustody::new(transport.server_name(), config, store),
             transport,
             scope: std::sync::OnceLock::new(),
+            cancel: std::sync::OnceLock::new(),
             materialized: std::sync::RwLock::new(BTreeMap::new()),
             resolution: tokio::sync::Mutex::new(()),
         })
     }
 
-    pub(crate) fn bind_scope(&self, scope: SourceScope) -> Result<(), SourceError> {
+    pub(crate) fn bind_scope(
+        &self,
+        scope: SourceScope,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), SourceError> {
         if let Some(current) = self.scope.get() {
-            return if current == &scope {
-                Ok(())
-            } else {
-                Err(SourceError::RunSuperseded)
-            };
+            if current != &scope {
+                return Err(SourceError::RunSuperseded);
+            }
+        } else {
+            self.scope
+                .set(scope)
+                .map_err(|_| SourceError::RunSuperseded)?;
         }
-        self.scope
-            .set(scope.clone())
-            .map_err(|_| SourceError::RunSuperseded)?;
+        // The runtime is scoped to one run generation. Skill resolvers share
+        // this owner, including when no ToolExecutionRequest is involved.
+        if let Some(cancel) = cancel {
+            self.cancel.get_or_init(|| cancel.clone());
+        }
         Ok(())
     }
 
@@ -901,7 +911,7 @@ impl CapabilitySourceRuntime {
                         "astra/capabilities/read_skill",
                         json!({"capability": candidate.capability, "discovery_tool": receipt.discovery_tool}),
                         false,
-                        None,
+                        self.cancel.get(),
                     )
                     .await
                     .map_err(|error| transport_failure(scope, "read_skill", &error))?;
@@ -967,7 +977,7 @@ impl CapabilitySourceRuntime {
         }
         let response = self.transport.capability_rpc("astra/capabilities/read_skill", json!({
             "capability": receipt.candidate.capability, "discovery_tool": receipt.discovery_tool, "path": path
-        }), false, None).await.map_err(|error| transport_failure(scope, "read_skill_resource", &error))?;
+        }), false, self.cancel.get()).await.map_err(|error| transport_failure(scope, "read_skill_resource", &error))?;
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Resource {
@@ -1324,7 +1334,7 @@ pub(crate) mod tests {
         use astra_skills::traits::{SkillError, SkillResolver};
         let fixture = http_fixture(true).await;
         let source = fixture.source();
-        source.bind_scope(fixture.scope.clone()).unwrap();
+        source.bind_scope(fixture.scope.clone(), None).unwrap();
         let resolver = CapabilitySourceSkillResolver {
             source,
             base: None,
@@ -1393,6 +1403,10 @@ pub(crate) mod tests {
         http_fixture_with_scope_inventory(skill, size, true, None).await
     }
 
+    pub(crate) async fn http_fixture_with_large_tool() -> HttpFixture {
+        http_fixture_for_source(false, 1, false, None, "source", true).await
+    }
+
     struct RpcGate {
         method: &'static str,
         started: tokio::sync::Notify,
@@ -1417,7 +1431,7 @@ pub(crate) mod tests {
         distinct_bindings: bool,
         rpc_gate: Option<Arc<RpcGate>>,
     ) -> HttpFixture {
-        http_fixture_for_source(skill, size, distinct_bindings, rpc_gate, "source").await
+        http_fixture_for_source(skill, size, distinct_bindings, rpc_gate, "source", false).await
     }
 
     async fn http_fixture_for_source(
@@ -1426,10 +1440,20 @@ pub(crate) mod tests {
         distinct_bindings: bool,
         rpc_gate: Option<Arc<RpcGate>>,
         source_id: &str,
+        large_tool: bool,
     ) -> HttpFixture {
         assert!(size > 0);
         let (store, scope) = fixture().await;
         let (mut candidate, mut descriptor) = candidate();
+        if large_tool {
+            let mut exact: Value = serde_json::from_str(&descriptor).unwrap();
+            exact["inputSchema"]["properties"] = Value::Object(
+                (0..220)
+                    .map(|index| (format!("optional_field_{index}"), json!({"type":"string"})))
+                    .collect(),
+            );
+            descriptor = exact.to_string();
+        }
         if skill {
             candidate.kind = CapabilityKind::Skill;
             candidate.capability.native_id = "review-repository".into();
@@ -1566,7 +1590,7 @@ pub(crate) mod tests {
         source: &CapabilitySourceRuntime,
         fixture: &HttpFixture,
     ) -> String {
-        source.bind_scope(fixture.scope.clone()).unwrap();
+        source.bind_scope(fixture.scope.clone(), None).unwrap();
         source
             .custody
             .register(
@@ -1762,9 +1786,9 @@ pub(crate) mod tests {
         use super::super::runtime_tool_executor::RuntimeToolExecutor;
         use super::super::tool_local_transport::ServerLocalToolTransport;
         for source_id in ["cap", "CAP", "cap__nested"] {
-            let fixture = http_fixture_for_source(false, 1, false, None, source_id).await;
+            let fixture = http_fixture_for_source(false, 1, false, None, source_id, false).await;
             let source = fixture.source();
-            source.bind_scope(fixture.scope.clone()).unwrap();
+            source.bind_scope(fixture.scope.clone(), None).unwrap();
             let alias = fixture.transport.public_tool_name("search").unwrap();
             let workspace = tempfile::tempdir().unwrap();
             let mut executor = RuntimeToolExecutor::new(
@@ -1810,6 +1834,72 @@ pub(crate) mod tests {
                 vec!["tools/call"]
             );
             assert_eq!(calls[0]["params"]["name"], "search");
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_skill_reads_notify_cancellation_and_wait_for_the_original_response() {
+        use astra_skills::traits::SkillResolver;
+        for resource in [false, true] {
+            let gate = Arc::new(RpcGate::new("astra/capabilities/read_skill"));
+            let fixture =
+                http_fixture_with_scope_inventory(true, 1, false, Some(gate.clone())).await;
+            let source = fixture.source();
+            let key = register_fixture_candidate(&source, &fixture).await;
+            let cancel = CancellationToken::new();
+            source
+                .bind_scope(fixture.scope.clone(), Some(&cancel))
+                .unwrap();
+            let resolver = CapabilitySourceSkillResolver {
+                source,
+                base: None,
+                policy: Default::default(),
+            };
+            if resource {
+                gate.release.notify_one();
+                resolver.resolve_for_execution(&key).await.unwrap();
+                gate.started.notified().await;
+            }
+            let read = async {
+                if resource {
+                    resolver
+                        .read_resource(&key, "references/guide.md")
+                        .await
+                        .map(|_| ())
+                } else {
+                    resolver.resolve_for_execution(&key).await.map(|_| ())
+                }
+            };
+            tokio::pin!(read);
+            tokio::select! {
+                _ = gate.started.notified() => {},
+                result = &mut read => panic!("read must block at the provider: {result:?}"),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => panic!("read did not dispatch"),
+            }
+            cancel.cancel();
+            tokio::select! {
+                _ = gate.cancelled.notified() => {},
+                result = &mut read => panic!("cancel notification cannot settle the exchange: {result:?}"),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => panic!("provider did not receive cancellation"),
+            }
+            assert!(futures_util::poll!(&mut read).is_pending());
+            gate.release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(1), read)
+                .await
+                .unwrap()
+                .unwrap();
+            let calls = fixture.calls.lock().unwrap();
+            let original = calls
+                .iter()
+                .rev()
+                .find(|call| call["method"] == "astra/capabilities/read_skill")
+                .unwrap();
+            let notification = calls
+                .iter()
+                .find(|call| call["method"] == "notifications/cancelled")
+                .unwrap();
+            assert_eq!(notification["params"]["requestId"], original["id"]);
+            assert_eq!(original["params"].get("path").is_some(), resource);
         }
     }
 
@@ -1944,7 +2034,7 @@ pub(crate) mod tests {
             .unwrap();
         let reopened =
             CapabilitySourceRuntime::new(fixture.transport.clone(), fixture.store.clone()).unwrap();
-        reopened.bind_scope(fixture.scope.clone()).unwrap();
+        reopened.bind_scope(fixture.scope.clone(), None).unwrap();
         reopened.materialize(&key, false).await.unwrap();
         reopened
             .invoke(&request(&fixture.scope, &key, json!({})), None, None)
@@ -1975,7 +2065,7 @@ pub(crate) mod tests {
         let fixture = http_fixture(false).await;
         let source =
             CapabilitySourceRuntime::new(fixture.transport.clone(), fixture.store.clone()).unwrap();
-        source.bind_scope(fixture.scope.clone()).unwrap();
+        source.bind_scope(fixture.scope.clone(), None).unwrap();
         let mut result = astra_mcp::McpToolCallResult {
             output: "ready".into(),
             is_error: false,
@@ -2044,7 +2134,7 @@ pub(crate) mod tests {
         let reopened = Arc::new(
             CapabilitySourceRuntime::new(fixture.transport.clone(), fixture.store.clone()).unwrap(),
         );
-        reopened.bind_scope(fixture.scope.clone()).unwrap();
+        reopened.bind_scope(fixture.scope.clone(), None).unwrap();
         let reopened = CapabilitySourceSkillResolver {
             source: reopened,
             base: None,

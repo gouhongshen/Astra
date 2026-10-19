@@ -78,8 +78,10 @@ Path authority must be checked before execution. A model-provided path is not au
 
 ### Foreground Bash output
 
-The local and Edge foreground Bash executor keeps stdout and stderr pipes as
-the command's own stdout and stderr. It also captures their original bytes in
+The local CLI and Edge foreground Bash executors share the output-capture owner
+without replacing their existing process-settlement or workspace-lease owners.
+They keep stdout and stderr pipes as the command's own stdout and stderr,
+and capture their original bytes in
 separate `0600` files with a shared random 16-lowercase-hex basename and
 `.stdout` / `.stderr` suffixes under the selected workspace's
 `astra-bash-outputs/` directory. This dedicated top-level directory holds
@@ -98,7 +100,11 @@ Retained results return both
 file paths, byte counts and SHA-256 digests. The redacted preview uses space
 remaining after the receipt and terminal facts in a 4,000-byte presentation
 target; an exceptionally long workspace path can make the mandatory receipt
-itself exceed that target. A complete capture's receipt instructs the caller
+itself exceed that target. The configured limit bounds disposable preview,
+not the mandatory file receipt or terminal facts; even a 64-byte budget must
+return complete paths, byte counts, digests and completeness. The owner marks
+this bounded native projection so downstream recording does not truncate its
+recovery receipt a second time. A complete capture's receipt instructs the caller
 to copy its paths exactly and filter or format the saved files locally,
 emitting only the fields or sections needed for the answer instead of
 rerunning the original command merely to change presentation. This guidance

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -15,6 +16,7 @@ use astra_tools::detach::{
     restore_detach_signal_receiver, sigkill_process_group, terminate_detached_payload,
 };
 use astra_tools::exit_semantics::{self, ExitSemantics};
+use astra_tools::shell_output_capture::{BashOutputCapture, BlockingCaptureWriter};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command as TokioCommand;
@@ -31,6 +33,31 @@ fn bash_preparation_rejection(message: String) -> super::ToolExecutionOutcome {
     astra_tools::execution_outcome::insert_not_executed_fact(fields);
     fields.insert("side_effects_maybe".into(), Value::Bool(false));
     outcome
+}
+
+fn mark_bash_capture_unavailable(outcome: &mut super::ToolExecutionOutcome) {
+    if outcome.is_error {
+        return;
+    }
+    outcome.is_error = true;
+    // An observed exit remains observed. Losing an output file does not turn
+    // that process acknowledgement into an unknown execution outcome.
+    let evidence = astra_core::ToolFailureEvidence::new(
+        astra_core::ErrorKind::ToolUnavailable,
+        astra_core::ToolFailureCause::CapabilityUnavailable,
+        false,
+        vec![astra_core::ToolRecoveryAction::InspectStructuredFailure],
+    );
+    let fields = outcome.tool_result_fields.get_or_insert_default();
+    fields.insert(
+        "error_kind".into(),
+        Value::String(evidence.kind.as_str().into()),
+    );
+    fields.insert("retryable".into(), Value::Bool(false));
+    fields.insert(
+        "recovery_evidence".into(),
+        serde_json::to_value(evidence).expect("capture failure evidence"),
+    );
 }
 
 fn attach_bash_workdir_outcome(
@@ -3128,8 +3155,48 @@ struct ShellRunConfig {
     sandbox_policy: Option<SandboxPolicy>,
     progress_sink: Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
     cancel_token: Option<tokio_util::sync::CancellationToken>,
+    output_capture: Option<(BlockingCaptureWriter, BlockingCaptureWriter)>,
     #[cfg(test)]
     supervisor_test_helper: Option<(PathBuf, Vec<String>)>,
+}
+
+enum ShellOutputBuffer {
+    Inline(Vec<u8>),
+    Captured(BlockingCaptureWriter),
+}
+
+impl ShellOutputBuffer {
+    fn failed(&self) -> bool {
+        matches!(self, Self::Captured(writer) if writer.failed())
+    }
+
+    fn read_failed(&self) {
+        if let Self::Captured(writer) = self {
+            writer.read_failed();
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Inline(bytes) => bytes,
+            Self::Captured(writer) => writer.into_preview(),
+        }
+    }
+}
+
+impl std::io::Write for ShellOutputBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Inline(buffer) => buffer.write(bytes),
+            Self::Captured(writer) => writer.write(bytes),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Inline(buffer) => buffer.flush(),
+            Self::Captured(writer) => writer.flush(),
+        }
+    }
 }
 
 /// A blocking shell worker outlives a dropped async join handle. Cancel its
@@ -3358,8 +3425,16 @@ fn run_shell_output_with_config(
     let deadline = std::time::Instant::now() + Duration::from_secs_f64(config.timeout_secs);
     let exit_status;
     let scope_settlement;
-    let mut stdout_buf: Vec<u8> = Vec::new();
-    let mut stderr_buf: Vec<u8> = Vec::new();
+    let (mut stdout_buf, mut stderr_buf) = match config.output_capture {
+        Some((stdout, stderr)) => (
+            ShellOutputBuffer::Captured(stdout),
+            ShellOutputBuffer::Captured(stderr),
+        ),
+        None => (
+            ShellOutputBuffer::Inline(Vec::new()),
+            ShellOutputBuffer::Inline(Vec::new()),
+        ),
+    };
     loop {
         let leader_pid = child.id();
         // Drain whatever's currently available on each pipe
@@ -3367,6 +3442,15 @@ fn run_shell_output_with_config(
         // TUI can show real counters mid-flight.
         drain_pipe_nonblocking(stdout_handle.as_mut(), &mut stdout_buf, &progress_sink);
         drain_pipe_nonblocking_stderr(stderr_handle.as_mut(), &mut stderr_buf, &progress_sink);
+
+        if stdout_buf.failed() || stderr_buf.failed() {
+            let ownership = settle_owned_shell_after_termination(&mut child, &mut invocation_owner);
+            return Err(ShellRunError::after_process_started(
+                "Error: Bash output capture failed; command terminated with incomplete output",
+                astra_core::ErrorKind::ToolOutcomeUnknown,
+                ownership,
+            ));
+        }
 
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -3416,27 +3500,37 @@ fn run_shell_output_with_config(
     // chunk not yet read. Use the same `read_timeout` budget as
     // before (drains until EOF or timeout).
     let read_timeout = BASH_PIPE_READ_TIMEOUT;
-    if let Some(h) = stdout_handle.as_mut() {
-        final_drain_stdout(h, &mut stdout_buf, read_timeout, &progress_sink);
+    if let Some(h) = stdout_handle.as_mut()
+        && !final_drain_stdout(h, &mut stdout_buf, read_timeout, &progress_sink)
+    {
+        stdout_buf.read_failed();
     }
-    if let Some(h) = stderr_handle.as_mut() {
-        final_drain_stderr(h, &mut stderr_buf, read_timeout, &progress_sink);
+    if let Some(h) = stderr_handle.as_mut()
+        && !final_drain_stderr(h, &mut stderr_buf, read_timeout, &progress_sink)
+    {
+        stderr_buf.read_failed();
     }
+    let stdout_buf = stdout_buf.into_bytes();
+    let stderr_buf = stderr_buf.into_bytes();
     #[cfg(all(test, target_os = "linux"))]
-    if uses_supervisor_test_helper {
-        // The libtest re-exec is only a fixture entrypoint for the real
-        // invocation supervisor. Its own prelude is not target-command
-        // stdout and must not change predicate or empty-output semantics.
-        for prelude in [
-            b"\nrunning 1 test\n".as_slice(),
-            b"running 1 test\n".as_slice(),
-        ] {
-            if stdout_buf.starts_with(prelude) {
-                stdout_buf.drain(..prelude.len());
-                break;
+    let stdout_buf = {
+        let mut stdout_buf = stdout_buf;
+        if uses_supervisor_test_helper {
+            // The libtest re-exec is only a fixture entrypoint for the real
+            // invocation supervisor. Its own prelude is not target-command
+            // stdout and must not change predicate or empty-output semantics.
+            for prelude in [
+                b"\nrunning 1 test\n".as_slice(),
+                b"running 1 test\n".as_slice(),
+            ] {
+                if stdout_buf.starts_with(prelude) {
+                    stdout_buf.drain(..prelude.len());
+                    break;
+                }
             }
         }
-    }
+        stdout_buf
+    };
 
     Ok(ScopedShellOutput {
         output: std::process::Output {
@@ -3861,7 +3955,7 @@ fn set_pipe_nonblocking_stderr(pipe: Option<&mut std::process::ChildStderr>) {
 /// progress sink. Stops as soon as `read` returns `WouldBlock`.
 fn drain_pipe_nonblocking(
     pipe: Option<&mut std::process::ChildStdout>,
-    buf: &mut Vec<u8>,
+    buf: &mut impl std::io::Write,
     sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
 ) {
     use std::io::Read;
@@ -3874,7 +3968,9 @@ fn drain_pipe_nonblocking(
                 if let Some(s) = sink {
                     s.record_chunk(&chunk[..n]);
                 }
-                buf.extend_from_slice(&chunk[..n]);
+                if buf.write_all(&chunk[..n]).is_err() {
+                    break;
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             // Retry on EINTR — a signal interrupted read() before any
@@ -3887,7 +3983,7 @@ fn drain_pipe_nonblocking(
 
 fn drain_pipe_nonblocking_stderr(
     pipe: Option<&mut std::process::ChildStderr>,
-    buf: &mut Vec<u8>,
+    buf: &mut impl std::io::Write,
     sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
 ) {
     use std::io::Read;
@@ -3900,7 +3996,9 @@ fn drain_pipe_nonblocking_stderr(
                 if let Some(s) = sink {
                     s.record_chunk(&chunk[..n]);
                 }
-                buf.extend_from_slice(&chunk[..n]);
+                if buf.write_all(&chunk[..n]).is_err() {
+                    break;
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -3914,24 +4012,26 @@ fn drain_pipe_nonblocking_stderr(
 /// letting us catch trailing bytes flushed at exit.
 fn final_drain_stdout(
     pipe: &mut std::process::ChildStdout,
-    buf: &mut Vec<u8>,
+    buf: &mut impl std::io::Write,
     timeout: Duration,
     sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
-) {
+) -> bool {
     use std::io::Read;
     let deadline = std::time::Instant::now() + timeout;
     let mut chunk = [0u8; 4096];
     loop {
         if std::time::Instant::now() > deadline {
-            break;
+            return false;
         }
         match pipe.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => return true,
             Ok(n) => {
                 if let Some(s) = sink {
                     s.record_chunk(&chunk[..n]);
                 }
-                buf.extend_from_slice(&chunk[..n]);
+                if buf.write_all(&chunk[..n]).is_err() {
+                    return false;
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
@@ -3939,37 +4039,39 @@ fn final_drain_stdout(
             // Retry on signal interruption — discarding here would
             // drop trailing output written just before exit.
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(_) => return false,
         }
     }
 }
 
 fn final_drain_stderr(
     pipe: &mut std::process::ChildStderr,
-    buf: &mut Vec<u8>,
+    buf: &mut impl std::io::Write,
     timeout: Duration,
     sink: &Option<std::sync::Arc<crate::cli::chat_stream::ToolProgressSink>>,
-) {
+) -> bool {
     use std::io::Read;
     let deadline = std::time::Instant::now() + timeout;
     let mut chunk = [0u8; 4096];
     loop {
         if std::time::Instant::now() > deadline {
-            break;
+            return false;
         }
         match pipe.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => return true,
             Ok(n) => {
                 if let Some(s) = sink {
                     s.record_chunk(&chunk[..n]);
                 }
-                buf.extend_from_slice(&chunk[..n]);
+                if buf.write_all(&chunk[..n]).is_err() {
+                    return false;
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(_) => return false,
         }
     }
 }
@@ -4036,6 +4138,7 @@ impl ToolExecutor {
             sandbox_policy,
             progress_sink: self.current_bash_progress_sink(),
             cancel_token: cancel_token.cloned(),
+            output_capture: None,
             #[cfg(test)]
             supervisor_test_helper: Some((
                 std::env::current_exe().expect("test executable"),
@@ -4956,6 +5059,18 @@ impl ToolExecutor {
         );
         config.explicit_verification = explicit_verification;
         config.workdir = Some(workdir.clone());
+        let output_limit = self.scaled_output_limit_for("bash");
+        let capture_limit =
+            output_limit.min(astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS);
+        let (capture, stdout, stderr) = match BashOutputCapture::start_blocking(
+            &self.effective_project_root(),
+            capture_limit,
+            output_limit.saturating_mul(2).max(16_384),
+        ) {
+            Ok(capture) => capture,
+            Err(message) => return bash_preparation_rejection(message),
+        };
+        config.output_capture = Some((stdout, stderr));
         let quarantine_root = self.effective_project_root();
         let command_for_settlement = command.clone();
         // The worker owns observation leases until its process group settles,
@@ -4979,6 +5094,7 @@ impl ToolExecutor {
         let coordination_unsettled = _observation_lease
             .as_ref()
             .is_some_and(|lease| !lease.coordination_integrity_valid());
+        let command_complete = matches!(&shell_result, Ok(Ok(_)));
         let outcome = match shell_result {
             Ok(Ok(output)) => {
                 let scope_ownership = output.scope_ownership;
@@ -5073,12 +5189,50 @@ impl ToolExecutor {
                 .await
             }
         };
-        attach_bash_workdir_outcome(
+        let mut outcome = attach_bash_workdir_outcome(
             attach_source_preimage_outcome(outcome, source_preimages),
             &self.effective_project_root(),
             &workdir,
             args,
-        )
+        );
+        // The blocking worker has settled before the capture is finalized.
+        // Its streams were tapped before the bounded renderer saw them.
+        let retain_for_preview = outcome.output.len() > capture_limit;
+        match capture
+            .finish(command_complete, command_complete, retain_for_preview)
+            .await
+        {
+            Ok(Some(receipt)) => {
+                if !receipt.complete {
+                    mark_bash_capture_unavailable(&mut outcome);
+                }
+                let fields = outcome.tool_result_fields.get_or_insert_default();
+                let terminal = format!(
+                    "[bash outcome: exit_code={}; exit_semantics={}; error_kind={}; background_children_reaped={}]",
+                    fields.get("exit_code").unwrap_or(&Value::Null),
+                    fields.get("exit_semantics").unwrap_or(&Value::Null),
+                    fields.get("error_kind").unwrap_or(&Value::Null),
+                    fields
+                        .get("background_children_reaped")
+                        .unwrap_or(&Value::Bool(false))
+                );
+                outcome.output = receipt.present(&outcome.output, &terminal, output_limit);
+                fields.extend(receipt.result_fields());
+            }
+            Ok(None) => {}
+            Err(failure) => {
+                outcome.output = format!(
+                    "[bash output capture failed: {failure}; no complete output file]\n{}",
+                    outcome.output
+                );
+                mark_bash_capture_unavailable(&mut outcome);
+                outcome.tool_result_fields.get_or_insert_default().insert(
+                    "bash_output_capture".into(),
+                    serde_json::json!({"complete":false,"failure":failure}),
+                );
+            }
+        }
+        outcome
     }
 
     async fn restore_bash_detach_handle(

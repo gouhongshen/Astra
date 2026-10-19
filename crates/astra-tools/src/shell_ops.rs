@@ -1595,47 +1595,21 @@ async fn execute_bash_inner(
     let capture = finish_capture(output.capture.take(), retain_for_preview).await;
 
     if let Some(Ok(receipt)) = capture.as_ref() {
-        let mut note = format!(
-            "[bash full output: stdout={} ({} bytes, sha256={}); stderr={} ({} bytes, sha256={}); complete={}]",
-            receipt.stdout.path.display(),
-            receipt.stdout.bytes,
-            receipt.stdout.sha256,
-            receipt.stderr.path.display(),
-            receipt.stderr.bytes,
-            receipt.stderr.sha256,
-            receipt.complete,
-        );
-        if receipt.complete {
-            note.push_str("\n[Copy the saved paths exactly; filter or format these files locally, emitting only the fields or sections needed for the answer. Do not rerun the original command merely to change presentation. Compute reported counts, groups and totals with code, not by estimating rows.]");
-        }
-        if let Some(failure) = receipt.failure {
-            note.push_str(&format!(
-                "\n[bash output capture failed: {failure}; files are incomplete]"
-            ));
-        }
-        // Keep the receipt and terminal facts in the inline view. Only a
-        // short, already-redacted preview belongs in the next model round;
-        // the raw complete streams are available through the file paths.
-        let inline_budget =
-            output_limit.min(astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS / 2);
-        let preview_budget = inline_budget.saturating_sub(note.len() + 2 + 512);
-        let preview = if result.len() > preview_budget {
-            if preview_budget > 12 {
-                astra_text_utils::credential_redaction::truncate_redacted_output(
-                    result,
-                    preview_budget - 12,
-                )
-            } else {
-                String::new()
-            }
-        } else {
-            result
-        };
-        result = format!("{note}\n\n{preview}");
+        result = receipt.present(&result, "", output_limit);
     } else if let Some(Err(failure)) = capture.as_ref() {
         result =
             format!("[bash output capture failed: {failure}; no complete output file]\n\n{result}");
     }
+
+    // Only the preview consumes the configured budget. A saved-file receipt
+    // and the process facts appended below must survive even a 64-byte budget.
+    let finish_presentation = |text| {
+        if capture.as_ref().is_some_and(Result::is_ok) {
+            text
+        } else {
+            astra_text_utils::credential_redaction::truncate_redacted_output(text, output_limit)
+        }
+    };
 
     let mut cap_notes = Vec::new();
     if output.stdout_capped {
@@ -1677,14 +1651,9 @@ async fn execute_bash_inner(
         }
         return attach_scope_settled(
             attach_source_preimage(
-                ToolResult::error(
-                    astra_text_utils::credential_redaction::truncate_redacted_output(
-                        result,
-                        output_limit,
-                    ),
-                )
-                .with_exit_semantics(ExitSemantics::TimedOut)
-                .with_exit_code(output.exit_code),
+                ToolResult::error(finish_presentation(result))
+                    .with_exit_semantics(ExitSemantics::TimedOut)
+                    .with_exit_code(output.exit_code),
                 source_preimages,
             ),
             output.scope_settled,
@@ -1703,14 +1672,9 @@ async fn execute_bash_inner(
         }
         return attach_scope_settled(
             attach_source_preimage(
-                ToolResult::error(
-                    astra_text_utils::credential_redaction::truncate_redacted_output(
-                        result,
-                        output_limit,
-                    ),
-                )
-                .with_exit_semantics(ExitSemantics::Cancelled)
-                .with_exit_code(output.exit_code),
+                ToolResult::error(finish_presentation(result))
+                    .with_exit_semantics(ExitSemantics::Cancelled)
+                    .with_exit_code(output.exit_code),
                 source_preimages,
             ),
             output.scope_settled,
@@ -1727,14 +1691,9 @@ async fn execute_bash_inner(
     }) {
         return attach_scope_settled(
             attach_source_preimage(
-                ToolResult::error(
-                    astra_text_utils::credential_redaction::truncate_redacted_output(
-                        result,
-                        output_limit,
-                    ),
-                )
-                .with_exit_semantics(ExitSemantics::ExecutionError)
-                .with_exit_code(output.exit_code),
+                ToolResult::error(finish_presentation(result))
+                    .with_exit_semantics(ExitSemantics::ExecutionError)
+                    .with_exit_code(output.exit_code),
                 source_preimages,
             ),
             output.scope_settled,
@@ -1754,8 +1713,7 @@ async fn execute_bash_inner(
     );
     if output.exit_code != 0 || result_class.is_tool_error() {
         let exit_code = output.exit_code;
-        let output_text =
-            astra_text_utils::credential_redaction::truncate_redacted_output(result, output_limit);
+        let output_text = finish_presentation(result);
         if exit_semantics.is_tool_error() || result_class.is_tool_error() {
             return attach_scope_settled(
                 attach_source_preimage(
@@ -1819,15 +1777,10 @@ async fn execute_bash_inner(
     } else {
         attach_scope_settled(
             attach_source_preimage(
-                ToolResult::text(
-                    astra_text_utils::credential_redaction::truncate_redacted_output(
-                        result,
-                        output_limit,
-                    ),
-                )
-                .with_exit_semantics(ExitSemantics::Success)
-                .with_result_class(result_class)
-                .with_exit_code(output.exit_code),
+                ToolResult::text(finish_presentation(result))
+                    .with_exit_semantics(ExitSemantics::Success)
+                    .with_result_class(result_class)
+                    .with_exit_code(output.exit_code),
                 source_preimages,
             ),
             output.scope_settled,
@@ -1885,20 +1838,16 @@ fn attach_scope_settled(
         metadata.insert("descendant_persistence".to_string(), Value::Bool(false));
     }
     if let Some(capture) = capture {
-        let value = match capture {
-            Ok(receipt) => serde_json::json!({
-                "stdout": {"path": receipt.stdout.path, "bytes": receipt.stdout.bytes, "sha256": receipt.stdout.sha256},
-                "stderr": {"path": receipt.stderr.path, "bytes": receipt.stderr.bytes, "sha256": receipt.stderr.sha256},
-                "complete": receipt.complete,
-                "failure": receipt.failure,
-            }),
-            Err(failure) => serde_json::json!({"complete": false, "failure": failure}),
-        };
-        result
-            .metadata
-            .as_mut()
-            .expect("scope metadata inserted")
-            .insert("bash_output_capture".into(), value);
+        let fields = result.metadata.as_mut().expect("scope metadata inserted");
+        match capture {
+            Ok(receipt) => fields.extend(receipt.result_fields()),
+            Err(failure) => {
+                fields.insert(
+                    "bash_output_capture".into(),
+                    serde_json::json!({"complete":false,"failure":failure}),
+                );
+            }
+        }
     }
     result
 }
@@ -6918,6 +6867,32 @@ printf 'probe.txt:1:needle\n'
                     .get("bash_output_capture")
                     .is_none()
             );
+            for (command, stdout, stderr, exit) in [
+                ("printf '%065d' 0", "0".repeat(65), String::new(), 0),
+                ("printf '%057d' 0 >&2", String::new(), "0".repeat(57), 0),
+                ("printf '%049d' 0; exit 7", "0".repeat(49), String::new(), 7),
+            ] {
+                let result = execute_bash(&ctx, &serde_json::json!({"command":command})).await;
+                let fields = result.metadata.as_ref().unwrap();
+                assert_eq!(fields["exit_code"], exit);
+                assert_eq!(fields["bash_output_capture"]["complete"], true);
+                assert!(result.output.contains("complete=true"), "{}", result.output);
+                for (stream, expected) in [("stdout", stdout), ("stderr", stderr)] {
+                    let receipt = &fields["bash_output_capture"][stream];
+                    let path = receipt["path"].as_str().unwrap();
+                    assert!(
+                        result.output.contains(path),
+                        "missing complete {stream} path: {}",
+                        result.output
+                    );
+                    assert!(result.output.contains(receipt["sha256"].as_str().unwrap()));
+                    assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
+                    assert_eq!(receipt["bytes"], expected.len());
+                }
+                if exit != 0 {
+                    assert!(result.output.contains("[exit code: 7]"));
+                }
+            }
         });
     }
 

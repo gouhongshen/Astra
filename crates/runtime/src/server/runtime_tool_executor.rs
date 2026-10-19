@@ -1379,11 +1379,12 @@ impl RuntimeToolExecutor {
         &self,
         scope: super::capability_source::SourceScope,
         activations: &[astra_turn_types::DeferredToolActivation],
+        cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<Vec<String>, super::capability_source::SourceError> {
         let Some(source) = &self.capability_source else {
             return Ok(Vec::new());
         };
-        source.bind_scope(scope)?;
+        source.bind_scope(scope, cancel)?;
         let mut expired = Vec::new();
         for activation in activations
             .iter()
@@ -1507,8 +1508,9 @@ impl RuntimeToolExecutor {
         );
         remove_prompt_schema_conflicts(&mut pool);
         dedupe_tool_schema_pool(&mut pool);
-        Some(astra_tools::ToolResult::text(
-            astra_tools::tool_search::tool_search(&pool, &request.args),
+        Some(astra_tools::tool_search::tool_search_result(
+            &pool,
+            &request.args,
         ))
     }
 
@@ -12888,7 +12890,7 @@ pub(crate) mod tests {
         reopened.set_capability_source(Some(fixture.source()));
         let activations = astra_turn_core::tool::deferred_activation::deferred_tool_activations_from_tool_search_output(&found.output);
         let expired = reopened
-            .restore_source_selections(fixture.scope.clone(), &activations)
+            .restore_source_selections(fixture.scope.clone(), &activations, None)
             .await
             .unwrap();
         assert!(expired.is_empty());
@@ -13160,7 +13162,7 @@ pub(crate) mod tests {
         next.set_agent_binding_mcp(fixture.transport.clone());
         next.set_capability_source(Some(fixture.source()));
         assert_eq!(
-            next.restore_source_selections(scope.clone(), &activations)
+            next.restore_source_selections(scope.clone(), &activations, None)
                 .await
                 .unwrap(),
             vec![key.clone()]

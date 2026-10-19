@@ -2,7 +2,7 @@
 //! These are ordinary workspace files, not immutable runtime artifacts.
 
 use std::fs::OpenOptions;
-use std::io::SeekFrom;
+use std::io::{SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -96,7 +96,7 @@ impl CaptureWriter {
     }
 }
 
-pub(super) struct BashOutputCapture {
+pub struct BashOutputCapture {
     stdout: PathBuf,
     stderr: PathBuf,
     state: CaptureState,
@@ -109,18 +109,18 @@ pub(super) struct BashOutputCapture {
 }
 
 #[derive(Debug)]
-pub(super) struct StreamReceipt {
-    pub(super) path: PathBuf,
-    pub(super) bytes: u64,
-    pub(super) sha256: String,
+pub struct StreamReceipt {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub sha256: String,
 }
 
 #[derive(Debug)]
-pub(super) struct CaptureReceipt {
-    pub(super) stdout: StreamReceipt,
-    pub(super) stderr: StreamReceipt,
-    pub(super) complete: bool,
-    pub(super) failure: Option<&'static str>,
+pub struct CaptureReceipt {
+    pub stdout: StreamReceipt,
+    pub stderr: StreamReceipt,
+    pub complete: bool,
+    pub failure: Option<&'static str>,
 }
 
 impl BashOutputCapture {
@@ -128,6 +128,40 @@ impl BashOutputCapture {
         workspace: &Path,
         inline_limit: usize,
     ) -> Result<(Self, CaptureWriter, CaptureWriter), String> {
+        let (capture, stdout, stderr) = Self::create(workspace, inline_limit)?;
+        let state = capture.state.clone();
+        Ok((
+            capture,
+            CaptureWriter {
+                file: File::from_std(stdout),
+                state: state.clone(),
+            },
+            CaptureWriter {
+                file: File::from_std(stderr),
+                state,
+            },
+        ))
+    }
+
+    /// Tap a blocking process runner without replacing its process owner.
+    pub fn start_blocking(
+        workspace: &Path,
+        inline_limit: usize,
+        preview_limit: usize,
+    ) -> Result<(Self, BlockingCaptureWriter, BlockingCaptureWriter), String> {
+        let (capture, stdout, stderr) = Self::create(workspace, inline_limit)?;
+        let state = capture.state.clone();
+        Ok((
+            capture,
+            BlockingCaptureWriter::new(stdout, state.clone(), preview_limit),
+            BlockingCaptureWriter::new(stderr, state, preview_limit),
+        ))
+    }
+
+    fn create(
+        workspace: &Path,
+        inline_limit: usize,
+    ) -> Result<(Self, std::fs::File, std::fs::File), String> {
         let directory = workspace.join(CAPTURE_DIRECTORY_NAME);
         #[cfg(unix)]
         let directory_fd = open_capture_directory(workspace)?;
@@ -188,14 +222,8 @@ impl BashOutputCapture {
                 #[cfg(unix)]
                 directory_fd,
             },
-            CaptureWriter {
-                file: File::from_std(stdout_file),
-                state: state.clone(),
-            },
-            CaptureWriter {
-                file: File::from_std(stderr_file),
-                state,
-            },
+            stdout_file,
+            stderr_file,
         ))
     }
 
@@ -203,7 +231,7 @@ impl BashOutputCapture {
         self.state.clone()
     }
 
-    pub(super) async fn finish(
+    pub async fn finish(
         mut self,
         streams_complete: bool,
         command_complete: bool,
@@ -253,6 +281,136 @@ impl BashOutputCapture {
         {
             std::fs::remove_file(path)
         }
+    }
+}
+
+/// A byte-exact tap with a bounded in-memory preview for synchronous runners.
+pub struct BlockingCaptureWriter {
+    file: std::fs::File,
+    state: CaptureState,
+    preview: Vec<u8>,
+    preview_limit: usize,
+    preview_capped: bool,
+}
+
+impl BlockingCaptureWriter {
+    fn new(file: std::fs::File, state: CaptureState, preview_limit: usize) -> Self {
+        Self {
+            file,
+            state,
+            preview: Vec::new(),
+            preview_limit,
+            preview_capped: false,
+        }
+    }
+
+    pub fn failed(&self) -> bool {
+        self.state.failed()
+    }
+
+    pub fn read_failed(&self) {
+        self.state.mark_io_failure();
+    }
+
+    pub fn into_preview(mut self) -> Vec<u8> {
+        // Never expose a credential split at the preview boundary: the
+        // redactor cannot recognize a value whose final bytes are absent.
+        if self.preview_capped {
+            let end = self
+                .preview
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1);
+            self.preview.truncate(end);
+        }
+        self.preview
+    }
+}
+
+impl std::io::Write for BlockingCaptureWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.state
+            .reserve(bytes.len())
+            .map_err(|_| std::io::Error::other("Bash capture limit reached"))?;
+        self.file
+            .write_all(bytes)
+            .inspect_err(|_| self.state.mark_io_failure())?;
+        let keep = bytes
+            .len()
+            .min(self.preview_limit.saturating_sub(self.preview.len()));
+        self.preview.extend_from_slice(&bytes[..keep]);
+        self.preview_capped |= keep < bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file
+            .flush()
+            .inspect_err(|_| self.state.mark_io_failure())
+    }
+}
+
+impl CaptureReceipt {
+    /// The receipt is mandatory recovery data, not disposable preview text.
+    /// The configured output limit bounds the preview, never a saved path.
+    pub fn present(&self, preview: &str, terminal: &str, output_limit: usize) -> String {
+        let mut note = format!(
+            "[bash full output: stdout={} ({} bytes, sha256={}); stderr={} ({} bytes, sha256={}); complete={}]",
+            self.stdout.path.display(),
+            self.stdout.bytes,
+            self.stdout.sha256,
+            self.stderr.path.display(),
+            self.stderr.bytes,
+            self.stderr.sha256,
+            self.complete,
+        );
+        if self.complete {
+            note.push_str("\n[Copy the saved paths exactly; filter or format these files locally, emitting only the fields or sections needed for the answer. Do not rerun the original command merely to change presentation. Compute reported counts, groups and totals with code, not by estimating rows.]");
+        }
+        if let Some(failure) = self.failure {
+            note.push_str(&format!(
+                "\n[bash output capture failed: {failure}; files are incomplete]"
+            ));
+        }
+        if !terminal.is_empty() {
+            note.push('\n');
+            note.push_str(terminal);
+        }
+        let target =
+            output_limit.min(astra_core::runtime_limits::DEFAULT_TOOL_RESULT_INLINE_CHARS / 2);
+        let budget = target.saturating_sub(note.len() + 2);
+        let preview = if preview.len() <= budget {
+            preview.to_string()
+        } else if budget > 12 {
+            astra_text_utils::credential_redaction::truncate_redacted_output(
+                preview.to_string(),
+                budget - 12,
+            )
+        } else {
+            String::new()
+        };
+        if !preview.is_empty() {
+            note.push_str("\n\n");
+            note.push_str(&preview);
+        }
+        note
+    }
+
+    pub fn metadata(&self) -> serde_json::Value {
+        serde_json::json!({
+            "stdout": {"path":self.stdout.path, "bytes":self.stdout.bytes, "sha256":self.stdout.sha256},
+            "stderr": {"path":self.stderr.path, "bytes":self.stderr.bytes, "sha256":self.stderr.sha256},
+            "complete":self.complete, "failure":self.failure,
+        })
+    }
+
+    pub fn result_fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut fields = crate::ToolResult::text(String::new())
+            .with_source_bounded_model_projection()
+            .metadata
+            .expect("producer presentation contract");
+        fields.insert("bash_output_capture".into(), self.metadata());
+        fields
     }
 }
 
@@ -469,6 +627,33 @@ mod tests {
         assert_eq!(
             receipt.failure,
             Some("output exceeded the 50 MiB capture limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_tap_bounds_preview_without_losing_bytes_or_splitting_credentials() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (capture, mut stdout, mut stderr) =
+            BashOutputCapture::start_blocking(workspace.path(), 64, 16).unwrap();
+        let bytes = b"first\nSECRET_KEY=secret-value-that-crosses-the-preview-boundary\n";
+        stdout.write_all(bytes).unwrap();
+        stderr.write_all(&[0, 255, 10]).unwrap();
+        assert_eq!(stdout.into_preview(), b"first\n");
+        assert_eq!(stderr.into_preview(), [0, 255, 10]);
+        let receipt = capture.finish(true, true, true).await.unwrap().unwrap();
+        assert!(receipt.complete);
+        assert_eq!(std::fs::read(&receipt.stdout.path).unwrap(), bytes);
+        let presented = receipt.present("preview", "[exit code: 7]", 64);
+        for stream in [&receipt.stdout, &receipt.stderr] {
+            assert!(presented.contains(stream.path.to_str().unwrap()));
+            assert!(presented.contains(&stream.sha256));
+        }
+        assert!(presented.contains("complete=true"));
+        assert!(presented.contains("[exit code: 7]"));
+        assert!(!presented.contains("preview"));
+        assert_eq!(
+            crate::model_result_presentation(Some(&receipt.result_fields())),
+            crate::ModelResultPresentation::SourceBounded
         );
     }
 

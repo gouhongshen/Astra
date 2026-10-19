@@ -20187,7 +20187,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             if let (Some(run_id), Some(generation)) = (&state.current_run_id, state.current_run_owner_generation) {
                 let expired = executor.restore_source_selections(super::capability_source::SourceScope {
                     user_id: self.user_id.clone(), session_id: self.session_id.clone(), run_id: run_id.clone(), generation,
-                }, &state.deferred_tool_activations).await.map_err(|error| astra_core::ClassifiedError::new(
+                }, &state.deferred_tool_activations, state.cancellation.token.as_deref()).await.map_err(|error| astra_core::ClassifiedError::new(
                     astra_core::ErrorKind::ContractViolation, error.to_string()))?;
                 if !expired.is_empty() {
                     state.deferred_tool_activations.retain(|activation| !expired.contains(&activation.name));
@@ -34473,7 +34473,7 @@ mod tests {
         executor.set_agent_binding_mcp(fixture.transport.clone());
         executor.set_capability_source(Some(fixture.source()));
         executor
-            .restore_source_selections(fixture.scope.clone(), &[])
+            .restore_source_selections(fixture.scope.clone(), &[], None)
             .await
             .unwrap();
         assert!(executor.source_selection_discovery_tool(&key).is_none());
@@ -34615,11 +34615,15 @@ mod tests {
             catalog_size: usize,
             distinct_bindings: bool,
             skill: bool,
+            large_tool: bool,
         ) -> [(usize, u32); 3] {
             use super::super::capability_source::tests::{
                 fixture_selection_key, http_fixture_with_bindings, http_fixture_with_inventory,
+                http_fixture_with_large_tool,
             };
-            let fixture = if distinct_bindings {
+            let fixture = if large_tool {
+                http_fixture_with_large_tool().await
+            } else if distinct_bindings {
                 http_fixture_with_bindings(skill, catalog_size).await
             } else {
                 http_fixture_with_inventory(skill, catalog_size).await
@@ -34709,7 +34713,7 @@ mod tests {
             executor.set_agent_binding_mcp(fixture.transport.clone());
             executor.set_capability_source(Some(source.clone()));
             executor
-                .restore_source_selections(fixture.scope.clone(), &[])
+                .restore_source_selections(fixture.scope.clone(), &[], None)
                 .await
                 .unwrap();
             let mut state = create_durable_execution_test_state(&fixture.scope.session_id);
@@ -34878,6 +34882,17 @@ mod tests {
             };
             let candidates = result_content(1, "source-discover");
             let selected = result_content(2, "source-select");
+            if large_tool {
+                assert!(
+                    selected.len() > astra_turn_core::tool_result_sanitize::MAX_TOOL_RESULT_CHARS
+                );
+                assert!(selected.len() <= astra_tools::tool_search::MAX_SELECTION_RESULT_BYTES);
+                let selection: Value = serde_json::from_str(&selected).unwrap();
+                assert_eq!(
+                    selection["matches"][0]["parameters"]["properties"]["optional_field_219"]["type"],
+                    "string"
+                );
+            }
             assert!(!candidates.contains(selected_text));
             assert!(!candidates.contains("inputSchema"));
             assert!(selected.contains(selected_text));
@@ -34897,7 +34912,7 @@ mod tests {
                     for skill in [false, true] {
                     for distinct_bindings in [false, true] {
                         for catalog_size in [10, 100, 1000] {
-                            let measured = run_case(catalog_size, distinct_bindings, skill).await;
+                            let measured = run_case(catalog_size, distinct_bindings, skill, false).await;
                             let selected_phase = if skill { "selected_skill_body" } else { "selected_schema" };
                             for (phase, (bytes, tokens)) in ["initial", "candidate_page", selected_phase].into_iter().zip(measured) {
                                 eprintln!("capability_source inventory={catalog_size} distinct_bindings={distinct_bindings} skill={skill} phase={phase} bytes={bytes} estimated_tokens={tokens}");
@@ -34909,6 +34924,7 @@ mod tests {
                     for group in measurements.chunks(3) {
                         assert!(group.iter().all(|value| *value == group[0]), "actual LLM-visible initial, bounded candidates and exact schema must not grow with the external catalog: {group:?}");
                     }
+                    run_case(1, false, false, true).await;
                 });
             }).unwrap().join().unwrap();
     }

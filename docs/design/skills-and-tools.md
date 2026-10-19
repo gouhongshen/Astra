@@ -173,11 +173,14 @@ that registers an alias matching a complete reserved selection key is rejected
 at binding admission. Unregistered malformed names in the reserved capability
 namespace fail at that owner, without local-name lookup or fuzzy matching.
 
-Selected source invocations use the ordinary Agent Binding MCP cancellation
-owner: each exchange has a unique request ID, cancellation sends
+Selected source invocations and scoped Skill/body/resource reads use the
+ordinary Agent Binding MCP cancellation owner: each exchange has a unique
+request ID, cancellation sends
 `notifications/cancelled`, and the original correlated response retains
 settlement authority. A cancellation notification alone cannot release an
-in-flight invocation or its workspace ownership.
+in-flight invocation or its workspace ownership. Skill resolvers obtain the
+run token from their existing generation-bound source runtime; it is not a
+model argument or part of the durable capability identity.
 
 For a selected source Skill, `skill(resource_path=...)` reads a package-relative
 text resource through the same custody and policy checks, with a 64 KiB content

@@ -23,6 +23,124 @@ fn git(root: &Path, args: &[&str]) {
 }
 
 #[tokio::test]
+async fn public_cli_bash_retains_byte_exact_large_output_and_terminal_facts() {
+    use sha2::{Digest, Sha256};
+    let workspace = tempfile::tempdir().unwrap();
+    let executor = executor(workspace.path());
+    let output = executor
+        .execute_with_metadata(
+            "bash",
+            &json!({
+                "command":"seq 1 20000; printf '\\000\\377stderr-tail\\n' >&2; exit 7"
+            }),
+        )
+        .await;
+    assert!(output.is_error, "{output:?}");
+    let fields = output.tool_result_fields.as_ref().unwrap();
+    assert_eq!(fields["execution_started"], true);
+    assert_eq!(fields["exit_code"], 7);
+    assert_eq!(fields["bash_output_capture"]["complete"], true);
+    assert!(output.output.contains("complete=true"));
+    assert!(output.output.contains("exit_code=7"));
+    let stdout = (1..=20000)
+        .map(|index| format!("{index}\n"))
+        .collect::<String>()
+        .into_bytes();
+    let mut stderr = vec![0, 255];
+    stderr.extend_from_slice(b"stderr-tail\n");
+    for (stream, expected) in [("stdout", stdout), ("stderr", stderr)] {
+        let receipt = &fields["bash_output_capture"][stream];
+        let path = receipt["path"].as_str().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), expected);
+        assert_eq!(receipt["bytes"], expected.len());
+        assert_eq!(
+            receipt["sha256"],
+            format!("{:x}", Sha256::digest(&expected))
+        );
+        assert!(output.output.contains(path));
+        assert!(output.output.contains(receipt["sha256"].as_str().unwrap()));
+    }
+    // Reuse the public tool owner: no new workspace quarantine or process
+    // lifetime is introduced by saving a large result.
+    let next = executor
+        .execute_with_metadata("bash", &json!({"command":"printf settled"}))
+        .await;
+    assert!(!next.is_error, "{next:?}");
+    assert_eq!(next.output.trim(), "settled");
+    assert!(
+        next.tool_result_fields
+            .as_ref()
+            .unwrap()
+            .get("bash_output_capture")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn public_cli_cancelled_bash_keeps_an_explicit_partial_capture() {
+    let workspace = tempfile::tempdir().unwrap();
+    let executor = executor(workspace.path());
+    let token = tokio_util::sync::CancellationToken::new();
+    let args = json!({
+        "command":"printf before-cancel; touch started; sleep 30"
+    });
+    let call = executor.execute_with_metadata_cancelable("bash", &args, Some(&token));
+    tokio::pin!(call);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                result = &mut call => panic!("command must still be running: {result:?}"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                    if workspace.path().join("started").exists() { break; }
+                }
+            }
+        }
+    })
+    .await
+    .expect("command must reach its started marker");
+    token.cancel();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), call)
+        .await
+        .unwrap();
+    assert!(output.is_error, "{output:?}");
+    let fields = output.tool_result_fields.as_ref().unwrap();
+    assert_eq!(fields["error_kind"], "cancelled");
+    assert_eq!(fields["execution_started"], true);
+    assert_eq!(fields["bash_output_capture"]["complete"], false);
+    assert!(output.output.contains("complete=false"));
+    let path = fields["bash_output_capture"]["stdout"]["path"]
+        .as_str()
+        .unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), b"before-cancel");
+}
+
+#[tokio::test]
+async fn public_cli_capture_failure_does_not_erase_the_observed_exit() {
+    let workspace = tempfile::tempdir().unwrap();
+    let executor = executor(workspace.path());
+    let output = executor
+        .execute_with_metadata(
+            "bash",
+            &json!({
+                "command":"printf done > command-done; mv astra-bash-outputs captured-away"
+            }),
+        )
+        .await;
+    assert!(output.is_error, "{output:?}");
+    assert_eq!(
+        std::fs::read(workspace.path().join("command-done")).unwrap(),
+        b"done"
+    );
+    let fields = output.tool_result_fields.as_ref().unwrap();
+    assert_eq!(fields["execution_started"], true);
+    assert_eq!(fields["exit_code"], 0);
+    assert_eq!(fields["error_kind"], "tool_unavailable");
+    assert_eq!(fields["retryable"], false);
+    assert_eq!(fields["bash_output_capture"]["complete"], false);
+    assert!(output.output.contains("no complete output file"));
+}
+
+#[tokio::test]
 async fn authorized_worktree_cleanup_and_absence_probe_do_not_require_a_directory_snapshot() {
     let fixture = tempfile::tempdir().unwrap();
     let repo = fixture.path().join("repo");

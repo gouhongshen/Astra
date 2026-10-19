@@ -44,7 +44,7 @@ pub mod rpc_bridge;
 #[cfg(unix)]
 pub mod run_script;
 pub mod shell_ops;
-mod shell_output_capture;
+pub mod shell_output_capture;
 pub mod source_preimage;
 pub mod tool_engine;
 pub mod tool_result_status;
