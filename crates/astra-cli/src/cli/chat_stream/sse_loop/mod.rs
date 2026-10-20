@@ -36,7 +36,7 @@ use crate::cli::session::session_runtime::{self, ServerDefaultModel};
 use crate::cli::stream::streaming_types::UsageAttribution;
 use agentic_sse_loop::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
-    partial_interruption_notice, resolved_tool_metrics,
+    resolved_tool_metrics, stream_interruption_notice,
 };
 use serde_json::{Value, json};
 use server_admission_host::CliServerAdmissionHost;
@@ -1033,7 +1033,7 @@ async fn stream_chat_sse_inner(
         applied_user_intents,
     });
     if let Some(ref tx) = p.stream_event_tx
-        && let Some(user_message) = partial_interruption_notice(&result)
+        && let Some(user_message) = stream_interruption_notice(&result)
         && tx
             .send(StreamEvent::RunInterrupted { user_message })
             .await

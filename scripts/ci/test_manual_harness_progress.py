@@ -58,6 +58,17 @@ def write_events(root, data, tail=b""):
 
 
 class ManualHarnessProgressTests(unittest.TestCase):
+    def test_captured_root_lifecycle_is_a_closed_unavailable_diagnostic(self):
+        for state in ("running", "waiting", "paused", "delegated", "interrupted", "failed", "cancelled"):
+            diagnostic = {"kind": "child_adoption", "status": "unavailable", "reason": f"root_{state}"}
+            h.safe_diagnostic(diagnostic, 0)
+            with self.assertRaises(ValueError):
+                h.safe_diagnostic({**diagnostic, "status": "contradicted"}, 0)
+            with self.assertRaises(ValueError):
+                h.safe_diagnostic({**diagnostic, "root_id": "private"}, 0)
+        with self.assertRaises(ValueError):
+            h.safe_diagnostic({"kind": "child_adoption", "status": "unavailable", "reason": "root_private_payload"}, 0)
+
     def test_failed_required_combination_explains_soft_child_without_regrading(self):
         child = {"type":"duration_between", "severity":"soft", "score":None,
                  "passed":False, "evaluation":"reported", "diagnostic":{

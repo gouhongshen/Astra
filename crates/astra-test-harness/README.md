@@ -1124,3 +1124,13 @@ require no provider or runtime process. A qualification report can be rejected
 even when the command succeeds; inspect `tuning.status`. Passing permits only
 offline shadow scoring, never production activation. See
 [the operator guide](../../docs/guides/model-router-offline.md).
+
+Child-adoption verification still requires a completed root. When a complete,
+owner-bound run tree contains a root in another canonical lifecycle state, the
+safe diagnostic reports `root_running`, `root_waiting`, `root_paused`,
+`root_delegated`, `root_interrupted`, `root_failed`, or `root_cancelled` instead
+of implying that capture was missing. Invalid or incomplete trees remain
+`run_tree_unavailable`. Neither diagnostic certifies child adoption.
+Parent question/answer verification uses canonical reply obligations and durable
+root/child communication observations, including stable parent mailbox identity;
+it does not impose a second recipient-spelling contract on tool arguments.

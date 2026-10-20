@@ -134,6 +134,12 @@ A run may appear stuck because of:
 
 The projection should expose the specific reason and next action.
 
+The CLI/TUI publishes an interruption as a separate lifecycle warning even
+when the model emitted no answer text. A notice-only fallback stored in the
+final result is not evidence that a text delta was displayed. Completed tool
+output and any partial model text remain visible; the warning does not become
+a model-authored answer or change the canonical paused/recovery state.
+
 A safe provider recovery publishes its scheduled attempt before waiting again,
 without inventing task progress or adding an assistant-authored history message.
 When recovery is exhausted, live and replayed interruption projections carry the

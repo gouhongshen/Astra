@@ -96,6 +96,13 @@ pub(crate) enum ChildProofReason {
     ResultDigestMismatch,
     FinalizationBeforeAdoption,
     RunTreeUnavailable,
+    RootRunning,
+    RootWaiting,
+    RootPaused,
+    RootDelegated,
+    RootInterrupted,
+    RootFailed,
+    RootCancelled,
     FanoutReceiptUnavailable,
     ModelIdentityUnavailable,
     OfferingIdentityUnavailable,
@@ -123,6 +130,11 @@ pub(crate) struct ChildProofFailure {
 }
 
 impl ChildProofFailure {
+    fn into_detail(self) -> &'static str {
+        self.unavailable_detail
+            .unwrap_or("execution evidence contradicted")
+    }
+
     fn contradicted(reason: ChildProofReason) -> Self {
         Self {
             reason,
@@ -223,10 +235,16 @@ impl SessionExecutionCapture {
     fn validated_runs(
         &self,
         root: &str,
-    ) -> Result<std::collections::BTreeMap<&str, &astra_server_types::SessionRunNode>, &'static str>
-    {
+    ) -> Result<
+        std::collections::BTreeMap<&str, &astra_server_types::SessionRunNode>,
+        ChildProofFailure,
+    > {
+        let unavailable =
+            |detail| ChildProofFailure::unavailable(ChildProofReason::RunTreeUnavailable, detail);
         if !self.matches(&self.session_id, &self.owner) || self.run_tree.truncated {
-            return Err("execution identity or complete run tree unavailable");
+            return Err(unavailable(
+                "execution identity or complete run tree unavailable",
+            ));
         }
         let runs: std::collections::BTreeMap<_, _> = self
             .run_tree
@@ -235,27 +253,42 @@ impl SessionExecutionCapture {
             .map(|run| (run.run_id.as_str(), run))
             .collect();
         if runs.len() != self.run_tree.runs.len()
-            || !runs.get(root).is_some_and(|run| {
-                run.parent_run_id.is_none() && run.status == SessionRunLifecycleStatus::Completed
-            })
+            || !runs
+                .get(root)
+                .is_some_and(|run| run.parent_run_id.is_none())
         {
-            return Err("root or unique run identities unavailable");
+            return Err(unavailable("root or unique run identities unavailable"));
         }
         for run in runs.values() {
             if let Some(parent) = run.parent_run_id.as_deref() {
                 let parent = runs
                     .get(parent)
-                    .ok_or("run parent missing from complete tree")?;
+                    .ok_or_else(|| unavailable("run parent missing from complete tree"))?;
                 if parent.depth.checked_add(1) != Some(run.depth)
                     || run.root_run_id != parent.root_run_id
                 {
-                    return Err("run lineage conflict");
+                    return Err(unavailable("run lineage conflict"));
                 }
             } else if run.depth != 0 || run.root_run_id.as_deref() != Some(run.run_id.as_str()) {
-                return Err("root lineage conflict");
+                return Err(unavailable("root lineage conflict"));
             }
         }
-        Ok(runs)
+        // A lifecycle is diagnostic evidence only after identity and lineage
+        // validation. Successful child certification still requires Completed.
+        let reason = match runs[root].status {
+            SessionRunLifecycleStatus::Completed => return Ok(runs),
+            SessionRunLifecycleStatus::Running => ChildProofReason::RootRunning,
+            SessionRunLifecycleStatus::Waiting => ChildProofReason::RootWaiting,
+            SessionRunLifecycleStatus::Paused => ChildProofReason::RootPaused,
+            SessionRunLifecycleStatus::Delegated => ChildProofReason::RootDelegated,
+            SessionRunLifecycleStatus::Interrupted => ChildProofReason::RootInterrupted,
+            SessionRunLifecycleStatus::Failed => ChildProofReason::RootFailed,
+            SessionRunLifecycleStatus::Cancelled => ChildProofReason::RootCancelled,
+        };
+        Err(ChildProofFailure::unavailable(
+            reason,
+            "captured root run has not completed",
+        ))
     }
 
     pub(crate) fn child_count(&self, root: &str) -> Option<usize> {
@@ -269,7 +302,9 @@ impl SessionExecutionCapture {
     }
 
     fn run_projection(&self, root: &str, run_id: &str) -> Result<&Value, &'static str> {
-        let runs = self.validated_runs(root)?;
+        let runs = self
+            .validated_runs(root)
+            .map_err(ChildProofFailure::into_detail)?;
         if runs
             .get(run_id)
             .is_none_or(|run| run_id != root && run.parent_run_id.as_deref() != Some(root))
@@ -381,7 +416,9 @@ impl SessionExecutionCapture {
         root: &str,
         run_id: &str,
     ) -> Result<Option<&str>, &'static str> {
-        let runs = self.validated_runs(root)?;
+        let runs = self
+            .validated_runs(root)
+            .map_err(ChildProofFailure::into_detail)?;
         let child = runs.get(run_id).ok_or("direct child unavailable")?;
         if child.parent_run_id.as_deref() != Some(root) {
             return Err("direct child identity conflict");
@@ -425,7 +462,9 @@ impl SessionExecutionCapture {
     }
 
     pub(crate) fn tools(&self, root: &str) -> Result<Vec<ExecutionToolCall<'_>>, &'static str> {
-        let runs = self.validated_runs(root)?;
+        let runs = self
+            .validated_runs(root)
+            .map_err(ChildProofFailure::into_detail)?;
         let page = self.transcript.as_ref().ok_or("transcript not captured")?;
         if page.session_id != self.session_id || page.has_more {
             return Err("complete transcript unavailable");
@@ -614,9 +653,7 @@ impl SessionExecutionCapture {
         fanout_group: Option<&FanoutGroupSelector>,
     ) -> Result<Vec<VerifiedChildEvidence<'a>>, ChildProofFailure> {
         use crate::criteria::ChildThinkingExpectation;
-        let runs = self.validated_runs(root).map_err(|detail| {
-            ChildProofFailure::unavailable(ChildProofReason::RunTreeUnavailable, detail)
-        })?;
+        let runs = self.validated_runs(root)?;
         let children: Vec<_> = runs
             .values()
             .filter(|child| child.parent_run_id.as_deref() == Some(root))
@@ -1245,39 +1282,78 @@ impl SessionExecutionCapture {
             .as_deref()
             .ok_or("question actor unavailable")?;
         let tools = self.tools(root)?;
-        let mut questions = tools.iter().filter(|call| {
+        let transcript = self
+            .transcript
+            .as_ref()
+            .ok_or("communication transcript unavailable")?;
+        // Root-owned durable send observations bind its canonical mailbox.
+        // That mailbox can differ from the execution run ID. Never reconstruct
+        // recipient aliases from raw tool arguments in the verifier.
+        let mut parent = None;
+        for item in &transcript.items {
+            let Some(AgentTranscriptEvidence::AgentCommunication { event }) = &item.evidence else {
+                continue;
+            };
+            if event.direction != Direction::Sent
+                || event.payload_kind != Kind::Response
+                || event.observed_by.run_id != root
+            {
+                continue;
+            }
+            // Select by the claimed canonical party, then validate the full
+            // correlated observations below. A known contradiction must not
+            // be hidden by another observation's missing provenance.
+            if parent.is_some_and(|previous| previous != &event.from) {
+                return Ok(false);
+            }
+            parent = Some(&event.from);
+        }
+        let parent = parent.ok_or("parent sender observation unavailable")?;
+        let mut selected = None;
+        for question in tools.iter().filter(|call| {
             call.run_id == child.run_id
                 && call.name == "agent"
                 && call.arguments.as_ref().is_some_and(|args| {
-                    args["action"] == "send_message"
-                        && args["message_type"] == "question"
-                        && args["to"] == "parent"
+                    args["action"] == "send_message" && args["message_type"] == "question"
                 })
-        });
-        let Some(question) = questions.next() else {
+        }) {
+            if agent_fanout_control_execution_fact(question.raw_result)
+                == Some(AgentFanoutControlExecutionFact::NotExecuted)
+            {
+                continue;
+            }
+            let receipt = question
+                .result
+                .as_ref()
+                .ok_or("question receipt unavailable")?;
+            let obligation: astra_turn_types::PendingReply =
+                serde_json::from_value(receipt["reply_obligation"].clone())
+                    .map_err(|_| "question responder unavailable")?;
+            if &obligation.expected_responder != parent {
+                continue;
+            }
+            if selected.replace((question, obligation)).is_some() {
+                return Ok(false);
+            }
+        }
+        let Some((question, obligation)) = selected else {
             return Ok(false);
         };
-        if questions.next().is_some() || question.ok != Some(true) {
-            return Ok(false);
-        }
         let receipt = question
             .result
             .as_ref()
             .ok_or("question receipt unavailable")?;
-        if receipt["run_id"] != child.run_id || receipt["status"] != "queued" {
+        if question.ok != Some(true)
+            || receipt["run_id"] != child.run_id
+            || receipt["status"] != "queued"
+        {
             return Ok(false);
         }
         let request = receipt["message_id"]
             .as_str()
             .filter(|id| !id.is_empty())
             .ok_or("question identity unavailable")?;
-        let obligation: astra_turn_types::PendingReply =
-            serde_json::from_value(receipt["reply_obligation"].clone())
-                .map_err(|_| "question responder unavailable")?;
-        if obligation.request_id != request
-            || obligation.expected_responder.run_id.is_empty()
-            || obligation.expected_responder.agent_id.is_empty()
-        {
+        if obligation.request_id != request || obligation.expected_responder.run_id.is_empty() {
             return Ok(false);
         }
         let mut answers = tools.iter().filter(|call| {
@@ -1303,10 +1379,6 @@ impl SessionExecutionCapture {
             .as_str()
             .filter(|id| !id.is_empty())
             .ok_or("answer identity unavailable")?;
-        let transcript = self
-            .transcript
-            .as_ref()
-            .ok_or("communication transcript unavailable")?;
         let mut sent = false;
         let mut received = false;
         let mut unavailable = false;
@@ -2678,6 +2750,62 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn child_proof_distinguishes_captured_root_lifecycle_from_invalid_tree() {
+        for (status, reason) in [
+            (SessionRunLifecycleStatus::Running, "root_running"),
+            (SessionRunLifecycleStatus::Waiting, "root_waiting"),
+            (SessionRunLifecycleStatus::Paused, "root_paused"),
+            (SessionRunLifecycleStatus::Delegated, "root_delegated"),
+            (SessionRunLifecycleStatus::Interrupted, "root_interrupted"),
+            (SessionRunLifecycleStatus::Failed, "root_failed"),
+            (SessionRunLifecycleStatus::Cancelled, "root_cancelled"),
+        ] {
+            let mut captured = capture();
+            captured.run_tree.runs[0].status = status;
+            for fault in ["none", "truncated", "duplicate", "lineage", "owner"] {
+                let mut observed = captured.clone();
+                match fault {
+                    "truncated" => observed.run_tree.truncated = true,
+                    "duplicate" => observed
+                        .run_tree
+                        .runs
+                        .push(observed.run_tree.runs[0].clone()),
+                    "lineage" => observed.run_tree.runs[1].depth = 9,
+                    "owner" => observed.owner.account_id.clear(),
+                    _ => {}
+                }
+                let mut outcome = crate::runner::RunOutcome::new("test-model").with_exit_code(0);
+                outcome.session_id = Some("session".into());
+                outcome.run_id = Some("root".into());
+                let mut stream = crate::runner::StreamCapture::default();
+                stream.identity_verified = true;
+                stream.execution = Some(observed);
+                outcome.stream_capture = Some(stream);
+                let criterion = crate::criteria::Criterion::ExecutionChildResultsAdopted {
+                    children: vec![expectation("observed-value", "test-model", None)],
+                    fanout_group: None,
+                };
+                let failure =
+                    crate::criteria::execution_contract_proof(&criterion, &outcome).unwrap_err();
+                assert_eq!(
+                    failure.diagnostic(),
+                    serde_json::json!({
+                        "kind":"child_adoption", "status":"unavailable",
+                        "reason": if fault == "none" { reason } else { "run_tree_unavailable" }
+                    }),
+                    "{status:?}/{fault}"
+                );
+                let results = crate::criteria::evaluate_deterministic(&[criterion], &outcome);
+                assert!(!results[0].passed);
+                assert_eq!(
+                    crate::classify::classify(&outcome, &results),
+                    crate::classify::FailureClass::InfraVerificationUnavailable
+                );
+            }
+        }
+    }
+
+    #[test]
     fn question_completion_requires_correlated_receipts_and_both_durable_observers() {
         use crate::classify::FailureClass::{
             BehaviorContractViolation, InfraVerificationUnavailable,
@@ -2756,6 +2884,107 @@ pub(crate) mod tests {
             proof_failure(original.clone(), vec![expected.clone()], None),
             None
         );
+        for recipient in [
+            "parent",
+            " PARENT ",
+            "orchestrator",
+            " OrChEsTrAtOr ",
+            "root",
+        ] {
+            let mut addressed = original.clone();
+            addressed.transcript.as_mut().unwrap().items[0].tool_calls[0].arguments =
+                serde_json::json!({"action":"send_message","message_type":"question","to":recipient}).to_string();
+            if recipient == "root" {
+                // Direct addressing uses a registered parent execution, rather
+                // than the separate stable-mailbox fixture used for aliases.
+                let page = addressed.transcript.as_mut().unwrap();
+                let mut receipt: Value = serde_json::from_str(&page.items[1].content).unwrap();
+                receipt["reply_obligation"]["expected_responder"]["run_id"] = "root".into();
+                page.items[1].content = receipt.to_string();
+                for item in &mut page.items[4..6] {
+                    let Some(astra_turn_types::AgentTranscriptEvidence::AgentCommunication {
+                        event,
+                    }) = &mut item.evidence
+                    else {
+                        unreachable!()
+                    };
+                    event.from.run_id = "root".into();
+                }
+            }
+            assert_eq!(
+                proof_failure(addressed, vec![expected.clone()], None),
+                None,
+                "{recipient}"
+            );
+        }
+        for recipient in ["peer", "parent"] {
+            let mut additional = original.clone();
+            additional.run_tree.runs[1].total_tool_calls += 1;
+            let page = additional.transcript.as_mut().unwrap();
+            let mut request = page.items[0].clone();
+            request.item_seq = 7;
+            request.source_event_id = Some("second-question-request".into());
+            request.tool_calls[0].tool_use_id = "second-question-call".into();
+            request.tool_calls[0].arguments = serde_json::json!({"action":"send_message","message_type":"question","to":recipient}).to_string();
+            let mut result = page.items[1].clone();
+            result.item_seq = 8;
+            result.source_event_id = Some("second-question-result".into());
+            result.tool_result.as_mut().unwrap().tool_use_id = "second-question-call".into();
+            let mut receipt: Value = serde_json::from_str(&result.content).unwrap();
+            receipt["message_id"] = "second-question".into();
+            receipt["reply_obligation"]["request_id"] = "second-question".into();
+            if recipient == "peer" {
+                receipt["reply_obligation"]["expected_responder"] =
+                    serde_json::json!({"run_id":"peer","agent_id":"peer"});
+            }
+            result.content = receipt.to_string();
+            page.items.splice(6..6, [request, result]);
+            assert_eq!(
+                proof_failure(additional, vec![expected.clone()], None),
+                (recipient == "parent").then_some(BehaviorContractViolation),
+                "additional {recipient}"
+            );
+        }
+        let mut custom_root = original.clone();
+        let Some(astra_turn_types::AgentTranscriptEvidence::AgentCommunication { event }) =
+            &mut custom_root.transcript.as_mut().unwrap().items[4].evidence
+        else {
+            unreachable!()
+        };
+        // A custom execution profile is distinct from its stable mailbox agent.
+        event.observed_by.agent_id = "planner".into();
+        assert_eq!(
+            proof_failure(custom_root, vec![expected.clone()], None),
+            None
+        );
+        for before in [false, true] {
+            let mut with_rejected_peer = original.clone();
+            with_rejected_peer.run_tree.runs[1].total_tool_calls += 1;
+            let page = with_rejected_peer.transcript.as_mut().unwrap();
+            let mut request = page.items[0].clone();
+            let mut result = page.items[1].clone();
+            if before {
+                for item in &mut page.items {
+                    item.item_seq += 2;
+                }
+            }
+            request.item_seq = if before { 1 } else { 7 };
+            result.item_seq = request.item_seq + 1;
+            request.source_event_id = Some("rejected-peer-request".into());
+            result.source_event_id = Some("rejected-peer-result".into());
+            request.tool_calls[0].tool_use_id = "rejected-peer-call".into();
+            request.tool_calls[0].arguments =
+                r#"{"action":"send_message","message_type":"question","to":"peer"}"#.into();
+            result.tool_result.as_mut().unwrap().tool_use_id = "rejected-peer-call".into();
+            result.content = serde_json::json!({"result_family":"control_receipt","action":"send_message","success":false,"executed":false,"status":"rejected","reason":"no peer"}).to_string();
+            page.items
+                .splice(if before { 0..0 } else { 6..6 }, [request, result]);
+            assert_eq!(
+                proof_failure(with_rejected_peer, vec![expected.clone()], None),
+                None,
+                "rejected peer before={before}"
+            );
+        }
         let mut run_addressed = original.clone();
         run_addressed.transcript.as_mut().unwrap().items[2].tool_calls[0].arguments =
             r#"{"action":"send_message","message_type":"answer","to":"child","request_id":"question-id"}"#.into();
@@ -2805,6 +3034,11 @@ pub(crate) mod tests {
             } else if fault == "reverse-question" {
                 altered.transcript.as_mut().unwrap().items[0].tool_calls[0].arguments =
                     r#"{"action":"send_message","message_type":"question","to":"member"}"#.into();
+                let item = &mut altered.transcript.as_mut().unwrap().items[1];
+                let mut receipt: Value = serde_json::from_str(&item.content).unwrap();
+                receipt["reply_obligation"]["expected_responder"] =
+                    serde_json::json!({"run_id":"peer","agent_id":"peer"});
+                item.content = receipt.to_string();
             } else {
                 let evidence = altered.transcript.as_mut().unwrap().items[5]
                     .evidence

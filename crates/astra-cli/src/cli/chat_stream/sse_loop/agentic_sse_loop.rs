@@ -198,17 +198,15 @@ fn interruption_visible_text(interruption: &Value, kind: Option<&str>) -> String
         })
 }
 
-pub(crate) fn partial_interruption_notice(result: &StreamResult) -> Option<String> {
+pub(crate) fn stream_interruption_notice(result: &StreamResult) -> Option<String> {
     let interruption = result.interruption.as_ref()?;
-    let notice = interruption_visible_text(interruption, result.interruption_kind.as_deref());
-    let assistant_text = result.full_text.trim();
-    // An interruption without provider text already uses this same safe
-    // notice as its only visible text. Publish a separate lifecycle row only
-    // when there is distinct partial assistant content to preserve.
-    if assistant_text.is_empty() || assistant_text == notice.trim() {
-        return None;
-    }
-    Some(notice)
+    // `full_text` also holds the notice-only fallback for non-stream consumers.
+    // Its contents do not prove that a Token event reached the TUI. Always
+    // project the interruption as a lifecycle row, separate from model output.
+    Some(interruption_visible_text(
+        interruption,
+        result.interruption_kind.as_deref(),
+    ))
 }
 
 pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
@@ -374,7 +372,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        StreamResultBuild, build_stream_result, partial_interruption_notice, resolved_tool_metrics,
+        StreamResultBuild, build_stream_result, resolved_tool_metrics, stream_interruption_notice,
     };
     use crate::cli::stream::streaming_types::UsageAttribution;
     use astra_runtime::turn::tool_health::ToolHealthTracker;
@@ -472,6 +470,7 @@ mod tests {
         assert_eq!(result.final_state, "completed");
         assert_eq!(result.interruption_kind, None);
         assert_eq!(result.tool_calls_count, 3);
+        assert_eq!(stream_interruption_notice(&result), None);
         assert_eq!(result.ttft_ms, Some(42));
         assert_eq!(result.context_ms, Some(100));
         assert_eq!(result.deferred_tool_activations.len(), 1);
@@ -529,7 +528,10 @@ mod tests {
         );
         assert!(result.full_text.contains("46 tool call(s) completed"));
         assert!(!result.full_text.contains("model kept calling tools"));
-        assert_eq!(partial_interruption_notice(&result), None);
+        assert_eq!(
+            stream_interruption_notice(&result),
+            Some(result.full_text.clone())
+        );
     }
 
     #[test]
@@ -551,7 +553,7 @@ mod tests {
             "The requested file was updated successfully."
         );
         assert_eq!(
-            partial_interruption_notice(&result).as_deref(),
+            stream_interruption_notice(&result).as_deref(),
             Some(
                 "Execution did not reach a verified terminal state. Progress is saved. Review the saved progress, then continue to reconcile the unfinished work."
             )
@@ -579,6 +581,10 @@ mod tests {
                 .starts_with("[harness_blocked] Turn interrupted.")
         );
         assert!(!result.full_text.contains("required harness capability"));
+        assert_eq!(
+            stream_interruption_notice(&result),
+            Some(result.full_text.clone())
+        );
     }
 
     #[test]

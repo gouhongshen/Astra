@@ -337,6 +337,24 @@ async fn partial_interruption_keeps_answer_once_and_renders_safe_notice_separate
     assert!(!rendered.contains("persistent unresolved tool outcome"));
 }
 
+#[test]
+fn notice_only_interruption_renders_once_without_an_assistant_cell() {
+    let mut widget = ChatWidget::new("");
+    widget.handle_event(AppEvent::User(UserEvent::Submit("inspect the turn".into())));
+    let notice = "The model provider is temporarily rate limited. Please wait before retrying.";
+    widget.handle_event(AppEvent::wire(WireEvent::RunInterrupted(notice.into())));
+    widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
+
+    let kinds: Vec<_> = widget
+        .history()
+        .iter()
+        .map(|cell| cell_kind_name(cell.as_ref()))
+        .collect();
+    assert_eq!(kinds, vec!["User", "System", "TurnSummary"]);
+    assert_eq!(render_history(&widget, 200).matches(notice).count(), 1);
+    assert!(widget.active_cell().is_none());
+}
+
 // ── helpers ─────────────────────────────────────────────────────
 
 fn cell_kind_name(c: &dyn HistoryCell) -> &'static str {

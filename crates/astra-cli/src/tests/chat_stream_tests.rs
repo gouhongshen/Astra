@@ -469,6 +469,195 @@ async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
     assert_eq!(follow_up["session_id"], request["session_id"]);
 }
 
+/// Exercise the real SSE adapter and ordered TUI bridge together. Injecting
+/// RunInterrupted directly into a widget would miss the notice-only regression.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn stream_chat_sse_projects_rate_limit_notice_without_answer_deltas() {
+    use crate::tui::{TuiAppEvent, create_channels, create_controlled_per_turn_bridge};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = ProcessJournalDirGuard::new(temp.path());
+    for (text, tools, interrupted) in [
+        ("", 2, true),
+        ("", 0, true),
+        ("Partial findings from the tools.", 2, true),
+        ("The requested work is complete.", 2, false),
+    ] {
+        let notice = format!(
+            "The model provider is temporarily rate limited. {tools} tool call(s) completed. Please wait ~30s before retrying."
+        );
+        let session_id = format!("sess-rate-limit-{tools}-{}-{interrupted}", text.len());
+        let run_id = format!("run-{session_id}");
+        let tools_used: &[&str] = if tools == 0 { &[] } else { &["introspect"] };
+        let source = sse_text_response_with_execution_summary(
+            text,
+            &session_id,
+            tools,
+            tools,
+            tools_used,
+            2,
+            (&run_id, 1),
+        );
+        let mut body = String::new();
+        for block in source.split("\n\n") {
+            let Some(data) = block.strip_prefix("data: ") else {
+                continue;
+            };
+            if data == "[DONE]" {
+                body.push_str("data: [DONE]\n\n");
+                continue;
+            }
+            let mut event: serde_json::Value = serde_json::from_str(data).unwrap();
+            let event_type = event["type"].as_str().unwrap().to_string();
+            if text.is_empty() && matches!(event_type.as_str(), "text_delta" | "text_done") {
+                continue;
+            }
+            if interrupted && event_type == "run_finished" {
+                body.push_str(&format!(
+                    "data: {}\n\n",
+                    serde_json::json!({
+                        "type": "run_interrupted", "run_id": run_id,
+                        "kind": "rate_limited", "resumable": true,
+                        "message": notice,
+                    })
+                ));
+                event["status"] = serde_json::json!("paused");
+            }
+            if interrupted && event_type == "turn_complete" {
+                event["execution_state"] = serde_json::json!({
+                    "status": "interrupted", "interruption_kind": "rate_limited",
+                });
+                event["interruption"] = serde_json::json!({
+                    "kind": "rate_limited", "resumable": true,
+                    "resume_action": {"wait_and_retry": {"delay_seconds": 30}},
+                    "user_message": notice, "has_checkpoint": false,
+                    "tool_calls_completed": tools, "turns_completed": 2,
+                    "remaining_turns": 22,
+                    "error_detail": "synthetic private provider diagnostic",
+                });
+            }
+            body.push_str(&format!("data: {event}\n\n"));
+            if event_type == "session_info" {
+                for index in 0..tools {
+                    for tool_event in [
+                        serde_json::json!({
+                            "type": "tool_call_start", "call_id": format!("call-{index}"),
+                            "tool": "introspect", "arguments": {"scope": "current_turn"},
+                            "transport": "server_local", "executor": {"kind": "server_local"},
+                        }),
+                        serde_json::json!({
+                            "type": "tool_call_end", "call_id": format!("call-{index}"),
+                            "tool": "introspect", "status": "ok", "duration_ms": 10,
+                            "result": format!("completed result {index}"),
+                            "transport": "server_local", "executor": {"kind": "server_local"},
+                        }),
+                    ] {
+                        body.push_str(&format!("data: {tool_event}\n\n"));
+                    }
+                }
+            }
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let app = Router::new().route(
+            "/chat/stream",
+            post(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                async move { (TEST_SSE_HEADERS, body) }
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let registry = astra_runtime::skills::empty_unified_registry();
+        let (tui_tx, mut tui_rx) = create_channels();
+        let (stream_tx, control) = create_controlled_per_turn_bridge(tui_tx);
+        let mut context = basic_chat_context(&api, &registry, "Inspect the current turn");
+        context.stream_event_tx = Some(stream_tx);
+        let mut pm = PermissionManager::new(true);
+        let result = stream_chat_sse(ChatTurnParams::basic_cli(
+            &context,
+            "synthetic-token",
+            Some(&session_id),
+            &mut pm,
+        ))
+        .await
+        .unwrap();
+        control.close_and_drain();
+
+        let mut notices = 0;
+        let mut answer = String::new();
+        let mut completed_tools = Vec::new();
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), tui_rx.recv())
+                .await
+                .expect("interrupted stream must drain")
+                .expect("TUI channel must stay open until the drain marker");
+            match event {
+                TuiAppEvent::RunInterrupted { user_message } => {
+                    assert_eq!(user_message, notice);
+                    notices += 1;
+                }
+                TuiAppEvent::Token { text, .. } => answer.push_str(&text),
+                TuiAppEvent::ToolCompleted {
+                    tool_use_id,
+                    status,
+                    output,
+                    ..
+                } => completed_tools.push((tool_use_id, status, output)),
+                TuiAppEvent::TurnProjectionDrained => break,
+                _ => {}
+            }
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "no automatic replay");
+        assert_eq!(result.tool_calls_count, tools);
+        assert_eq!(
+            result.final_state,
+            if interrupted {
+                "interrupted"
+            } else {
+                "completed"
+            }
+        );
+        assert_eq!(notices, usize::from(interrupted));
+        assert_eq!(answer, text, "no synthetic answer or repeated partial text");
+        assert_eq!(completed_tools.len(), tools as usize);
+        for index in 0..tools {
+            assert_eq!(
+                completed_tools[index as usize],
+                (
+                    format!("call-{index}"),
+                    "completed".into(),
+                    Some(format!("completed result {index}"))
+                )
+            );
+        }
+        if interrupted {
+            let interruption = result.interruption.as_ref().unwrap();
+            assert_eq!(interruption["kind"], "rate_limited");
+            assert_eq!(interruption["resumable"], true);
+            assert_eq!(
+                interruption["resume_action"]["wait_and_retry"]["delay_seconds"],
+                30
+            );
+            assert_eq!(
+                result.full_text,
+                if text.is_empty() {
+                    notice.as_str()
+                } else {
+                    text
+                }
+            );
+        }
+    }
+}
+
 fn mock_mcp_server_binary() -> std::path::PathBuf {
     crate::mcp_client::ensure_mock_mcp_server_binary()
 }
