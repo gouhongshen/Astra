@@ -11978,6 +11978,7 @@ impl AgenticRunLifecycleService {
                 );
                 (bundle?, prepared_skills?)
             };
+        bundle = bundle.with_descriptor_metadata(&mcp_descriptor.metadata)?;
         if let Some(config) =
             super::super::capability_source::CapabilitySourceConfig::parse(&mcp_descriptor.metadata)
                 .map_err(|error| {
