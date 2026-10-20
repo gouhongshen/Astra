@@ -18,7 +18,9 @@ before a model request is admitted.
 
 The completion line shows elapsed time, time to first token (`ttft`), primary
 model tokens, and cache usage when reported. Complete input accounting shows
-the cached-input percentage; incomplete accounting shows lower bounds such as
+the cached-input percentage in both CLI and TUI, even when output usage is
+unreported. The denominator is fresh input + cache reads + cache creation;
+output and auxiliary calls are excluded. Incomplete input accounting shows lower bounds such as
 `≥19.9k tokens · ≥17.9k cached`. Missing cache measurements are omitted, not
 reported as zero. The `≥` counts are reported lower bounds; no cache
 percentage is shown without a complete input total. Session totals remain
@@ -186,7 +188,8 @@ user configuration instead. Both files use a top-level `mcpServers` object:
 without the `mcpServers` wrapper. It supports `stdio` (the default, using
 `command`, `args`, and optional `env`), `sse`, `streamable_http`, and `ws`
 (using `url`, optional `headers`, and optional `auth_token`). Use the exact
-`streamable_http` spelling in configuration; `http` is not a chat-loader alias.
+`streamable_http` spelling in configuration; `http`, `streamable-http`, and
+`websocket` are not accepted aliases.
 `add` writes a stdio entry. Both commands default to project scope and reject
 an existing name in that file; remove the existing entry or edit the file to
 replace it. Adding configuration does not install an executable or test access.
@@ -199,7 +202,10 @@ sorted by path. A standalone entry with `disabled: true` or a skill entry with
 can still win. Unsupported or incomplete standalone entries are skipped with
 a warning. A malformed file produces a warning and contributes no entries;
 a missing optional file is normal. Configuration changes apply to the next
-chat startup.
+chat startup. Cooperating Astra configuration writers serialize each destination
+through its stable sibling lockfile before reading and atomically replacing it;
+different destinations remain independent. External editors do not participate
+in that lock protocol.
 
 `list` and `get` show enabled configurations eligible for discovery, including
 the winning source path. They hide connection settings, including commands,
@@ -208,7 +214,19 @@ uses the same loader as chat; it describes configuration, without proving a
 connection or tool availability. In an active chat, `/mcp` shows connected
 servers and tools. The standalone `astra mcp test NAME -s project|user` and
 `astra mcp ping NAME -s project|user` explicitly connect to the selected server;
-for stdio this launches its configured command.
+for stdio this launches its configured command. Each diagnostic performs one
+top-level connection attempt using the existing transport deadlines. Both
+commands use the chat loader for the selected file and reject disabled or
+invalid definitions; they do not fall back to other scopes or skill manifests.
+A malformed typed field can invalidate the whole file, just as at chat startup.
+Chat connection recovery retains its own retry policy.
+
+The CLI agent receives stable guidance to discover these existing commands and
+use only its selected local executor. Configuration JSON and raw connection
+errors are omitted from Astra-owned command output. `test` can still print
+server-provided tool/resource data; diagnostic logs and shell history are not
+secret stores. Use protected local configuration files for credentials rather
+than placing them in inline shell arguments.
 
 ## astra admin
 

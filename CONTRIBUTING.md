@@ -96,7 +96,8 @@ requires the exact ordered gate inventory; missing, duplicate, legacy or
 unknown rows and unsupported source declarations fail closed.
 
 CLI tests build and run all library/binary unit tests plus the offline
-`cli_pipe`, `process_supervisor`, and `shell_execution_boundaries` integration
+`cli_pipe`, `process_supervisor`, `shell_execution_boundaries`, and
+`cli_mcp_setup` integration
 targets once, after building the standalone mock MCP server. Five protected
 check labels require that same completed job; they do not repeat setup, builds,
 archive downloads, or tests.

@@ -36,6 +36,7 @@ pub(crate) struct TurnSummaryCell {
     pub cache_creation_tokens: Option<u64>,
     pub model_name: Option<String>,
     pub auxiliary_summary: Option<String>,
+    pub input_usage_complete: bool,
     pub usage_partial: bool,
     pub tools: u32,
     pub cumulative_tokens: Option<u64>,
@@ -56,6 +57,7 @@ impl TurnSummaryCell {
                 cache_creation_tokens,
                 model_name,
                 auxiliary_summary,
+                input_usage_complete,
                 usage_partial,
                 tools,
                 cumulative_tokens,
@@ -69,6 +71,7 @@ impl TurnSummaryCell {
                 cache_creation_tokens,
                 model_name,
                 auxiliary_summary,
+                input_usage_complete,
                 usage_partial,
                 tools,
                 cumulative_tokens,
@@ -111,6 +114,7 @@ impl HistoryCell for TurnSummaryCell {
             cache_creation_tokens: self.cache_creation_tokens,
             model_name: self.model_name.clone(),
             auxiliary_summary: self.auxiliary_summary.clone(),
+            input_usage_complete: self.input_usage_complete,
             usage_partial: self.usage_partial,
             tools: self.tools,
             cumulative_tokens: self.cumulative_tokens,
@@ -164,7 +168,7 @@ impl TurnSummaryCell {
             self.tokens_in,
             self.cache_read_tokens,
             self.cache_creation_tokens,
-            !self.usage_partial,
+            self.input_usage_complete,
         ) {
             sections.push(Section::primary(vec![Span::styled(cache, value)]));
         }
@@ -330,6 +334,67 @@ mod tests {
         buffer_to_string(&draw_widget(p, width, 3))
     }
 
+    #[test]
+    fn complete_input_cache_rate_survives_missing_output_usage() {
+        use crate::cli::stream::streaming_types::{AttributedTokenUsage, UsageAttribution};
+        use crate::cli::turn::turn_reporting::project_primary_usage;
+        use crate::tui::app_event::TuiAppEvent;
+        use crate::tui::chat_widget::{ChatWidget, TurnContext, translate};
+        for (fresh, read, write, complete, expected) in [
+            (Some(100), Some(900), Some(0), true, Some("90% cached")),
+            (Some(100), Some(900), Some(0), false, None),
+            (Some(100), Some(900), Some(100), true, Some("81% cached")),
+            (Some(0), Some(0), Some(0), true, None),
+            (Some(100), None, Some(0), false, None),
+        ] {
+            let usage = UsageAttribution {
+                primary: Some(AttributedTokenUsage {
+                    fresh_input_tokens: fresh,
+                    cache_read_tokens: read,
+                    cache_creation_tokens: write,
+                    output_tokens: None,
+                }),
+                primary_input_complete: complete,
+                primary_complete: false,
+                auxiliary: Some(AttributedTokenUsage {
+                    cache_read_tokens: Some(50_000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let projected = project_primary_usage(&usage, true);
+            let ctx = TurnContext {
+                tokens_in: projected.fresh_input_tokens,
+                tokens_out: projected.output_tokens,
+                cache_read_tokens: projected.cache_read_tokens,
+                cache_creation_tokens: projected.cache_creation_tokens,
+                input_usage_complete: projected.input_complete,
+                usage_partial: !projected.complete,
+                ..Default::default()
+            };
+            let mut widget = ChatWidget::new("cache-input");
+            widget.handle_event(translate(TuiAppEvent::TurnComplete, ctx).unwrap());
+            let cell = widget
+                .history()
+                .iter()
+                .find_map(|cell| cell.as_any_ref().downcast_ref::<TurnSummaryCell>())
+                .unwrap();
+            let out = render(cell, 120);
+            if let Some(expected) = expected {
+                assert!(out.contains(expected), "{out}");
+            } else {
+                assert!(!out.contains('%'), "{out}");
+            }
+            if fresh == Some(100) && read == Some(900) && write == Some(0) {
+                assert!(out.contains("≥1.0k tokens"), "{out}");
+            }
+            let serialized = serde_json::to_string(&cell.to_persist().unwrap()).unwrap();
+            let restored =
+                TurnSummaryCell::from_persist(serde_json::from_str(&serialized).unwrap()).unwrap();
+            assert_eq!(render(&restored, 120), out);
+        }
+    }
+
     fn mk_full() -> TurnSummaryCell {
         TurnSummaryCell {
             elapsed_ms: Some(16_600),
@@ -340,6 +405,7 @@ mod tests {
             cache_creation_tokens: None,
             model_name: None,
             auxiliary_summary: None,
+            input_usage_complete: false,
             usage_partial: false,
             tools: 2,
             cumulative_tokens: Some(145_000),

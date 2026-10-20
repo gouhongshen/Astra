@@ -151,7 +151,7 @@ printf '%s\\n' "$*" >> "${MOCK_SUDO_LOG}"
             shlex.split(
                 "cargo nextest run --locked -p astra-cli --lib --bins "
                 "--test cli_pipe --test process_supervisor "
-                "--test shell_execution_boundaries --profile ci"
+                "--test shell_execution_boundaries --test cli_mcp_setup --profile ci"
             ),
             "Preserve the complete selected offline CLI inventory without test filters",
         )

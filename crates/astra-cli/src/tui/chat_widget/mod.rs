@@ -199,12 +199,12 @@ pub(crate) struct TurnStats {
     /// rendered compactly in the default completion marker.
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
-    /// Of the `tokens_in` total, how many were served from the provider's
-    /// prompt cache. `None` when the provider did not report cache stats.
+    /// Cached input, separate from fresh `tokens_in`; `None` means unreported.
     pub cache_read_tokens: Option<u64>,
     pub cache_creation_tokens: Option<u64>,
     pub model_name: Option<String>,
     pub auxiliary_summary: Option<String>,
+    pub input_usage_complete: bool,
     pub usage_partial: bool,
     pub tools: u32,
     pub cumulative_tokens: Option<u64>,
@@ -4426,6 +4426,7 @@ impl ChatWidget {
             cache_creation_tokens: stats.cache_creation_tokens,
             model_name: stats.model_name,
             auxiliary_summary: stats.auxiliary_summary,
+            input_usage_complete: stats.input_usage_complete,
             usage_partial: stats.usage_partial,
             tools: stats.tools,
             cumulative_tokens: stats.cumulative_tokens,
@@ -7044,6 +7045,7 @@ mod tests {
                 cache_creation_tokens: None,
                 model_name: None,
                 auxiliary_summary: None,
+                input_usage_complete: false,
                 usage_partial: false,
                 tools: 0,
                 cumulative_tokens: Some(15),
@@ -7601,6 +7603,7 @@ mod tests {
                 cache_creation_tokens: None,
                 model_name: None,
                 auxiliary_summary: None,
+                input_usage_complete: false,
                 usage_partial: false,
                 tools: 0,
                 cumulative_tokens: None,

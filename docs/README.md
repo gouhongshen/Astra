@@ -10,6 +10,10 @@ operators, and kernel contributors to the level of detail they need.
 > ahead of the implementation on a given branch. Code, contract tests, and
 > runtime-profile tests remain authoritative for current behavior.
 
+Start with the [current capability status](reference/capabilities.md) to distinguish
+implemented paths and limits from target contracts. Release notes link the exact
+source snapshot used for that version.
+
 ## Choose your path
 
 | Goal | Start here | Next |

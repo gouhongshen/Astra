@@ -31,6 +31,12 @@ impact. -->
 - Superseded code, states, tables, shims, or self-only tests removed:
 - If parallel implementations remain, their boundary and retirement condition:
 
+## Capability assessment
+
+<!-- For new/changed public behavior, profiles, defaults or claims, update
+docs/reference/capabilities.md or explain why its current assessment applies.
+Use N/A only for changes without capability impact. -->
+
 ## Verification
 
 <!-- List the exact commands or manual checks run and their results. Include the

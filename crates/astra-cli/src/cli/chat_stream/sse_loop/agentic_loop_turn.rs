@@ -686,6 +686,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         ),
         "thinking": thinking_config.to_payload_value(),
     });
+    payload["edge_profile"]
+        [astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_STABLE_TEXTS] =
+        json!([crate::cli::mcp_config::MCP_SETUP_GUIDANCE]);
     if let Some(offering_id) = ctx.offering_id {
         payload["model_selection"] = json!({"offering_id": offering_id});
     }
@@ -2416,6 +2419,45 @@ mod tests {
             "ordinary user turns with runtime context must remain user turns"
         );
         assert!(payload.get("messages").is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_setup_guidance_is_stable_and_survives_admission() {
+        let mut previous = None;
+        for message in ["configure an MCP server", "explain this code"] {
+            let payload = prepare_payload_with_reasoning_for_test(
+                vec![json!({"role": "user", "content": message})],
+                &[],
+                &[],
+                message,
+                None,
+                Some(("mcp-setup-offering", "test-model", None)),
+            )
+            .await
+            .0;
+            let key =
+                astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_STABLE_TEXTS;
+            let texts = payload["edge_profile"][key]
+                .as_array()
+                .expect("CLI setup guidance");
+            assert_eq!(texts.len(), 1);
+            assert!(texts[0].as_str().unwrap().contains("astra mcp --help"));
+            if let Some(previous) = previous.as_ref() {
+                assert_eq!(previous, &texts[0]);
+            }
+            previous = Some(texts[0].clone());
+            let admitted = server_loop_admission_payload_with_execution_time_budget(
+                payload.clone(),
+                message,
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                admitted["context"]["edge_profile"][key],
+                payload["edge_profile"][key]
+            );
+        }
     }
 
     #[tokio::test]

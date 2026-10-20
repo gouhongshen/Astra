@@ -11327,6 +11327,7 @@ pub(crate) async fn run_tui_session(
                                             auxiliary_summary: turn_usage.as_ref().and_then(
                                                 |usage| usage.usage_attribution.auxiliary_summary(),
                                             ),
+                                            input_usage_complete: primary_usage.input_complete,
                                             usage_partial: turn_usage
                                                 .as_ref()
                                                 .is_some_and(|_| {
