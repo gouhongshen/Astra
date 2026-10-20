@@ -1322,6 +1322,30 @@ fn stored_artifact_from_row(
     })
 }
 
+fn stored_composite_snapshot_index_artifact_from_record(
+    record: &SessionArtifactJsonRecord,
+) -> StoredSessionArtifact {
+    StoredSessionArtifact {
+        artifact_id: record.artifact_id.clone(),
+        session_id: record.session_id.clone(),
+        user_id: record.user_id.clone(),
+        artifact_kind: record.artifact_kind.clone(),
+        source: record.source.clone(),
+        turn: record.turn,
+        round: record.round,
+        content: record.content.clone(),
+        metadata: record.metadata.clone(),
+        retention_policy: None,
+        retention_until: None,
+        status: Some("active".to_string()),
+        referenced_by_manifest_count: 0,
+        referenced_by_state_items_count: 0,
+        referenced_by_citation_count: 0,
+        referenced_by_durable_count: 0,
+        created_at: None,
+    }
+}
+
 pub(crate) async fn load_latest_json_artifact_from_pool(
     pool: &sqlx::Pool<sqlx::MySql>,
     user_id: &str,
@@ -1647,13 +1671,9 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         tx.commit().await?;
         connection.release();
 
-        self.load_json_artifact(&record.user_id, &record.session_id, &record.artifact_id)
-            .await?
-            .ok_or(SessionArtifactStoreError::ArtifactNotFound {
-                artifact_id: record.artifact_id,
-                session_id: record.session_id,
-                user_id: record.user_id,
-            })
+        Ok(stored_composite_snapshot_index_artifact_from_record(
+            &record,
+        ))
     }
 
     async fn retain_json_artifact_reference(

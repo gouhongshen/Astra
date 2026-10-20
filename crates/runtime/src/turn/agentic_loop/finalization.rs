@@ -253,7 +253,7 @@ async fn persist_context_trace_to_workspace_if_present(
     }
 }
 
-fn persist_remote_composite_snapshot_index_blocking(
+fn schedule_remote_composite_snapshot_index_persist(
     persistence: Option<&super::host::ContextTracePersistenceContext>,
     session_id: &str,
     index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
@@ -262,34 +262,73 @@ fn persist_remote_composite_snapshot_index_blocking(
     let Some(persistence) = persistence.cloned() else {
         return;
     };
-    let session_id = session_id.to_string();
-    let session_id_for_log = session_id.clone();
-    let index = index.clone();
-    let future = async move {
-        astra_services::session_restore::persist_remote_composite_snapshot_index(
+    let user_id = persistence.user_id.clone();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let session_id = session_id.to_string();
+            let source = source.to_string();
+            let index = index.clone();
+            spawn_remote_composite_snapshot_index_persist(
+                handle,
+                session_id,
+                user_id,
+                index,
+                source,
+                persistence.artifact_store,
+            );
+        }
+        Err(_) => {
+            let session_id = session_id.to_string();
+            let session_id_for_log = session_id.clone();
+            let source = source.to_string();
+            let index = index.clone();
+            let build_result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let result = match build_result {
+                Ok(runtime) => runtime.block_on(async move {
+                    astra_services::session_restore::persist_remote_composite_snapshot_index(
+                        &session_id,
+                        &user_id,
+                        &index,
+                        &persistence.artifact_store,
+                    )
+                    .await
+                    .map(|_| ())
+                }),
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = result {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "Failed to {source} for {session_id_for_log}: {error}"
+                );
+            }
+        }
+    }
+}
+
+fn spawn_remote_composite_snapshot_index_persist(
+    handle: tokio::runtime::Handle,
+    session_id: String,
+    user_id: String,
+    index: astra_core::composite_snapshot::CompositeSnapshotIndex,
+    source: String,
+    artifact_store: astra_services::DatabaseSessionArtifactStore,
+) {
+    handle.spawn(async move {
+        let result = astra_services::session_restore::persist_remote_composite_snapshot_index(
             &session_id,
-            &persistence.user_id,
+            &user_id,
             &index,
-            &persistence.artifact_store,
+            &artifact_store,
         )
         .await
-        .map(|_| ())
-    };
-    let result = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map(|runtime| runtime.block_on(future))
-            .map_err(|error| error.to_string())
-            .and_then(|result| result),
-    };
-    if let Err(error) = result {
-        astra_core::agent_warn!(
-            "checkpoint",
-            "Failed to {source} for {session_id_for_log}: {error}"
-        );
-    }
+        .map(|_| ());
+        if let Err(error) = result {
+            astra_core::agent_warn!("checkpoint", "Failed to {source} for {session_id}: {error}");
+        }
+    });
 }
 
 /// Best-effort heavy checkpoint write.
@@ -443,7 +482,7 @@ pub fn commit_session_continuity_checkpoint(
                 return None;
             }
         };
-    persist_remote_composite_snapshot_index_blocking(
+    schedule_remote_composite_snapshot_index_persist(
         persistence,
         session_id,
         &index,
