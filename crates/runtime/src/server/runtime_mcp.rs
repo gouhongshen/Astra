@@ -59,30 +59,33 @@ pub(crate) struct RuntimeMcpBundle {
         crate::server::semantic_read_freshness::ProviderSemanticFreshnessRegistry,
 }
 
+/// Admit the gateway's invocation budget before starting live discovery or
+/// preparing a snapshot. Discovery and cancellation retain separate budgets.
+pub(crate) fn parse_agent_binding_mcp_tool_call_timeout(
+    metadata: &serde_json::Map<String, Value>,
+) -> Result<Duration, (StatusCode, Json<ErrorResponse>)> {
+    let Some(value) = metadata.get("tool_call_timeout_ms") else {
+        return Ok(Duration::from_secs(AGENT_BINDING_MCP_RPC_TIMEOUT_SECS));
+    };
+    let timeout_ms = value
+        .as_u64()
+        .filter(|value| (1..=AGENT_BINDING_MCP_MAX_TOOL_CALL_TIMEOUT_MS).contains(value))
+        .ok_or_else(|| {
+            mcp_error(
+                StatusCode::BAD_REQUEST,
+                "capability_descriptors.mcp.metadata.tool_call_timeout_ms must be an integer between 1 and 3600000",
+                "agent_binding_capability_ref_invalid",
+            )
+        })?;
+    Ok(Duration::from_millis(timeout_ms))
+}
+
 impl RuntimeMcpBundle {
-    /// The authenticated gateway owns its tools' execution durations. Keep
-    /// that transport budget separate from discovery and cancellation waits.
-    pub(crate) fn with_descriptor_metadata(
-        mut self,
-        metadata: &serde_json::Map<String, Value>,
-    ) -> Result<Self, (StatusCode, Json<ErrorResponse>)> {
-        let Some(value) = metadata.get("tool_call_timeout_ms") else {
-            return Ok(self);
-        };
-        let timeout_ms = value
-            .as_u64()
-            .filter(|value| (1..=AGENT_BINDING_MCP_MAX_TOOL_CALL_TIMEOUT_MS).contains(value))
-            .ok_or_else(|| {
-                mcp_error(
-                    StatusCode::BAD_REQUEST,
-                    "capability_descriptors.mcp.metadata.tool_call_timeout_ms must be an integer between 1 and 3600000",
-                    "agent_binding_capability_ref_invalid",
-                )
-            })?;
+    pub(crate) fn with_tool_call_timeout(mut self, timeout: Duration) -> Self {
         if let Some(runtime) = self.agent_binding_mcp.as_mut() {
-            Arc::make_mut(runtime).tool_call_timeout = Duration::from_millis(timeout_ms);
+            Arc::make_mut(runtime).tool_call_timeout = timeout;
         }
-        Ok(self)
+        self
     }
 
     /// Return the resolver-owned public-alias to provider-native identity
@@ -2209,9 +2212,9 @@ mod tests {
 
     #[test]
     fn gateway_tool_call_timeout_metadata_is_explicit_and_bounded() {
-        let default = timeout_fixture_bundle("http://127.0.0.1:1/mcp")
-            .with_descriptor_metadata(&serde_json::Map::new())
-            .unwrap();
+        let default = timeout_fixture_bundle("http://127.0.0.1:1/mcp").with_tool_call_timeout(
+            parse_agent_binding_mcp_tool_call_timeout(&serde_json::Map::new()).unwrap(),
+        );
         assert_eq!(
             default.agent_binding_mcp.unwrap().tool_call_timeout,
             Duration::from_secs(120)
@@ -2225,8 +2228,7 @@ mod tests {
             json!(3_600_001),
         ] {
             let metadata = serde_json::Map::from_iter([("tool_call_timeout_ms".into(), value)]);
-            let result = timeout_fixture_bundle("http://127.0.0.1:1/mcp")
-                .with_descriptor_metadata(&metadata);
+            let result = parse_agent_binding_mcp_tool_call_timeout(&metadata);
             match result {
                 Err((status, _)) => assert_eq!(status, StatusCode::BAD_REQUEST),
                 Ok(_) => panic!("invalid explicit timeout must not become a default"),
@@ -2235,8 +2237,7 @@ mod tests {
         let metadata =
             serde_json::Map::from_iter([("tool_call_timeout_ms".into(), json!(630_000))]);
         let configured = timeout_fixture_bundle("http://127.0.0.1:1/mcp")
-            .with_descriptor_metadata(&metadata)
-            .unwrap();
+            .with_tool_call_timeout(parse_agent_binding_mcp_tool_call_timeout(&metadata).unwrap());
         assert_eq!(
             configured.agent_binding_mcp.unwrap().tool_call_timeout,
             Duration::from_secs(630)
@@ -2256,9 +2257,9 @@ mod tests {
         for (timeout_ms, should_complete) in [(50, false), (5_000, true)] {
             let metadata =
                 serde_json::Map::from_iter([("tool_call_timeout_ms".into(), json!(timeout_ms))]);
-            let bundle = timeout_fixture_bundle(&endpoint)
-                .with_descriptor_metadata(&metadata)
-                .unwrap();
+            let bundle = timeout_fixture_bundle(&endpoint).with_tool_call_timeout(
+                parse_agent_binding_mcp_tool_call_timeout(&metadata).unwrap(),
+            );
             let result = bundle
                 .agent_binding_mcp
                 .as_ref()
@@ -2300,8 +2301,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let metadata = serde_json::Map::from_iter([("tool_call_timeout_ms".into(), json!(50))]);
         let bundle = timeout_fixture_bundle(&endpoint)
-            .with_descriptor_metadata(&metadata)
-            .unwrap();
+            .with_tool_call_timeout(parse_agent_binding_mcp_tool_call_timeout(&metadata).unwrap());
         let result = bundle
             .agent_binding_mcp
             .as_ref()
@@ -2356,8 +2356,7 @@ mod tests {
         let metadata =
             serde_json::Map::from_iter([("tool_call_timeout_ms".into(), json!(3_600_000))]);
         let bundle = timeout_fixture_bundle(&endpoint)
-            .with_descriptor_metadata(&metadata)
-            .unwrap();
+            .with_tool_call_timeout(parse_agent_binding_mcp_tool_call_timeout(&metadata).unwrap());
         let runtime = bundle.agent_binding_mcp.as_ref().unwrap();
         let token = CancellationToken::new();
         let args = json!({});
@@ -2383,7 +2382,10 @@ mod tests {
         }
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(121)).await;
-        let error = call.await.unwrap_err();
+        let error = tokio::time::timeout(Duration::from_secs(1), call)
+            .await
+            .expect("cancellation must settle within its 120-second budget, not the one-hour RPC budget")
+            .unwrap_err();
         assert!(error.is_timeout());
         assert!(error.side_effects_maybe());
         assert!(!error.provider_acknowledged);
