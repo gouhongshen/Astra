@@ -9,6 +9,8 @@ use std::time::Duration;
 const RUNTIME_EVENT_RING_CAPACITY: i64 = 1_024;
 const MAX_PROJECTION_BATCH: u16 = 100;
 const MAX_STEPS_PER_WORK_PER_SWEEP: u16 = 8;
+const PROJECTION_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const PROJECTION_BACKLOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WorkRuntimeEventProjectionResult {
@@ -433,7 +435,7 @@ pub fn spawn_work_runtime_event_projector(
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        let mut interval = tokio::time::interval(PROJECTION_IDLE_POLL_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
@@ -441,12 +443,17 @@ pub fn spawn_work_runtime_event_projector(
                 _ = interval.tick() => {}
             }
             match project_pending_runtime_events(&pool, MAX_PROJECTION_BATCH).await {
-                Ok(result) if result.total() > 0 => tracing::debug!(
-                    target: "astra_services::work_runtime_event_projector",
-                    projected = result.projected,
-                    coverage_expired = result.coverage_expired,
-                    "projected durable Work runtime events"
-                ),
+                Ok(result) if result.total() > 0 => {
+                    interval = tokio::time::interval(PROJECTION_BACKLOG_POLL_INTERVAL);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    tracing::debug!(
+                        target: "astra_services::work_runtime_event_projector",
+                        projected = result.projected,
+                        coverage_expired = result.coverage_expired,
+                        "projected durable Work runtime events"
+                    );
+                }
+                // The default 5-second interval remains active until the next projected result.
                 Ok(_) => {}
                 Err(error) => tracing::warn!(
                     target: "astra_services::work_runtime_event_projector",
