@@ -498,15 +498,11 @@ impl RunOwnerLeaseAuthority {
 /// Exact execution-owner epoch created with a durable run start. This is
 /// process-local authority carried into the executor; it is never reconstructed
 /// by reading whichever owner happens to be current later.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RunExecutionAuthority {
-    pub owner_generation: u64,
-}
+pub use astra_services::runs::DurableRunStartAuthority as RunExecutionAuthority;
 
-/// Evidence returned by the activation renewal and consumed exactly once when
-/// the owner heartbeat starts. For durable stores, the deadline is anchored
-/// to the activation request start so a delayed acknowledgement cannot grant
-/// the local executor more time than the renewed database lease.
+/// Evidence from a committed start or activation renewal, consumed when the
+/// owner heartbeat starts. Its deadline is anchored before the durable write
+/// so a delayed acknowledgement cannot grant the local executor more time.
 #[derive(Debug)]
 pub(crate) struct ConfirmedExecutionAuthority {
     owner_lease_fence_deadline: Option<tokio::time::Instant>,
@@ -1686,6 +1682,86 @@ impl RunEngine {
         })
     }
 
+    /// Activate only the initial lease returned by a successful creation.
+    /// Reusing this committed receipt avoids a cross-connection/CN visibility
+    /// gap between INSERT and a redundant first renewal. Its pre-creation
+    /// deadline is immutable: a slow or reconciled COMMIT never buys more time.
+    pub(crate) fn confirm_started_execution_authority(
+        &self,
+        authority: RunExecutionAuthority,
+        cancel_token: &tokio_util::sync::CancellationToken,
+    ) -> Result<ExecutionAuthorityConfirmation, String> {
+        if cancel_token.is_cancelled() {
+            return Err("run start activation was cancelled".into());
+        }
+        let deadline = match (self.owner_lease_policy(), authority.owner_lease_expires_at) {
+            (None, None) => None,
+            (Some(policy), Some(expires_at)) => {
+                let Some(deadline) = expires_at.checked_sub(policy.safety_margin) else {
+                    return Ok(ExecutionAuthorityConfirmation::Superseded);
+                };
+                if deadline <= tokio::time::Instant::now() {
+                    return Ok(ExecutionAuthorityConfirmation::Superseded);
+                }
+                Some(deadline)
+            }
+            _ => {
+                return Err(
+                    "committed run-start receipt disagrees with the owner-lease policy".into(),
+                );
+            }
+        };
+        Ok(ExecutionAuthorityConfirmation::Confirmed(
+            ConfirmedExecutionAuthority {
+                owner_lease_fence_deadline: deadline,
+            },
+        ))
+    }
+
+    /// Preparation remains inside the heartbeat's already proven lease window.
+    /// Do not replace it with a new snapshot or restart its clock at activation.
+    /// Provider/tool authorization and periodic durable renewals retain their
+    /// existing owner/generation, cancellation and expiry checks.
+    pub(crate) fn confirm_local_execution_authority(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        expected_owner_generation: u64,
+        cancel_token: &tokio_util::sync::CancellationToken,
+    ) -> Result<ExecutionAuthorityConfirmation, String> {
+        if self.owner_lease_policy().is_none() {
+            if cancel_token.is_cancelled() {
+                return Err(format!("run {run_id} activation was cancelled"));
+            }
+            return Ok(ExecutionAuthorityConfirmation::Confirmed(
+                ConfirmedExecutionAuthority {
+                    owner_lease_fence_deadline: None,
+                },
+            ));
+        }
+        let Ok(authority) = self.owner_lease_authority(
+            user_id,
+            expected_session_id,
+            run_id,
+            expected_owner_generation,
+        ) else {
+            return Ok(ExecutionAuthorityConfirmation::Superseded);
+        };
+        let state = authority.current_state();
+        if Self::validate_owner_lease_state(run_id, expected_owner_generation, state).is_err() {
+            return Ok(ExecutionAuthorityConfirmation::Superseded);
+        }
+        if cancel_token.is_cancelled() {
+            return Err(format!("run {run_id} activation was cancelled"));
+        }
+        Ok(ExecutionAuthorityConfirmation::Confirmed(
+            ConfirmedExecutionAuthority {
+                owner_lease_fence_deadline: Some(state.deadline),
+            },
+        ))
+    }
+
     /// Prove and refresh execution authority at the activation boundary.
     /// This closes the durable-start-to-executor gap for delegated work: an
     /// exact generation alone is not enough once its lease has expired.
@@ -1884,6 +1960,10 @@ impl RunEngine {
         execution_deadline: Option<tokio::time::Instant>,
     ) -> Result<RunExecutionAuthority, String> {
         if let Some(stage) = context.collaborator_stage.take() {
+            let lease_expires_at = self
+                .store
+                .owner_lease_duration()
+                .map(|ttl| tokio::time::Instant::now() + ttl);
             let receipt = self
                 .admit_collaborator_stage(
                     run_id,
@@ -1906,6 +1986,7 @@ impl RunEngine {
             }
             return Ok(RunExecutionAuthority {
                 owner_generation: receipt.owner_generation,
+                owner_lease_expires_at: lease_expires_at,
             });
         }
         let build_record = self.build_run_start_record(
@@ -1928,16 +2009,10 @@ impl RunEngine {
         if execution_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
             return Err("sub-run deadline expired before durable admission".to_string());
         }
-        let owner_generation = record.run_generation;
         match execution_deadline {
-            Some(deadline) => {
-                self.store
-                    .insert_run_with_deadline(record, deadline)
-                    .await?;
-            }
-            None => self.store.insert_run(record).await?,
+            Some(deadline) => self.store.insert_run_with_deadline(record, deadline).await,
+            None => self.store.insert_run(record).await,
         }
-        Ok(RunExecutionAuthority { owner_generation })
     }
 
     /// Admit one stage through the same run-record construction and store as
@@ -5139,6 +5214,108 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn committed_start_keeps_its_original_lease_after_delayed_acknowledgement() {
+        let store = Arc::new(
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120)),
+        );
+        let engine = RunEngine::new(store);
+        let before_creation = tokio::time::Instant::now();
+        let authority = engine.start_run("fresh", "user", "session").await.unwrap();
+        assert_eq!(authority.owner_generation, 0);
+        assert_eq!(
+            authority.owner_lease_expires_at,
+            Some(before_creation + Duration::from_secs(120))
+        );
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let token = Arc::new(tokio_util::sync::CancellationToken::new());
+        let ExecutionAuthorityConfirmation::Confirmed(confirmed) = engine
+            .confirm_started_execution_authority(authority, &token)
+            .unwrap()
+        else {
+            panic!("the committed initial lease is still live")
+        };
+        assert_eq!(
+            confirmed.owner_lease_fence_deadline,
+            Some(before_creation + Duration::from_secs(105))
+        );
+
+        let heartbeat = engine
+            .start_owner_lease_heartbeat(
+                "user".into(),
+                "session".into(),
+                "fresh".into(),
+                0,
+                confirmed,
+                Arc::new(AtomicBool::new(false)),
+                token.clone(),
+            )
+            .unwrap();
+        assert!(matches!(
+            engine
+                .confirm_local_execution_authority("user", "session", "fresh", 0, &token)
+                .unwrap(),
+            ExecutionAuthorityConfirmation::Confirmed(_)
+        ));
+        assert!(matches!(
+            engine
+                .confirm_local_execution_authority("user", "session", "fresh", 1, &token)
+                .unwrap(),
+            ExecutionAuthorityConfirmation::Superseded
+        ));
+        drop(heartbeat);
+        assert!(matches!(
+            engine
+                .confirm_local_execution_authority("user", "session", "fresh", 0, &token)
+                .unwrap(),
+            ExecutionAuthorityConfirmation::Superseded
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn committed_start_cannot_activate_after_its_lease_window_or_cancellation() {
+        let store = Arc::new(
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite)
+                .with_owner_lease_policy(Duration::from_secs(15), Duration::from_secs(120)),
+        );
+        let engine = RunEngine::new(store);
+        let authority = engine
+            .start_run("expired", "user", "session")
+            .await
+            .unwrap();
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        assert!(
+            engine
+                .confirm_started_execution_authority(authority, &token)
+                .is_err()
+        );
+
+        tokio::time::advance(Duration::from_secs(106)).await;
+        assert!(matches!(
+            engine
+                .confirm_started_execution_authority(
+                    authority,
+                    &tokio_util::sync::CancellationToken::new()
+                )
+                .unwrap(),
+            ExecutionAuthorityConfirmation::Superseded
+        ));
+        assert!(
+            engine
+                .confirm_started_execution_authority(
+                    RunExecutionAuthority {
+                        owner_generation: 0,
+                        owner_lease_expires_at: None
+                    },
+                    &tokio_util::sync::CancellationToken::new()
+                )
+                .is_err()
+        );
+    }
+
     #[test]
     fn production_owner_lease_policy_preserves_two_complete_attempts() {
         let policy = OwnerLeasePolicy::new(Duration::from_secs(120), Duration::from_secs(15));
@@ -7215,8 +7392,18 @@ mod tests {
             self.inner.reconcile_execution_handoff(claim).await
         }
 
-        async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
-            self.inner.insert_run(record).await
+        async fn insert_run(
+            &self,
+            record: DurableRunRecord,
+        ) -> Result<RunExecutionAuthority, String> {
+            let authority = RunExecutionAuthority {
+                owner_generation: record.run_generation,
+                owner_lease_expires_at: self
+                    .owner_lease_duration()
+                    .map(|ttl| tokio::time::Instant::now() + ttl),
+            };
+            self.inner.insert_run(record).await?;
+            Ok(authority)
         }
 
         async fn claim_run_start(

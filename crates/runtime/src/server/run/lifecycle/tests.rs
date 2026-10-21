@@ -10266,6 +10266,7 @@ pub(crate) struct FaultInjectedRunStateStore {
     interaction_wait_release: Option<Arc<tokio::sync::Notify>>,
     counters: StdMutex<FaultInjectedRunStoreCounters>,
     append_delay: Duration,
+    run_start_ack_delay: Duration,
     cancellation_discovery_delay: Duration,
     terminal_transition_delay: Duration,
     terminal_transition_release: Option<Arc<tokio::sync::Semaphore>>,
@@ -10276,8 +10277,7 @@ pub(crate) struct FaultInjectedRunStateStore {
     activation_renewal_entered: Option<Arc<tokio::sync::Notify>>,
     activation_renewal_refused: bool,
     live_owner_lease: bool,
-    refuse_final_activation: bool,
-    owner_lease_renewals: AtomicUsize,
+    refuse_background_renewal: bool,
     descendant_transition_entered: Option<Arc<tokio::sync::Notify>>,
     descendant_transition_release: Option<Arc<tokio::sync::Notify>>,
     blocked_descendant_run_id: Option<String>,
@@ -10287,15 +10287,19 @@ pub(crate) struct FaultInjectedRunStateStore {
 }
 
 impl FaultInjectedRunStateStore {
-    fn with_refused_final_activation(mut self) -> Self {
-        self.live_owner_lease = true;
-        self.refuse_final_activation = true;
-        self
+    fn with_refused_background_renewal(mut self) -> Self {
+        self.refuse_background_renewal = true;
+        self.with_live_owner_lease()
     }
 
     fn with_live_owner_lease(mut self) -> Self {
         self.live_owner_lease = true;
         self
+    }
+
+    fn with_run_start_ack_delay(mut self, delay: Duration) -> Self {
+        self.run_start_ack_delay = delay;
+        self.with_live_owner_lease()
     }
 
     pub(crate) fn new(fail_status_calls: &[usize], fail_append_calls: &[usize]) -> Self {
@@ -10319,6 +10323,7 @@ impl FaultInjectedRunStateStore {
             interaction_wait_release: None,
             counters: StdMutex::new(FaultInjectedRunStoreCounters::default()),
             append_delay: Duration::ZERO,
+            run_start_ack_delay: Duration::ZERO,
             cancellation_discovery_delay: Duration::ZERO,
             terminal_transition_delay: Duration::ZERO,
             terminal_transition_release: None,
@@ -10329,8 +10334,7 @@ impl FaultInjectedRunStateStore {
             activation_renewal_entered: None,
             activation_renewal_refused: false,
             live_owner_lease: false,
-            refuse_final_activation: false,
-            owner_lease_renewals: AtomicUsize::new(0),
+            refuse_background_renewal: false,
             descendant_transition_entered: None,
             descendant_transition_release: None,
             blocked_descendant_run_id: None,
@@ -10409,7 +10413,7 @@ impl FaultInjectedRunStateStore {
 
     fn with_pending_activation_renewal(mut self, entered: Arc<tokio::sync::Notify>) -> Self {
         self.activation_renewal_entered = Some(entered);
-        self
+        self.with_live_owner_lease()
     }
 
     fn with_blocked_descendant_run_transition(
@@ -10435,7 +10439,7 @@ impl FaultInjectedRunStateStore {
 
     fn with_refused_activation_renewal(mut self) -> Self {
         self.activation_renewal_refused = true;
-        self
+        self.with_live_owner_lease()
     }
 
     fn terminal_transition_entries(&self) -> usize {
@@ -10656,8 +10660,19 @@ impl RunStateStore for FaultInjectedRunStateStore {
         self.inner.claim_recoverable_active_runs(limit).await
     }
 
-    async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
-        self.inner.insert_run(record).await
+    async fn insert_run(
+        &self,
+        record: DurableRunRecord,
+    ) -> Result<crate::server::run::engine::RunExecutionAuthority, String> {
+        let authority = crate::server::run::engine::RunExecutionAuthority {
+            owner_generation: record.run_generation,
+            owner_lease_expires_at: self
+                .owner_lease_duration()
+                .map(|ttl| tokio::time::Instant::now() + ttl),
+        };
+        self.inner.insert_run(record).await?;
+        tokio::time::sleep(self.run_start_ack_delay).await;
+        Ok(authority)
     }
 
     async fn request_run_cancellation(&self, user_id: &str, run_id: &str) -> Result<bool, String> {
@@ -10774,9 +10789,21 @@ impl RunStateStore for FaultInjectedRunStateStore {
         record: DurableRunRecord,
         requested_session_id: Option<&str>,
     ) -> Result<DurableRunStartClaim, String> {
-        self.inner
+        let authority = crate::server::run::engine::RunExecutionAuthority {
+            owner_generation: record.run_generation,
+            owner_lease_expires_at: self
+                .owner_lease_duration()
+                .map(|ttl| tokio::time::Instant::now() + ttl),
+        };
+        let claim = self
+            .inner
             .claim_run_start(record, requested_session_id)
-            .await
+            .await?;
+        tokio::time::sleep(self.run_start_ack_delay).await;
+        Ok(match claim {
+            DurableRunStartClaim::Started { .. } => DurableRunStartClaim::Started { authority },
+            other => other,
+        })
     }
 
     async fn load_run(
@@ -11204,6 +11231,9 @@ impl RunStateStore for FaultInjectedRunStateStore {
                 .await?;
             return Ok(false);
         }
+        if self.refuse_background_renewal && !self.append_delay.is_zero() {
+            tokio::time::sleep(self.append_delay).await;
+        }
         self.inner
             .append_events_if_current_generation_and_status(
                 user_id,
@@ -11317,8 +11347,7 @@ impl RunStateStore for FaultInjectedRunStateStore {
         if let Some(entered) = self.activation_renewal_entered.as_ref() {
             entered.notify_one();
         }
-        let renewal = self.owner_lease_renewals.fetch_add(1, Ordering::SeqCst);
-        if self.activation_renewal_refused || (self.refuse_final_activation && renewal > 0) {
+        if self.activation_renewal_refused || self.refuse_background_renewal {
             Ok(false)
         } else if self.activation_renewal_entered.is_some() {
             std::future::pending::<Result<bool, String>>().await
@@ -15771,7 +15800,10 @@ fn subrun_authority_binding_rejects_missing_mismatched_and_wrong_domain_capabili
         let result = config.bind_execution_authority(
             case.durable,
             case.admitted.map(|owner_generation| {
-                crate::server::run::engine::RunExecutionAuthority { owner_generation }
+                crate::server::run::engine::RunExecutionAuthority {
+                    owner_generation,
+                    owner_lease_expires_at: None,
+                }
             }),
         );
         match case.expected {
@@ -22991,11 +23023,14 @@ async fn streamed_edge_approval_reaches_current_observer_before_cancellation() {
     crate::server::run::cleanup_run_session_fixture(&pool, &owner, &session).await;
 }
 
-#[tokio::test]
-async fn final_activation_refusal_closes_prepared_delivery_and_preserves_recovery_workspace() {
+#[tokio::test(start_paused = true)]
+async fn lease_loss_during_preparation_closes_delivery_and_preserves_recovery_workspace() {
     for streaming in [false, true] {
-        let store =
-            Arc::new(FaultInjectedRunStateStore::new(&[], &[]).with_refused_final_activation());
+        let store = Arc::new(
+            FaultInjectedRunStateStore::new(&[], &[])
+                .with_refused_background_renewal()
+                .with_append_delay(Duration::from_millis(1500)),
+        );
         let directory = Arc::new(tempfile::tempdir().unwrap());
         let svc = test_service_with_store(store.clone())
             .with_fixture_workspace_provider(directory, "final-activation-provider");
@@ -23014,9 +23049,11 @@ async fn final_activation_refusal_closes_prepared_delivery_and_preserves_recover
         } else {
             err(svc.create_run("user-1".into(), request).await)
         };
+        // The heartbeat cancels preparation before runtime-context publication,
+        // so that existing guard rejects the run before final activation.
         assert_eq!(
             result.1.0.error_code.as_deref(),
-            Some("execution_authority_not_current")
+            Some("runtime_context_publication_fenced")
         );
         assert!(svc.runs.read().await.is_empty());
         assert!(svc.approval_channels.lock().await.is_empty());
@@ -23084,10 +23121,80 @@ async fn preparation_failure_keeps_lease_until_terminal_commit_and_releases_sess
 }
 
 #[tokio::test]
-async fn refused_activation_returns_coded_conflict_without_rejecting_durable_admission() {
-    for entrypoint in ["create", "stream", "idempotent_stream", "cloud"] {
+async fn fresh_run_uses_committed_lease_before_preparation() {
+    let store =
+        Arc::new(FaultInjectedRunStateStore::new(&[], &[]).with_refused_activation_renewal());
+    let svc = test_service_with_store(store.clone()).with_run_concurrency_limit(1);
+    let permit = svc.test_run_semaphore().acquire_owned().await.unwrap();
+    let mut request = test_request("start from the committed owner lease");
+    request.session_id = Some("committed-start-session".into());
+
+    // The run creation is committed, but a different pooled connection cannot
+    // yet match it for renewal. Initial execution must use the creation's
+    // bounded lease proof rather than treating that stale snapshot as a loss.
+    let started = ok(svc.create_run("user-1".into(), request).await);
+    assert_eq!(started.session_id, "committed-start-session");
+    let run = store
+        .load_run("user-1", &started.run_id)
+        .await
+        .unwrap()
+        .expect("the accepted run is durable");
+    assert_eq!(run.session_id, started.session_id);
+    assert_eq!(run.run_generation, 0);
+    ok(svc.cancel_run(started.run_id, "user-1".into()).await);
+    drop(permit);
+}
+
+#[tokio::test]
+async fn fresh_stream_uses_committed_lease_for_new_and_idempotent_starts() {
+    for idempotent in [false, true] {
         let store =
             Arc::new(FaultInjectedRunStateStore::new(&[], &[]).with_refused_activation_renewal());
+        let svc = test_service_with_store(store.clone()).with_run_concurrency_limit(1);
+        let permit = svc.test_run_semaphore().acquire_owned().await.unwrap();
+        let mut request = test_request("start streaming from the committed owner lease");
+        request.session_id = Some("committed-stream-session".into());
+        if idempotent {
+            request.run_start_idempotency = Some(
+                RunStartIdempotency::new(
+                    RunStartIdempotencyKind::WorkTurn,
+                    "committed-stream-run",
+                    "a".repeat(64),
+                )
+                .unwrap(),
+            );
+        }
+        let stream = ok(svc.stream_chat("user-1".into(), request.clone()).await);
+        assert_eq!(stream.session_id, "committed-stream-session");
+        let original = store
+            .load_run("user-1", &stream.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.run_generation, 0);
+        if idempotent {
+            let replay = ok(svc.stream_chat("user-1".into(), request).await);
+            assert_eq!(replay.run_id, stream.run_id);
+            let retained = store
+                .load_run("user-1", &stream.run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained.created_at, original.created_at);
+            assert_eq!(retained.run_generation, original.run_generation);
+        }
+        ok(svc.cancel_run(stream.run_id.clone(), "user-1".into()).await);
+        drop(permit);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_start_receipt_returns_coded_conflict_without_rejecting_durable_admission() {
+    for entrypoint in ["create", "stream", "idempotent_stream", "cloud"] {
+        let store = Arc::new(
+            FaultInjectedRunStateStore::new(&[], &[])
+                .with_run_start_ack_delay(Duration::from_secs(3)),
+        );
         let svc = test_service_with_store(store);
         let mut request = test_request("hello");
         request.session_id = Some("authority-session".into());

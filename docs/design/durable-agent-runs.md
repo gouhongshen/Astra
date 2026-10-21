@@ -131,9 +131,23 @@ or evidence that same-run recovery is implemented.
   there is no unconditional status writer. Cancellation requires its existing
   typed authority and settlement flow, never a status-only write.
 - Lease expiry enables recovery.
-- Start activation whose owner renewal no longer matches returns HTTP 409 with
-  `execution_authority_not_current`. This does not prove lease expiry: owner,
-  generation, status, cancellation, or lease predicates may have changed.
+- Fresh creation returns one process-local receipt for the owner generation
+  and initial lease committed with the run, session slot and opening events.
+  Initial activation consumes that receipt instead of renewing through another
+  pooled connection, whose MatrixOne CN snapshot may predate the creation.
+  Its monotonic lease bound starts before the creation operation, including
+  commit-receipt reconciliation, and retains the normal safety margin. A late
+  acknowledgement never resets that bound; an exhausted bound cannot execute.
+  Exact replays return the existing run identity without fresh authority.
+- Preparation starts the existing owner heartbeat immediately. Final activation
+  checks that same live, exact-generation local lease. Periodic renewal and
+  provider/tool-boundary database authorization keep their existing owner,
+  generation, status, cancellation and expiry predicates; recovery and resumed
+  execution must still establish current authority through their durable paths.
+- Start activation without live execution authority returns HTTP 409 with
+  `execution_authority_not_current`. A refused durable renewal does not prove
+  lease expiry: owner, generation, status, cancellation, or lease predicates
+  may have changed.
   The persisted run remains subject to durable recovery, not pre-admission
   rejection. Logs identify the activation stage, session, run and expected
   generation; clients should inspect session status before another submission.

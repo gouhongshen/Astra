@@ -8851,9 +8851,7 @@ impl AgenticRunLifecycleService {
                 .run_engine
                 .start_run_with_context(run_id, user_id, session_id, context)
                 .await
-                .map(|authority| DurableRunStartClaim::Started {
-                    owner_generation: authority.owner_generation,
-                }),
+                .map(|authority| DurableRunStartClaim::Started { authority }),
             RunStartPersistenceMode::ClaimOrReplay => {
                 self.run_engine
                     .claim_run_with_context(
@@ -17147,7 +17145,7 @@ impl AgenticRunLifecycleService {
 
         // Win the durable session slot before provisioning any resources.
         // Exact retries attach to the winner instead of repeating preparation.
-        let execution_owner_generation = match self
+        let execution_start_authority = match self
             .persist_run_start(
                 &run_id,
                 &user_id,
@@ -17167,7 +17165,7 @@ impl AgenticRunLifecycleService {
             )
             .await?
         {
-            DurableRunStartClaim::Started { owner_generation } => Some(owner_generation),
+            DurableRunStartClaim::Started { authority } => authority,
             DurableRunStartClaim::Existing {
                 start_request_fingerprint,
                 ..
@@ -17192,6 +17190,8 @@ impl AgenticRunLifecycleService {
             }
         };
 
+        let execution_owner_generation = execution_start_authority.owner_generation;
+
         // A new start claim is already a durable execution owner. Its
         // lease must be activated before workspace provisioning, catalog
         // checks, fanout setup, or Work projection can await external systems.
@@ -17200,64 +17200,55 @@ impl AgenticRunLifecycleService {
         // before the later activation check notices.
         let (mut run_state, cancel_flag, pause_flag, llm_cancel_token, execution_lease_lost) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
-        let mut owner_lease_heartbeat = None;
-        if let Some(owner_generation) = execution_owner_generation {
-            let early_authority_confirmation = self
-                .run_engine
-                .confirm_execution_authority(
-                    &user_id,
-                    &session_id,
-                    &run_id,
+        let owner_generation = execution_owner_generation;
+        let early_authority_confirmation = self.run_engine.confirm_started_execution_authority(
+            execution_start_authority,
+            llm_cancel_token.as_ref(),
+        );
+        let confirmed_authority = match early_authority_confirmation {
+            Ok(ExecutionAuthorityConfirmation::Confirmed(confirmed)) => confirmed,
+            failed => {
+                // Creation has committed, but a spent receipt cannot grant
+                // execution. No provider/tool side effect has started. Keep
+                // the original lease bound and leave the durable Running row
+                // to exact-generation recovery instead of refreshing it from
+                // a later snapshot or extending its clock after COMMIT.
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    user_id,
+                    run_id,
                     owner_generation,
-                    llm_cancel_token.as_ref(),
-                )
-                .await;
-            let confirmed_authority = match early_authority_confirmation {
-                Ok(ExecutionAuthorityConfirmation::Confirmed(confirmed)) => confirmed,
-                failed => {
-                    // A timeout here normally means the durable store itself is
-                    // unavailable. Issuing a second synchronous terminal write
-                    // against that same store would undo the activation bound.
-                    // No provider/tool side effect has started, so drop only the
-                    // process-local projection and let the exact-generation lease
-                    // recovery path reconcile the durable Running row.
-                    tracing::warn!(
-                        target: "astra_runtime::run_lifecycle",
-                        user_id,
-                        run_id,
-                        owner_generation,
-                        "idempotent run activation failed before side effects; durable recovery owns the row"
-                    );
-                    return match failed {
-                        Ok(ExecutionAuthorityConfirmation::Superseded) => {
-                            Err(execution_authority_not_current_response(
-                                "after_idempotent_claim",
-                                &user_id,
-                                &session_id,
-                                &run_id,
-                                owner_generation,
-                            ))
-                        }
-                        Err(error) => Err(error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("failed to activate durable execution authority: {error}"),
-                        )),
-                        Ok(ExecutionAuthorityConfirmation::Confirmed(_)) => {
-                            unreachable!("matched above")
-                        }
-                    };
-                }
-            };
-            owner_lease_heartbeat = self.run_engine.start_owner_lease_heartbeat(
-                user_id.clone(),
-                session_id.clone(),
-                run_id.clone(),
-                owner_generation,
-                confirmed_authority,
-                execution_lease_lost.clone(),
-                llm_cancel_token.clone(),
-            );
-        }
+                    "idempotent run activation failed before side effects; durable recovery owns the row"
+                );
+                return match failed {
+                    Ok(ExecutionAuthorityConfirmation::Superseded) => {
+                        Err(execution_authority_not_current_response(
+                            "after_idempotent_claim",
+                            &user_id,
+                            &session_id,
+                            &run_id,
+                            owner_generation,
+                        ))
+                    }
+                    Err(error) => Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to activate durable execution authority: {error}"),
+                    )),
+                    Ok(ExecutionAuthorityConfirmation::Confirmed(_)) => {
+                        unreachable!("matched above")
+                    }
+                };
+            }
+        };
+        let mut owner_lease_heartbeat = self.run_engine.start_owner_lease_heartbeat(
+            user_id.clone(),
+            session_id.clone(),
+            run_id.clone(),
+            owner_generation,
+            confirmed_authority,
+            execution_lease_lost.clone(),
+            llm_cancel_token.clone(),
+        );
 
         let mut cloud_workspace_record = None;
         let mut delivery: Option<OwnedStreamDelivery> = None;
@@ -17366,8 +17357,7 @@ impl AgenticRunLifecycleService {
             if let Some(snapshot) = execution_bindings.as_ref() {
                 let binding_events =
                     binding_snapshot_events(&run_id, &session_id, snapshot, &completion_checks);
-                let owner_generation = execution_owner_generation
-                    .expect("an idempotent start claim owns an execution generation");
+                let owner_generation = execution_owner_generation;
                 let binding_commit = self
                     .run_engine
                     .append_events_if_current_generation_and_status(
@@ -17487,13 +17477,13 @@ impl AgenticRunLifecycleService {
                 &edge_context,
                 Some(&edge_profile),
                 &runtime_capabilities,
-                execution_owner_generation,
+                Some(execution_owner_generation),
                 &facts.hooks,
             );
             let mut state = Self::assemble_loop_state(environment, facts);
             install_active_personal_skills(&mut state, active_personal_skills);
             state.context_manifest_user_id = Some(user_id.clone());
-            state.current_run_owner_generation = execution_owner_generation;
+            state.current_run_owner_generation = Some(execution_owner_generation);
             state.runtime_manifest = Self::build_runtime_manifest(
                 &request,
                 &runtime_capabilities,
@@ -17713,8 +17703,6 @@ impl AgenticRunLifecycleService {
                     "execution_local_projection_conflict",
                 ));
             }
-            let execution_owner_generation = execution_owner_generation
-                .expect("every newly executing stream owns its durable generation");
             if let (Some(snapshot), Some(event_tx)) =
                 (execution_bindings.as_ref(), event_tx.as_ref())
             {
@@ -17961,16 +17949,14 @@ impl AgenticRunLifecycleService {
 
             // Reconfirm the same generation immediately before activation.
             bind_execution_owner_generation(&mut state, execution_owner_generation);
-            let execution_authority_confirmation = self
-                .run_engine
-                .confirm_execution_authority(
+            let execution_authority_confirmation =
+                self.run_engine.confirm_local_execution_authority(
                     &user_id,
                     &session_id,
                     &run_id,
                     execution_owner_generation,
                     llm_cancel_token.as_ref(),
-                )
-                .await;
+                );
             match execution_authority_confirmation {
                 Ok(ExecutionAuthorityConfirmation::Confirmed(_)) => {}
                 failed => {
@@ -18024,7 +18010,7 @@ impl AgenticRunLifecycleService {
                 cancel_flag,
                 pause_flag,
                 llm_cancel_token: llm_cancel_token.clone(),
-                execution_lease_lost,
+                execution_lease_lost: execution_lease_lost.clone(),
                 descendant_spawner: stream_agent_spawner,
                 delivery: delivery.take(),
             })
@@ -18036,32 +18022,35 @@ impl AgenticRunLifecycleService {
                 event_rx,
             }),
             Err(error) => {
-                let generation =
-                    execution_owner_generation.expect("new execution was durably claimed");
-                let committed = if authority_unconfirmed {
-                    false
-                } else {
-                    let events = pre_spawn_failure_terminal_events(
-                        &error.1.0.detail,
-                        PreSpawnFailureCode::PreSpawnFailure,
-                    );
-                    matches!(
-                        self.run_engine
-                            .commit_terminal_status_with_events_if_current_owner(
-                                &user_id,
-                                &session_id,
-                                &run_id,
-                                &[STATUS_RUNNING, STATUS_PAUSED, STATUS_WAITING],
-                                generation,
-                                STATUS_FAILED,
-                                None,
-                                Some(&error.1.0.detail),
-                                &events,
-                            )
-                            .await,
-                        Ok(TerminalTransitionOutcome::Committed(_))
-                    )
-                };
+                let generation = execution_owner_generation;
+                // A heartbeat can lose ownership before preparation reaches
+                // final activation. That producer must not settle the run;
+                // leave its durable row and workspace to fenced recovery.
+                let committed =
+                    if authority_unconfirmed || execution_lease_lost.load(Ordering::Acquire) {
+                        false
+                    } else {
+                        let events = pre_spawn_failure_terminal_events(
+                            &error.1.0.detail,
+                            PreSpawnFailureCode::PreSpawnFailure,
+                        );
+                        matches!(
+                            self.run_engine
+                                .commit_terminal_status_with_events_if_current_owner(
+                                    &user_id,
+                                    &session_id,
+                                    &run_id,
+                                    &[STATUS_RUNNING, STATUS_PAUSED, STATUS_WAITING],
+                                    generation,
+                                    STATUS_FAILED,
+                                    None,
+                                    Some(&error.1.0.detail),
+                                    &events,
+                                )
+                                .await,
+                            Ok(TerminalTransitionOutcome::Committed(_))
+                        )
+                    };
                 let mut runs = self.runs.write().await;
                 let owns_local = runs
                     .get(&run_id)
@@ -23762,6 +23751,7 @@ impl ServerSubRunExecutor {
 struct DurableSubrunAdmission {
     owner_generation: u64,
     root_run_id: String,
+    initial_authority: Option<crate::server::run::engine::RunExecutionAuthority>,
 }
 
 impl ServerSubRunExecutor {
@@ -24683,6 +24673,7 @@ impl ServerSubRunExecutor {
             return Ok(Some(DurableSubrunAdmission {
                 owner_generation: expected_generation,
                 root_run_id,
+                initial_authority: None,
             }));
         }
         if let Some(expected_generation) = config.execution_owner_generation {
@@ -24812,6 +24803,7 @@ impl ServerSubRunExecutor {
                 Some(DurableSubrunAdmission {
                     owner_generation: authority.owner_generation,
                     root_run_id,
+                    initial_authority: Some(authority),
                 })
             })
     }
@@ -25901,6 +25893,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             let execution_authority = durable_admission.as_ref().map(|admission| {
                 crate::server::run::engine::RunExecutionAuthority {
                     owner_generation: admission.owner_generation,
+                    owner_lease_expires_at: None,
                 }
             });
             let durable_run_engine = self.durable_run_engine();
@@ -25914,16 +25907,24 @@ impl SubRunExecutor for ServerSubRunExecutor {
             let confirmed_execution_authority = if let (Some(engine), Some(authority)) =
                 (durable_run_engine.as_ref(), execution_authority)
             {
-                let confirmed = match engine
-                    .confirm_execution_authority(
+                // A child created by this invocation has the same committed
+                // initial lease as a root run. Preclaimed/recovered children
+                // carry only their captured generation and must renew durably.
+                let confirmation = match durable_admission.as_ref()
+                    .and_then(|admission| admission.initial_authority)
+                {
+                    Some(initial) => engine.confirm_started_execution_authority(
+                        initial, local_cancel_token.as_ref(),
+                    ),
+                    None => engine.confirm_execution_authority(
                         &config.user_id,
                         &config.session_id,
                         &config.run_id,
                         authority.owner_generation,
                         local_cancel_token.as_ref(),
-                    )
-                    .await
-                {
+                    ).await,
+                };
+                let confirmed = match confirmation {
                     Ok(ExecutionAuthorityConfirmation::Confirmed(confirmed)) => confirmed,
                     Ok(ExecutionAuthorityConfirmation::Superseded) => {
                         let exact_cancellation = engine

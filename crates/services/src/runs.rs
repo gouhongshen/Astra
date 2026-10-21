@@ -2775,6 +2775,25 @@ impl DurableRunRecord {
     }
 }
 
+/// Process-local evidence of a newly committed run and its initial owner lease.
+/// The deadline is anchored before creation starts, never when COMMIT is
+/// acknowledged. Delayed acknowledgement therefore cannot extend ownership.
+/// This receipt is not persisted or reconstructed from an existing run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurableRunStartAuthority {
+    pub owner_generation: u64,
+    pub owner_lease_expires_at: Option<tokio::time::Instant>,
+}
+
+impl DurableRunStartAuthority {
+    fn before_creation(owner_generation: u64, lease_duration: Option<Duration>) -> Self {
+        Self {
+            owner_generation,
+            owner_lease_expires_at: lease_duration.map(|ttl| tokio::time::Instant::now() + ttl),
+        }
+    }
+}
+
 /// Result of atomically claiming a caller-selected durable run identity.
 ///
 /// Provider retries use this operation to ensure exactly one request creates
@@ -2783,10 +2802,9 @@ impl DurableRunRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DurableRunStartClaim {
     Started {
-        /// Execution-owner epoch installed by the successful start claim.
-        /// Heartbeats and releases must compare this value so an expired
-        /// producer cannot renew or clear a successor's lease.
-        owner_generation: u64,
+        /// Only the request that commits a fresh creation receives authority.
+        /// Exact retries return Existing and cannot start another executor.
+        authority: DurableRunStartAuthority,
     },
     Existing {
         session_id: String,
@@ -2795,6 +2813,17 @@ pub enum DurableRunStartClaim {
     SessionMismatch {
         bound_session_id: String,
     },
+}
+
+impl DurableRunStartClaim {
+    fn into_started_authority(self) -> Result<DurableRunStartAuthority, String> {
+        match self {
+            Self::Started { authority } => Ok(authority),
+            Self::Existing { .. } | Self::SessionMismatch { .. } => {
+                Err("run creation did not acquire fresh execution authority".into())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5831,8 +5860,12 @@ pub trait RunStateStore: Send + Sync {
         None
     }
 
-    /// Insert a new run record.
-    async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String>;
+    /// Commit a new run and return its original owner-lease window. Success
+    /// proves creation; observing an existing identity cannot mint this receipt.
+    async fn insert_run(
+        &self,
+        record: DurableRunRecord,
+    ) -> Result<DurableRunStartAuthority, String>;
 
     /// Derive correlation from the real dispatched invocation and original
     /// Run admission, never from a client's generation or decision snapshot.
@@ -5909,7 +5942,7 @@ pub trait RunStateStore: Send + Sync {
         &self,
         record: DurableRunRecord,
         deadline: tokio::time::Instant,
-    ) -> Result<(), String> {
+    ) -> Result<DurableRunStartAuthority, String> {
         tokio::time::timeout_at(deadline, self.insert_run(record))
             .await
             .map_err(|_| {
@@ -7062,6 +7095,10 @@ impl InMemoryRunStateStore {
         claim_existing: bool,
         requested_session_id: Option<&str>,
     ) -> Result<DurableRunStartClaim, String> {
+        let authority = DurableRunStartAuthority::before_creation(
+            record.run_generation,
+            self.owner_lease_duration(),
+        );
         if let Some(owner_pod_id) = self.execution_owner_pod_id.as_ref() {
             record.owner_pod_id = Some(owner_pod_id.clone());
             record.owner_lease_expires_at = Some(
@@ -7148,9 +7185,7 @@ impl InMemoryRunStateStore {
         }
         self.sync_projection(&inserted, Some("run_started".to_string()), None)
             .await;
-        Ok(DurableRunStartClaim::Started {
-            owner_generation: inserted.run_generation,
-        })
+        Ok(DurableRunStartClaim::Started { authority })
     }
 }
 
@@ -8341,10 +8376,13 @@ impl RunStateStore for InMemoryRunStateStore {
         self.execution_owner_pod_id.as_deref()
     }
 
-    async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
+    async fn insert_run(
+        &self,
+        record: DurableRunRecord,
+    ) -> Result<DurableRunStartAuthority, String> {
         self.insert_run_record(record, false, None)
-            .await
-            .map(|_| ())
+            .await?
+            .into_started_authority()
     }
 
     async fn commit_pre_durable_child_terminal(
@@ -15505,6 +15543,8 @@ impl DatabaseRunStateStore {
             return Err("durable run admission deadline expired before the insert began".into());
         }
         let initial_event_rows = self.prepare_initial_run_event_rows(&mut record)?;
+        let admission_authority =
+            DurableRunStartAuthority::before_creation(record.run_generation, Some(self.lease_ttl));
         let receipt_record = deadline.map(|_| record.clone());
         let transaction = self.insert_run_record_transaction(
             record,
@@ -15536,7 +15576,12 @@ impl DatabaseRunStateStore {
                         run_id = %expected.run_id,
                         "reconciled timed-out run-start commit from exact durable receipts"
                     );
-                    DurableRunStartClaim::Started { owner_generation }
+                    DurableRunStartClaim::Started {
+                        authority: DurableRunStartAuthority {
+                            owner_generation,
+                            ..admission_authority
+                        },
+                    }
                 }
             },
             None => transaction.await?,
@@ -16815,6 +16860,13 @@ impl DatabaseRunStateStore {
 
         let requires_execution_slot = run_requires_session_execution_slot(&record)
             && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref());
+        // The INSERT commits the owner, generation and initial lease together
+        // with the run, session slot and opening events. MatrixOne can give a
+        // different pooled connection an older CN snapshot, so a second UPDATE
+        // is not a reliable way to rediscover this acknowledged creation.
+        // Carry its original, conservative lease window out of the transaction.
+        let authority =
+            DurableRunStartAuthority::before_creation(record.run_generation, Some(self.lease_ttl));
         let insert_result = match self
             .insert_run_row_tx(&mut tx, &record, &retry_scope, &run_insert_null_shape)
             .await
@@ -17013,12 +17065,7 @@ impl DatabaseRunStateStore {
                 "recovered exact run create commit acknowledgement"
             );
         }
-        Ok((
-            DurableRunStartClaim::Started {
-                owner_generation: record.run_generation,
-            },
-            stage_receipt,
-        ))
+        Ok((DurableRunStartClaim::Started { authority }, stage_receipt))
     }
 }
 
@@ -18549,10 +18596,13 @@ impl RunStateStore for DatabaseRunStateStore {
         Some(&self.owner_pod_id)
     }
 
-    async fn insert_run(&self, record: DurableRunRecord) -> Result<(), String> {
+    async fn insert_run(
+        &self,
+        record: DurableRunRecord,
+    ) -> Result<DurableRunStartAuthority, String> {
         self.insert_run_record(record, false, None)
-            .await
-            .map(|_| ())
+            .await?
+            .into_started_authority()
     }
 
     async fn commit_pre_durable_child_terminal(
@@ -18753,10 +18803,10 @@ impl RunStateStore for DatabaseRunStateStore {
         &self,
         record: DurableRunRecord,
         deadline: tokio::time::Instant,
-    ) -> Result<(), String> {
+    ) -> Result<DurableRunStartAuthority, String> {
         self.insert_run_record_with_deadline(record, false, None, Some(deadline))
-            .await
-            .map(|_| ())
+            .await?
+            .into_started_authority()
     }
 
     async fn claim_run_start(
@@ -32331,6 +32381,67 @@ mod tests {
             cancelled
         );
         cleanup_execution_resume_fixture(&pool, &user, &run_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_creation_returns_initial_lease_without_granting_it_to_replays() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        for lost_ack in [false, true] {
+            let nonce = Uuid::new_v4();
+            let user = format!("start-receipt-user-{nonce}");
+            let session = format!("start-receipt-session-{nonce}");
+            let run_id = format!("start-receipt-run-{nonce}");
+            insert_active_database_session_fixture(&pool, &user, &session).await;
+            let mut record = durable_run_record(&run_id);
+            record.user_id = user.clone();
+            record.session_id = session.clone();
+            let store = if lost_ack {
+                store.clone().with_run_create_commit_ack_loss_once()
+            } else {
+                store.clone()
+            };
+            let before = tokio::time::Instant::now();
+            let DurableRunStartClaim::Started { authority } = store
+                .claim_run_start(record.clone(), Some(&session))
+                .await
+                .unwrap()
+            else {
+                panic!("this request must create the run")
+            };
+            let after = tokio::time::Instant::now();
+            assert_eq!(authority.owner_generation, record.run_generation);
+            let expires = authority
+                .owner_lease_expires_at
+                .expect("durable initial lease");
+            assert!(expires >= before + store.lease_ttl);
+            assert!(expires <= after + store.lease_ttl);
+            let persisted = store.load_run(&user, &run_id).await.unwrap().unwrap();
+            assert_eq!(persisted.session_id, session);
+            assert_eq!(persisted.owner_pod_id.as_deref(), Some("runs-it-pod"));
+            assert_eq!(persisted.run_generation, authority.owner_generation);
+            let replay = store.claim_run_start(record, Some(&session)).await.unwrap();
+            assert!(
+                matches!(replay, DurableRunStartClaim::Existing { session_id, .. }
+                if session_id == session)
+            );
+
+            cleanup_database_run_fixture(&pool, &user, &run_id).await;
+            sqlx::query(
+                "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&user)
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+            sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+                .bind(&user)
+                .bind(&session)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
     }
 
     async fn database_session_lock_wait_timeout(connection: &mut sqlx::MySqlConnection) -> i64 {
