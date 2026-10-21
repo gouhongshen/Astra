@@ -44,6 +44,18 @@ fn criteria(values: &[CriterionResult], outcome: &RunOutcome) -> io::Result<Vec<
                     json!({"kind":"exit", "expected":code, "actual":outcome.exit_code}),
                 Criterion::Judger { threshold, .. } | Criterion::HardJudger { threshold, .. } =>
                     json!({"kind":"judge", "threshold":threshold, "assessment":crate::judger::assessment_status(c)}),
+                Criterion::PromptCacheReuseScope { .. } => {
+                    let diagnostic = c.full_detail.as_deref()
+                        .and_then(|raw| serde_json::from_str::<crate::criteria::CacheScopeDiagnostic>(raw).ok());
+                    match diagnostic {
+                        Some(diagnostic) => {
+                            let mut value = diagnostic.safe_value()?;
+                            value["kind"] = json!("cache_scope");
+                            value
+                        }
+                        None => Value::Null,
+                    }
+                }
                 Criterion::AllOf { .. } | Criterion::AnyOf { .. } => {
                     let nested = c.full_detail.as_deref()
                         .and_then(|raw| serde_json::from_str::<Vec<CriterionResult>>(raw).ok());
@@ -221,6 +233,37 @@ pub async fn observe(
 mod tests {
     use super::*;
     use crate::{report::StepResult, runner::RunOutcome};
+
+    #[test]
+    fn missing_cache_scope_evidence_is_explained_without_publishing_private_data() {
+        let mut outcome = RunOutcome::new("private-sentinel");
+        outcome.stderr = "private-sentinel".into();
+        let checks = crate::criteria::evaluate_deterministic(
+            &[Criterion::PromptCacheReuseScope {
+                scope: crate::case::PromptCacheReuseScope::ConversationTurns,
+            }],
+            &outcome,
+        );
+        let projected = criteria(&checks, &outcome).unwrap();
+        assert_eq!(projected[0]["passed"], false);
+        assert_eq!(projected[0]["diagnostic"]["kind"], "cache_scope");
+        assert_eq!(projected[0]["diagnostic"]["observations"], Value::Null);
+        assert_eq!(
+            projected[0]["diagnostic"]["executions"][0]["capture"],
+            "missing"
+        );
+        assert!(
+            !serde_json::to_string(&projected)
+                .unwrap()
+                .contains("private-sentinel")
+        );
+        let mut bad = checks;
+        let mut diagnostic: Value =
+            serde_json::from_str(bad[0].full_detail.as_deref().unwrap()).unwrap();
+        diagnostic["post_cold_cache_read_tokens"] = json!("private-sentinel");
+        bad[0].full_detail = Some(diagnostic.to_string());
+        assert!(criteria(&bad, &outcome).is_err());
+    }
 
     #[test]
     fn canonical_predicate_failure_reports_counts_without_publishing_documents() {

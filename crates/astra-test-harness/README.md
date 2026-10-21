@@ -236,6 +236,13 @@ and free-form judge diagnostics remain private; public artifacts do not include
 them. Checks without a safe numeric projection explicitly say that their detailed
 payload is withheld. Full private diagnostics remain in the local suite report.
 
+Prompt-cache scope checks retain their grading-time observation count, post-cold
+cache-read sum, and bounded per-execution capture status, identity-match flags,
+scope count, and cache-read counters. This distinguishes a missing/pending explain
+capture from an observed absence of warm reuse without publishing session/run
+identities, prompt content, provider bodies, or raw capture diagnostics. These
+fields explain the existing verdict; they do not change cache-scope acceptance.
+
 Once execution identity is verified, child-adoption checks publish a closed `child_adoption` diagnostic with status
 `proven`, `contradicted`, or `unavailable`, and a fixed failure reason such as
 `child_not_completed`, `fanout_start_repeated`, `model_mismatch`,

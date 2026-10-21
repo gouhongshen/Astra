@@ -108,9 +108,36 @@ def safe_diagnostic(value, depth):
               "sequence": {"matched", "expected"}, "proof": {"proven"},
               "judge": {"threshold", "assessment"}, "unavailable": set(), "composite": {"checks"},
               "child_adoption": {"status", "reason"}}
+    fields["cache_scope"] = {"scope", "observations", "post_cold_cache_read_tokens", "executions", "executions_omitted"}
     if kind not in fields or set(value) != {"kind"} | fields[kind]:
         raise ValueError("unexpected diagnostic payload")
-    if kind == "composite":
+    if kind == "cache_scope":
+        if value["scope"] not in ("conversation_turns", "intra_turn_rounds"):
+            raise ValueError("invalid cache scope")
+        observations, reads = value["observations"], value["post_cold_cache_read_tokens"]
+        if (observations is None) != (reads is None):
+            raise ValueError("incomplete cache observation")
+        if observations is not None:
+            integer(observations)
+            if (not isinstance(reads, str) or not 1 <= len(reads) <= 39
+                or any(c not in "0123456789" for c in reads) or int(reads) >= 1 << 128):
+                raise ValueError("invalid cache read sum")
+        integer(value["executions_omitted"])
+        if not isinstance(value["executions"], list) or len(value["executions"]) > 16:
+            raise ValueError("invalid cache execution evidence")
+        for execution in value["executions"]:
+            if (not isinstance(execution, dict) or set(execution) != {
+                "capture", "run_matches", "session_matches", "scope_count", "cache_read_tokens"}
+                or execution["capture"] not in ("missing", "identity_unverified", "capture_diagnostic",
+                                                "snapshot_pending", "stream_gap", "verified")):
+                raise ValueError("invalid cache capture diagnostic")
+            for key in ("run_matches", "session_matches"):
+                if execution[key] is not None and type(execution[key]) is not bool:
+                    raise ValueError("invalid cache identity diagnostic")
+            for key in ("scope_count", "cache_read_tokens"):
+                if execution[key] is not None:
+                    integer(execution[key])
+    elif kind == "composite":
         safe_criteria(value["checks"], owner_passed=False, depth=depth+1)
     elif kind == "child_adoption":
         status, reason = value["status"], value["reason"]
@@ -256,6 +283,11 @@ def check_lines(items, prefix):
                     reason += "; Attribution: contract mismatch observed; root cause is not established by these counts"
         elif kind == "exit":
             reason = f"expected exit={diagnostic['expected']}, observed exit={diagnostic['actual']}"
+        elif kind == "cache_scope":
+            reason = (f"required scope={diagnostic['scope']}; observations={diagnostic['observations']}; "
+                      f"post-cold cache reads={diagnostic['post_cold_cache_read_tokens']}; "
+                      "execution evidence=" + json.dumps(diagnostic["executions"], sort_keys=True) +
+                      f"; omitted executions={diagnostic['executions_omitted']}")
         elif kind == "sequence":
             reason = f"matched {diagnostic['matched']} of {diagnostic['expected']} ordered tool receipts"
         elif kind == "unavailable":

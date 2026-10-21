@@ -58,6 +58,44 @@ def write_events(root, data, tail=b""):
 
 
 class ManualHarnessProgressTests(unittest.TestCase):
+    def test_cache_scope_evidence_survives_summary_without_regrading(self):
+        diagnostic = {"kind":"cache_scope", "scope":"conversation_turns",
+                      "observations":None, "post_cold_cache_read_tokens":None,
+                      "executions":[{"capture":"snapshot_pending", "run_matches":True,
+                                     "session_matches":True, "scope_count":None,
+                                     "cache_read_tokens":None}], "executions_omitted":0}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = events(("failed",))
+            result = next(e["row"] for e in data if e["type"] == "case_completed")
+            result["steps"] = []
+            result["criteria"] = [{"type":"prompt_cache_reuse_scope", "severity":"hard",
+                                   "score":None, "passed":False, "evaluation":"reported",
+                                   "diagnostic":diagnostic}]
+            write_events(root, data)
+            (root / "report.json").write_text("private-sentinel")
+            (root / "execution.json").write_text(json.dumps({"exit_code":1,"termination":"finished"}))
+            code, summary = self.publish(root, "failure", cli=True)
+            self.assertEqual(code, 1)
+            self.assertIsNone(summary["observation_error"])
+            self.assertEqual(summary["runs"][0]["criteria"][0]["diagnostic"], diagnostic)
+            self.assertIn("snapshot_pending", (root / "job-summary").read_text())
+            self.assertFalse(summary["runs"][0]["criteria"][0]["passed"])
+            self.assertNotIn("private-sentinel", (root / "progress.safe.jsonl").read_text())
+
+    def test_cache_scope_projection_rejects_private_or_malformed_fields(self):
+        valid = {"kind":"cache_scope", "scope":"conversation_turns",
+                 "observations":2, "post_cold_cache_read_tokens":"9800",
+                 "executions":[], "executions_omitted":0}
+        h.safe_diagnostic(valid, 0)
+        for changes in [{"detail":"private-sentinel"}, {"scope":"private-sentinel"},
+                        {"post_cold_cache_read_tokens":"private-sentinel"},
+                        {"post_cold_cache_read_tokens":None}, {"observations":False},
+                        {"post_cold_cache_read_tokens":str(1 << 128)},
+                        {"executions":[{"capture":"private-sentinel"}]}]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                h.safe_diagnostic(dict(valid, **changes), 0)
+
     def test_captured_root_lifecycle_is_a_closed_unavailable_diagnostic(self):
         for state in ("running", "waiting", "paused", "delegated", "interrupted", "failed", "cancelled"):
             diagnostic = {"kind": "child_adoption", "status": "unavailable", "reason": f"root_{state}"}

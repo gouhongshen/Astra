@@ -5197,6 +5197,104 @@ fn assess_cache_read_nonregression(
     })
 }
 
+/// Safe evidence retained at grading time: the aggregate outcome deliberately
+/// drops physical captures, so the progress observer cannot reconstruct this.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CacheScopeDiagnostic {
+    scope: PromptCacheReuseScope,
+    observations: Option<usize>,
+    // Decimal u128 avoids truncating the sum of provider-owned u64 counters.
+    post_cold_cache_read_tokens: Option<String>,
+    executions: Vec<CacheScopeExecutionDiagnostic>,
+    executions_omitted: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacheScopeExecutionDiagnostic {
+    capture: CacheScopeCaptureStatus,
+    run_matches: Option<bool>,
+    session_matches: Option<bool>,
+    scope_count: Option<usize>,
+    cache_read_tokens: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CacheScopeCaptureStatus {
+    Missing,
+    IdentityUnverified,
+    CaptureDiagnostic,
+    SnapshotPending,
+    StreamGap,
+    Verified,
+}
+
+impl CacheScopeDiagnostic {
+    pub(crate) fn safe_value(&self) -> serde_json::Result<serde_json::Value> {
+        if self
+            .post_cold_cache_read_tokens
+            .as_ref()
+            .is_some_and(|value| {
+                value.parse::<u128>().is_err() || value.bytes().any(|b| !b.is_ascii_digit())
+            })
+        {
+            return Err(serde::de::Error::custom("invalid cache read sum"));
+        }
+        serde_json::to_value(self)
+    }
+
+    fn capture(
+        scope: PromptCacheReuseScope,
+        executions: &[&RunOutcome],
+        observed: Option<(usize, u128)>,
+    ) -> String {
+        let session = executions.first().and_then(|o| o.session_id.as_deref());
+        let evidence = executions
+            .iter()
+            .take(16)
+            .map(|execution| {
+                let capture = execution.explain_capture.as_ref();
+                let graph = capture.and_then(|capture| capture.canonical_graph());
+                let status = match capture {
+                    None => CacheScopeCaptureStatus::Missing,
+                    Some(c) if !c.identity_verified => CacheScopeCaptureStatus::IdentityUnverified,
+                    Some(c) if !c.diagnostics.is_empty() => {
+                        CacheScopeCaptureStatus::CaptureDiagnostic
+                    }
+                    Some(c) if c.snapshot_pending => CacheScopeCaptureStatus::SnapshotPending,
+                    Some(c) if c.gap_unrecovered => CacheScopeCaptureStatus::StreamGap,
+                    Some(_) => CacheScopeCaptureStatus::Verified,
+                };
+                CacheScopeExecutionDiagnostic {
+                    capture: status,
+                    run_matches: capture.map(|c| {
+                        c.events
+                            .iter()
+                            .all(|event| execution.run_id.as_deref() == Some(event.run_id.as_str()))
+                    }),
+                    session_matches: session
+                        .filter(|id| !id.is_empty())
+                        .map(|id| execution.session_id.as_deref() == Some(id)),
+                    scope_count: graph.as_ref().map(|g| g.execution_scope_coverage().len()),
+                    cache_read_tokens: graph
+                        .as_ref()
+                        .and_then(|g| g.primary_prompt_cache_read_tokens()),
+                }
+            })
+            .collect();
+        serde_json::to_string(&Self {
+            scope,
+            observations: observed.map(|(count, _)| count),
+            post_cold_cache_read_tokens: observed.map(|(_, reads)| reads.to_string()),
+            executions: evidence,
+            executions_omitted: executions.len().saturating_sub(16),
+        })
+        .expect("bounded numeric cache diagnostic serializes")
+    }
+}
+
 fn evaluate_prompt_cache_reuse_scope(
     criterion: &Criterion,
     scope: PromptCacheReuseScope,
@@ -5212,7 +5310,7 @@ fn evaluate_prompt_cache_reuse_scope(
             severity: criterion_severity(criterion),
             passed: false,
             detail: "required prompt-cache scope: evidence unavailable: incomplete, conflicting, or unordered primary execution coverage".into(),
-            full_detail: None,
+            full_detail: Some(CacheScopeDiagnostic::capture(scope, executions, None)),
             score: None,
         };
     };
@@ -5243,7 +5341,11 @@ fn evaluate_prompt_cache_reuse_scope(
             "required prompt-cache scope={boundary}: observations={observations}, \
              post-cold cache_read_tokens={reuse_reads}, expected >=2 observations and read>0"
         ),
-        full_detail: None,
+        full_detail: Some(CacheScopeDiagnostic::capture(
+            scope,
+            executions,
+            Some((observations, reuse_reads)),
+        )),
         score: None,
     }
 }
@@ -10908,7 +11010,27 @@ mod tests {
         let one = check(&[&cold], conversation);
         assert!(!one.passed);
         assert_eq!(one.severity, CriterionSeverity::Hard);
-        assert!(check(&[&cold, &warm], conversation).passed);
+        let warm_result = check(&[&cold, &warm], conversation);
+        assert!(warm_result.passed);
+        let diagnostic: CacheScopeDiagnostic =
+            serde_json::from_str(warm_result.full_detail.as_deref().unwrap()).unwrap();
+        assert_eq!(diagnostic.observations, Some(2));
+        assert_eq!(
+            diagnostic.post_cold_cache_read_tokens.as_deref(),
+            Some("9800")
+        );
+        assert_eq!(diagnostic.executions[1].cache_read_tokens, Some(9800));
+        let mut pending = warm.clone();
+        pending.explain_capture.as_mut().unwrap().snapshot_pending = true;
+        let pending_result = check(&[&cold, &pending], conversation);
+        assert!(!pending_result.passed);
+        let diagnostic: CacheScopeDiagnostic =
+            serde_json::from_str(pending_result.full_detail.as_deref().unwrap()).unwrap();
+        assert!(diagnostic.observations.is_none());
+        assert!(matches!(
+            diagnostic.executions[1].capture,
+            CacheScopeCaptureStatus::SnapshotPending
+        ));
         assert!(
             !check(&[&cold, &warm], intra).passed,
             "different turns cannot prove intra-run reuse"
