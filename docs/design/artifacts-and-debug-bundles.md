@@ -109,6 +109,19 @@ does not pretty-print or otherwise rewrite those bytes: descriptor hashes,
 byte ranges and recovery windows must all address the same source. Formatting
 belongs to bounded display projections.
 
+The model-facing tool-result reference is `artifact://session/tool-result/result_<sha256>`
+(or `guidance_<sha256>` for the separately identified runtime-guidance document).
+The digest addresses a small immutable descriptor manifest in the same
+owner/session-local tool-result store. It covers the producer run, call,
+document kind, byte length and content digest. The reader verifies the manifest
+and then verifies the original payload through the existing bounded reader.
+Missing, non-regular or changed manifests fail explicitly; references never
+select a nearby result or cross owner/session boundaries. Manifest publication
+is required before a successful recoverable projection is returned. Exact
+replay may finish publication after an interrupted write. Existing inline
+descriptor references in durable histories remain readable and preserve their
+own reference while paging; reading does not create a replacement manifest.
+
 Artifact possession does not grant read authority. Stored result previews and
 compact projections retain the artifact identity without promising a callable
 reader. The shared request assembler derives bounded recovery guidance from
