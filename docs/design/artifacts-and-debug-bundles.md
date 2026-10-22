@@ -115,7 +115,11 @@ The digest addresses a small immutable descriptor manifest in the same
 owner/session-local tool-result store. It covers the producer run, call,
 document kind, byte length and content digest. The reader verifies the manifest
 and then verifies the original payload through the existing bounded reader.
-Missing, non-regular or changed manifests fail explicitly; references never
+Serialized manifests have a 64 KiB metadata bound, enforced before publication
+and by a bounded read before hashing or decoding; payload paging limits remain
+independent. Immutable replay requires a regular file for both payloads and
+manifests, and rejects symlinks even when their target has the expected bytes.
+Missing, non-regular, oversized or changed manifests fail explicitly; references never
 select a nearby result or cross owner/session boundaries. Manifest publication
 is required before a successful recoverable projection is returned. Exact
 replay may finish publication after an interrupted write. Existing inline

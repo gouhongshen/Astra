@@ -78,6 +78,8 @@ const TOOL_RESULTS_SUBDIR: &str = "tool-results";
 /// identities.
 const RUN_SCOPED_RESULTS_SUBDIR: &str = "runs";
 const ARTIFACT_MANIFESTS_SUBDIR: &str = "manifests";
+/// Descriptor metadata has a separate bound from the pageable result payload.
+const MAX_ARTIFACT_MANIFEST_BYTES: usize = 64 * 1024;
 
 static NEXT_IMMUTABLE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -538,22 +540,6 @@ fn persist_tool_document(
             "run_id is not a valid durable identifier",
         )));
     }
-    let authoritative_path =
-        run_scoped_document_path(session_dir, run_id, tool_call_id, document_kind);
-    match write_immutable_result(&authoritative_path, content.as_bytes()) {
-        Ok(()) => {}
-        Err(ImmutableWriteError::IdentityConflict) => {
-            return Err(ToolResultPersistenceError::IdentityConflict {
-                run_id: run_id.to_string(),
-                call_id: tool_call_id.to_string(),
-                document_kind,
-            });
-        }
-        Err(ImmutableWriteError::Io(error)) => {
-            return Err(ToolResultPersistenceError::Io(error));
-        }
-    }
-
     let persisted_bytes = content.as_bytes();
     let byte_len = u64::try_from(persisted_bytes.len()).map_err(|_| {
         ToolResultPersistenceError::Io(io::Error::other(
@@ -570,6 +556,27 @@ fn persist_tool_document(
         content_sha256: content_sha256.clone(),
     };
     let (manifest, digest) = encoded_artifact_manifest(&descriptor);
+    if manifest.len() > MAX_ARTIFACT_MANIFEST_BYTES {
+        return Err(ToolResultPersistenceError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tool-result manifest exceeds the descriptor size limit",
+        )));
+    }
+    let authoritative_path =
+        run_scoped_document_path(session_dir, run_id, tool_call_id, document_kind);
+    match write_immutable_result(&authoritative_path, persisted_bytes) {
+        Ok(()) => {}
+        Err(ImmutableWriteError::IdentityConflict) => {
+            return Err(ToolResultPersistenceError::IdentityConflict {
+                run_id: run_id.to_string(),
+                call_id: tool_call_id.to_string(),
+                document_kind,
+            });
+        }
+        Err(ImmutableWriteError::Io(error)) => {
+            return Err(ToolResultPersistenceError::Io(error));
+        }
+    }
     match write_immutable_result(&artifact_manifest_path(session_dir, &digest), &manifest) {
         Ok(()) => {}
         Err(ImmutableWriteError::IdentityConflict) => {
@@ -671,11 +678,9 @@ fn write_immutable_result_with(
 
     let published = match std::fs::hard_link(&temp_path, path) {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => match std::fs::read(path) {
-            Ok(existing) if existing == content => Ok(()),
-            Ok(_) => Err(ImmutableWriteError::IdentityConflict),
-            Err(error) => Err(ImmutableWriteError::Io(error)),
-        },
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            verify_immutable_replay(path, content)
+        }
         Err(error) => Err(ImmutableWriteError::Io(error)),
     };
     if let Err(error) = published {
@@ -690,6 +695,29 @@ fn write_immutable_result_with(
     let sync = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
     cleanup.map_err(ImmutableWriteError::Io)?;
     sync.map_err(ImmutableWriteError::Io)
+}
+
+fn verify_immutable_replay(path: &Path, content: &[u8]) -> Result<(), ImmutableWriteError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(ImmutableWriteError::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ImmutableWriteError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "immutable tool document is not a regular owner-scoped file",
+        )));
+    }
+    if metadata.len() != content.len() as u64 {
+        return Err(ImmutableWriteError::IdentityConflict);
+    }
+    let mut existing = Vec::new();
+    std::fs::File::open(path)
+        .map_err(ImmutableWriteError::Io)?
+        .take((content.len() as u64).saturating_add(1))
+        .read_to_end(&mut existing)
+        .map_err(ImmutableWriteError::Io)?;
+    if existing != content {
+        return Err(ImmutableWriteError::IdentityConflict);
+    }
+    Ok(())
 }
 
 /// Read and verify the complete bytes named by a typed journal descriptor.
@@ -857,8 +885,18 @@ fn resolve_session_tool_result_artifact_uri(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err("tool-result manifest is not a regular owner-scoped file".to_string());
     }
-    let bytes = std::fs::read(&path)
+    if metadata.len() > MAX_ARTIFACT_MANIFEST_BYTES as u64 {
+        return Err("tool-result manifest exceeds the descriptor size limit".to_string());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)
+        .map_err(|error| format!("failed to open tool-result manifest: {error}"))?
+        .take(MAX_ARTIFACT_MANIFEST_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| format!("failed to read tool-result manifest: {error}"))?;
+    if bytes.len() > MAX_ARTIFACT_MANIFEST_BYTES {
+        return Err("tool-result manifest exceeds the descriptor size limit".to_string());
+    }
     if format!("{:x}", Sha256::digest(&bytes)) != digest {
         return Err("tool-result manifest digest does not match its reference".to_string());
     }
@@ -1945,6 +1983,138 @@ mod tests {
                 resolve_session_tool_result_artifact_uri(dir.path(), invalid).is_err(),
                 "{invalid}"
             );
+        }
+    }
+
+    #[test]
+    fn compact_manifest_rejects_oversized_files_before_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let persisted = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-bounded",
+            "call-bounded",
+            "read_file",
+            "evidence",
+        )
+        .unwrap();
+        let reference = session_tool_result_artifact_uri_for_descriptor(&persisted.descriptor);
+        let (_, digest) = encoded_artifact_manifest(&persisted.descriptor);
+        std::fs::File::create(artifact_manifest_path(dir.path(), &digest))
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+        let error = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":reference,"max_bytes":1}),
+        )
+        .unwrap()
+        .unwrap_err();
+        assert!(error.contains("manifest exceeds"), "{error}");
+    }
+
+    #[test]
+    fn compact_manifest_publication_rejects_oversized_descriptors() {
+        let dir = tempfile::tempdir().unwrap();
+        let Err(error) = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-bounded",
+            &"call".repeat(32 * 1024),
+            "read_file",
+            "evidence",
+        ) else {
+            panic!("oversized descriptor must not publish a reference");
+        };
+        assert!(
+            matches!(error, ToolResultPersistenceError::Io(ref error)
+            if error.kind() == io::ErrorKind::InvalidInput),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn immutable_manifest_replay_recovers_after_nonregular_path_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-recovery",
+            "call-recovery",
+            "read_file",
+            "recoverable evidence",
+        )
+        .unwrap();
+        let (_, digest) = encoded_artifact_manifest(&stored.descriptor);
+        let path = artifact_manifest_path(dir.path(), &digest);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let error = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-recovery",
+            "call-recovery",
+            "read_file",
+            "recoverable evidence",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, ToolResultPersistenceError::Io(ref error)
+            if error.kind() == io::ErrorKind::InvalidData),
+            "{error}"
+        );
+        std::fs::remove_dir(path).unwrap();
+        let replay = persist_tool_result_with_descriptor(
+            dir.path(),
+            "run-recovery",
+            "call-recovery",
+            "read_file",
+            "recoverable evidence",
+        )
+        .unwrap();
+        assert_eq!(replay.descriptor, stored.descriptor);
+        let result = resolve_session_tool_result_artifact_request(
+            dir.path(),
+            &serde_json::json!({"artifact":session_tool_result_artifact_uri_for_descriptor(&replay.descriptor)}),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(result.contains("recoverable evidence"), "{result}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_replay_rejects_symlinks_for_payload_and_manifest() {
+        for manifest in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let persisted = persist_tool_result_with_descriptor(
+                dir.path(),
+                "run-replay",
+                "call-replay",
+                "read_file",
+                "evidence",
+            )
+            .unwrap();
+            let path = if manifest {
+                let (_, digest) = encoded_artifact_manifest(&persisted.descriptor);
+                artifact_manifest_path(dir.path(), &digest)
+            } else {
+                run_scoped_result_path(dir.path(), "run-replay", "call-replay")
+            };
+            let target = dir.path().join("replay-target");
+            let expected = std::fs::read(&path).unwrap();
+            std::fs::rename(&path, &target).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            let error = persist_tool_result_with_descriptor(
+                dir.path(),
+                "run-replay",
+                "call-replay",
+                "read_file",
+                "evidence",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, ToolResultPersistenceError::Io(ref error)
+                if error.kind() == io::ErrorKind::InvalidData),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(target).unwrap(), expected);
         }
     }
 
