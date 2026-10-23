@@ -22922,6 +22922,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
             return None;
         }
+        let spill_count = pre_turn_summary_spill_count(&state.messages);
+        if spill_count == 0 {
+            state.compaction_effectiveness.record_futile();
+            tracing::debug!(
+                target: "astra::pre_turn_compaction",
+                pressure,
+                session_id = %self.session_id,
+                "pre-turn compaction skipped because no completed history prefix can be summarized"
+            );
+            return None;
+        }
         let config = match self.resolve_llm_config_for_state(state).await {
             Ok(config) => config,
             Err(error) => {
@@ -22985,17 +22996,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         };
         let client =
             self.pre_turn_summary_client(&config, state, summary_tools, cache_capability)?;
-        let spill_count = pre_turn_summary_spill_count(&state.messages);
-        if spill_count == 0 {
-            state.compaction_effectiveness.record_futile();
-            tracing::debug!(
-                target: "astra::pre_turn_compaction",
-                pressure,
-                session_id = %self.session_id,
-                "pre-turn compaction skipped because active canonical authority protects the entire history"
-            );
-            return None;
-        }
         if let Some(summary_text) = astra_turn_core::cloud_summary::generate_inline_summary(
             &system_messages,
             &state.messages[..spill_count],
@@ -53042,6 +53042,32 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn single_task_pre_turn_compaction_rejects_before_model_resolution() {
+        let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
+        let mut host = test_host_builder("user-no-prefix", "session-no-prefix").build();
+        let mut state = create_test_state();
+        state.messages = vec![json!({"role":"user","content":"Continue the long task"})];
+        for i in 0..16 {
+            state
+                .messages
+                .push(json!({"role":"assistant","content":format!("Observation {i}")}));
+        }
+        let original = state.messages.clone();
+        let event = <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::maybe_pre_turn_compact(
+            &mut host, &mut state, 0.95,
+        ).await;
+        assert!(event.is_none());
+        assert_eq!(state.messages, original);
+        assert!(host.resolved_llm_config.is_none());
+        assert_eq!(
+            state.compaction_effectiveness.consecutive_futile_attempts,
+            1
+        );
+        assert_eq!(state.compact_tier_applied, CompactionTier::Normal);
     }
 
     #[tokio::test]

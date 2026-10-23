@@ -288,3 +288,14 @@ transaction, and session deletion retains bounded owner/session cleanup.
 The durable run retry counter is retired from the fresh schema and Rust record.
 Verification retries retain their `retry_of` and `retry_scope` lineage; recovery
 generations and provider-attempt retry accounting remain separate authorities.
+
+## Empty provider canonical recovery
+
+The canonical transition loader classifies owner-scoped recovery work in one
+statement snapshot. An existing writable Session with no admitted primary
+invocation, no current WAL/head, and no absorbed WAL/head can return an empty
+chain without a reconstruction transaction. Missing/deleting Sessions and
+committed lifecycle fences fail closed. Nonempty state retains the existing
+retirement, expired-owner recovery and fenced reconstruction boundaries.
+The classification grants no inference authority; later provider admission
+still validates its owner, generation, lease, control and canonical frontier.

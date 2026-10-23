@@ -3874,26 +3874,103 @@ pub async fn load_inference_canonical_transitions_for_session(
     )?;
     validate_identity(user_id, "user_id", 128)?;
     validate_identity(session_id, "session_id", 64)?;
-    if let Some(previous_turn) = first_turn.checked_sub(1)
-        && let Err(error) = retire_inference_canonical_transitions_through_turn(
+    // One statement snapshot replaces the separate retirement/reconciliation
+    // preflights for the common empty boundary. It grants no admission authority:
+    // nonempty recovery and subsequent provider admission retain their fences.
+    let mut snapshot_connection = CancellationSafePoolConnection::acquire(pool.get())
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "acquire canonical recovery preflight connection",
+                error,
+            )
+        })?;
+    let snapshot: Option<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT
+            CASE WHEN EXISTS (SELECT 1 FROM inference_canonical_transition_wal
+                              WHERE user_id = ? AND session_id = ? AND turn_index < ?)
+                   OR EXISTS (SELECT 1 FROM inference_canonical_transition_heads
+                              WHERE user_id = ? AND session_id = ? AND turn_index < ?)
+                 THEN 1 ELSE 0 END,
+            CASE WHEN EXISTS (SELECT 1 FROM inference_canonical_transition_wal
+                              WHERE user_id = ? AND session_id = ? AND turn_index = ?)
+                   OR EXISTS (SELECT 1 FROM inference_canonical_transition_heads
+                              WHERE user_id = ? AND session_id = ? AND turn_index = ?)
+                 THEN 1 ELSE 0 END,
+            CASE WHEN EXISTS (SELECT 1 FROM inference_invocations
+                              WHERE user_id = ? AND session_id = ? AND turn_index >= ?
+                                AND scope_kind = 'run' AND purpose = 'primary_agent'
+                                AND status = 'admitted')
+                 THEN 1 ELSE 0 END
+         FROM agent_sessions session_root
+         LEFT JOIN agent_session_lifecycle_fences fence
+           ON fence.user_id = session_root.user_id AND fence.session_id = session_root.session_id
+         WHERE session_root.user_id = ? AND session_root.session_id = ?
+           AND session_root.status <> 'deleting'
+           AND fence.delete_requested_at IS NULL AND fence.database_deleted_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(first_turn))
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(first_turn))
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(first_turn))
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(first_turn))
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(first_turn))
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(snapshot_connection.connection_mut())
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "snapshot canonical transition recovery work",
+            error,
+        )
+    })?;
+    snapshot_connection.release();
+    let (absorbed, current, admitted) = snapshot.ok_or_else(|| {
+        ServiceError::not_found("canonical transition WAL session is unavailable")
+    })?;
+    if absorbed == 0 && current == 0 && admitted == 0 {
+        return Ok(Vec::new());
+    }
+    if absorbed != 0
+        && let Some(previous_turn) = first_turn.checked_sub(1)
+        && let Err(error) = retire_inference_canonical_transitions_through_turn_inner(
             pool,
             user_id,
             session_id,
             previous_turn,
+            false,
         )
         .await
     {
         tracing::warn!(
             target: "astra_services::inference_execution",
-            user_id,
-            session_id,
-            previous_turn,
-            %error,
+            user_id, session_id, previous_turn, %error,
             "failed to retire already-absorbed provider canonical WAL; recovery continues"
         );
     }
-    reconcile_provider_canonical_transition_boundary(pool.get(), user_id, session_id, first_turn)
+    // The snapshot checkout is released before recovery acquires connections.
+    // A racing admission is still rejected by the locked recheck below.
+    if admitted != 0 {
+        reconcile_provider_canonical_transition_boundary(
+            pool.get(),
+            user_id,
+            session_id,
+            first_turn,
+        )
         .await?;
+    }
     // Reconciliation intentionally runs before acquiring the shared session
     // child-write fence because expired-owner recovery needs that same lock.
     // Once fenced, recheck admission inside this transaction: a provider
@@ -4498,6 +4575,23 @@ pub async fn retire_inference_canonical_transitions_through_turn(
     session_id: &str,
     through_turn: u32,
 ) -> ServiceResult<u64> {
+    retire_inference_canonical_transitions_through_turn_inner(
+        pool,
+        user_id,
+        session_id,
+        through_turn,
+        true,
+    )
+    .await
+}
+
+async fn retire_inference_canonical_transitions_through_turn_inner(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    through_turn: u32,
+    check_empty: bool,
+) -> ServiceResult<u64> {
     validate_identity(user_id, "user_id", 128)?;
     validate_identity(session_id, "session_id", 64)?;
     let mut connection = CancellationSafePoolConnection::acquire(pool.get())
@@ -4512,8 +4606,9 @@ pub async fn retire_inference_canonical_transitions_through_turn(
     // Most session boundaries have nothing left to retire. An empty,
     // writable snapshot needs no child-write transaction; nonempty or
     // unavailable snapshots still use the canonical locked boundary below.
-    let pending: Option<i64> = sqlx::query_scalar(
-        "SELECT CASE WHEN
+    if check_empty {
+        let pending: Option<i64> = sqlx::query_scalar(
+            "SELECT CASE WHEN
             EXISTS (SELECT 1 FROM inference_canonical_transition_wal
                     WHERE user_id = ? AND session_id = ? AND turn_index <= ?)
             OR EXISTS (SELECT 1 FROM inference_canonical_transition_heads
@@ -4525,27 +4620,28 @@ pub async fn retire_inference_canonical_transitions_through_turn(
          WHERE session_root.user_id = ? AND session_root.session_id = ?
            AND session_root.status <> 'deleting'
            AND fence.delete_requested_at IS NULL AND fence.database_deleted_at IS NULL",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(i64::from(through_turn))
-    .bind(user_id)
-    .bind(session_id)
-    .bind(i64::from(through_turn))
-    .bind(user_id)
-    .bind(session_id)
-    .fetch_optional(connection.connection_mut())
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "check absorbed inference canonical transition retirement work",
-            error,
         )
-    })?;
-    if pending == Some(0) {
-        connection.release();
-        return Ok(0);
+        .bind(user_id)
+        .bind(session_id)
+        .bind(i64::from(through_turn))
+        .bind(user_id)
+        .bind(session_id)
+        .bind(i64::from(through_turn))
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(connection.connection_mut())
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "check absorbed inference canonical transition retirement work",
+                error,
+            )
+        })?;
+        if pending == Some(0) {
+            connection.release();
+            return Ok(0);
+        }
     }
     let mut tx = connection.begin().await.map_err(|error| {
         ServiceError::with_source(

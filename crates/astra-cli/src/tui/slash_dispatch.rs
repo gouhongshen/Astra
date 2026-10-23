@@ -61,7 +61,58 @@ pub(crate) enum ImmediateControl {
     StopCurrentRun,
 }
 
+/// Classify raw composer text before command dispatch. Queues retain the raw
+/// spelling; literal escapes are removed only when projecting or delivering it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmissionInput<'a> {
+    Conversation(&'a str),
+    Literal(&'a str),
+    Command(&'a str),
+}
+
+impl<'a> SubmissionInput<'a> {
+    pub(crate) fn text(self) -> &'a str {
+        match self {
+            Self::Conversation(text) | Self::Literal(text) | Self::Command(text) => text,
+        }
+    }
+
+    pub(crate) fn is_command(self) -> bool {
+        matches!(self, Self::Command(_))
+    }
+
+    pub(crate) fn is_literal(self) -> bool {
+        matches!(self, Self::Literal(_))
+    }
+}
+
+pub(crate) fn parse_submission(text: &str) -> SubmissionInput<'_> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("//") {
+        SubmissionInput::Literal(&trimmed[1..])
+    } else if trimmed.starts_with('/') {
+        SubmissionInput::Command(text)
+    } else {
+        SubmissionInput::Conversation(text)
+    }
+}
+
+/// Return semantic conversation text to the command-aware composer. Custody
+/// returns carry already decoded text, so escape it again before an Enter can
+/// interpret it as a local control.
+pub(crate) fn conversation_for_composer(text: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with('/') {
+        std::borrow::Cow::Owned(format!("/{trimmed}"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 pub(crate) fn immediate_control(text: &str) -> Option<ImmediateControl> {
+    let SubmissionInput::Command(text) = parse_submission(text) else {
+        return None;
+    };
     let (command, _args) = parse_slash(text);
     match command_registry::resolve_command(command).ok()? {
         "/exit" => Some(ImmediateControl::Exit),
@@ -332,11 +383,11 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 let hints: Vec<&'static str> = scored.into_iter().take(3).map(|(_, n)| n).collect();
                 if hints.is_empty() {
                     ctx.show_error(format!(
-                        "Unknown command: {cmd}  ·  type / to browse all commands"
+                        "Unknown command: {cmd}  ·  type / to browse all commands\nFor literal slash text, use // (for example //tmp/path)."
                     ));
                 } else {
                     ctx.show_error(format!(
-                        "Unknown command: {cmd}  ·  did you mean: {}?",
+                        "Unknown command: {cmd}  ·  did you mean: {}?\nFor literal slash text, use // (for example //tmp/path).",
                         hints.join(", ")
                     ));
                 }
@@ -688,8 +739,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                         .iter()
                         .filter(|manifest| manifest.user_invocable)
                         .count();
-                    ctx.bottom_pane.composer.set_text("$");
-                    ctx.bottom_pane.sync_popups();
+                    ctx.bottom_pane.start_composer_draft("$");
                     ctx.show_response(format!(
                         "Opened skills · {skill_count} available · type to filter"
                     ));
@@ -1596,7 +1646,7 @@ pub(crate) fn handle_display_view_result(result: ViewResult, bottom_pane: &mut B
             ));
         }
         ViewResult::InsertCommand(command) => {
-            bottom_pane.composer.set_text(&format!("{command} "));
+            bottom_pane.start_composer_draft(&format!("{command} "));
         }
         _ => {}
     }
@@ -2903,6 +2953,7 @@ fn keyboard_shortcut_pairs() -> Vec<(&'static str, String)> {
             "Ctrl+Q",
             "queue conversational input for the next turn while working; send normally when idle".into(),
         ),
+        ("//", "send literal slash text: //tmp/path sends /tmp/path; //stop stays a message".into()),
         ("Shift+Enter", "insert a newline in the composer".into()),
         (
             "Ctrl+C",
@@ -2975,6 +3026,9 @@ pub(crate) const MODEL_THINKING_PICKER_FOOTER_HINT: &str =
 /// from direct model selection so the event loop can fetch the catalog without
 /// borrowing its UI state across a network wait.
 pub(crate) fn is_model_picker_request(text: &str) -> bool {
+    let SubmissionInput::Command(text) = parse_submission(text) else {
+        return false;
+    };
     let (command, args) = parse_slash(text);
     matches!(command_registry::resolve_command(command), Ok("/model"))
         && matches!(args.trim(), "" | "list")

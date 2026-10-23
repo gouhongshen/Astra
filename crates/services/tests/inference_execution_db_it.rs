@@ -543,6 +543,26 @@ async fn empty_canonical_wal_recovery_reuses_its_physical_connection() {
     let run_id = format!("empty-wal-run-{suffix}");
     seed_run(pool, &user_id, &session_id, &run_id).await;
 
+    // Cancel while the new snapshot preflight waits for the only pool slot.
+    // Releasing that slot must still permit an independent query and recovery.
+    let held = pool.acquire().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            load_inference_canonical_transitions_for_session(
+                &shared_pool,
+                &user_id,
+                &session_id,
+                0,
+            ),
+        )
+        .await
+        .is_err(),
+        "recovery must wait for the occupied snapshot checkout"
+    );
+    drop(held);
+    assert_independent_query_can_replace_cancelled_checkout(pool).await;
+
     let connection_id_before: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
         .fetch_one(pool)
         .await
@@ -567,7 +587,85 @@ async fn empty_canonical_wal_recovery_reuses_its_physical_connection() {
         connection_id_before, connection_id_after,
         "successful empty WAL recovery must return its healthy connection to the pool"
     );
+    let transition = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
+        None,
+        astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[]).unwrap(),
+        &[serde_json::json!({"role":"user","content":"one-slot recovery"})],
+        vec![canonical_authority("one-slot")],
+    )
+    .unwrap();
+    commit_canonical_transition(
+        &shared_pool,
+        &user_id,
+        &session_id,
+        &run_id,
+        0,
+        "one-slot",
+        &transition,
+    )
+    .await;
+    let recovered = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        load_inference_canonical_transitions_for_session(&shared_pool, &user_id, &session_id, 1),
+    )
+    .await
+    .expect("nonempty recovery must release the snapshot checkout")
+    .unwrap();
+    assert_eq!(recovered.len(), 1);
+    let retired = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        load_inference_canonical_transitions_for_session(&shared_pool, &user_id, &session_id, 2),
+    )
+    .await
+    .expect("retirement must acquire the one available connection")
+    .unwrap();
+    assert!(retired.is_empty());
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inference_canonical_transition_wal WHERE user_id = ? AND session_id = ?")
+        .bind(&user_id).bind(&session_id).fetch_one(pool).await.unwrap();
+    assert_eq!(
+        rows, 0,
+        "absorbed WAL must be retired, not hidden by the empty path"
+    );
+
+    let foreign = load_inference_canonical_transitions_for_session(
+        &shared_pool,
+        "another-owner",
+        &session_id,
+        0,
+    )
+    .await
+    .expect_err("an empty snapshot must not hide owner mismatch");
+    assert_eq!(foreign.kind, ServiceErrorKind::NotFound);
+    let missing = load_inference_canonical_transitions_for_session(
+        &shared_pool,
+        &user_id,
+        &format!("missing-{suffix}"),
+        0,
+    )
+    .await
+    .expect_err("an absent session is not empty recovery");
+    assert_eq!(missing.kind, ServiceErrorKind::NotFound);
+
+    // A committed deletion intent still wins when there is no WAL at all.
+    let fenced = sqlx::query("UPDATE agent_session_lifecycle_fences SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
+        .bind(&user_id).bind(&session_id).execute(pool).await.unwrap();
+    assert_eq!(
+        fenced.rows_affected(),
+        1,
+        "fixture must install a real deletion fence"
+    );
+    let deleted =
+        load_inference_canonical_transitions_for_session(&shared_pool, &user_id, &session_id, 0)
+            .await
+            .expect_err("empty recovery cannot bypass a lifecycle fence");
+    assert_eq!(deleted.kind, ServiceErrorKind::NotFound);
     cleanup(pool, &user_id, &session_id, &run_id).await;
+    pool.close().await;
+    let unavailable =
+        load_inference_canonical_transitions_for_session(&shared_pool, &user_id, &session_id, 0)
+            .await
+            .expect_err("preflight acquisition failure must not look like empty recovery");
+    assert_eq!(unavailable.kind, ServiceErrorKind::Persistence);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

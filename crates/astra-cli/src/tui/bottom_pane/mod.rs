@@ -122,6 +122,8 @@ pub(crate) struct BottomPane {
     /// current turn has committed its canonical boundary. These are next-turn
     /// submissions, not guidance for the previous run.
     queued_next_turn_submissions: std::collections::VecDeque<NextTurnSubmission>,
+    /// Recovery is editable input, not authority for automatic next-turn replay.
+    restored_drafts: std::collections::VecDeque<String>,
     applied_user_intent_ids: std::collections::HashSet<String>,
     /// Typed actions emitted while a retained projection refreshes. These are
     /// not user-input events: for example, a live agent transcript upgrades
@@ -297,6 +299,7 @@ impl BottomPane {
             approval_queue: ApprovalQueue::new(),
             pending_user_intents: std::collections::VecDeque::new(),
             queued_next_turn_submissions: std::collections::VecDeque::new(),
+            restored_drafts: std::collections::VecDeque::new(),
             applied_user_intent_ids: std::collections::HashSet::new(),
             projection_actions: std::collections::VecDeque::new(),
             model_catalog: None,
@@ -642,24 +645,70 @@ impl BottomPane {
         };
         self.pending_user_intents.remove(index);
         self.applied_user_intent_ids.insert(intent_id.to_string());
-        self.restore_into_composer(runtime_content);
+        self.restore_into_composer(&super::slash_dispatch::conversation_for_composer(
+            runtime_content,
+        ));
         true
     }
 
-    /// Restore queued-but-unapplied input into the composer at run end,
-    /// preserving any draft the user is currently editing by appending
-    /// beneath it. Never silently drop user input.
+    /// Return unapplied input for editing, without authorizing a new submission.
     pub fn restore_into_composer(&mut self, text: &str) {
-        if text.trim().is_empty() {
-            return;
+        self.restore_inputs_into_composer(std::iter::once(text));
+    }
+
+    /// Merge only adjacent conversation fragments. Commands and shell drafts
+    /// retain their own submission boundary and require a fresh gesture each.
+    pub(crate) fn restore_inputs_into_composer(
+        &mut self,
+        inputs: impl IntoIterator<Item = impl AsRef<str>>,
+    ) {
+        for input in inputs {
+            let text = input.as_ref();
+            if !text.trim().is_empty() {
+                self.restored_drafts.push_back(text.to_owned());
+            }
         }
-        if self.composer.is_empty() {
-            self.composer.set_text(text);
+        self.restore_next_draft();
+    }
+
+    fn restore_next_draft(&mut self) -> bool {
+        use super::slash_dispatch::parse_submission;
+        let conversation = |text: &str| {
+            !text.trim().is_empty()
+                && !parse_submission(text).is_command()
+                && crate::cli::turn::turn_entry::shell_input_body(text).is_none()
+        };
+        if self.restored_drafts.is_empty() || self.composer.paste_burst_active() {
+            return false;
+        }
+        let mut raw = self.composer.text();
+        let mut changed = false;
+        let compatible = if raw.is_empty() {
+            raw = self.restored_drafts.pop_front().expect("nonempty drafts");
+            changed = true;
+            conversation(&raw)
         } else {
-            let existing = self.composer.text();
-            self.composer
-                .set_text(&format!("{}\n\n{}", existing.trim_end(), text));
+            conversation(&self.composer.expanded_raw_text())
+        };
+        if compatible {
+            // Keep the first fragment's composer encoding and paste placeholders.
+            // Only later fragments lose their leading literal escape; they no
+            // longer occupy a command boundary in the combined conversation.
+            while self
+                .restored_drafts
+                .front()
+                .is_some_and(|text| conversation(text))
+            {
+                let next = self.restored_drafts.pop_front().expect("checked front");
+                raw.push_str("\n\n");
+                raw.push_str(parse_submission(&next).text());
+                changed = true;
+            }
         }
+        if changed {
+            self.replace_composer_text(&raw);
+        }
+        changed
     }
 
     /// Drain active-run intents when the run settles.
@@ -1430,7 +1479,11 @@ impl BottomPane {
             }
         }
 
-        if self.view_stack.is_empty() && text.starts_with('$') && !self.skill_items.is_empty() {
+        if self.view_stack.is_empty()
+            && text.starts_with('$')
+            && !text.contains(['\n', '\r'])
+            && !self.skill_items.is_empty()
+        {
             self.slash_menu = None;
             self.close_mention();
             let popup = self
@@ -1760,12 +1813,7 @@ impl BottomPane {
         // One quiet row above the composer is reserved for the context rail.
         // Keeping it stable avoids shifting the input when the first usage
         // measurement arrives; before that it simply acts as breathing room.
-        content_h
-            + approval_h
-            + queue_h
-            + popup_h
-            + 2
-            + self.update_notice_lines(width).len() as u16
+        content_h + approval_h + queue_h + popup_h + 2 + self.notice_lines(width).len() as u16
     }
 
     /// Top-level key routing. Dispatches to named phase handlers so
@@ -1778,6 +1826,17 @@ impl BottomPane {
     /// 5. Popup navigation (slash / skill / mention menus)
     /// 6. Composer (text input)
     pub fn handle_key(&mut self, key: KeyEvent) -> BottomPaneAction {
+        if self.composer.is_empty() {
+            self.restore_next_draft();
+        }
+        let action = self.handle_key_inner(key);
+        if self.composer.is_empty() {
+            self.restore_next_draft();
+        }
+        action
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) -> BottomPaneAction {
         if let Some(a) = self.handle_ctrl_keys(key) {
             return a;
         }
@@ -1793,12 +1852,20 @@ impl BottomPane {
                 .is_some_and(|view| view.slash_reclaims_focus())
         {
             self.pop_active_view();
-            self.composer.set_text("/");
-            self.sync_popups();
+            self.start_composer_draft("/");
             return BottomPaneAction::Consumed;
         }
         if let Some(a) = self.handle_active_view_key(key) {
             return a;
+        }
+        // A trailing pasted newline belongs to editing, before a popup or
+        // approval can interpret Enter. The textarea consumes it atomically.
+        if key.code == KeyCode::Enter
+            && key.modifiers.is_empty()
+            && self.composer.consume_guarded_enter()
+        {
+            self.sync_popups();
+            return BottomPaneAction::Consumed;
         }
         if let Some(a) = self.handle_approval_keys(key) {
             return a;
@@ -2209,6 +2276,7 @@ impl BottomPane {
         // Flush paste burst buffer when idle timeout expires.
         if self.composer.flush_paste_burst() {
             self.sync_popups();
+            self.restore_next_draft();
             changed = true;
         }
         if self
@@ -2219,6 +2287,14 @@ impl BottomPane {
             changed = true;
         }
         changed
+    }
+
+    /// A command/view starts another draft without discarding ongoing editing.
+    pub(crate) fn start_composer_draft(&mut self, text: &str) {
+        for draft in self.composer.take_recoverable_drafts().into_iter().rev() {
+            self.restored_drafts.push_front(draft);
+        }
+        self.replace_composer_text(text);
     }
 
     pub fn replace_composer_text(&mut self, text: &str) {
@@ -2274,7 +2350,7 @@ impl BottomPane {
 
         // Keep installation notices below the composer/status strip, outside
         // conversation history. Modal views retain their existing layout.
-        let notice_lines = self.update_notice_lines(area.width);
+        let notice_lines = self.notice_lines(area.width);
         let notice_h = (notice_lines.len() as u16).min(area.height.saturating_sub(3));
         let content_area = Rect::new(area.x, area.y, area.width, area.height - notice_h);
         ratatui::widgets::Paragraph::new(notice_lines).render(
@@ -2335,17 +2411,27 @@ impl BottomPane {
         }
     }
 
-    fn update_notice_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let Some(notice) = &self.update_notice else {
-            return Vec::new();
-        };
-        super::wrapping::word_wrap_lines(
-            [Line::styled(
-                notice.clone(),
-                Style::default().fg(super::theme::current().warn),
-            )],
-            width.max(1) as usize,
-        )
+    fn notice_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let style = Style::default().fg(super::theme::current().warn);
+        let mut lines = Vec::new();
+        if let Some(notice) = &self.update_notice {
+            lines.push(Line::styled(notice.clone(), style));
+        }
+        if let Some(next) = self.restored_drafts.front() {
+            let preview: String = next
+                .chars()
+                .take(60)
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .collect();
+            lines.push(Line::styled(
+                format!(
+                    "Unsent drafts ({}) · send or clear this draft to edit next: {preview}",
+                    self.restored_drafts.len(),
+                ),
+                style,
+            ));
+        }
+        super::wrapping::word_wrap_lines(lines, width.max(1) as usize)
     }
 
     fn render_focused_approval(&self, area: Rect, buf: &mut Buffer) {
@@ -2545,7 +2631,7 @@ impl BottomPane {
         }
 
         let notice_h =
-            (self.update_notice_lines(area.width).len() as u16).min(area.height.saturating_sub(3));
+            (self.notice_lines(area.width).len() as u16).min(area.height.saturating_sub(3));
         let area = Rect::new(area.x, area.y, area.width, area.height - notice_h);
 
         let approval_h = self.focused_approval_height(area.width);

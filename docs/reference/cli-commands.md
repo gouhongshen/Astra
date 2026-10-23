@@ -305,3 +305,21 @@ level; verify the deployment's supported values before declaring its protocol.
 - Once a chat stream has started, `astra chat --json` and `--print --output-format json` also return a structured result on hard failure (exit code 3 for API failures). It retains the validated root run identity, partial output and observed usage, with `success: false` and partial evidence coverage. A request rejected before Run admission has no run identity; an error does not imply successful or resumable execution.
 - An unsupported local workspace coordination host fails before admission with exit code `1`, `error_kind: "tool_unavailable"`, `error_code: "workspace_host_unsupported"`, non-retryable metadata, and `server_admission_not_dispatched: true`. No model or tool ran. Interactive mode restores the draft and preserves recovery state. Human diagnostics remain on stderr in text, JSON, and stream-json modes. Repair the host prerequisite described in the diagnostic; changing workspace grants does not repair it.
 - Interactive mode launches the TUI (requires a TTY; use `astra chat -m` or `--print` for non-interactive invocations). There is no separate console slash frontend.
+
+In the interactive composer, a leading `/` selects a slash action. To send literal
+slash text, escape it with another slash: `//tmp/project inspect this` sends
+`/tmp/project inspect this`, and `//stop` sends `/stop` as conversation text.
+The escape also applies to queued messages and guidance for an active run.
+Returned conversation can merge with an existing conversation draft. Commands
+and shell drafts, including multiline pasted content, stay separate. Intentional
+whitespace-only drafts also remain editable. “Unsent drafts” shows retained input, which
+moves into the composer after the current draft is sent or cleared. Each draft
+requires a new submission gesture; restoration never sends it automatically.
+Navigation also preserves the draft suspended while browsing history, including
+pasted content. An unchanged recalled message remains in history; edited recall
+and distinct original drafts return for editing through the same unsent list.
+These editable drafts remain local to the running client.
+Ctrl+R also restores the latest conversation with its slash escape, so editing
+and resending `/exit` text keeps it a message. The transcript shows the original
+conversation text, without the composer escape.
+Unknown or ambiguous single-slash actions still report a command error.

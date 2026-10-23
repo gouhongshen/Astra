@@ -165,6 +165,9 @@ Compaction should preserve:
 Compaction should not turn transient tool output into permanent truth without attribution.
 Generate a compaction summary only after history actually changes. An elevated
 pressure tier alone does not authorize an LLM call for intact or protected history.
+Pre-turn summarization rejects a zero spill prefix before resolving the model,
+revalidating its Offering or assembling a summary request. This optimization
+does not widen the prefix or preserve arbitrary single-task intermediate facts.
 
 ## Memory injection
 

@@ -34,6 +34,11 @@ pub(crate) enum ShellPassthroughDecision {
     DenyHighRisk { cmd: String, risks: Vec<String> },
 }
 
+/// Syntactic shell boundary shared by dispatch and composer restoration.
+pub(crate) fn shell_input_body(line: &str) -> Option<&str> {
+    line.trim_start().strip_prefix('!')
+}
+
 /// Classify a chat-input line that started with `!` (or `!!`).
 ///
 /// This is the policy hot path for the user-typed shell pass-through.
@@ -50,12 +55,10 @@ pub(crate) enum ShellPassthroughDecision {
 /// - `!!` always allows the command after risk reporting — it's the
 ///   "I see the warning, run it anyway" override.
 pub(crate) fn classify_shell_passthrough(line: &str) -> Option<ShellPassthroughDecision> {
-    let trimmed = line.trim_start();
-    let (override_high_risk, body) = if let Some(rest) = trimmed.strip_prefix("!!") {
-        (true, rest)
-    } else {
-        let rest = trimmed.strip_prefix('!')?;
-        (false, rest)
+    let body = shell_input_body(line)?;
+    let (override_high_risk, body) = match body.strip_prefix('!') {
+        Some(rest) => (true, rest),
+        None => (false, body),
     };
     let cmd = body.trim();
     if cmd.is_empty() {
