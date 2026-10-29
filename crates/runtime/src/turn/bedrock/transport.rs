@@ -184,11 +184,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
             });
         }
 
-        let idle = if accum.has_message_stop() {
-            crate::turn::llm::client::stream_terminal_drain_timeout(idle_timeout)
-        } else {
-            idle_timeout
-        };
+        let terminal_deadline = yield_state.terminal_deadline(idle_timeout);
         let yield_deadline = yield_state.deadline(semantic_progress_timeout);
         let next = tokio::select! {
             biased;
@@ -213,7 +209,8 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
                     partial: partial(&accum),
                 });
             },
-            next = tokio::time::timeout(idle, byte_stream.next()) => next,
+            _ = wait_optional_deadline(terminal_deadline) => break,
+            next = tokio::time::timeout(idle_timeout, byte_stream.next()) => next,
         };
         let chunk_result = match next {
             Ok(Some(c)) => c,
@@ -221,7 +218,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
             Err(_elapsed) if accum.has_complete_terminal_facts() => break,
             Err(_elapsed) => {
                 return Err(BedrockStreamError::Transport {
-                    error: format!("bedrock stream idle > {}ms", idle.as_millis()),
+                    error: format!("bedrock stream idle > {}ms", idle_timeout.as_millis()),
                     partial: partial(&accum),
                 });
             }
@@ -324,6 +321,9 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
                         partial: partial(&accum),
                     });
                 }
+            }
+            if accum.has_complete_terminal_facts() {
+                break 'body;
             }
         }
 
@@ -963,5 +963,58 @@ pub(crate) mod tests {
         assert_eq!(result.reasoning, "thinking".repeat(40));
         assert_eq!(result.usage["output_tokens"], 1);
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(400));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_tail_noise_cannot_delay_completion_or_missing_usage() {
+        for (metadata_at, noisy) in [
+            (None, true),
+            (None, false),
+            (Some(3), true),
+            (Some(6), true),
+        ] {
+            let source = async_stream::stream! {
+                yield Ok::<_, std::io::Error>(eventstream_frame("contentBlockDelta", br#"{"contentBlockIndex":0,"delta":{"text":"done"}}"#));
+                yield Ok(eventstream_frame("messageStop", br#"{"stopReason":"end_turn"}"#));
+                for step in 1..=10 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if metadata_at == Some(step) {
+                        yield Ok(eventstream_frame("metadata", br#"{"usage":{"inputTokens":10,"outputTokens":3,"totalTokens":13}}"#));
+                    }
+                    if noisy {
+                        yield Ok(eventstream_frame("futureExtension", br#"{"ignored":true}"#));
+                    }
+                }
+                std::future::pending::<()>().await;
+            };
+            let response = axum::http::Response::builder()
+                .body(reqwest::Body::wrap_stream(source))
+                .unwrap()
+                .into();
+            let started = TokioInstant::now();
+            let result = collect_bedrock_stream(
+                response,
+                "bedrock-test-model",
+                started.into_std(),
+                LlmCancel::None,
+                std::time::Duration::from_secs(30),
+                None,
+            )
+            .await;
+            if metadata_at == Some(3) {
+                let result = result.expect("complete terminal facts must finish before noisy EOF");
+                assert_eq!(result.full_text, "done");
+                assert_eq!(result.usage["output_tokens"], 3);
+                assert_eq!(started.elapsed(), std::time::Duration::from_millis(300));
+            } else {
+                let error = result.expect_err("missing or late usage must remain partial delivery");
+                let BedrockStreamError::Transport { partial, .. } = error else {
+                    panic!("expected a partial transport failure");
+                };
+                assert_eq!(partial.full_text, "done");
+                assert!(partial.usage.is_empty());
+                assert_eq!(started.elapsed(), std::time::Duration::from_millis(500));
+            }
+        }
     }
 }

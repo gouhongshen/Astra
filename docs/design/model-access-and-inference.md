@@ -840,6 +840,10 @@ watchdogs, not a default whole-response wall-clock limit. Text, reasoning, and
 authorized tool argument progress refresh semantic liveness; heartbeats alone
 do not. The shared OpenAI-compatible, Anthropic and Bedrock collectors retain
 cancellation, response-size limits, and bounded terminal draining.
+Terminal draining has a fixed deadline, at most 500ms after the first terminal
+signal. Empty events and duplicate terminal signals cannot extend that window.
+Bedrock returns as soon as both `messageStop` and usage metadata are present;
+missing metadata at the deadline remains a partial transport failure.
 
 The HTTP transport must not add a hidden total body timeout, including for
 user-owned compatible endpoints. An explicit caller budget or positive

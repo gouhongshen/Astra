@@ -2023,7 +2023,9 @@ pub(crate) enum StreamYieldState {
         last_semantic_activity_at: TokioInstant,
         actionable_delivery_observed: bool,
     },
-    Terminal,
+    Terminal {
+        observed_at: TokioInstant,
+    },
 }
 
 impl StreamYieldState {
@@ -2035,7 +2037,7 @@ impl StreamYieldState {
     }
 
     pub(crate) fn is_terminal(self) -> bool {
-        matches!(self, Self::Terminal)
+        matches!(self, Self::Terminal { .. })
     }
 
     pub(crate) fn has_actionable_yield(self) -> bool {
@@ -2058,7 +2060,17 @@ impl StreamYieldState {
                 last_semantic_activity_at,
                 ..
             } => Some(last_semantic_activity_at + timeout),
-            Self::Terminal => None,
+            Self::Terminal { .. } => None,
+        }
+    }
+
+    /// Tail traffic cannot move the deadline established by the first terminal.
+    pub(crate) fn terminal_deadline(self, idle_timeout: Duration) -> Option<TokioInstant> {
+        match self {
+            Self::Terminal { observed_at } => {
+                Some(observed_at + stream_terminal_drain_timeout(idle_timeout))
+            }
+            _ => None,
         }
     }
 
@@ -2094,7 +2106,7 @@ impl StreamYieldState {
                 last_semantic_activity_at: now,
                 actionable_delivery_observed,
             },
-            Self::Terminal => Self::Terminal,
+            terminal @ Self::Terminal { .. } => terminal,
         };
     }
 
@@ -2126,12 +2138,16 @@ impl StreamYieldState {
                     actionable_delivery_observed: true,
                 };
             }
-            Self::Delivering { .. } | Self::Terminal => {}
+            Self::Delivering { .. } | Self::Terminal { .. } => {}
         }
     }
 
     pub(crate) fn mark_terminal(&mut self) {
-        *self = Self::Terminal;
+        if !self.is_terminal() {
+            *self = Self::Terminal {
+                observed_at: TokioInstant::now(),
+            };
+        }
     }
 }
 
@@ -6288,12 +6304,8 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 ),
             });
         }
-        let ordinary_idle = if made_progress { idle_post } else { idle_pre };
-        let idle = if yield_state.is_terminal() {
-            stream_terminal_drain_timeout(ordinary_idle)
-        } else {
-            ordinary_idle
-        };
+        let idle = if made_progress { idle_post } else { idle_pre };
+        let terminal_deadline = yield_state.terminal_deadline(idle);
         let yield_deadline = yield_state.deadline(semantic_progress_timeout);
         let item = tokio::select! {
             biased;
@@ -6339,6 +6351,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                     ),
                 });
             },
+            _ = wait_optional_deadline(terminal_deadline) => break,
             r = tokio::time::timeout(idle, sse.next()) => match r {
                 Ok(v) => v,
                 Err(_elapsed) => {
@@ -6938,12 +6951,8 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                 ),
             });
         }
-        let ordinary_idle = if made_progress { idle_post } else { idle_pre };
-        let idle = if yield_state.is_terminal() {
-            stream_terminal_drain_timeout(ordinary_idle)
-        } else {
-            ordinary_idle
-        };
+        let idle = if made_progress { idle_post } else { idle_pre };
+        let terminal_deadline = yield_state.terminal_deadline(idle);
         let yield_deadline = yield_state.deadline(semantic_progress_timeout);
         let item = tokio::select! {
             biased;
@@ -6992,6 +7001,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                     ),
                 });
             },
+            _ = wait_optional_deadline(terminal_deadline) => break,
             r = tokio::time::timeout(idle, sse.next()) => match r {
                 Ok(v) => v,
                 Err(_elapsed) => {
@@ -10908,7 +10918,7 @@ mod tests {
         assert!(state.timed_out(start + std::time::Duration::from_millis(36), timeout));
 
         state.mark_terminal();
-        assert_eq!(state, StreamYieldState::Terminal);
+        assert!(state.is_terminal());
         assert_eq!(state.deadline(timeout), None);
     }
 
@@ -11595,6 +11605,7 @@ mod tests {
         let byte_stream =
             stream::iter(vec![Ok(bytes)]).chain(stream::pending::<Result<Bytes, reqwest::Error>>());
 
+        let started = TokioInstant::now();
         let result = collect_llm_stream(
             byte_stream,
             "test-model",
@@ -11609,6 +11620,83 @@ mod tests {
 
         assert_eq!(result.full_text, "done");
         assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_tail_noise_does_not_restart_grace() {
+        for terminal in [
+            json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function",
+                "function":{"name":"bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+        ] {
+            let repeated_terminal = json!({"choices":[{"delta":{},
+                "finish_reason":terminal["choices"][0]["finish_reason"]}]});
+            for noise in [json!({"choices":[]}), repeated_terminal] {
+                let expected_finish = terminal["choices"][0]["finish_reason"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let terminal_frame = format!("data: {terminal}\n\n");
+                let source = Box::pin(async_stream::stream! {
+                    yield Ok::<Bytes, reqwest::Error>(Bytes::from(terminal_frame));
+                    for _ in 0..10 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        yield Ok(Bytes::from(format!("data: {noise}\n\n")));
+                    }
+                    std::future::pending::<()>().await;
+                });
+                let started = TokioInstant::now();
+                let result = collect_llm_stream(
+                    source,
+                    "test-model",
+                    started.into_std(),
+                    LlmCancel::None,
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    None,
+                )
+                .await
+                .expect("completed output must not wait for a noisy open socket");
+                assert_eq!(
+                    result.finish_reason.as_deref(),
+                    Some(expected_finish.as_str())
+                );
+                assert_eq!(started.elapsed(), Duration::from_millis(500));
+                if expected_finish == "tool_calls" {
+                    assert_eq!(result.tool_calls[0]["function"]["name"], "bash");
+                    assert_eq!(result.tool_calls[0]["function"]["arguments"], "{}");
+                } else {
+                    assert_eq!(result.full_text, "done");
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_tail_preserves_usage_inside_grace() {
+        let source = Box::pin(async_stream::stream! {
+            yield Ok::<Bytes, reqwest::Error>(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n"));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            yield Ok(Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3}}\n\n"));
+            std::future::pending::<()>().await;
+        });
+        let started = TokioInstant::now();
+        let result = collect_llm_stream(
+            source,
+            "test-model",
+            started.into_std(),
+            LlmCancel::None,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.full_text, "done");
+        assert_eq!(result.usage["input_tokens"], 10);
+        assert_eq!(result.usage["output_tokens"], 3);
+        assert_eq!(started.elapsed(), Duration::from_millis(300));
     }
 
     #[tokio::test]
