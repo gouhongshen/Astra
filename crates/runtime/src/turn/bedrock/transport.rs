@@ -15,6 +15,7 @@ use crate::turn::bedrock::eventstream::FrameDecoder;
 use crate::turn::bedrock::stream::{BedrockStreamAccumulator, BedrockStreamEvent};
 use crate::turn::llm::client::{
     LlmCallResult, LlmCancel, LlmStreamCallback, LlmStreamUpdate, StreamYieldState,
+    wait_optional_deadline,
 };
 
 fn bedrock_response_id(response: &reqwest::Response) -> Option<String> {
@@ -87,7 +88,7 @@ pub(crate) async fn collect_bedrock_stream_for_wire(
     response: reqwest::Response,
     model_name: &str,
     started: Instant,
-    provider_work_budget: std::time::Duration,
+    provider_work_budget: Option<std::time::Duration>,
     cancel: LlmCancel<'_>,
     idle_timeout: std::time::Duration,
     authorized_tool_names: &HashSet<String>,
@@ -121,7 +122,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline(
         response,
         model_name,
         started,
-        crate::turn::llm::client::llm_total_budget(),
+        crate::turn::llm::client::llm_stream_total_budget(),
         cancel,
         idle_timeout,
         semantic_progress_timeout,
@@ -135,7 +136,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
     response: reqwest::Response,
     model_name: &str,
     started: Instant,
-    provider_work_budget: std::time::Duration,
+    provider_work_budget: Option<std::time::Duration>,
     cancel: LlmCancel<'_>,
     idle_timeout: std::time::Duration,
     semantic_progress_timeout: std::time::Duration,
@@ -153,7 +154,8 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
     let mut byte_stream = response.bytes_stream();
     let mut yield_state = StreamYieldState::new(TokioInstant::now());
     let mut delivered_tool_arguments = HashMap::<u64, String>::new();
-    let provider_work_deadline = started + provider_work_budget;
+    let provider_work_deadline =
+        provider_work_budget.map(|budget| TokioInstant::from_std(started + budget));
     let partial = |accum: &BedrockStreamAccumulator| accum.clone().into_result(model_name);
 
     'body: loop {
@@ -165,9 +167,12 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
                 partial: partial(&accum),
             });
         }
-        if !accum.has_complete_terminal_facts() && started.elapsed() >= provider_work_budget {
+        if let Some(budget) = provider_work_budget
+            && !accum.has_complete_terminal_facts()
+            && started.elapsed() >= budget
+        {
             return Err(BedrockStreamError::ProviderWorkDeadline {
-                elapsed_ms: provider_work_budget.as_millis() as u64,
+                elapsed_ms: budget.as_millis() as u64,
                 partial: partial(&accum),
             });
         }
@@ -184,9 +189,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
         } else {
             idle_timeout
         };
-        let yield_deadline = yield_state
-            .deadline(semantic_progress_timeout)
-            .unwrap_or_else(|| TokioInstant::from_std(provider_work_deadline));
+        let yield_deadline = yield_state.deadline(semantic_progress_timeout);
         let next = tokio::select! {
             biased;
             _ = crate::turn::llm::client::wait_llm_cancel(cancel) => {
@@ -197,15 +200,13 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
                     partial: partial(&accum),
                 });
             }
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                provider_work_deadline
-            )), if !accum.has_complete_terminal_facts() => {
+            deadline = wait_optional_deadline(provider_work_deadline), if !accum.has_complete_terminal_facts() => {
                 return Err(BedrockStreamError::ProviderWorkDeadline {
-                    elapsed_ms: provider_work_budget.as_millis() as u64,
+                    elapsed_ms: deadline.duration_since(TokioInstant::from_std(started)).as_millis() as u64,
                     partial: partial(&accum),
                 });
             },
-            _ = tokio::time::sleep_until(yield_deadline), if !yield_state.is_terminal() => {
+            _ = wait_optional_deadline(yield_deadline), if !yield_state.is_terminal() => {
                 return Err(BedrockStreamError::SemanticProgressTimeout {
                     elapsed_ms: semantic_progress_timeout.as_millis() as u64,
                     made_semantic_progress: yield_state.has_actionable_yield(),
@@ -797,7 +798,7 @@ pub(crate) mod tests {
             response,
             "bedrock-test-model",
             Instant::now(),
-            std::time::Duration::from_secs(30),
+            Some(std::time::Duration::from_secs(30)),
             LlmCancel::None,
             std::time::Duration::from_millis(60),
             std::time::Duration::from_millis(20),
@@ -832,7 +833,7 @@ pub(crate) mod tests {
             response,
             "bedrock-test-model",
             Instant::now(),
-            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_millis(20),
@@ -858,7 +859,7 @@ pub(crate) mod tests {
             response,
             "bedrock-test-model",
             Instant::now(),
-            std::time::Duration::from_secs(30),
+            Some(std::time::Duration::from_secs(30)),
             LlmCancel::None,
             std::time::Duration::from_millis(20),
             std::time::Duration::from_millis(10),
@@ -888,7 +889,7 @@ pub(crate) mod tests {
             response,
             "bedrock-test-model",
             Instant::now(),
-            std::time::Duration::from_secs(1),
+            Some(std::time::Duration::from_secs(1)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_millis(100),
@@ -909,7 +910,7 @@ pub(crate) mod tests {
             response,
             "bedrock-test-model",
             Instant::now(),
-            std::time::Duration::from_millis(20),
+            Some(std::time::Duration::from_millis(20)),
             LlmCancel::None,
             std::time::Duration::from_secs(1),
             std::time::Duration::from_secs(1),
@@ -923,5 +924,44 @@ pub(crate) mod tests {
             panic!("expected Bedrock provider-work deadline")
         };
         assert_eq!(partial.reasoning, "working through the task");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_bedrock_stream_allows_progress_beyond_five_minutes() {
+        let source = async_stream::stream! {
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                yield Ok::<_, std::io::Error>(eventstream_frame(
+                    "contentBlockDelta",
+                    br#"{"contentBlockIndex":0,"delta":{"reasoningContent":{"text":"thinking"}}}"#,
+                ));
+            }
+            for frame in [
+                eventstream_frame("contentBlockDelta", br#"{"contentBlockIndex":0,"delta":{"text":"done"}}"#),
+                eventstream_frame("messageStop", br#"{"stopReason":"end_turn"}"#),
+                eventstream_frame("metadata", br#"{"usage":{"inputTokens":1,"outputTokens":1,"totalTokens":2}}"#),
+            ] {
+                yield Ok(frame);
+            }
+        };
+        let response = axum::http::Response::builder()
+            .body(reqwest::Body::wrap_stream(source))
+            .unwrap()
+            .into();
+        let started = TokioInstant::now();
+        let result = collect_bedrock_stream(
+            response,
+            "bedrock-test-model",
+            started.into_std(),
+            LlmCancel::None,
+            std::time::Duration::from_secs(60),
+            None,
+        )
+        .await
+        .expect("active Bedrock reasoning must not hit an implicit total deadline");
+        assert_eq!(result.full_text, "done");
+        assert_eq!(result.reasoning, "thinking".repeat(40));
+        assert_eq!(result.usage["output_tokens"], 1);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(400));
     }
 }

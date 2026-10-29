@@ -833,6 +833,23 @@ handoff checkpoints carry their complete checked continuation without loading a
 provider-attempt WAL. Run/Context commits and tool side-effect admission and
 deduplication keep their independent contracts.
 
+### Provider timeout ownership
+
+Ordinary agent streaming calls use rolling transport-idle and semantic-progress
+watchdogs, not a default whole-response wall-clock limit. Text, reasoning, and
+authorized tool argument progress refresh semantic liveness; heartbeats alone
+do not. The shared OpenAI-compatible, Anthropic and Bedrock collectors retain
+cancellation, response-size limits, and bounded terminal draining.
+
+The HTTP transport must not add a hidden total body timeout, including for
+user-owned compatible endpoints. An explicit caller budget or positive
+`ASTRA_LLM_TOTAL_BUDGET_S` override still limits the logical call across retries
+and leaves its existing terminalization reserve. Without such a limit, setup
+and retries are bounded until a response starts, and ledger operations have
+independent bounded waits; they do not consume a progressing stream's lifetime.
+Non-stream, auxiliary inference, model checks, and run/resource deadlines retain
+their own limits. Unknown provider delivery is still not blindly retried.
+
 ## Control plane and data plane
 
 ```text
