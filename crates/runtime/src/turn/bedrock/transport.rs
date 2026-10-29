@@ -122,7 +122,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline(
         response,
         model_name,
         started,
-        crate::turn::llm::client::llm_stream_total_budget(),
+        crate::turn::llm::client::llm_stream_total_budget().expect("valid test streaming budget"),
         cancel,
         idle_timeout,
         semantic_progress_timeout,

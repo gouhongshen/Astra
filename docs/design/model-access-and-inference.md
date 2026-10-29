@@ -844,6 +844,7 @@ Terminal draining has a fixed deadline, at most 500ms after the first terminal
 signal. Empty events and duplicate terminal signals cannot extend that window.
 Bedrock returns as soon as both `messageStop` and usage metadata are present;
 missing metadata at the deadline remains a partial transport failure.
+Anthropic completes immediately on `message_stop` and does not enter a tail wait.
 
 The HTTP transport must not add a hidden total body timeout, including for
 user-owned compatible endpoints. An explicit caller budget or positive
@@ -853,6 +854,10 @@ and retries are bounded until a response starts, and ledger operations have
 independent bounded waits; they do not consume a progressing stream's lifetime.
 Non-stream, auxiliary inference, model checks, and run/resource deadlines retain
 their own limits. Unknown provider delivery is still not blindly retried.
+An unset, empty, or whitespace-only total-budget variable leaves ordinary
+streaming uncapped. Invalid nonempty values produce an actionable
+`InvalidRequest` before streaming attempt admission, rather than selecting a
+default cap.
 
 ## Control plane and data plane
 

@@ -1971,10 +1971,37 @@ pub(crate) fn llm_total_budget() -> std::time::Duration {
     ))
 }
 
-/// Ordinary streaming has no implicit lifetime cap. Existing configured values
-/// retain their parsing and explicit-budget semantics.
-pub(crate) fn llm_stream_total_budget() -> Option<Duration> {
-    std::env::var_os("ASTRA_LLM_TOTAL_BUDGET_S").map(|_| llm_total_budget())
+/// Only an explicit positive duration enables the stream total deadline.
+pub(crate) fn llm_stream_total_budget() -> Result<Option<Duration>, astra_core::ClassifiedError> {
+    parse_llm_stream_total_budget(std::env::var("ASTRA_LLM_TOTAL_BUDGET_S"))
+}
+
+fn parse_llm_stream_total_budget(
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<Duration>, astra_core::ClassifiedError> {
+    let invalid = || {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::InvalidRequest,
+            "ASTRA_LLM_TOTAL_BUDGET_S must be unset/empty or a positive integer number of seconds within the supported deadline range",
+        )
+    };
+    let value = match value {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => return Err(invalid()),
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let duration = value
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .filter(|duration| Instant::now().checked_add(*duration).is_some())
+        .ok_or_else(invalid)?;
+    Ok(Some(duration))
 }
 
 /// A missing deadline disables only this timer, never cancellation or idle checks.
@@ -5119,9 +5146,10 @@ pub(crate) async fn call_prepared_llm_and_collect_with_stream_callback(
     attempt_observer: Option<&dyn ProviderAttemptObserver>,
     total_budget: Option<std::time::Duration>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
+    let configured_budget = llm_stream_total_budget()?;
     let total_budget = total_budget.or_else(|| match prepared.purpose {
         astra_turn_types::InferencePurpose::PrimaryAgent
-        | astra_turn_types::InferencePurpose::SubAgent => llm_stream_total_budget(),
+        | astra_turn_types::InferencePurpose::SubAgent => configured_budget,
         purpose => Some(auxiliary_execution_budget(purpose, llm_total_budget())),
     });
     call_prepared_llm_with_total_budget(
@@ -6180,7 +6208,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline(
         stream,
         model_name,
         started,
-        llm_stream_total_budget(),
+        llm_stream_total_budget().expect("valid test streaming budget"),
         cancel,
         idle_pre,
         idle_post,
@@ -6824,7 +6852,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline(
         stream,
         model_name,
         started,
-        llm_stream_total_budget(),
+        llm_stream_total_budget().expect("valid test streaming budget"),
         cancel,
         idle_pre,
         idle_post,
@@ -6952,7 +6980,6 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
             });
         }
         let idle = if made_progress { idle_post } else { idle_pre };
-        let terminal_deadline = yield_state.terminal_deadline(idle);
         let yield_deadline = yield_state.deadline(semantic_progress_timeout);
         let item = tokio::select! {
             biased;
@@ -7001,7 +7028,6 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                     ),
                 });
             },
-            _ = wait_optional_deadline(terminal_deadline) => break,
             r = tokio::time::timeout(idle, sse.next()) => match r {
                 Ok(v) => v,
                 Err(_elapsed) => {
@@ -8811,6 +8837,46 @@ mod tests {
     }
 
     #[test]
+    fn streaming_total_budget_configuration_requires_an_explicit_positive_duration() {
+        assert_eq!(
+            parse_llm_stream_total_budget(Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
+        for value in ["", " \t\n"] {
+            assert_eq!(
+                parse_llm_stream_total_budget(Ok(value.to_string())).unwrap(),
+                None
+            );
+        }
+        for (value, seconds) in [("1", 1), (" 60 ", 60)] {
+            assert_eq!(
+                parse_llm_stream_total_budget(Ok(value.to_string())).unwrap(),
+                Some(Duration::from_secs(seconds))
+            );
+        }
+        for value in [
+            "0",
+            "-1",
+            "not-a-duration",
+            "18446744073709551616",
+            "18446744073709551615",
+        ] {
+            let error = parse_llm_stream_total_budget(Ok(value.to_string())).unwrap_err();
+            assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+            assert!(error.message.contains("ASTRA_LLM_TOTAL_BUDGET_S"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let error = parse_llm_stream_total_budget(Err(std::env::VarError::NotUnicode(
+                std::ffi::OsString::from_vec(vec![0xff]),
+            )))
+            .unwrap_err();
+            assert_eq!(error.kind, astra_core::ErrorKind::InvalidRequest);
+        }
+    }
+
+    #[test]
     fn default_semantic_progress_timeout_is_300s() {
         assert_eq!(
             llm_semantic_progress_timeout(),
@@ -9118,6 +9184,25 @@ mod tests {
             for tool_choice in [RuntimeToolChoice::Auto, RuntimeToolChoice::None] {
                 assert_default_streaming_call_accepts_long_output(purpose, tool_choice).await;
             }
+        }
+    }
+
+    #[test]
+    fn empty_total_budget_environment_keeps_progressing_streams_alive() {
+        for value in ["", " \t\n"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("turn::llm::client::tests::default_streaming_call_accepts_progress_beyond_six_minutes")
+                .arg("--nocapture")
+                .env("ASTRA_LLM_TOTAL_BUDGET_S", value)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "empty total budget must behave as unset:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
