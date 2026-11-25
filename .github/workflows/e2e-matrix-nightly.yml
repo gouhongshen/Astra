@@ -1,84 +1,96 @@
-# Optional: full ignored Matrix system E2E (`system_matrix_http_e2e`).
-# See `docs/testing/system-e2e-matrix.md` for env ↔ test mapping.
-name: E2E Matrix (manual)
-
-permissions:
-  contents: read
+name: Diagnose IDC compiler depth (no publication)
 
 on:
   workflow_dispatch:
     inputs:
-      test_name_filter:
-        description: "Optional `cargo test` name filter (substring). Empty = run all ignored tests."
-        required: false
-        default: ""
+      source_ref:
+        required: true
+        type: string
+      architecture:
+        required: true
+        default: amd64
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
-  system-matrix-e2e:
+  diagnose:
+    name: Find first compiler-depth failure
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-
-    env:
-      MATRIXONE_HOST: localhost
-      MATRIXONE_PORT: "6001"
-      MATRIXONE_USER: root
-      MATRIXONE_PASSWORD: "111"
-      ASTRA_DATABASE: astra_runtime
-      ASTRA_AUTO_CREATE_DATABASE: "1"
-      ASTRA_JWT_SECRET: ci-jwt-secret-key-at-least-32-chars-long
-      ASTRA_TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
-      ASTRA_TEST_E2E_SECRET: ci-server-e2e-secret-at-least-32-chars
-      ASTRA_RUNTIME_ROOT_SECRET: ci-runtime-root-secret-at-least-32-chars
-      MEMORIA_BASE_URL: http://localhost:8100
-      MEMORIA_MASTER_KEY: ci-test-master-key
-      MEMORIA_EMBEDDING_PROVIDER: mock
-      MEMORIA_EMBEDDING_DIM: "384"
-
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Prepare dependency env
-        run: |
-          cp .env.example .env
-          {
-            echo "MEMORIA_MASTER_KEY=${MEMORIA_MASTER_KEY}"
-            echo "MEMORIA_EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER}"
-            echo "MEMORIA_EMBEDDING_DIM=${MEMORIA_EMBEDDING_DIM}"
-          } >> .env
-      - name: Start dependencies
-        run: make dev-deps-up
-      - uses: ./.github/actions/rust-setup
-        with:
-          shared-key: ci-e2e
-          install-nextest: false
-      - name: Wait for dependencies
-        run: make dev-deps-wait
-
-      - name: Run system Matrix HTTP E2E (ignored tests)
+      - name: Restrict diagnostic control plane
         env:
-          ASTRA_TEST_DB_IT: "1"
-          RUST_MIN_STACK: "16777216"
-          ASTRA_BACKEND_SERVICE_KEY: "test-service-key-e2e"
-          ASTRA_LLM_RETRY_BASE_MS: "10"
-          ASTRA_DEFAULT_RETRY_AFTER_MS: "10"
-          ASTRA_BCRYPT_COST: "4"
-          TEST_NAME_FILTER: ${{ github.event.inputs.test_name_filter || '' }}
+          SELECTED_ARCH: ${{ inputs.architecture }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/codex/diagnose-idc-depth-45579480681
+          test "$SELECTED_ARCH" = amd64
+          test "$SOURCE_REF" = c8412bc193d6b4cd4a3ac8032001a7a58c792859
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: c8412bc193d6b4cd4a3ac8032001a7a58c792859
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Prepare exact IDC Rust compiler environment
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          source = Path('Dockerfile').read_text()
+          prefix, marker, _ = source.partition('RUN --mount=type=cache,target=/usr/local/cargo/registry')
+          assert marker, 'Expected IDC compiler stage boundary missing'
+          Path('/tmp/astra-depth-compiler.Dockerfile').write_text(prefix)
+          PYCODE
+          docker build --platform linux/amd64 -t astra-depth-compiler -f - . < /tmp/astra-depth-compiler.Dockerfile
+          docker run --detach --name astra-depth-compiler --platform linux/amd64 --workdir /app \
+            --mount "type=bind,source=$PWD,target=/app" \
+            --env CARGO_TARGET_DIR=/tmp/astra-depth-target --env CARGO_BUILD_JOBS=2 \
+            astra-depth-compiler sleep infinity
+          docker exec astra-depth-compiler git config --global --add safe.directory /app
+          docker exec astra-depth-compiler rustc --version --verbose
+      - name: Compile main commits after last successful IDC image
+        id: diagnose
+        shell: bash
         run: |
           set -euo pipefail
-          FILTER="${TEST_NAME_FILTER:-}"
-          if [ -n "$FILTER" ]; then
-            cargo test --manifest-path Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
-              --features e2e-hooks -- "$FILTER" --ignored --nocapture
-          else
-            cargo test --manifest-path Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
-              --features e2e-hooks -- --ignored --nocapture
-          fi
-
-      - name: Dump dependency logs
-        if: failure()
-        run: make dev-deps-logs-once
-
-      - name: Stop dependencies
+          base=5e7c20f46b54a8c776156984a7a16d73a79c5e22
+          target=c8412bc193d6b4cd4a3ac8032001a7a58c792859
+          git merge-base --is-ancestor "$base" "$target"
+          mkdir -p /tmp/astra-depth-logs
+          printf '| Commit | Result |\n|---|---|\n' >> "$GITHUB_STEP_SUMMARY"
+          mapfile -t commits < <(git rev-list --reverse --first-parent "$base..$target")
+          for revision in "${commits[@]}"; do
+            git switch --detach "$revision"
+            title=$(git log -1 --format=%s)
+            printf '\nDIAGNOSE_SOURCE=%s %s\n' "$revision" "$title"
+            logfile="/tmp/astra-depth-logs/$revision.log"
+            set +e
+            timeout 30m docker exec \
+              --env "ASTRA_BUILD_SOURCE_GIT_SHA=$revision" \
+              --env ASTRA_BUILD_SOURCE_GIT_DIRTY=false \
+              astra-depth-compiler cargo build --release --locked --no-default-features \
+                --features astra-runtime/otel -p astra-runtime --bin astra-server \
+                -p astra-cli --bin astra > "$logfile" 2>&1
+            result=$?
+            set -e
+            if [ "$result" -eq 0 ]; then
+              echo "DIAGNOSE_PASS=$revision $title"
+              printf '| `%s` %s | PASS |\n' "$revision" "$title" >> "$GITHUB_STEP_SUMMARY"
+            elif grep -q 'queries overflow the depth limit' "$logfile"; then
+              echo "FIRST_BAD_SHA=$revision $title"
+              grep -A 9 -B 2 'queries overflow the depth limit' "$logfile"
+              printf '| `%s` %s | FIRST DEPTH FAILURE |\n' "$revision" "$title" >> "$GITHUB_STEP_SUMMARY"
+              echo "first_bad_sha=$revision" >> "$GITHUB_OUTPUT"
+              exit 0
+            else
+              echo "DIAGNOSE_UNEXPECTED_FAILURE=$revision exit=$result"
+              tail -80 "$logfile"
+              exit 1
+            fi
+          done
+          echo 'DIAGNOSE_NOT_REPRODUCED'
+          echo 'Exact source compiler flags did not reproduce IDC depth overflow.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Stop diagnostic container
         if: always()
-        run: make dev-deps-down
+        run: docker rm --force astra-depth-compiler || true
