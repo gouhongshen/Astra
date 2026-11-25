@@ -1,38 +1,22 @@
-name: Diagnose IDC compiler depth (no publication)
-
+name: Verify IDC runtime release fix (no publication)
 on:
   workflow_dispatch:
-    inputs:
-      source_ref:
-        required: true
-        type: string
-      architecture:
-        required: true
-        default: amd64
-        type: string
-
 permissions:
   contents: read
-
 jobs:
-  diagnose:
-    name: Find first compiler-depth failure
+  release:
+    name: Exact IDC amd64 release compilation
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 75
     steps:
-      - name: Restrict diagnostic control plane
-        env:
-          SELECTED_ARCH: ${{ inputs.architecture }}
-          SOURCE_REF: ${{ inputs.source_ref }}
-        run: |
-          test "$GITHUB_REF" = refs/heads/codex/diagnose-idc-depth-45579480681
-          test "$SELECTED_ARCH" = amd64
-          case "$SOURCE_REF" in c8412bc193d6b4cd4a3ac8032001a7a58c792859|5e7c20f46b54a8c776156984a7a16d73a79c5e22) ;; *) exit 1 ;; esac
+      - name: Restrict validation branch
+        run: test "$GITHUB_REF" = refs/heads/codex/diagnose-idc-depth-45579480681
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: c8412bc193d6b4cd4a3ac8032001a7a58c792859
-          fetch-depth: 0
+          ref: 927714f3a5345ea4172e51635ffde93f397724f9
           persist-credentials: false
+      - name: Verify fixed source
+        run: test "$(git rev-parse HEAD)" = 927714f3a5345ea4172e51635ffde93f397724f9
       - name: Prepare exact IDC Rust compiler environment
         run: |
           python3 - <<'PYCODE'
@@ -49,72 +33,14 @@ jobs:
             astra-depth-compiler sleep infinity
           docker exec astra-depth-compiler git config --global --add safe.directory /app
           docker exec astra-depth-compiler rustc --version --verbose
-      - name: Locate compiler-depth transition from verified published source
-        id: diagnose
-        shell: bash
-        env:
-          DIAGNOSTIC_TARGET: ${{ inputs.source_ref }}
+      - name: Compile exact IDC release binaries
         run: |
-          set -euo pipefail
-          base=f400b59aa630152d60d9d3085f3608785f420857
-          target="$DIAGNOSTIC_TARGET"
-          git merge-base --is-ancestor "$base" "$target"
-          mkdir -p /tmp/astra-depth-logs
-          printf '| Commit | Result |\n|---|---|\n' >> "$GITHUB_STEP_SUMMARY"
-          compile_revision() {
-            revision="$1"
-            git switch --detach "$revision" || return 20
-            test "$(git rev-parse HEAD)" = "$revision" || return 20
-            title=$(git log -1 --format=%s) || return 20
-            echo "DIAGNOSE_SOURCE=$revision $title"
-            logfile="/tmp/astra-depth-logs/$revision.log"
-            set +e
-            timeout 30m docker exec \
-              --env "ASTRA_BUILD_SOURCE_GIT_SHA=$revision" \
-              --env ASTRA_BUILD_SOURCE_GIT_DIRTY=false \
-              astra-depth-compiler cargo build --release --locked --no-default-features \
-                --features astra-runtime/otel -p astra-runtime --bin astra-server \
-                -p astra-cli --bin astra > "$logfile" 2>&1
-            result=$?
-            set -e
-            if [ "$result" -eq 0 ]; then
-              echo "DIAGNOSE_PASS=$revision $title"
-              printf '| `%s` %s | PASS |\n' "$revision" "$title" >> "$GITHUB_STEP_SUMMARY"
-              return 0
-            elif grep -q 'queries overflow the depth limit' "$logfile"; then
-              echo "DIAGNOSE_DEPTH_FAILURE=$revision $title"
-              grep -A 9 -B 2 'queries overflow the depth limit' "$logfile"
-              printf '| `%s` %s | DEPTH FAILURE |\n' "$revision" "$title" >> "$GITHUB_STEP_SUMMARY"
-              return 10
-            else
-              echo "DIAGNOSE_UNEXPECTED_FAILURE=$revision exit=$result"
-              tail -80 "$logfile"
-              return 20
-            fi
-          }
-          if compile_revision "$target"; then
-            echo "DIAGNOSTIC_TARGET_PASSED=$target"
-            exit 0
-          else
-            test "$?" -eq 10
-          fi
-          mapfile -t changes < <(git rev-list --reverse --first-parent "$base..$target")
-          revisions=("$base" "${changes[@]}")
-          low=0
-          high=$((${#revisions[@]} - 1))
-          while [ $((high-low)) -gt 1 ]; do
-            mid=$(((low+high)/2))
-            if compile_revision "${revisions[$mid]}"; then
-              low=$mid
-            else
-              test "$?" -eq 10
-              high=$mid
-            fi
-          done
-          echo "FIRST_BAD_SHA=${revisions[$high]}"
-          echo "PRECEDING_GOOD_SHA=${revisions[$low]}"
-          git show -s --format='%H %s' "${revisions[$high]}"
-          printf '\nFirst bad: `%s`; preceding good: `%s`.\n' "${revisions[$high]}" "${revisions[$low]}" >> "$GITHUB_STEP_SUMMARY"
-      - name: Stop diagnostic container
+          docker exec \
+            --env ASTRA_BUILD_SOURCE_GIT_SHA=927714f3a5345ea4172e51635ffde93f397724f9 \
+            --env ASTRA_BUILD_SOURCE_GIT_DIRTY=false \
+            astra-depth-compiler cargo build --release --locked --no-default-features \
+              --features astra-runtime/otel -p astra-runtime --bin astra-server \
+              -p astra-cli --bin astra
+      - name: Stop validation container
         if: always()
         run: docker rm --force astra-depth-compiler || true
