@@ -63,8 +63,9 @@ jobs:
           printf '| Commit | Result |\n|---|---|\n' >> "$GITHUB_STEP_SUMMARY"
           compile_revision() {
             revision="$1"
-            git switch --detach "$revision"
-            title=$(git log -1 --format=%s)
+            git switch --detach "$revision" || return 20
+            test "$(git rev-parse HEAD)" = "$revision" || return 20
+            title=$(git log -1 --format=%s) || return 20
             echo "DIAGNOSE_SOURCE=$revision $title"
             logfile="/tmp/astra-depth-logs/$revision.log"
             set +e
